@@ -2,12 +2,15 @@ import os
 import re
 import logging
 from PyQt5.QtCore import pyqtSignal, QThread, QUrl, Qt
-from PyQt5.QtWidgets import QWidget, QFrame, QVBoxLayout, QHBoxLayout, QFileDialog, QApplication, QSizePolicy
+from PyQt5.QtWidgets import (QWidget, QFrame, QVBoxLayout, QHBoxLayout, QFileDialog, 
+                            QApplication, QSizePolicy, QCheckBox)
 from PyQt5.QtGui import QDesktopServices, QFont, QDragEnterEvent, QDropEvent
 from qfluentwidgets import (
     PushButton, LineEdit, ComboBox, ProgressBar, TextEdit, SubtitleLabel,
-    FluentIcon, InfoBar, InfoBarPosition, MessageBox
+    FluentIcon, InfoBar, InfoBarPosition, MessageBox, CheckBox
 )
+from Core.extractor_thread import ExtractorThread
+from Core.config_manager import ConfigManager
 
 # Logger class for GUI output
 class QTextEditLogger(logging.Handler):
@@ -24,28 +27,6 @@ class QTextEditLogger(logging.Handler):
         scrollbar = self.textEdit.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
-# Thread for extraction
-class ExtractorThread(QThread):
-    progressUpdated = pyqtSignal(int)
-    extractionFinished = pyqtSignal(str)
-    extractionError = pyqtSignal(str)
-    
-    def __init__(self, lpk_path, config_path, output_dir):
-        super().__init__()
-        self.lpk_path = lpk_path
-        self.config_path = config_path
-        self.output_dir = output_dir
-        
-    def run(self):
-        try:
-            # Import inside the method to prevent early loading
-            from Core.lpk_loader import LpkLoader
-            loader = LpkLoader(self.lpk_path, self.config_path)
-            loader.extract(self.output_dir)
-            self.extractionFinished.emit(self.output_dir)
-        except Exception as e:
-            self.extractionError.emit(str(e))
-
 class ExtractorPage(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -55,8 +36,18 @@ class ExtractorPage(QFrame):
         # Enable drop
         self.setAcceptDrops(True)
         
+        # Configuration manager
+        self.config_manager = ConfigManager()
+        
         # Default output directory
         self.default_output_dir = os.path.join(os.getcwd(), "output")
+        
+        # Track selected files and folders
+        self.selected_files = []
+        self.selected_configs = []
+        
+        # Track last output directory
+        self.last_output_dir = self.default_output_dir
         
         self.setupUI()
         self.configure_logging()
@@ -71,34 +62,28 @@ class ExtractorPage(QFrame):
         self.main_layout.setSpacing(10)
         
         # Add title
-        self.title_label = SubtitleLabel("LPK File Extractor", self)
+        self.title_label = SubtitleLabel("LPK/WPK File Extractor", self)
         self.main_layout.addWidget(self.title_label)
         
-        # LPK file selection
-        self.lpk_layout = QHBoxLayout()
-        self.lpk_label = SubtitleLabel("LPK File:", self)
-        self.lpk_edit = LineEdit(self)
-        self.lpk_edit.setPlaceholderText("Select LPK file or drag & drop file here...")
-        self.lpk_button = PushButton("Browse", self)
-        self.lpk_button.setIcon(FluentIcon.FOLDER)
-        self.lpk_button.clicked.connect(self.browse_lpk)
-        self.lpk_layout.addWidget(self.lpk_label)
-        self.lpk_layout.addWidget(self.lpk_edit, 1)
-        self.lpk_layout.addWidget(self.lpk_button)
-        self.main_layout.addLayout(self.lpk_layout)
+        # File selection (supports multiple files)
+        self.file_layout = QHBoxLayout()
+        self.file_label = SubtitleLabel("Files/Folders:", self)
+        self.file_edit = LineEdit(self)
+        self.file_edit.setPlaceholderText("Select LPK/WPK files or folders, or drag & drop here...")
+        self.file_edit.setReadOnly(True)
+        self.file_button = PushButton("Browse Files", self)
+        self.file_button.setIcon(FluentIcon.FOLDER)
+        self.file_button.clicked.connect(self.browse_files)
         
-        # Config file selection (optional)
-        self.config_layout = QHBoxLayout()
-        self.config_label = SubtitleLabel("Config File:", self)
-        self.config_edit = LineEdit(self)
-        self.config_edit.setPlaceholderText("Select config.json (required for Steam workshop files)")
-        self.config_button = PushButton("Browse", self)
-        self.config_button.setIcon(FluentIcon.FOLDER)
-        self.config_button.clicked.connect(self.browse_config)
-        self.config_layout.addWidget(self.config_label)
-        self.config_layout.addWidget(self.config_edit, 1)
-        self.config_layout.addWidget(self.config_button)
-        self.main_layout.addLayout(self.config_layout)
+        self.folder_button = PushButton("Browse Folder", self)
+        self.folder_button.setIcon(FluentIcon.FOLDER_ADD)
+        self.folder_button.clicked.connect(self.browse_folder)
+        
+        self.file_layout.addWidget(self.file_label)
+        self.file_layout.addWidget(self.file_edit, 1)
+        self.file_layout.addWidget(self.file_button)
+        self.file_layout.addWidget(self.folder_button)
+        self.main_layout.addLayout(self.file_layout)
         
         # Output directory selection
         self.output_layout = QHBoxLayout()
@@ -114,6 +99,12 @@ class ExtractorPage(QFrame):
         self.output_layout.addWidget(self.output_edit, 1)
         self.output_layout.addWidget(self.output_button)
         self.main_layout.addLayout(self.output_layout)
+        
+        # Extract images only checkbox
+        self.images_only_checkbox = CheckBox("Extract Images Only", self)
+        self.images_only_checkbox.setChecked(self.config_manager.get_extract_images_only())
+        self.images_only_checkbox.stateChanged.connect(self.on_images_only_changed)
+        self.main_layout.addWidget(self.images_only_checkbox)
         
         # Progress bar
         self.progress_bar = ProgressBar(self)
@@ -154,38 +145,103 @@ class ExtractorPage(QFrame):
         # 设置TextEdit的响应式尺寸
         self.log_text.setMinimumHeight(200)
         self.log_text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+    
+    def on_images_only_changed(self, state):
+        """Handle images only checkbox state change"""
+        self.config_manager.set_extract_images_only(state == Qt.Checked)
         
     # Drag & Drop support
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
-            # Accept only files with .lpk or .json extensions
-            for url in event.mimeData().urls():
-                path = url.toLocalFile()
-                ext = os.path.splitext(path)[1].lower()
-                if ext == '.lpk' or ext == '.json':
-                    event.acceptProposedAction()
-                    return
+            # Accept files and folders
+            event.acceptProposedAction()
                     
     def dropEvent(self, event: QDropEvent):
-        # Process the dropped files
+        # Process the dropped files/folders
+        files = []
+        configs = []
+        
         for url in event.mimeData().urls():
             path = url.toLocalFile()
-            ext = os.path.splitext(path)[1].lower()
             
-            # Handle LPK file
-            if ext == '.lpk':
-                self.lpk_edit.setText(path)
-                # Try to find config.json in same directory
-                dir_path = os.path.dirname(path)
-                potential_config = os.path.join(dir_path, "config.json")
-                if os.path.exists(potential_config):
-                    self.config_edit.setText(potential_config)
-                    
-            # Handle JSON config file
-            elif ext == '.json' and os.path.basename(path).lower() == 'config.json':
-                self.config_edit.setText(path)
+            if os.path.isdir(path):
+                # Process folder
+                folder_files, folder_configs = self.scan_folder(path)
+                files.extend(folder_files)
+                configs.extend(folder_configs)
+            elif os.path.isfile(path):
+                ext = os.path.splitext(path)[1].lower()
+                if ext in ['.lpk', '.wpk']:
+                    files.append(path)
+                    # Look for config in same directory
+                    config_path = os.path.join(os.path.dirname(path), 'config.json')
+                    if os.path.exists(config_path) and config_path not in configs:
+                        configs.append(config_path)
+                elif ext == '.json' and os.path.basename(path).lower() == 'config.json':
+                    if path not in configs:
+                        configs.append(path)
+        
+        if files:
+            self.selected_files = files
+            self.selected_configs = configs
+            self.update_file_display()
                 
         event.acceptProposedAction()
+    
+    def browse_files(self):
+        """Browse for multiple files"""
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self, "Select LPK/WPK Files", "", "Package Files (*.lpk *.wpk);;All Files (*.*)"
+        )
+        if file_paths:
+            self.selected_files = [os.path.abspath(f) for f in file_paths]
+            self.selected_configs = []
+            
+            # Try to find config files
+            for file_path in self.selected_files:
+                dir_name = os.path.dirname(file_path)
+                config_path = os.path.join(dir_name, "config.json")
+                if os.path.exists(config_path) and config_path not in self.selected_configs:
+                    self.selected_configs.append(config_path)
+            
+            self.update_file_display()
+    
+    def browse_folder(self):
+        """Browse for a folder"""
+        folder_path = QFileDialog.getExistingDirectory(
+            self, "Select Folder Containing LPK/WPK Files"
+        )
+        if folder_path:
+            files, configs = self.scan_folder(folder_path)
+            self.selected_files = files
+            self.selected_configs = configs
+            self.update_file_display()
+    
+    def scan_folder(self, folder_path):
+        """Scan folder for LPK/WPK files and configs"""
+        files = []
+        configs = []
+        
+        for root, dirs, filenames in os.walk(folder_path):
+            for filename in filenames:
+                full_path = os.path.join(root, filename)
+                ext = os.path.splitext(filename)[1].lower()
+                
+                if ext in ['.lpk', '.wpk']:
+                    files.append(full_path)
+                elif filename.lower() == 'config.json':
+                    configs.append(full_path)
+        
+        return files, configs
+    
+    def update_file_display(self):
+        """Update the file display text"""
+        if not self.selected_files:
+            self.file_edit.clear()
+        elif len(self.selected_files) == 1:
+            self.file_edit.setText(self.selected_files[0])
+        else:
+            self.file_edit.setText(f"{len(self.selected_files)} files selected")
         
     def configure_logging(self):
         # Setup logging to capture to text widget
@@ -195,28 +251,6 @@ class ExtractorPage(QFrame):
         root_logger = logging.getLogger()
         root_logger.setLevel(logging.INFO)
         root_logger.addHandler(self.log_handler)
-        
-    def browse_lpk(self):
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Select LPK File", "", "LPK Files (*.lpk)"
-        )
-        if file_path:
-            # Use absolute path
-            file_path = os.path.abspath(file_path)
-            self.lpk_edit.setText(file_path)
-            # Try to auto-locate config.json in the same directory
-            dir_name = os.path.dirname(file_path)
-            potential_config = os.path.join(dir_name, "config.json")
-            if os.path.exists(potential_config):
-                self.config_edit.setText(potential_config)
-                
-    def browse_config(self):
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Select Config File", "", "JSON Files (*.json)"
-        )
-        if file_path:
-            # Use absolute path
-            self.config_edit.setText(os.path.abspath(file_path))
             
     def browse_output(self):
         dir_path = QFileDialog.getExistingDirectory(
@@ -226,60 +260,26 @@ class ExtractorPage(QFrame):
             # Use absolute path
             self.output_edit.setText(os.path.abspath(dir_path))
             
-    def normalize_path(self, path):
-        """
-        Normalize path to ensure consistent format and handle relative/absolute paths correctly
-        """
-        # Convert all backslashes to forward slashes
-        path = path.replace('\\', '/')
-        
-        # Handle absolute paths - for Windows that starts with drive letter (e.g., D:/)
-        if re.match(r'^[a-zA-Z]:/.*', path):
-            # Already absolute path, just ensure proper format
-            return path
-        
-        # Handle paths starting with leading / (Unix absolute paths)
-        if path.startswith('/'):
-            return path
-            
-        # For relative paths, ensure no duplication of directory structure
-        # Remove any leading ./ or D:/ etc.
-        path = re.sub(r'^\.?[/\\]', '', path)
-        path = re.sub(r'^[a-zA-Z]:[/\\]', '', path)
-        
-        return path
-        
     def start_extraction(self):
         # Validate inputs
-        lpk_path = self.lpk_edit.text()
-        config_path = self.config_edit.text()
         output_dir = self.output_edit.text()
         
-        # Convert to absolute paths
-        if lpk_path:
-            lpk_path = os.path.abspath(lpk_path)
-        if config_path:
-            config_path = os.path.abspath(config_path)
-        if output_dir:
-            output_dir = os.path.abspath(output_dir)
-        else:
-            # Use default output directory
-            output_dir = os.path.abspath(self.default_output_dir)
-            self.output_edit.setText(output_dir)
-        
-        if not lpk_path or not os.path.exists(lpk_path):
+        if not self.selected_files:
             InfoBar.error(
                 title="Error",
-                content="Please select a valid LPK file.",
+                content="Please select LPK/WPK files or folders.",
                 parent=self,
                 position=InfoBarPosition.TOP,
                 duration=3000
             )
             return
-            
-        if not output_dir:
-            # If output directory is empty, use default
-            output_dir = self.default_output_dir
+        
+        # Convert to absolute paths
+        if output_dir:
+            output_dir = os.path.abspath(output_dir)
+        else:
+            # Use default output directory
+            output_dir = os.path.abspath(self.default_output_dir)
             self.output_edit.setText(output_dir)
             
         # Create output directory if it doesn't exist
@@ -296,53 +296,86 @@ class ExtractorPage(QFrame):
                 )
                 return
         
-        # Determine if we're using default output or custom directory
-        is_default_output = os.path.normpath(output_dir) == os.path.normpath(self.default_output_dir)
-                
-        # Set verbosity level - now fixed to INFO
-        root_logger = logging.getLogger()
-        root_logger.setLevel(logging.INFO)
+        # Save last output directory
+        self.last_output_dir = output_dir
+        self.config_manager.set_last_output_dir(output_dir)
         
         # Disable controls during extraction
         self.extract_button.setEnabled(False)
+        self.file_button.setEnabled(False)
+        self.folder_button.setEnabled(False)
         
-        # Fix: Use setValue(1) and disable the range to show indeterminate progress
-        # instead of using setIndeterminate(True) which doesn't exist
-        self.progress_bar.setRange(0, 0)  # No range = indeterminate
+        # Reset progress bar
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        
+        # Clear log
+        self.log_text.clear()
+        
+        # Get extract images only setting
+        extract_images_only = self.images_only_checkbox.isChecked()
         
         # Start extraction in a separate thread
-        self.extractor_thread = ExtractorThread(lpk_path, config_path, output_dir)
+        self.extractor_thread = ExtractorThread(
+            self.selected_files,
+            self.selected_configs,
+            output_dir,
+            extract_images_only
+        )
+        self.extractor_thread.progressUpdated.connect(self.on_progress_updated)
         self.extractor_thread.extractionFinished.connect(self.extraction_finished)
         self.extractor_thread.extractionError.connect(self.extraction_error)
+        self.extractor_thread.logMessage.connect(self.on_log_message)
         self.extractor_thread.start()
         
         # Log start of extraction
-        logging.info(f"Starting extraction of {lpk_path} to {output_dir}")
+        logging.info(f"Starting extraction of {len(self.selected_files)} file(s) to {output_dir}")
+    
+    def on_progress_updated(self, value):
+        """Handle progress update from thread"""
+        self.progress_bar.setValue(value)
+    
+    def on_log_message(self, level, message):
+        """Handle log message from thread"""
+        # Map level to logging level
+        level_map = {
+            "DEBUG": logging.DEBUG,
+            "INFO": logging.INFO,
+            "WARNING": logging.WARNING,
+            "ERROR": logging.ERROR
+        }
+        
+        log_level = level_map.get(level, logging.INFO)
+        logger = logging.getLogger()
+        logger.log(log_level, message)
         
     def extraction_finished(self, output_dir):
         # Re-enable controls
         self.extract_button.setEnabled(True)
-        # Fix: Restore normal range and set to 100%
-        self.progress_bar.setRange(0, 100) 
+        self.file_button.setEnabled(True)
+        self.folder_button.setEnabled(True)
         self.progress_bar.setValue(100)
         self.open_folder_button.setEnabled(True)
+        
+        # Update last output directory
+        self.last_output_dir = output_dir
         
         # Show success message
         InfoBar.success(
             title="Success",
-            content=f"LPK file extracted successfully to {output_dir}",
+            content=f"Extraction completed successfully",
             parent=self,
             position=InfoBarPosition.TOP,
             duration=5000
         )
         
-        logging.info(f"Extraction completed successfully. Files saved to {output_dir}")
+        logging.info(f"All extractions completed successfully. Files saved to {output_dir}")
         
     def extraction_error(self, error_message):
         # Re-enable controls
         self.extract_button.setEnabled(True)
-        # Fix: Restore normal range and set to 0%
-        self.progress_bar.setRange(0, 100)
+        self.file_button.setEnabled(True)
+        self.folder_button.setEnabled(True)
         self.progress_bar.setValue(0)
         
         # Show error message
@@ -355,7 +388,9 @@ class ExtractorPage(QFrame):
         logging.error(f"Extraction failed: {error_message}")
         
     def open_output_folder(self):
-        output_dir = self.output_edit.text()
+        # Use the last output directory
+        output_dir = self.last_output_dir or self.output_edit.text()
+        
         if os.path.exists(output_dir):
             QDesktopServices.openUrl(QUrl.fromLocalFile(output_dir))
         else:

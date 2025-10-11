@@ -1,4 +1,5 @@
 PyQt-Fluent-Widgets>=1.4.0
 PyQt5>=5.15.0
 filetype>=1.0.0
-live2d-py>=0.3.3
+UnityPy>=1.10.0
+Pillow>=9.0.0

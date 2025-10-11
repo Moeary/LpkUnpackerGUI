@@ -1,38 +1,48 @@
 import sys
 import os
-from PyQt5.QtCore import Qt, QCoreApplication
+from PyQt5.QtCore import Qt, QCoreApplication, QTranslator
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtGui import QIcon
 
-# 确保设置正确的属性来支持高DPI缩放
+# Enable high DPI scaling
 QCoreApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
 QCoreApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
 
 def run_application():
-    # 创建QApplication实例
+    """Main application entry point"""
+    # Create QApplication instance
     app = QApplication(sys.argv)
     
-    # 设置应用程序图标 - 这会影响任务栏图标
-    icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Img/icon.ico")
-    app_icon = QIcon(icon_path)
-    app.setWindowIcon(app_icon)
+    # Set application icon
+    icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Img", "icon.ico")
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
     
-    # 设置全局字体缩放因子
+    # Load translator for internationalization
+    translator = QTranslator()
+    from Core.config_manager import ConfigManager
+    config_manager = ConfigManager()
+    language = config_manager.get_language()
+    
+    if language == "zh-CN":
+        translator_file = os.path.join(os.path.dirname(__file__), "translations", "zh_CN.qm")
+        if os.path.exists(translator_file):
+            translator.load(translator_file)
+            app.installTranslator(translator)
+    
+    # Set base font
     font = app.font()
-    font.setPointSize(10)  # 设置一个基础字号大小
+    font.setPointSize(10)
     app.setFont(font)
     
     try:
-        # 导入主窗口类
+        # Import and create main window
         from GUI.MainWindow import MainWindow
         
-        # 创建主窗口
         window = MainWindow()
-        # 确保窗口也使用相同的图标
-        window.setWindowIcon(app_icon)
         window.show()
         
-        # 启动应用程序事件循环
+        # Start event loop
         return app.exec_()
     except Exception as e:
         import traceback
