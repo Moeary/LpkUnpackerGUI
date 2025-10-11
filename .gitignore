@@ -1,0 +1,6 @@
+output/*
+input/*
+GUI/__pycache__/*
+Core/__pycache__/*
+Resources/*
+build/*
