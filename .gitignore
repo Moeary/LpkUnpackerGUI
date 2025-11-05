@@ -4,3 +4,32 @@ GUI/__pycache__/*
 Core/__pycache__/*
 Resources/*
 build/*
+
+# Build outputs
+build/
+dist/
+*.exe
+*.spec
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Nuitka
+.nuitka/
+*.onefile/

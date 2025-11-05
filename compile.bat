@@ -1,44 +1,42 @@
 @echo off
-REM filepath: d:\Python_Project\LpkUnpackerGUI\compile.bat
+REM LpkUnpackerGUI Compiler Script
+setlocal enabledelayedexpansion
+
 echo ===== LpkUnpackerGUI Compiler =====
 echo Starting compilation process...
-
-REM Activate Conda base environment
-echo Activating Conda base environment...
-call conda activate base
-if %ERRORLEVEL% neq 0 (
-    echo Error: Failed to activate Conda base environment!
-    echo Make sure Conda is properly installed and initialized.
-    pause
-    exit /b 1
-)
+echo.
 
 REM Check if Python is available
 where python >nul 2>&1
 if %ERRORLEVEL% neq 0 (
-    echo Error: Python not found in Conda environment!
+    echo Error: Python not found in PATH!
+    echo Please ensure Python is installed and added to PATH.
     pause
     exit /b 1
 )
 
-REM Check if nuitka is installed
+echo Checking Python version...
+python --version
+
+REM Check if required packages are installed
+echo.
+echo Checking dependencies...
 python -c "import nuitka" >nul 2>&1
 if %ERRORLEVEL% neq 0 (
-    echo Warning: Nuitka not found. Attempting to install it...
-    conda install -c conda-forge nuitka -y
-    if %ERRORLEVEL% neq 0 (
-        echo Failed to install Nuitka through Conda. Trying pip...
-        pip install nuitka
-        if %ERRORLEVEL% neq 0 (
-            echo Failed to install Nuitka. Aborting compilation.
-            pause
-            exit /b 1
-        )
-    )
+    echo Installing Nuitka...
+    pip install nuitka ordered-set
 )
 
-echo Compiling application with Nuitka in Conda base environment...
-echo This may take several minutes. Please be patient...
+python -c "import PyQt5" >nul 2>&1
+if %ERRORLEVEL% neq 0 (
+    echo Installing PyQt5 dependencies...
+    pip install -r requirements.txt
+)
+
+echo.
+echo Building executable with Nuitka...
+echo This may take 5-10 minutes. Please be patient...
+echo.
 
 REM Main compilation command
 python -m nuitka --onefile ^
@@ -56,13 +54,14 @@ python -m nuitka --onefile ^
     LpkUnpackerGUI.py
 
 if %ERRORLEVEL% neq 0 (
-    echo Compilation failed with error code %ERRORLEVEL%.
+    echo.
+    echo Error: Compilation failed with error code %ERRORLEVEL%.
     pause
     exit /b %ERRORLEVEL%
 )
 
 echo.
-echo Compilation completed successfully!
-echo Executable can be found in the 'build' directory.
+echo ===== Compilation Successful! =====
+echo Executable location: build\LpkUnpackerGUI.exe
 echo.
 pause
