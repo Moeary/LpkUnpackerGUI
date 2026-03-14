@@ -18,6 +18,18 @@ except Exception as e:
             QHBoxLayout(self).addWidget(QFrame(self))
 
 try:
+    from GUI.UnityExtractorPage import UnityExtractorPage
+except Exception as e:
+    import traceback
+    print(f"Error importing UnityExtractorPage: {e}")
+    traceback.print_exc()
+    class UnityExtractorPage(QFrame):
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setObjectName('unityExtractorPage')
+            QHBoxLayout(self).addWidget(QFrame(self))
+
+try:
     from GUI.Live2DModPage import Live2DModPage
 except Exception as e:
     import traceback
@@ -55,6 +67,13 @@ class MainWindow(FluentWindow):
             print(f"Error creating ExtractorPage: {e}")
             self.extractorPage = QFrame(self)
             self.extractorPage.setObjectName('extractorPage')
+
+        try:
+            self.unityExtractorPage = UnityExtractorPage(self)
+        except Exception as e:
+            print(f"Error creating UnityExtractorPage: {e}")
+            self.unityExtractorPage = QFrame(self)
+            self.unityExtractorPage.setObjectName('unityExtractorPage')
             
         try:
             self.live2dModPage = Live2DModPage(self)
@@ -93,6 +112,12 @@ class MainWindow(FluentWindow):
         except Exception as e:
             print(f"Error adding ExtractorPage to navigation: {e}")
         
+        # Add Unity image extractor page
+        try:
+            self.addSubInterface(self.unityExtractorPage, FIF.PHOTO, 'Unity Image Extractor')
+        except Exception as e:
+            print(f"Error adding UnityExtractorPage to navigation: {e}")
+
         self.navigationInterface.addSeparator()
         
         # Add Live2D mod tool
@@ -138,6 +163,6 @@ class MainWindow(FluentWindow):
         app.setFont(font)
         
         # Notify sub-pages about font update
-        for page in [self.extractorPage, self.live2dModPage, self.settingsPage]:
+        for page in [self.extractorPage, self.unityExtractorPage, self.live2dModPage, self.settingsPage]:
             if hasattr(page, 'updateUIScale'):
                 page.updateUIScale(self.width(), self.height())

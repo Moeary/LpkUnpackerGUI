@@ -50,8 +50,8 @@ class ImageExtractor:
             return "LPK"
         elif ext == '.wpk':
             return "WPK"
-        elif ext == '':
-            # No extension - might be Unity file
+        elif ext in ['', '.assets', '.sharedassets', '.bundle', '.unity3d']:
+            # No extension or Unity-related extension - might be Unity file
             if UNITYPY_AVAILABLE:
                 try:
                     # Try to load as Unity file
