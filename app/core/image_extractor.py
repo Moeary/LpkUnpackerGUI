@@ -4,14 +4,8 @@ import hashlib
 import tempfile
 import shutil
 from typing import Dict, Tuple, List
+from app.core.assetstudio_cli import AssetStudioCLI, AssetStudioCLIError
 from app.core.lpk_loader import LpkLoader
-
-try:
-    import UnityPy
-    UNITYPY_AVAILABLE = True
-except ImportError:
-    UNITYPY_AVAILABLE = False
-    print("Warning: UnityPy not available. Unity file extraction will not work.")
 
 class ImageExtractor:
     """Extract only images/textures from LPK, WPK, and Unity files"""
@@ -50,18 +44,8 @@ class ImageExtractor:
             return "LPK"
         elif ext == '.wpk':
             return "WPK"
-        elif ext in ['', '.assets', '.sharedassets', '.bundle', '.unity3d']:
-            # No extension or Unity-related extension - might be Unity file
-            if UNITYPY_AVAILABLE:
-                try:
-                    # Try to load as Unity file
-                    env = UnityPy.load(file_path)
-                    # Check if it contains any objects
-                    for obj in env.objects:
-                        return "UNITY"
-                except:
-                    pass
-            return "UNKNOWN"
+        elif ext in ['', '.assets', '.sharedassets', '.bundle', '.unity3d', '.resource', '.resS']:
+            return "UNITY"
         else:
             return "UNKNOWN"
     
@@ -205,20 +189,14 @@ class ImageExtractor:
                         except Exception as e:
                             print(f"  Error extracting {filename}: {e}")
             
-            # Also check for Unity files (no extension) in the temp directory
-            print(f"  Scanning for Unity asset files...")
-            for root, dirs, files in os.walk(temp_dir):
-                for filename in files:
-                    # Check files without extension
-                    if not self.has_extension(filename):
-                        file_path = os.path.join(root, filename)
-                        
-                        # Try to extract textures from Unity file
-                        unity_extracted, unity_skipped = self.extract_unity_textures_from_file(
-                            file_path, image_dir, filename
-                        )
-                        extracted_count += unity_extracted
-                        skipped_count += unity_skipped
+            print(f"  Running AssetStudio CLI for Unity textures...")
+            unity_extracted, unity_skipped = self.extract_unity_textures_from_path(
+                temp_dir,
+                image_dir,
+                title,
+            )
+            extracted_count += unity_extracted
+            skipped_count += unity_skipped
             
         finally:
             # Clean up temporary directory
@@ -231,87 +209,16 @@ class ImageExtractor:
         
         return extracted_count, skipped_count
     
-    def extract_unity_textures_from_file(self, file_path, output_dir, base_name):
-        """Extract textures from a Unity file"""
-        if not UNITYPY_AVAILABLE:
-            return 0, 0
-        
-        extracted_count = 0
-        skipped_count = 0
-        
+    def extract_unity_textures_from_path(self, input_path, output_dir, base_name=None):
+        """Extract textures from Unity assets through AssetStudio CLI."""
         try:
-            # Try to load as Unity file
-            env = UnityPy.load(file_path)
-            
-            # Initialize counters for this base name
-            if base_name not in self.md5_registry:
-                self.md5_registry[base_name] = {}
-                self.file_counter[base_name] = 0
-            
-            # Collect all textures
-            textures_in_file = []
-            
-            for obj in env.objects:
-                if obj.type.name == "Texture2D":
-                    try:
-                        data = obj.read()
-                        img = data.image
-                        
-                        if not img:
-                            continue
-                        
-                        # Calculate MD5
-                        img_md5 = self.calculate_image_md5(img)
-                        textures_in_file.append((img, img_md5))
-                        
-                    except Exception as e:
-                        print(f"  Error reading texture from {base_name}: {e}")
-            
-            if not textures_in_file:
-                return 0, 0
-            
-            # Check if all textures are duplicates
-            all_duplicates = all(
-                img_md5 in self.md5_registry[base_name] 
-                for img, img_md5 in textures_in_file
-            )
-            
-            if all_duplicates:
-                print(f"  Skipped duplicate Unity file: {base_name} ({len(textures_in_file)} textures)")
-                skipped_count = len(textures_in_file)
-            else:
-                # Assign new file index
-                current_file_index = self.file_counter[base_name]
-                self.file_counter[base_name] += 1
-                
-                texture_index = 0
-                for img, img_md5 in textures_in_file:
-                    # Check for duplicate
-                    if img_md5 in self.md5_registry[base_name]:
-                        existing_file = self.md5_registry[base_name][img_md5]
-                        print(f"  Skipped duplicate texture (MD5: {img_md5[:8]}..., exists: {existing_file})")
-                        skipped_count += 1
-                        continue
-                    
-                    # Generate filename: basename_fileindex_textureindex.png
-                    output_name = f"{base_name}_{current_file_index}_{texture_index}.png"
-                    output_path = os.path.join(output_dir, output_name)
-                    
-                    # Save image
-                    img.save(output_path)
-                    
-                    # Register MD5
-                    self.md5_registry[base_name][img_md5] = output_name
-                    
-                    print(f"  ✓ Extracted from Unity: {output_name} (MD5: {img_md5[:8]}...)")
-                    extracted_count += 1
-                    texture_index += 1
-            
-        except Exception as e:
-            # Not a Unity file or error processing, ignore
-            pass
-        
-        return extracted_count, skipped_count
+            result = AssetStudioCLI().export_textures(input_path, output_dir)
+            for path in result.exported_files:
+                print(f"  ✓ AssetStudio exported: {path.name}")
+            return result.exported_count, 0
+        except AssetStudioCLIError as e:
+            print(f"  Warning: AssetStudio CLI skipped {base_name or input_path}: {e}")
+            return 0, 0
     
     def extract_from_wpk(self, output_dir):
         """Extract textures from WPK file"""
@@ -358,10 +265,7 @@ class ImageExtractor:
                 shutil.rmtree(temp_dir)
     
     def extract_from_unity(self, output_dir):
-        """Extract Texture2D from Unity file (no extension)"""
-        if not UNITYPY_AVAILABLE:
-            raise ImportError("UnityPy is required for Unity file extraction. Install with: pip install UnityPy")
-        
+        """Extract Texture2D/Sprite assets from Unity files via AssetStudio CLI."""
         # Get base name from file
         base_name = os.path.basename(self.file_path)
         
@@ -370,7 +274,7 @@ class ImageExtractor:
         os.makedirs(image_dir, exist_ok=True)
         
         # Extract textures
-        return self.extract_unity_textures_from_file(self.file_path, image_dir, base_name)
+        return self.extract_unity_textures_from_path(self.file_path, image_dir, base_name)
     
     def get_title_from_config(self):
         """Get title from config file or use default"""

@@ -8,6 +8,7 @@ build/
 dist/
 *.exe
 *.spec
+app/tools/AssetStudioCLI/
 
 # Python
 __pycache__/

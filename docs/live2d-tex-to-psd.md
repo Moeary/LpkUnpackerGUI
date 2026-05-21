@@ -21,6 +21,14 @@ Practical reconstruction flow:
 6. Write a PSD with one RGBA layer per Drawable using `psd-tools`, Pillow, and optionally OpenCV.
 7. Validate by compositing the generated PSD and comparing it against a default-pose SDK render.
 
+Current implementation:
+
+- `app/core/psd_reconstructor.py` accepts a `model3.json`, a `.moc3`, or a model folder.
+- Texture atlas fallback works with only `model3.json` and texture PNG files, producing one PSD layer per atlas.
+- Mesh reconstruction is enabled when a sidecar mesh file exists next to the model, such as `drawables.json`, `mesh.json`, `<model>.drawables.json`, or `<moc>.drawables.json`.
+- Sidecar drawable entries should provide `id`, `texture_index`, `vertices`, `uvs`, and `indices`. UVs can be normalized `0..1` values or texture pixel coordinates.
+- The installed `live2d` Python wrapper currently does not expose enough Cubism Core drawable geometry accessors to extract vertices, UVs, and triangle indices directly from `.moc3`.
+
 Expected limitations:
 
 - Original layer groups, hidden layers, masks, effects, and draft layers are not recoverable.

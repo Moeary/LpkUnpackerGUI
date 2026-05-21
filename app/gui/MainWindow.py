@@ -116,6 +116,20 @@ except Exception as e:
 
 
 try:
+    from app.gui.PsdReconstructionPage import PsdReconstructionPage
+except Exception as e:
+    import traceback
+    print(f"Error importing PsdReconstructionPage: {e}")
+    traceback.print_exc()
+
+    class PsdReconstructionPage(QFrame):
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setObjectName("psdReconstructionPage")
+            QHBoxLayout(self).addWidget(QFrame(self))
+
+
+try:
     from app.gui.SettingsPage import SettingsPage
 except Exception as e:
     import traceback
@@ -152,6 +166,9 @@ class MainWindow(FluentWindow):
         self.steamWorkshopPage = self._create_page(SteamWorkshopPage, "steamWorkshopPage")
         self.webPreviewPage = self._create_page(WebPreviewPage, "webPreviewPage")
         self.live2dModPage = self._create_page(Live2DModPage, "live2dModPage")
+        self.psdReconstructionPage = self._create_page(
+            PsdReconstructionPage, "psdReconstructionPage"
+        )
         self.settingsPage = self._create_page(SettingsPage, "settingsPage")
 
         language_changed = getattr(self.settingsPage, "languageChanged", None)
@@ -224,6 +241,16 @@ class MainWindow(FluentWindow):
 
         try:
             self.addSubInterface(
+                self.psdReconstructionPage,
+                FIF.IMAGE_EXPORT,
+                tr("main.nav.psd_reconstruction"),
+                NavigationItemPosition.SCROLL,
+            )
+        except Exception as e:
+            print(f"Error adding PsdReconstructionPage to navigation: {e}")
+
+        try:
+            self.addSubInterface(
                 self.encryptionPage,
                 FIF.DOWNLOAD,
                 tr("main.nav.encryption"),
@@ -274,6 +301,7 @@ class MainWindow(FluentWindow):
             self.steamWorkshopPage,
             self.webPreviewPage,
             self.live2dModPage,
+            self.psdReconstructionPage,
             self.settingsPage,
         ]
         for page in filter(None, pages):
@@ -326,6 +354,7 @@ class MainWindow(FluentWindow):
             self.steamWorkshopPage,
             self.webPreviewPage,
             self.live2dModPage,
+            self.psdReconstructionPage,
             self.settingsPage,
         ]:
             if page is not None and hasattr(page, "retranslate_ui"):

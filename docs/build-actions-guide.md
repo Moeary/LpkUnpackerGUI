@@ -8,11 +8,18 @@ This project uses pixi for environment management and Nuitka for Windows packagi
 pixi install
 pixi run check
 pixi run build
+pixi run build-gcc
 ```
 
 `pixi run check` performs a lightweight syntax parse of files under `app/` and `scripts/`.
 
 `pixi run build` runs `scripts/build_nuitka.py`. The script locates `VsDevCmd.bat`, initializes the Visual Studio 2022 toolchain, then runs `python -m nuitka`.
+
+`pixi run build-gcc` is an experimental MinGW path. It uses:
+
+```powershell
+python -m nuitka --standalone --mingw64 --low-memory --jobs=1 --lto=no ...
+```
 
 Resolution order:
 
@@ -24,9 +31,20 @@ The Nuitka command pins MSVC with `--msvc=14.3`. Nuitka's `--msvc` option accept
 
 ## Why MSVC
 
-MSVC is not theoretically required for every Nuitka build on Windows, but it is the practical compiler for this project. The previous MinGW/GCC run reached Nuitka's C backend, then failed inside `cc1.exe` while compiling generated C files from large dependencies such as UnityPy.
+MSVC is not theoretically required for every Nuitka build on Windows. The previous MinGW/GCC run reached Nuitka's C backend, then failed inside `cc1.exe` while compiling generated C files from large Python dependencies.
 
 That failure is not the same as total system RAM being exhausted. GCC's `cc1.exe` can fail because of compiler process address space, huge generated translation units, parallel compile pressure, or MinGW runtime limits even when Task Manager still shows available memory.
+
+There is no simple GCC switch that "gives cc1 more RAM" in the way a JVM heap flag would. Useful knobs are about lowering peak memory:
+
+- `--low-memory`
+- `--jobs=1`
+- `--lto=no`
+- excluding unused heavy imports with `--nofollow-import-to`
+
+If an older project compiled fine, it likely generated smaller C translation units, included fewer large packages, used different Nuitka/GCC versions, or compiled with lower parallelism.
+
+Unity asset parsing is intentionally delegated to the external AssetStudioModCLI binary under `app/tools/AssetStudioCLI/`, so Nuitka no longer needs to compile a Python Unity parser.
 
 The local toolchain has been verified to expose:
 

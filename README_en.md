@@ -87,6 +87,11 @@ pixi install
 pixi run build
 ```
 
+To try the low-memory MinGW/GCC build path:
+```
+pixi run build-gcc
+```
+
 The compiled application is saved under the Nuitka standalone output directory inside `build`.
 
 ## Notice
@@ -109,11 +114,18 @@ To decrypt .wpk file, you need to unzip it with 7zip or other unzip tools, and y
 - [x] GUI for unpacking LPK files
 - [x] Batch unpacking of LPK files from Steam Workshop
 - [x] WPK batch scanning and unpacking
-- [x] Unity image extraction via UnityPy
+- [x] Unity image/Live2D asset extraction through bundled AssetStudioModCLI
 - [x] Direct preview of Live2D files (implemented via both Web and Software rendering)
 - [x] Live2D one-click mod tool
+- [~] Experimental Live2D PSD reconstruction (texture atlas layer export, OpenCV affine reconstruction when sidecar mesh data exists)
 
 ## To-Do List
 
-- [ ] More complete reconstruction of game Live2D resource structures (via UnityPy/AssetStudio CLI)
-- [ ] Export PSD files separately by layers for easier modification
+- [ ] More complete reconstruction of game Live2D resource structures (via AssetStudio CLI)
+- [ ] Read Drawable mesh data directly from `.moc3` and export high-fidelity layered PSD files
+
+## Third-Party Tools
+
+This project bundles AssetStudio/AssetStudioModCLI as an external command-line tool for extracting Unity assets.
+AssetStudio is licensed under the MIT License. See `app/tools/AssetStudioCLI/LICENSE.txt` for details.
+This project is not affiliated with Unity Technologies.

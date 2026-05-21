@@ -87,6 +87,11 @@ release中的版本使用 Nuitka 编译，并通过 pixi 管理构建环境。�
    pixi run build
    ```
 
+   如果想试 MinGW/GCC 低内存编译路径：
+   ```
+   pixi run build-gcc
+   ```
+
 编译好的可执行文件会保存在 `build` 目录下的 Nuitka standalone 输出目录中。
 
 ## 注意
@@ -105,11 +110,18 @@ Steam创意工坊中的lpk文件通常需要config.json来解密
 - [√] i18n支持（英语和中文）
 - [√] 批量解包Steam创意工坊中的LPK文件
 - [√] WPK 文件批量扫描与解包
-- [√] Unity 图片资源提取（借助 UnityPy）
+- [√] Unity 图片/Live2D 资源提取（调用随包附带的 AssetStudioModCLI）
 - [√] 软件内直接预览Live2D文件（支持网页及软件两种渲染方式）
 - [√] Live2D 一键魔改工具
+- [~] 实验性 Live2D PSD 还原（贴图图集图层导出，支持 sidecar 网格数据时使用 OpenCV 仿射还原）
 
 ## 计划功能（To-Do List）
 
-- [ ] 更完整地还原游戏中的 Live2D 资源结构（借助 UnityPy / AssetStudio CLI）
-- [ ] 分图层导出PSD格式文件，方便二次魔改
+- [ ] 更完整地还原游戏中的 Live2D 资源结构（借助 AssetStudio CLI）
+- [ ] 直接从 `.moc3` 读取 Drawable 网格并高精度分图层导出 PSD
+
+## 第三方工具
+
+本项目随包附带 AssetStudio/AssetStudioModCLI 作为外部命令行工具，用于解析和导出 Unity 资源。
+AssetStudio 采用 MIT License，详见 `app/tools/AssetStudioCLI/LICENSE.txt`。
+本项目与 Unity Technologies 无从属、授权或赞助关系。

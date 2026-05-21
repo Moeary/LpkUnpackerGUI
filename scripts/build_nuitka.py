@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import os
 import subprocess
 import sys
@@ -63,22 +64,28 @@ def find_vsdevcmd() -> Path:
     )
 
 
-def main() -> int:
-    vsdevcmd = find_vsdevcmd()
-    nuitka_args = [
+def build_nuitka_args(compiler: str) -> list[str]:
+    compiler_args = ["--msvc=14.3"]
+    if compiler == "mingw":
+        compiler_args = ["--mingw64", "--low-memory", "--jobs=1", "--lto=no"]
+
+    return [
         sys.executable,
         "-m",
         "nuitka",
         "--standalone",
-        "--msvc=14.3",
+        *compiler_args,
         "--enable-plugin=pyside6",
         "--output-dir=build",
         "--output-filename=LpkUnpackerGUI.exe",
         "--windows-console-mode=disable",
         "--include-data-dir=./assets=assets",
+        "--include-data-dir=./app/tools=tools",
         "--include-data-dir=./app/i18n/locales=app/i18n/locales",
         "--include-package=qfluentwidgets",
         "--include-package=filetype",
+        "--include-package=cv2",
+        "--include-package=psd_tools",
         "--windows-icon-from-ico=assets/app/icon.ico",
         "--nofollow-import-to=matplotlib,scipy,pandas,tkinter",
         "--python-flag=no_site",
@@ -86,6 +93,23 @@ def main() -> int:
         "--remove-output",
         "app/main.py",
     ]
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Build LpkUnpackerGUI with Nuitka.")
+    parser.add_argument(
+        "--compiler",
+        choices=("msvc", "mingw"),
+        default="msvc",
+        help="Backend compiler preset. Default: msvc.",
+    )
+    args = parser.parse_args()
+
+    nuitka_args = build_nuitka_args(args.compiler)
+    if args.compiler == "mingw":
+        return subprocess.call(nuitka_args, cwd=ROOT, stdin=subprocess.DEVNULL)
+
+    vsdevcmd = find_vsdevcmd()
     command = (
         f'call "{vsdevcmd}" -arch=x64 -host_arch=x64 -no_logo '
         f"&& {subprocess.list2cmdline(nuitka_args)}"
