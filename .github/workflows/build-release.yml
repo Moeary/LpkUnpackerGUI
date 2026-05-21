@@ -7,7 +7,8 @@ on:
   workflow_dispatch:  # Allow manual trigger
 
 jobs:
-  build:
+  build_windows:
+    name: Build Windows
     runs-on: windows-latest
     
     steps:
@@ -19,15 +20,7 @@ jobs:
       with:
         python-version: '3.10'
         cache: 'pip'
-    
-    - name: Install system dependencies
-      run: |
-        # Install Visual C++ build tools components if needed
-        Write-Host "Python version:"
-        python --version
-        Write-Host "Pip version:"
-        pip --version
-    
+
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
@@ -38,71 +31,60 @@ jobs:
       uses: actions/cache@v4
       with:
         path: ~\AppData\Local\Nuitka
-        key: nuitka-cache-${{ runner.os }}-${{ hashFiles('**/requirements.txt') }}
+        key: nuitka-cache-windows-${{ hashFiles('**/requirements.txt') }}
         restore-keys: |
-          nuitka-cache-${{ runner.os }}-
+          nuitka-cache-windows-
     
     - name: Build executable with Nuitka
       run: |
-        python -m nuitka --onefile `
-          --enable-plugin=pyqt5 `
-          --output-dir=build `
-          --windows-console-mode=disable `
-          --include-data-dir=./Img=Img `
-          --include-package=qfluentwidgets `
-          --include-package=filetype `
-          --windows-icon-from-ico=Img/icon.ico `
-          --nofollow-import-to=numpy,matplotlib,scipy,pandas,tkinter `
-          --assume-yes-for-downloads `
-          --python-flag=no_site `
-          --python-flag=no_docstrings `
-          --remove-output `
-          LpkUnpackerGUI.py
+        .\compile.bat
+      shell: cmd
       
     - name: Verify build output
       run: |
-        if (-Not (Test-Path "build/LpkUnpackerGUI.exe")) {
-          Write-Error "Build failed: LpkUnpackerGUI.exe not found"
+        if (-Not (Test-Path "build/LpkUnpackerGUI.dist/LpkUnpackerGUI.exe")) {
+          Write-Error "Build failed: build/LpkUnpackerGUI.dist/LpkUnpackerGUI.exe not found"
           exit 1
         }
-        $fileSize = (Get-Item "build/LpkUnpackerGUI.exe").Length / 1MB
-        Write-Host "Build successful! File size: $fileSize MB"
+        Write-Host "Build successful!"
     
-    - name: Get version from tag
-      id: get_version
+    - name: Package build output
+      id: package
       run: |
-        $tag = "${{ github.ref }}" -replace 'refs/tags/', ''
-        echo "VERSION=$tag" >> $env:GITHUB_OUTPUT
-    
-    - name: Prepare Release Notes
-      id: release_notes
-      run: |
-        $version = "${{ steps.get_version.outputs.VERSION }}"
-        $buildDate = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-        $notes = @"
-        ## Release $version
-        
-        **Build Date:** $buildDate
-        
-        ### Features
-        - LPK/WPK file extraction
-        - Image extraction with deduplication
-        - Live2D model mod tool
-        - Multi-language support (EN/ZH)
-        "@
-        $notes | Out-File -FilePath RELEASE_NOTES.md -Encoding UTF8
-    
-    - name: Create Release
-      uses: ncipollo/release-action@v1
+        if ("${{ github.ref }}" -match '^refs/tags/(.+)$') {
+          $version = $matches[1]
+        } else {
+          $version = "${{ github.sha }}".Substring(0, 7)
+        }
+        $zipName = "LpkUnpacker-$version-windows-x64.zip"
+        Compress-Archive -Path "build/LpkUnpackerGUI.dist/*" -DestinationPath $zipName -CompressionLevel Optimal
+        echo "ZIP_NAME=$zipName" >> $env:GITHUB_OUTPUT
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
       with:
-        tag: ${{ steps.get_version.outputs.VERSION }}
-        name: Release ${{ steps.get_version.outputs.VERSION }}
-        bodyFile: RELEASE_NOTES.md
-        artifacts: build/LpkUnpackerGUI.exe
-        artifactContentType: application/octet-stream
-        draft: false
-        prerelease: false
-        token: ${{ secrets.GITHUB_TOKEN }}
+        name: windows-x64-binary
+        path: ${{ steps.package.outputs.ZIP_NAME }}
+
+  release:
+    name: Create Release
+    needs: [build_windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+    - name: Download Windows artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: windows-x64-binary
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          LpkUnpacker-*-windows-x64.zip
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     
     - name: Upload build logs on failure
       if: failure()
@@ -113,3 +95,4 @@ jobs:
           build/
           *.log
         retention-days: 7
+

@@ -35,3 +35,6 @@ Thumbs.db
 *.onefile/
 
 settings.json
+start.bat
+output
+Resources/

@@ -1,7 +1,10 @@
 from __future__ import unicode_literals
+import shutil
+import sys
 from typing import Tuple
 import zipfile
 import json
+from typing import List
 from Core.utils import *
 import logging
 import os
@@ -25,10 +28,9 @@ class LpkLoader():
         except KeyError:
             try:
                 config_mlve_raw = self.lpkfile.read("config.mlve").decode('utf-8-sig')
-            except:
-                logger.fatal("Failed to retrieve lpk config!")
-                exit(0)
-
+            except Exception as e:
+                logger.fatal(f"Failed to retrieve lpk config {self.configpath} for: {e}")
+                raise e
 
         self.mlve_config = json.loads(config_mlve_raw)
 
@@ -42,27 +44,28 @@ class LpkLoader():
         self.config = json.loads(open(self.configpath, "r", encoding="utf8").read())
     
     def extract(self, outputdir: str):
-        if self.lpkType in ["STD2_0", "STM_1_0"]:
-            for chara in self.mlve_config["list"]:
-                if self.lpkType == "STM_1_0" and hasattr(self, 'config') and 'title' in self.config:
-                    chara_name = self.config["title"]
-                else:
-                    chara_name = chara["character"] if chara["character"] != "" else "character"
-                subdir =  os.path.join(outputdir, chara_name)
-                safe_mkdir(subdir)
+        subdir = ""
+        try:
+            if self.lpkType in ["STD2_0", "STM_1_0"]:
+                for chara in self.mlve_config["list"]:
+                    if self.lpkType == "STM_1_0" and hasattr(self, 'config') and 'title' in self.config:
+                        chara_name = self.config["title"]
+                    else:
+                        chara_name = chara["character"] if chara["character"] != "" else "character"
+                    subdir =  os.path.join(outputdir, normalize(chara_name))
+                    safe_mkdir(subdir)
 
-                for i in range(len(chara["costume"])):
-                    logger.info(f"extracting {chara_name}_costume_{i}")
-                    self.extract_costume(chara["costume"][i], subdir)
+                    for i in range(len(chara["costume"])):
+                        logger.info(f"extracting {chara_name}_costume_{i}")
+                        self.extract_costume(chara["costume"][i], subdir)
 
-                # replace encryped filename to decrypted filename in entrys(model.json)
-                for name in self.entrys:
-                    out_s: str = self.entrys[name]
-                    for k in self.trans:
-                        out_s = out_s.replace(k, self.trans[k])
-                    open(os.path.join(subdir, name), "w", encoding="utf8").write(out_s)
-        else:
-            try:
+                    # replace encryped filename to decrypted filename in entrys(model.json)
+                    for name in self.entrys:
+                        out_s: str = self.entrys[name]
+                        for k in self.trans:
+                            out_s = out_s.replace(k, self.trans[k])
+                        open(os.path.join(subdir, name), "w", encoding="utf8").write(out_s)
+            else:
                 print("Deprecated/unknown lpk format detected. Attempting with STD_1_0 format...")
                 print("Decryption may not work for some packs, even though this script outputs all files.")
                 self.encrypted = self.mlve_config.get("encrypt", "true")
@@ -74,8 +77,8 @@ class LpkLoader():
                 for file in self.lpkfile.namelist():
                     if os.path.splitext(file)[-1] == '':
                         continue
-                    subdir = os.path.join(outputdir, os.path.dirname(file))
-                    outputFilePath = os.path.join(subdir, os.path.basename(file))
+                    subdir = os.path.join(outputdir, normalize(os.path.dirname(file)))
+                    outputFilePath = os.path.join(subdir, normalize(os.path.basename(file)))
                     safe_mkdir(subdir)
                     if os.path.splitext(file)[-1] in [".json", ".mlve", ".txt"]:
                         print(f"Extracting {file} -> {outputFilePath}")
@@ -85,10 +88,16 @@ class LpkLoader():
                         decryptedData = self.decrypt_file(file)
                         with open(outputFilePath, "wb") as outputFile:
                             outputFile.write(decryptedData)
-            except:
-                logger.fatal(f"Failed to decrypt {self.lpkpath}, possibly wrong/unsupported format.")
-                exit(0)
-    
+        except Exception as e:
+            logger.fatal(f"Failed to decrypt {self.lpkpath} for:{e}")
+            try:
+                # pass
+                if os.path.exists(subdir) and (not os.listdir(subdir)):
+                    shutil.rmtree(subdir, ignore_errors=True)
+            except Exception as de:
+                logging.error(f"Failed to clean up empty directories created by error unpacking: {de}")
+            raise e
+
     def extract_costume(self, costume: dict, dir: str):
         if costume["path"] == "":
             return
@@ -122,14 +131,14 @@ class LpkLoader():
             logger.debug(f"{name} -> {val}")
             # extract submodel
             if (name.lower().endswith("_command") or name.lower().endswith("_postcommand")) and val:
-                commands = val.split(";")
+                commands:List[str] = val.split(";")
                 for cmd in commands:
                     enc_file = find_encrypted_file(cmd)
                     if enc_file == None:
                         continue
 
-                    if cmd.startswith("change_cos"):
-                        enc_file = find_encrypted_file(cmd)
+                    if self.is_model_command(cmd):
+                        enc_file = find_encrypted_file(cmd) # 是否重复赋值？Shall it be re-assigned?
                         self.extract_model_json(enc_file, dir)
                     else:
                         name += f"_{id}"
@@ -152,6 +161,12 @@ class LpkLoader():
         
         logger.debug(f"========= end of model {model_json} =========")
 
+    def is_model_command(self, cmd: str):
+        model_commands = ["change_cos", "change_model", "add_submodel", "remove_submodel"]
+        for model_cmd in model_commands:
+            if cmd.startswith(model_cmd):
+                return True
+        return False
 
     def check_decrypt(self, filename):
         '''
@@ -185,9 +200,8 @@ class LpkLoader():
                 self.config["fileId"] = fileid
                 try:
                     self.decrypt_file(filename).decode(encoding="utf8")
-                except UnicodeDecodeError:
-                    logger.fatal("decrypt failed!")
-                    exit(0)
+                except UnicodeDecodeError as e:
+                    logger.fatal(f"decrypt error, the LPK file: {self.lpkpath} for {e}")
 
     def recovery(self, filename, output) -> Tuple[bytes, str]:
         ret = self.decrypt_file(filename)
