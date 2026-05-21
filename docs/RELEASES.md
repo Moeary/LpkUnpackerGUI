@@ -67,7 +67,7 @@ git push origin v1.1.0
 **Q: 编译失败了怎么办？**
 - 查看 Actions 日志找出错误
 - 检查 Python 版本是否为 3.10
-- 确保 requirements.txt 所有依赖都正确
+- 确保 `pixi.toml` 和 `pixi.lock` 中的依赖都正确
 
 **Q: 如何重新编译某个版本？**
 - 进入 "Actions" → "Build and Release"
@@ -75,7 +75,7 @@ git push origin v1.1.0
 - 点击 "Re-run all jobs"
 
 **Q: 本地编译和发布的区别？**
-- 本地编译: 使用 `compile.bat` 脚本
+- 本地编译: 使用 `pixi run build`
 - GitHub Actions: 自动化编译和发布到 Release
 - GitHub Actions 更方便且可以在任何电脑上触发
 

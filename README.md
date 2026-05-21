@@ -21,27 +21,27 @@
 
 4. 点击"Extract"按钮开始解包过程,过程可以参考下面的动画演示：
 
-![Demo_Animation](Img/Guide.gif)
+![Demo_Animation](assets/readme/Guide.gif)
 
 5. Steam创意工坊文件批量处理(只演示查找,因为文件太多不演示批量解包部分):
 
-![Demo_Batch_Unpack](Img/Batch_Unpack.gif)
+![Demo_Batch_Unpack](assets/readme/Batch_Unpack.gif)
 
 6. 直接在软件内预览Live2D模型(软件渲染):
 
-![Demo_Software_Rendering](Img/Software_Rendering.gif)
+![Demo_Software_Rendering](assets/readme/Software_Rendering.gif)
 
 7. 直接在软件内预览Live2D模型(网页渲染):
 
-![Demo_Web_Rendering](Img/Web_Rendering.gif)
+![Demo_Web_Rendering](assets/readme/Web_Rendering.gif)
 
 ### 方法二：从源码运行
 
 如果你希望从源码运行，请按照以下步骤操作：
 
-1. 安装依赖
+1. 安装 pixi 环境
 ```
-python -m pip install -r requirements.txt
+pixi install
 ```
 
 2. 运行程序
@@ -49,18 +49,18 @@ python -m pip install -r requirements.txt
 如果你需要使用GUI版本，使用如下的命令：
 
 ```
-python LpkUnpackerGUI.py
+pixi run start
 ```
 
 如果你需要使用命令行解包，可以使用以下命令:
 ```
-python LpkUnpacker.py <args>
+pixi run cli <args>
 ```
 
-LpkUnpacker.py的参数说明如下所示：
+命令行参数说明如下所示：
 
 ```
-usage: LpkUnpacker.py [-h] [-v] [-c CONFIG] target_lpk output_dir
+usage: cli.py [-h] [-v] [-c CONFIG] target_lpk output_dir
 
 positional arguments:
   target_lpk            path to lpk file
@@ -75,20 +75,19 @@ options:
 
 ## 编译
 
-release中的版本使用nuitka编译，如果你希望自行编译可执行文件，可以使用提供的编译脚本：
+release中的版本使用 Nuitka 编译，并通过 pixi 管理构建环境。如果你希望自行编译可执行文件：
 
-1. 确保已安装所有依赖：
+1. 安装 pixi 环境：
    ```
-   pip install -r requirements.txt
-   pip install nuitka
-   ```
-
-2. 运行编译脚本：
-   ```
-   compile.bat
+   pixi install
    ```
 
-编译好的可执行文件将保存在build目录中。
+2. 运行编译：
+   ```
+   pixi run build
+   ```
+
+编译好的可执行文件会保存在 `build` 目录下的 Nuitka standalone 输出目录中。
 
 ## 注意
 

@@ -1,9 +1,7 @@
-output/*
-input/*
-GUI/__pycache__/*
-Core/__pycache__/*
-Resources/*
-build/*
+output/
+input/
+Resources/
+.pixi/
 
 # Build outputs
 build/
@@ -33,8 +31,7 @@ Thumbs.db
 # Nuitka
 .nuitka/
 *.onefile/
+nuitka-crash-report.xml
 
 settings.json
 start.bat
-output
-Resources/

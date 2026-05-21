@@ -13,7 +13,7 @@ def update_version(version):
     """Update version in relevant files"""
     
     # Update __version__ if exists
-    init_file = "GUI/__init__.py"
+    init_file = "app/gui/__init__.py"
     if os.path.exists(init_file):
         with open(init_file, 'r', encoding='utf-8') as f:
             content = f.read()

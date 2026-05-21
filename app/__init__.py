@@ -1,0 +1,1 @@
+"""LpkUnpackerGUI application package."""

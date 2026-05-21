@@ -1,0 +1,33 @@
+[workspace]
+name = "lpkunpackergui"
+version = "0.1.0"
+description = "GUI tool for unpacking Live2DViewerEX LPK/WPK packages"
+channels = ["conda-forge"]
+platforms = ["win-64"]
+
+[tasks]
+start = "python -m app.main"
+cli = "python -m app.cli"
+build = "python scripts/build_nuitka.py"
+check = "python scripts/check_sources.py"
+
+[dependencies]
+python = "3.10.*"
+pip = ">=25.0.0,<26"
+
+[pypi-dependencies]
+"PySide6-Fluent-Widgets" = ">=1.4.0"
+PySide6 = ">=6.6.0"
+filetype = ">=1.0.0"
+UnityPy = ">=1.10.0"
+Pillow = ">=9.0.0"
+"live2d-py" = ">=0.5.4"
+numpy = ">=1.21.0"
+PyOpenGL = ">=3.1.0"
+Nuitka = ">=2.8.4"
+fastapi = ">=0.115.0"
+uvicorn = ">=0.30.0"
+websockets = ">=12.0"
+requests = ">=2.31.0"
+"ordered-set" = ">=4.1.0"
+zstandard = ">=0.23.0"

@@ -21,36 +21,46 @@ However, not all packs can be decrypted due to an unknown keygen/decryption algo
 
 4. Click the "Extract" button to begin unpacking. You can refer to the animation demonstration below:
 
-![Demo_Animation](Img/Guide.gif)
+![Demo_Animation](assets/readme/Guide.gif)
 
 5. Batch processing of Steam Workshop files (only showing the search process, as there are too many files for a batch unpack demo):
 
-![Demo_Batch_Unpack](Img/Batch_Unpack.gif)
+![Demo_Batch_Unpack](assets/readme/Batch_Unpack.gif)
 
 6. Direct Live2D model preview in software (Software Rendering):
 
-![Demo_Software_Rendering](Img/Software_Rendering.gif)
+![Demo_Software_Rendering](assets/readme/Software_Rendering.gif)
 
 7. Direct Live2D model preview in software (Web Rendering):
 
-![Demo_Web_Rendering](Img/Web_Rendering.gif)
+![Demo_Web_Rendering](assets/readme/Web_Rendering.gif)
 
 ### Method 2: Run from Source Code
 
 If you prefer to run from source code, please follow these steps:
 
-1. Install requirements
+1. Install the pixi environment
 ```
-python -m pip install -r requirements.txt
+pixi install
 ```
 
 2. Run the program
 
 If you want to use the GUI version, run the following command:
 
+```
+pixi run start
+```
+
 ### Cmdline
 ```
-usage: LpkUnpacker.py [-h] [-v] [-c CONFIG] target_lpk output_dir
+pixi run cli <args>
+```
+
+Command line arguments:
+
+```
+usage: cli.py [-h] [-v] [-c CONFIG] target_lpk output_dir
 
 positional arguments:
   target_lpk            path to lpk file
@@ -65,19 +75,19 @@ options:
 
 ## Compile
 
-The release executable was compiled with Nuitka. To compile it yourself, use the following commands.
+The release executable is compiled with Nuitka in a pixi-managed environment. To compile it yourself, use the following commands.
 
-1. install requirements
+1. Install the pixi environment
 ```
-pip install nuitka
+pixi install
 ```
 
 2. Compile
 ```
-compile.bat
+pixi run build
 ```
 
-The compiled file will be saved in the `build` directory.
+The compiled application is saved under the Nuitka standalone output directory inside `build`.
 
 ## Notice
 
