@@ -307,6 +307,11 @@ class Live2DCanvas(ADPOpenGLCanvas):
         self.canvas: Optional[Canvas] = None
         self.setWindowTitle("Live2DCanvas")
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        if hasattr(Qt.WidgetAttribute, "WA_AlwaysStackOnTop"):
+            self.setAttribute(Qt.WidgetAttribute.WA_AlwaysStackOnTop, True)
+        if hasattr(Qt.WidgetAttribute, "WA_NoSystemBackground"):
+            self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setAutoFillBackground(False)
         self.radius_per_frame = math.pi * 0.5 / 120
         self.total_radius = 0
         # Mouse follow control
@@ -365,6 +370,14 @@ class Live2DCanvas(ADPOpenGLCanvas):
         self._apply_mouse_follow(nx, ny)
         self.update()
         return super().mouseMoveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            try:
+                self.playDefaultTapMotion()
+            except Exception:
+                pass
+        return super().mousePressEvent(event)
 
     def leaveEvent(self, event):
         # Reset follow when cursor leaves
@@ -527,12 +540,16 @@ class Live2DCanvas(ADPOpenGLCanvas):
                 if not rel:
                     continue
                 full_path = os.path.normpath(os.path.join(base_dir, rel))
+                sound_rel = it.get('Sound') or ''
+                sound_path = os.path.normpath(os.path.join(base_dir, sound_rel)) if sound_rel else ''
                 display = f"{group}[{idx}] - {os.path.basename(rel)}"
                 motions.append({
                     'group': str(group),
                     'index': int(idx),
                     'file': full_path,
                     'rel': rel,
+                    'sound': sound_path,
+                    'sound_rel': sound_rel,
                     'display': display,
                 })
         return motions
@@ -553,3 +570,95 @@ class Live2DCanvas(ADPOpenGLCanvas):
         except Exception:
             pass
         return False
+
+    def findMotion(self, group: str, index: int) -> Dict[str, Any] | None:
+        for motion in self.listMotions():
+            try:
+                if str(motion.get("group", "")) == str(group) and int(motion.get("index", -1)) == int(index):
+                    return motion
+            except Exception:
+                continue
+        return None
+
+    def playMotionItem(self, motion: Dict[str, Any] | None) -> Dict[str, Any] | None:
+        if not motion:
+            return None
+        ok = self.playMotion(str(motion.get("group", "")), int(motion.get("index", 0)))
+        return motion if ok else None
+
+    def pickInteractionMotion(
+        self,
+        x_ratio: float = 0.5,
+        y_ratio: float = 0.5,
+        region_words: tuple[str, ...] | None = None,
+        hit_area_name: str | None = None,
+    ) -> Dict[str, Any] | None:
+        """Choose a likely interaction motion from click position.
+
+        y_ratio is top=0, bottom=1. Model-specific hit testing is not exposed by
+        live2d-py here, so this uses group/file naming conventions first.
+        """
+        motions = self.listMotions()
+        if not motions:
+            return None
+        y_ratio = max(0.0, min(1.0, float(y_ratio)))
+        x_ratio = max(0.0, min(1.0, float(x_ratio)))
+        if not region_words:
+            if y_ratio < 0.36:
+                region_words = ("head", "face", "hair", "eye")
+            elif y_ratio < 0.76:
+                region_words = ("body", "chest", "breast", "arm", "hand")
+            else:
+                region_words = ("leg", "foot", "skirt")
+        if x_ratio < 0.33:
+            side_words = ("left",)
+        elif x_ratio > 0.67:
+            side_words = ("right",)
+        else:
+            side_words = ()
+        area_words = tuple(str(word).lower() for word in (region_words or ()) if word)
+        if hit_area_name:
+            area_words += tuple(part for part in str(hit_area_name).lower().replace("_", " ").split() if part)
+        preferred_words = area_words + tuple(side_words) + ("tap", "touch", "hit", "click")
+
+        def score(motion: Dict[str, Any]) -> int:
+            text = " ".join(
+                str(motion.get(key, "")).lower()
+                for key in ("group", "display", "rel", "file", "sound_rel")
+            )
+            value = 0
+            for word in preferred_words:
+                if word and word in text:
+                    value += 10 if word in area_words else 3
+            if "tap" in text and "touch" in text:
+                value += 2
+            if "idle" in text:
+                value -= 5
+            if "start" in text:
+                value -= 2
+            return value
+
+        selected = max(motions, key=score)
+        if score(selected) <= 0:
+            tap_words = ("tap", "touch", "hit", "click")
+            for motion in motions:
+                text = " ".join(str(motion.get(key, "")).lower() for key in ("group", "display", "rel", "file"))
+                if any(word in text for word in tap_words):
+                    return motion
+            return motions[0]
+        return selected
+
+    def playInteractiveMotion(
+        self,
+        x_ratio: float = 0.5,
+        y_ratio: float = 0.5,
+        region_words: tuple[str, ...] | None = None,
+        hit_area_name: str | None = None,
+    ) -> Dict[str, Any] | None:
+        return self.playMotionItem(
+            self.pickInteractionMotion(x_ratio, y_ratio, region_words, hit_area_name)
+        )
+
+    def playDefaultTapMotion(self) -> bool:
+        """Play a likely tap/touch motion when the user clicks the model."""
+        return self.playInteractiveMotion(0.5, 0.5) is not None

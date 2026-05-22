@@ -14,6 +14,7 @@ APP_ICON = ASSETS_DIR / "app" / "icon.ico"
 RUNTIME_DIR = PROJECT_ROOT / "runtime"
 RUNTIME_TEMP_DIR = RUNTIME_DIR / "temp"
 RUNTIME_OUTPUT_DIR = RUNTIME_DIR / "output"
+RUNTIME_LOG_DIR = RUNTIME_DIR / "log"
 RUNTIME_SETTINGS_FILE = RUNTIME_DIR / "setting.json"
 
 OUTPUT_DIR_NAMES = {
@@ -28,6 +29,7 @@ OUTPUT_DIR_NAMES = {
 def ensure_runtime_dirs() -> None:
     RUNTIME_TEMP_DIR.mkdir(parents=True, exist_ok=True)
     RUNTIME_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    RUNTIME_LOG_DIR.mkdir(parents=True, exist_ok=True)
     for name in OUTPUT_DIR_NAMES.values():
         (RUNTIME_OUTPUT_DIR / name).mkdir(parents=True, exist_ok=True)
 

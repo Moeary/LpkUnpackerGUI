@@ -1,6 +1,7 @@
 import os
-from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QApplication)
-from PySide6.QtCore import Signal, QPoint, Qt, QEvent
+from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QApplication, QLabel, QSizeGrip)
+from PySide6.QtCore import Signal, QPoint, QRect, Qt, QEvent, QTimer, QUrl
+from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QCursor
 from qfluentwidgets import (PushButton, SubtitleLabel, BodyLabel)
 from qfluentwidgets import CardWidget
 from qfluentwidgets import ComboBox
@@ -8,6 +9,72 @@ from qfluentwidgets import InfoBar, InfoBarPosition
 from app.i18n import get_i18n, tr
 
 from app.gui.Live2DCanvas import Live2DCanvas
+
+try:
+    from PySide6.QtMultimedia import QSoundEffect
+except Exception:
+    QSoundEffect = None
+
+
+class HitAreaOverlay(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._regions = []
+        self._active_region_id = None
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.hide()
+
+    def set_regions(self, regions: list[dict]):
+        self._regions = list(regions or [])
+        self.update()
+
+    def regions(self) -> list[dict]:
+        return list(self._regions)
+
+    def set_active_region(self, region_id: str | None):
+        self._active_region_id = region_id
+        self.update()
+
+    def region_at(self, pos: QPoint) -> dict | None:
+        width = max(1, self.width())
+        height = max(1, self.height())
+        for region in reversed(self._regions):
+            x, y, w, h = region.get("rect", (0, 0, 0, 0))
+            rect = QRect(
+                int(x * width),
+                int(y * height),
+                max(1, int(w * width)),
+                max(1, int(h * height)),
+            )
+            if rect.contains(pos):
+                return region
+        return None
+
+    def paintEvent(self, event):
+        if not self._regions:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        width = max(1, self.width())
+        height = max(1, self.height())
+        for region in self._regions:
+            x, y, w, h = region.get("rect", (0, 0, 0, 0))
+            rect = QRect(
+                int(x * width),
+                int(y * height),
+                max(1, int(w * width)),
+                max(1, int(h * height)),
+            )
+            active = str(region.get("id") or region.get("name") or "") == str(self._active_region_id or "")
+            fill = QColor(0, 166, 179, 72 if active else 42)
+            border = QPen(QColor(0, 166, 179, 230 if active else 170), 3 if active else 2)
+            text_color = QColor(0, 96, 104, 240)
+            painter.setPen(border)
+            painter.setBrush(QBrush(fill))
+            painter.drawRoundedRect(rect, 8, 8)
+            painter.setPen(text_color)
+            painter.drawText(rect.adjusted(8, 6, -8, -6), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft, str(region.get("name", "")))
 
 
 class Live2DPreviewWindow(QWidget):
@@ -20,11 +87,27 @@ class Live2DPreviewWindow(QWidget):
         self.model_path = model_path
         self.i18n = get_i18n()
         self.live2d_canvas = None
+        self.hit_area_overlay = None
+        self.hit_area_toggle_btn = None
         self.control_panel = None
         self.dragging = False
         self.drag_position = QPoint()
-        self._selected_motion = None  # tuple(group, index)
-        self._motion_items = []  # [(group, index, display)]
+        self._selected_motion = None
+        self._motion_items = []
+        self._dock_rect = None
+        self._requested_canvas_size = (400, 300)
+        self._show_hit_areas = True
+        self._resize_margin = 12
+        self._resizing = False
+        self._resize_edges = set()
+        self._resize_start_global = QPoint()
+        self._resize_start_geometry = QRect()
+        self._sound_effect = None
+        self._last_bubble_motion = None
+        self.bubble_label = None
+        self.bubble_timer = QTimer(self)
+        self.bubble_timer.setSingleShot(True)
+        self.bubble_timer.timeout.connect(self._hide_bubble)
         self.controls_title = None
         self.motion_label = None
         self.toggle_controls_btn = None
@@ -35,6 +118,7 @@ class Live2DPreviewWindow(QWidget):
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
         self.setWindowFlag(Qt.WindowType.Tool, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setMouseTracking(True)
         # 设置窗口大小和位置
         self.resize(400, 300)
         self.move_to_screen_center()
@@ -100,12 +184,19 @@ class Live2DPreviewWindow(QWidget):
         """)
 
         # 监听canvas右键
+        self.live2d_canvas.setMouseTracking(True)
         self.live2d_canvas.installEventFilter(self)
         layout.addWidget(self.live2d_canvas)
+        self.hit_area_overlay = HitAreaOverlay(self.live2d_canvas)
+        self.hit_area_overlay.setGeometry(self.live2d_canvas.rect())
+        self.hit_area_overlay.set_regions(self._load_hit_regions())
+        self.hit_area_overlay.setVisible(self._show_hit_areas and bool(self.hit_area_overlay.regions()))
+        self.hit_area_overlay.raise_()
         # 创建控制面板（可隐藏）
         self.control_panel = self.create_control_panel()
         self.control_panel.setVisible(False)  # 默认隐藏
         layout.addWidget(self.control_panel)
+        self._create_bubble_label()
 
     def create_control_panel(self):
         """创建控制面板"""
@@ -148,10 +239,17 @@ class Live2DPreviewWindow(QWidget):
         self.toggle_controls_btn.clicked.connect(self.toggle_control_panel)
         button_layout.addWidget(self.toggle_controls_btn)
 
+        self.hit_area_toggle_btn = PushButton("", panel)
+        self.hit_area_toggle_btn.clicked.connect(self._toggle_hit_area_overlay)
+        button_layout.addWidget(self.hit_area_toggle_btn)
+
         # 关闭按钮
         self.close_btn = PushButton("", panel)
         self.close_btn.clicked.connect(self.close)
         button_layout.addWidget(self.close_btn)
+
+        button_layout.addStretch()
+        button_layout.addWidget(QSizeGrip(panel))
 
         layout.addLayout(button_layout)
 
@@ -166,6 +264,7 @@ class Live2DPreviewWindow(QWidget):
         self._selected_motion = None
         if not self.model_path or not os.path.exists(self.model_path):
             return
+        base_dir = os.path.dirname(self.model_path)
         try:
             with open(self.model_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
@@ -176,8 +275,16 @@ class Live2DPreviewWindow(QWidget):
                     continue
                 for idx, it in enumerate(items):
                     rel = (it or {}).get('File') or ''
+                    sound_rel = (it or {}).get('Sound') or ''
                     display = f"{g}[{idx}] - {os.path.basename(rel) if rel else ''}"
-                    self._motion_items.append((g, idx, display))
+                    self._motion_items.append({
+                        "group": str(g),
+                        "index": int(idx),
+                        "display": display,
+                        "rel": rel,
+                        "sound": os.path.normpath(os.path.join(base_dir, sound_rel)) if sound_rel else "",
+                        "sound_rel": sound_rel,
+                    })
         except Exception:
             self._motion_items = []
         if not self._motion_items:
@@ -185,34 +292,298 @@ class Live2DPreviewWindow(QWidget):
             self.motion_combo.setEnabled(False)
             return
         self.motion_combo.setEnabled(True)
-        for (_, _, disp) in self._motion_items:
-            self.motion_combo.addItem(disp)
+        for motion in self._motion_items:
+            self.motion_combo.addItem(str(motion.get("display") or motion.get("group") or "motion"))
         # 默认选中第一个
         self.motion_combo.setCurrentIndex(0)
         self._on_motion_changed(0)
 
     def _on_motion_changed(self, i: int):
         if 0 <= i < len(self._motion_items):
-            g, idx, _ = self._motion_items[i]
-            self._selected_motion = (str(g), int(idx))
+            self._selected_motion = self._motion_items[i]
         else:
             self._selected_motion = None
 
-    def eventFilter(self, obj, event):
-        # 在canvas上右键 -> 播放选中动作
-        if obj is self.live2d_canvas and event.type() == QEvent.Type.MouseButtonPress:
+    def _load_hit_regions(self) -> list[dict]:
+        import json
+
+        hit_areas = []
+        if self.model_path and os.path.exists(self.model_path):
             try:
-                if event.button() == Qt.MouseButton.RightButton and self._selected_motion:
-                    group, index = self._selected_motion
-                    # 调用画布播放
-                    try:
-                        self.live2d_canvas.playMotion(group, index)
-                    except Exception:
-                        pass
+                with open(self.model_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                hit_areas = (data or {}).get("HitAreas") or []
+            except Exception:
+                hit_areas = []
+
+        regions = []
+        seen = set()
+        for item in hit_areas:
+            if not isinstance(item, dict):
+                continue
+            hit_id = str(item.get("Id") or item.get("id") or "")
+            name = str(item.get("Name") or item.get("name") or hit_id or "HitArea")
+            key = (hit_id.lower(), name.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            regions.append(self._hit_region_spec(name, hit_id))
+
+        if regions:
+            return regions
+        return [
+            {"id": "HitAreaHead", "name": "Head", "rect": (0.28, 0.05, 0.44, 0.28), "words": ("head", "face", "hair", "eye")},
+            {"id": "HitAreaBody", "name": "Body", "rect": (0.20, 0.30, 0.60, 0.42), "words": ("body", "chest", "breast", "arm", "hand")},
+            {"id": "HitAreaLower", "name": "Lower", "rect": (0.25, 0.70, 0.50, 0.25), "words": ("leg", "foot", "skirt")},
+        ]
+
+    def _hit_region_spec(self, name: str, hit_id: str) -> dict:
+        label = name or hit_id or "HitArea"
+        text = f"{hit_id} {name}".lower().replace("_", " ").replace("-", " ")
+        if any(word in text for word in ("head", "face", "hair", "eye", "口", "目", "顔", "頭", "脸", "头")):
+            rect = (0.28, 0.05, 0.44, 0.28)
+            words = ("head", "face", "hair", "eye")
+        elif any(word in text for word in ("left", "左")) and any(word in text for word in ("hand", "arm", "手", "腕")):
+            rect = (0.02, 0.32, 0.24, 0.42)
+            words = ("left", "hand", "arm", "body")
+        elif any(word in text for word in ("right", "右")) and any(word in text for word in ("hand", "arm", "手", "腕")):
+            rect = (0.74, 0.32, 0.24, 0.42)
+            words = ("right", "hand", "arm", "body")
+        elif any(word in text for word in ("body", "torso", "chest", "breast", "bust", "身体", "体", "胸")):
+            rect = (0.20, 0.30, 0.60, 0.42)
+            words = ("body", "chest", "breast", "arm", "hand")
+        elif any(word in text for word in ("leg", "foot", "skirt", "feet", "脚", "足", "裙")):
+            rect = (0.25, 0.70, 0.50, 0.25)
+            words = ("leg", "foot", "skirt")
+        else:
+            rect = (0.25, 0.25, 0.50, 0.50)
+            words = tuple(part for part in text.split() if part) + ("tap", "touch")
+        return {"id": hit_id or label, "name": label, "rect": rect, "words": words}
+
+    def eventFilter(self, obj, event):
+        if obj is self.live2d_canvas:
+            try:
+                pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+
+                if event.type() == QEvent.Type.MouseMove:
+                    if self._resizing:
+                        self._resize_from_global(self._event_global_pos(event))
+                        return True
+                    if not (event.buttons() & Qt.MouseButton.LeftButton):
+                        edges = self._resize_edges_at_pos(pos)
+                        self.live2d_canvas.setCursor(self._cursor_for_edges(edges))
+                    return False
+
+                if event.type() == QEvent.Type.MouseButtonRelease and self._resizing:
+                    self._resizing = False
+                    self._resize_edges = set()
+                    self.live2d_canvas.unsetCursor()
                     return True
+
+                if event.type() == QEvent.Type.MouseButtonPress:
+                    if event.button() == Qt.MouseButton.LeftButton:
+                        edges = self._resize_edges_at_pos(pos)
+                        if edges:
+                            self._begin_resize(edges, self._event_global_pos(event))
+                            return True
+                        w = max(1, self.live2d_canvas.width())
+                        h = max(1, self.live2d_canvas.height())
+                        region = self._hit_region_at_canvas_pos(pos)
+                        words = tuple(region.get("words", ())) if region else None
+                        name = str(region.get("name") or "") if region else None
+                        if self.hit_area_overlay:
+                            active_id = str(region.get("id") or region.get("name") or "") if region else None
+                            self.hit_area_overlay.set_active_region(active_id)
+                        motion = self.live2d_canvas.playInteractiveMotion(pos.x() / w, pos.y() / h, words, name)
+                        self._after_motion_triggered(motion, pos)
+                        return True
+                    if event.button() == Qt.MouseButton.RightButton and self._selected_motion:
+                        self._play_motion_item(self._selected_motion, pos)
+                        return True
             except Exception:
                 pass
         return super().eventFilter(obj, event)
+
+    def _hit_region_at_canvas_pos(self, pos: QPoint) -> dict | None:
+        if self.hit_area_overlay is None:
+            return None
+        return self.hit_area_overlay.region_at(pos)
+
+    def _sync_overlay_geometry(self):
+        if not self.hit_area_overlay or not self.live2d_canvas:
+            return
+        self.hit_area_overlay.setGeometry(self.live2d_canvas.rect())
+        self.hit_area_overlay.setVisible(self._show_hit_areas and bool(self.hit_area_overlay.regions()))
+        self.hit_area_overlay.raise_()
+
+    def _toggle_hit_area_overlay(self):
+        self._show_hit_areas = not self._show_hit_areas
+        self._sync_overlay_geometry()
+        self.retranslate_ui()
+
+    def _resize_edges_at_pos(self, pos: QPoint) -> set[str]:
+        if not self.live2d_canvas:
+            return set()
+        width = max(1, self.live2d_canvas.width())
+        height = max(1, self.live2d_canvas.height())
+        margin = self._resize_margin
+        edges = set()
+        if pos.x() <= margin:
+            edges.add("left")
+        elif pos.x() >= width - margin:
+            edges.add("right")
+        if pos.y() <= margin:
+            edges.add("top")
+        elif pos.y() >= height - margin:
+            edges.add("bottom")
+        return edges
+
+    def _cursor_for_edges(self, edges: set[str]) -> QCursor:
+        if edges in ({"left", "top"}, {"right", "bottom"}):
+            return QCursor(Qt.CursorShape.SizeFDiagCursor)
+        if edges in ({"right", "top"}, {"left", "bottom"}):
+            return QCursor(Qt.CursorShape.SizeBDiagCursor)
+        if edges & {"left", "right"}:
+            return QCursor(Qt.CursorShape.SizeHorCursor)
+        if edges & {"top", "bottom"}:
+            return QCursor(Qt.CursorShape.SizeVerCursor)
+        return QCursor(Qt.CursorShape.ArrowCursor)
+
+    def _begin_resize(self, edges: set[str], global_pos: QPoint):
+        self._resizing = True
+        self.dragging = False
+        self._resize_edges = set(edges)
+        self._resize_start_global = QPoint(global_pos)
+        self._resize_start_geometry = QRect(self.geometry())
+        self.live2d_canvas.setCursor(self._cursor_for_edges(edges))
+
+    def _resize_from_global(self, global_pos: QPoint):
+        delta = global_pos - self._resize_start_global
+        geometry = QRect(self._resize_start_geometry)
+        min_w = 240
+        min_h = 240
+
+        if "left" in self._resize_edges:
+            new_left = geometry.left() + delta.x()
+            if geometry.right() - new_left + 1 >= min_w:
+                geometry.setLeft(new_left)
+        if "right" in self._resize_edges:
+            geometry.setRight(max(geometry.left() + min_w - 1, geometry.right() + delta.x()))
+        if "top" in self._resize_edges:
+            new_top = geometry.top() + delta.y()
+            if geometry.bottom() - new_top + 1 >= min_h:
+                geometry.setTop(new_top)
+        if "bottom" in self._resize_edges:
+            geometry.setBottom(max(geometry.top() + min_h - 1, geometry.bottom() + delta.y()))
+
+        geometry = self._clamp_resize_geometry(geometry)
+        self.setGeometry(geometry)
+        self._sync_overlay_geometry()
+
+    def _clamp_resize_geometry(self, geometry: QRect) -> QRect:
+        if not self._dock_rect:
+            return geometry
+        dock = QRect(
+            int(self._dock_rect.get("x", geometry.x())),
+            int(self._dock_rect.get("y", geometry.y())),
+            int(self._dock_rect.get("w", geometry.width())),
+            int(self._dock_rect.get("h", geometry.height())),
+        )
+        geometry.setWidth(min(geometry.width(), dock.width()))
+        geometry.setHeight(min(geometry.height(), dock.height()))
+        if geometry.left() < dock.left():
+            geometry.moveLeft(dock.left())
+        if geometry.top() < dock.top():
+            geometry.moveTop(dock.top())
+        if geometry.right() > dock.right():
+            geometry.moveRight(dock.right())
+        if geometry.bottom() > dock.bottom():
+            geometry.moveBottom(dock.bottom())
+        return geometry
+
+    def _create_bubble_label(self):
+        self.bubble_label = QLabel(self)
+        self.bubble_label.setWordWrap(True)
+        self.bubble_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.bubble_label.setStyleSheet("""
+            QLabel {
+                color: white;
+                background: rgba(30, 30, 30, 185);
+                border-radius: 10px;
+                padding: 10px 14px;
+            }
+        """)
+        self.bubble_label.hide()
+
+    def _hide_bubble(self):
+        if self.bubble_label:
+            self.bubble_label.hide()
+
+    def _bubble_text(self, motion):
+        if not motion:
+            return tr("preview_window.bubble_tap")
+        name = os.path.basename(str(motion.get("sound") or motion.get("rel") or motion.get("display") or ""))
+        if not name:
+            name = str(motion.get("group") or "motion")
+        return tr("preview_window.bubble_triggered", motion=name)
+
+    def _show_bubble(self, motion, pos=None):
+        if not self.bubble_label:
+            return
+        if motion is not None:
+            self._last_bubble_motion = motion
+        motion = motion if motion is not None else self._last_bubble_motion
+        self.bubble_label.setText(self._bubble_text(motion))
+        self.bubble_label.setMaximumWidth(max(220, min(420, self.width() - 40)))
+        self.bubble_label.adjustSize()
+        x = (self.width() - self.bubble_label.width()) // 2
+        y = 24
+        if pos is not None:
+            x = max(16, min(pos.x() - self.bubble_label.width() // 2, self.width() - self.bubble_label.width() - 16))
+            y = max(16, min(pos.y() - self.bubble_label.height() - 18, self.height() - self.bubble_label.height() - 16))
+        self.bubble_label.move(x, y)
+        self.bubble_label.raise_()
+        self.bubble_label.show()
+        self.bubble_timer.start(2600)
+
+    def _play_motion_sound(self, motion):
+        if not motion or QSoundEffect is None:
+            return
+        sound_path = str(motion.get("sound") or "")
+        if not sound_path or not os.path.isfile(sound_path):
+            return
+        try:
+            if self._sound_effect is not None:
+                self._sound_effect.stop()
+                self._sound_effect.deleteLater()
+            self._sound_effect = QSoundEffect(self)
+            self._sound_effect.setSource(QUrl.fromLocalFile(sound_path))
+            self._sound_effect.setVolume(0.85)
+            self._sound_effect.play()
+        except Exception:
+            pass
+
+    def _after_motion_triggered(self, motion, pos=None):
+        if motion:
+            self._play_motion_sound(motion)
+        self._show_bubble(motion, pos)
+
+    def _play_motion_item(self, motion, pos=None):
+        if not self.live2d_canvas or not motion:
+            return
+        played = self.live2d_canvas.playMotionItem(motion)
+        self._after_motion_triggered(played, pos)
+
+    def play_motion(self, group: str, index: int):
+        if not self.live2d_canvas:
+            return
+        motion = self.live2d_canvas.findMotion(group, index)
+        if motion is None:
+            for item in self._motion_items:
+                if str(item.get("group", "")) == str(group) and int(item.get("index", -1)) == int(index):
+                    motion = item
+                    break
+        self._play_motion_item(motion, None)
 
     def move_to_screen_center(self):
         """将窗口移动到屏幕中央"""
@@ -230,9 +601,15 @@ class Live2DPreviewWindow(QWidget):
         if not settings:
             return
 
+        if 'show_controls' in settings and self.control_panel:
+            should_show = bool(settings.get('show_controls'))
+            if self.control_panel.isVisible() != should_show:
+                self.toggle_control_panel()
+
         # 应用窗口设置
         if 'window_size' in settings:
             w, h = settings['window_size']
+            self._requested_canvas_size = (int(w), int(h))
             # 当控制面板可见时，窗口总高度 = 目标画布高度 + 控制面板高度
             extra_h = 0
             try:
@@ -242,7 +619,7 @@ class Live2DPreviewWindow(QWidget):
                 extra_h = 0
             total_h = int(h) + extra_h
             try:
-                self.resize(int(w), int(total_h))
+                self._resize_clamped(int(w), int(total_h))
             except Exception:
                 self._show_error_infobar("Failed to resize preview window.")
 
@@ -282,12 +659,40 @@ class Live2DPreviewWindow(QWidget):
             self.control_panel.setVisible(False)
             self.toggle_controls_btn.setText(tr("preview_window.show_controls"))
             # 调整窗口大小
-            self.resize(self.width(), self.height() - self.control_panel.height())
+            self._resize_clamped(self.width(), self.height() - self.control_panel.height())
         else:
             self.control_panel.setVisible(True)
             self.toggle_controls_btn.setText(tr("preview_window.hide_controls"))
             # 调整窗口大小
-            self.resize(self.width(), self.height() + self.control_panel.height())
+            self._resize_clamped(self.width(), self.height() + self.control_panel.height())
+
+    def _resize_clamped(self, width: int, height: int):
+        max_w = width
+        max_h = height
+        if self._dock_rect:
+            max_w = int(self._dock_rect.get("w", width))
+            max_h = int(self._dock_rect.get("h", height))
+        self.resize(max(240, min(int(width), max_w)), max(240, min(int(height), max_h)))
+
+    def apply_dock_geometry(self, rect: dict):
+        if not rect:
+            return
+        try:
+            x = int(rect.get("x", self.x()))
+            y = int(rect.get("y", self.y()))
+            w = max(240, int(rect.get("w", self.width())))
+            h = max(240, int(rect.get("h", self.height())))
+        except Exception:
+            return
+        self._dock_rect = {"x": x, "y": y, "w": w, "h": h}
+        self.setMaximumSize(w, h)
+        self.move(x, y)
+        target_w = min(self.width(), w)
+        target_h = min(self.height(), h)
+        if target_w != self.width() or target_h != self.height():
+            self.resize(target_w, target_h)
+        self._sync_overlay_geometry()
+        self.raise_()
 
     def mousePressEvent(self, event):
         """鼠标按下事件 - 用于拖拽窗口"""
@@ -304,7 +709,7 @@ class Live2DPreviewWindow(QWidget):
 
     def mouseMoveEvent(self, event):
         """鼠标移动事件 - 拖拽窗口"""
-        if event.buttons() == Qt.MouseButton.LeftButton and self.dragging:
+        if (event.buttons() & Qt.MouseButton.LeftButton) and self.dragging:
             self.move(self._event_global_pos(event) - self.drag_position)
             event.accept()
         else:
@@ -333,6 +738,12 @@ class Live2DPreviewWindow(QWidget):
             return event.globalPosition().toPoint()
         return event.globalPos()
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._sync_overlay_geometry()
+        if self.bubble_label and self.bubble_label.isVisible():
+            self._show_bubble(None)
+
     def closeEvent(self, event):
         """窗口关闭事件"""
         if self.live2d_canvas:
@@ -354,6 +765,11 @@ class Live2DPreviewWindow(QWidget):
                 self.toggle_controls_btn.setText(tr("preview_window.hide_controls"))
             else:
                 self.toggle_controls_btn.setText(tr("preview_window.show_controls"))
+        if self.hit_area_toggle_btn:
+            if self._show_hit_areas:
+                self.hit_area_toggle_btn.setText(tr("preview_window.hide_hit_areas"))
+            else:
+                self.hit_area_toggle_btn.setText(tr("preview_window.show_hit_areas"))
         if self.close_btn:
             self.close_btn.setText(tr("common.close"))
 

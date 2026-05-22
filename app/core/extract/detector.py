@@ -16,6 +16,13 @@ UNITY_EXTENSIONS = {
     ".resss",
 }
 
+UNITY_SCAN_EXTENSIONS = {
+    ".assets",
+    ".sharedassets",
+    ".bundle",
+    ".unity3d",
+}
+
 
 def detect_source_type(path: str | Path) -> ExtractSourceType:
     source = Path(path)
@@ -47,6 +54,8 @@ def scan_package_folder(folder_path: str | Path) -> tuple[list[str], list[str]]:
             continue
         suffix = path.suffix.lower()
         if suffix in {".lpk", ".wpk"}:
+            files.append(str(path))
+        elif suffix in UNITY_SCAN_EXTENSIONS:
             files.append(str(path))
         elif path.name.lower() == "config.json":
             configs.append(str(path))

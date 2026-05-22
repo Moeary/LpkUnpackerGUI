@@ -1,5 +1,8 @@
 import os
+import json
 import shutil
+import subprocess
+import sys
 import tempfile
 
 from PySide6.QtWidgets import (
@@ -12,20 +15,23 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QLabel,
     QScrollArea,
+    QSizePolicy,
 )
-from PySide6.QtCore import Qt, Signal, QTimer, QCoreApplication, QThread
+from PySide6.QtCore import Qt, Signal, QTimer, QCoreApplication, QThread, QPoint
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QColor, QPixmap
 from qfluentwidgets import (SubtitleLabel, BodyLabel, PushButton, Slider, CheckBox, SpinBox, InfoBar, InfoBarPosition,
-                           CardWidget, SingleDirectionScrollArea, TextBrowser, ColorDialog, FluentIcon, IconWidget)
+                           CardWidget, SingleDirectionScrollArea, TextBrowser, ColorDialog, FluentIcon, IconWidget,
+                           ComboBox)
 
 from app.core.assetstudio_cli import AssetStudioCLI
 from app.core.model import is_model_json_path, resolve_live2d_package
 from app.core.preview import prepare_preview_import
 from app.core.settings_manager import SettingsManager
-from app.gui.Live2DPreviewWindow import Live2DPreviewWindow
 from app.i18n import get_i18n, tr
+from app.paths import PROJECT_ROOT
 IMAGE_PREVIEW_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tga"}
 PACKAGE_PREVIEW_EXTENSIONS = {".lpk", ".wpk"}
+SPINE_PREVIEW_EXTENSIONS = {".skel", ".atlas"}
 UNITY_PREVIEW_EXTENSIONS = {
     "",
     ".assets",
@@ -53,11 +59,28 @@ def _is_unity_preview_source(path: str) -> bool:
     return os.path.splitext(path)[1].lower() in UNITY_PREVIEW_EXTENSIONS
 
 
+def _is_spine_preview_source(path: str) -> bool:
+    if not os.path.isfile(path):
+        return False
+    suffix = os.path.splitext(path)[1].lower()
+    if suffix in SPINE_PREVIEW_EXTENSIONS:
+        return True
+    if suffix == ".json":
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                head = f.read(4096).lower()
+            return '"skeleton"' in head and '"bones"' in head
+        except Exception:
+            return False
+    return False
+
+
 def _is_supported_preview_source(path: str) -> bool:
     suffix = os.path.splitext(path)[1].lower()
     return (
         _is_model_json(path)
         or _is_image_file(path)
+        or _is_spine_preview_source(path)
         or suffix in PACKAGE_PREVIEW_EXTENSIONS
         or os.path.isdir(path)
         or _is_unity_preview_source(path)
@@ -79,6 +102,31 @@ def _collect_preview_images(path: str, limit: int = 48) -> list[str]:
                     return images
     return images
 
+
+def _safe_export_name(label: str | None, fallback: str) -> str:
+    raw = os.path.basename(os.path.normpath(label or "")) or fallback
+    stem, _ext = os.path.splitext(raw)
+    name = stem or raw or fallback
+    safe = "".join(ch if ch.isalnum() or ch in "._- " else "_" for ch in name).strip(" .")
+    return safe or fallback
+
+
+def _unique_path(path: str) -> str:
+    if not os.path.exists(path):
+        return path
+    base, ext = os.path.splitext(path)
+    index = 1
+    while True:
+        candidate = f"{base}_{index}{ext}"
+        if not os.path.exists(candidate):
+            return candidate
+        index += 1
+
+
+def _unique_dir(path: str) -> str:
+    return _unique_path(path)
+
+
 class DragDropArea(QFrame):
     """拖拽区域组件"""
     fileDropped = Signal(str)  # 文件拖拽信号
@@ -94,37 +142,43 @@ class DragDropArea(QFrame):
 
     def setupUI(self):
         """设置拖拽区域UI"""
-        self.setMinimumHeight(200)
+        self.setMinimumHeight(190)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.setStyleSheet("""
             DragDropArea {
-                border: 2px dashed #ccc;
-                border-radius: 10px;
-                background: transparent;
+                border: 2px dashed #C8CDD6;
+                border-radius: 8px;
+                background: #FAFBFD;
             }
             DragDropArea:hover {
-                border-color: #007ACC;
-                background-color: transparent;
+                border-color: #00A6B3;
+                background: #F5FBFC;
             }
         """)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(8)
         layout.setAlignment(Qt.AlignCenter)
 
         # 拖拽图标
         icon_label = IconWidget(FluentIcon.FOLDER, self)
-        icon_label.setFixedSize(32, 32)
+        icon_label.setFixedSize(42, 42)
 
         # 主要提示文字
         self.main_text = SubtitleLabel("", self)
         self.main_text.setAlignment(Qt.AlignCenter)
+        self.main_text.setWordWrap(True)
 
         # 次要提示文字
         self.sub_text = BodyLabel("", self)
         self.sub_text.setAlignment(Qt.AlignCenter)
+        self.sub_text.setWordWrap(True)
 
         # 额外提示文字
         self.browse_text = BodyLabel("", self)
         self.browse_text.setAlignment(Qt.AlignCenter)
+        self.browse_text.setWordWrap(True)
 
         # 浏览文件按钮
         self.browse_btn = PushButton("", self)
@@ -153,13 +207,13 @@ class DragDropArea(QFrame):
                     event.acceptProposedAction()
                     self.setStyleSheet("""
                         DragDropArea {
-                            border: 2px solid #007ACC;
-                            border-radius: 10px;
-                            background-color: transparent;
+                            border: 2px solid #00A6B3;
+                            border-radius: 8px;
+                            background: #EFFBFC;
                         }
                         DragDropArea:hover {
-                            border-color: #007ACC;
-                            background-color: transparent;
+                            border-color: #00A6B3;
+                            background: #EFFBFC;
                         }
                     """)
                     return
@@ -169,13 +223,13 @@ class DragDropArea(QFrame):
         """拖拽离开事件"""
         self.setStyleSheet("""
             DragDropArea {
-                border: 2px dashed #ccc;
-                border-radius: 10px;
-                background-color: transparent;
+                border: 2px dashed #C8CDD6;
+                border-radius: 8px;
+                background: #FAFBFD;
             }
             DragDropArea:hover {
-                border-color: #007ACC;
-                background-color: transparent;
+                border-color: #00A6B3;
+                background: #F5FBFC;
             }
         """)
 
@@ -235,6 +289,78 @@ class UnityTexturePreviewThread(QThread):
             self.failed.emit(str(exc), self.temp_dir)
 
 
+class PreviewExportThread(QThread):
+    exported = Signal(str, int)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        output_root: str,
+        folder_name: str,
+        source_dir: str | None = None,
+        files: list[str] | None = None,
+        image_only: bool = False,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.output_root = output_root
+        self.folder_name = folder_name
+        self.source_dir = source_dir
+        self.files = list(files or [])
+        self.image_only = image_only
+
+    def run(self):
+        try:
+            target_dir = _unique_dir(os.path.join(self.output_root, self.folder_name))
+            if self.source_dir and os.path.isdir(self.source_dir):
+                source_abs = os.path.abspath(self.source_dir)
+                target_abs = os.path.abspath(target_dir)
+                try:
+                    if os.path.commonpath([source_abs, target_abs]) == source_abs:
+                        raise RuntimeError("Export directory cannot be inside the preview source directory.")
+                except ValueError:
+                    pass
+            os.makedirs(target_dir, exist_ok=True)
+            copied = self._copy_to(target_dir)
+            if copied <= 0:
+                raise RuntimeError("No files were available for export.")
+            self.exported.emit(target_dir, copied)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+    def _copy_to(self, target_dir: str) -> int:
+        if self.source_dir and os.path.isdir(self.source_dir):
+            return self._copy_tree(self.source_dir, target_dir)
+        return self._copy_flat(target_dir)
+
+    def _copy_tree(self, source_dir: str, target_dir: str) -> int:
+        copied = 0
+        source_dir_abs = os.path.abspath(source_dir)
+        for root, _dirs, filenames in os.walk(source_dir_abs):
+            for filename in filenames:
+                source_file = os.path.join(root, filename)
+                if self.image_only and os.path.splitext(filename)[1].lower() not in IMAGE_PREVIEW_EXTENSIONS:
+                    continue
+                rel = os.path.relpath(source_file, source_dir_abs)
+                target_file = os.path.join(target_dir, rel)
+                os.makedirs(os.path.dirname(target_file), exist_ok=True)
+                shutil.copy2(source_file, _unique_path(target_file))
+                copied += 1
+        return copied
+
+    def _copy_flat(self, target_dir: str) -> int:
+        copied = 0
+        for source_file in self.files:
+            if not os.path.isfile(source_file):
+                continue
+            if self.image_only and os.path.splitext(source_file)[1].lower() not in IMAGE_PREVIEW_EXTENSIONS:
+                continue
+            target_file = os.path.join(target_dir, os.path.basename(source_file))
+            shutil.copy2(source_file, _unique_path(target_file))
+            copied += 1
+        return copied
+
+
 class ModelPreviewImportThread(QThread):
     modelReady = Signal(str, str, str)
     failed = Signal(str, str)
@@ -259,50 +385,163 @@ class ModelPreviewImportThread(QThread):
 class ImagePreviewPanel(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._image_paths = []
+        self._current_index = 0
+        self._thumb_size = 168
+        self._last_columns = 0
         self.title_label = BodyLabel("", self)
+        self.main_image_label = QLabel(self)
+        self.path_label = BodyLabel("", self)
+        self.prev_btn = PushButton("", self)
+        self.next_btn = PushButton("", self)
         self.grid_widget = QWidget(self)
         self.grid_layout = QGridLayout(self.grid_widget)
-        self.grid_layout.setContentsMargins(8, 8, 8, 8)
-        self.grid_layout.setSpacing(10)
+        self.grid_layout.setContentsMargins(4, 10, 4, 10)
+        self.grid_layout.setSpacing(12)
 
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
         scroll.setWidget(self.grid_widget)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
         layout.addWidget(self.title_label)
+
+        self.main_image_label.setMinimumHeight(420)
+        self.main_image_label.setAlignment(Qt.AlignCenter)
+        self.main_image_label.setStyleSheet("""
+            QLabel {
+                border: 1px solid #DDE2EA;
+                border-radius: 8px;
+                background: #FFFFFF;
+                color: #68707D;
+            }
+        """)
+        layout.addWidget(self.main_image_label, 1)
+
+        nav_layout = QHBoxLayout()
+        self.prev_btn.setIcon(FluentIcon.LEFT_ARROW)
+        self.prev_btn.clicked.connect(self.show_previous)
+        self.next_btn.setIcon(FluentIcon.RIGHT_ARROW)
+        self.next_btn.clicked.connect(self.show_next)
+        self.path_label.setWordWrap(True)
+        nav_layout.addWidget(self.prev_btn)
+        nav_layout.addWidget(self.path_label, 1)
+        nav_layout.addWidget(self.next_btn)
+        layout.addLayout(nav_layout)
+
+        scroll.setMaximumHeight(210)
         layout.addWidget(scroll)
-        self.setMinimumHeight(220)
+        self.setMinimumHeight(420)
 
     def load_images(self, image_paths: list[str]):
-        self.clear()
+        self._image_paths = list(image_paths)
+        self._current_index = 0
         self.title_label.setText(tr("preview.image_preview_title", count=len(image_paths)))
-        for index, path in enumerate(image_paths):
+        self._populate_images()
+        self._show_current_image()
+
+    def _column_count(self) -> int:
+        width = max(self.width(), self.grid_widget.width(), 720)
+        return max(2, min(7, width // (self._thumb_size + 18)))
+
+    def _populate_images(self):
+        self._clear_grid()
+        columns = self._column_count()
+        self._last_columns = columns
+        for index, path in enumerate(self._image_paths):
             thumb = QLabel(self.grid_widget)
-            thumb.setFixedSize(124, 124)
+            thumb.setFixedSize(self._thumb_size, self._thumb_size)
             thumb.setAlignment(Qt.AlignCenter)
             thumb.setToolTip(path)
+            thumb.setWordWrap(True)
+            thumb.setStyleSheet("""
+                QLabel {
+                    border: 1px solid #E3E6EA;
+                    border-radius: 8px;
+                    background: #FFFFFF;
+                    color: #30343B;
+                }
+            """)
             pixmap = QPixmap(path)
             if pixmap.isNull():
                 thumb.setText(os.path.basename(path))
             else:
                 thumb.setPixmap(
                     pixmap.scaled(
-                        120,
-                        120,
+                        self._thumb_size - 12,
+                        self._thumb_size - 12,
                         Qt.KeepAspectRatio,
                         Qt.SmoothTransformation,
                     )
                 )
-            self.grid_layout.addWidget(thumb, index // 4, index % 4)
+            thumb.mousePressEvent = lambda _event, i=index: self.select_image(i)
+            self.grid_layout.addWidget(thumb, index // columns, index % columns)
+        self.grid_layout.setRowStretch((len(self._image_paths) // columns) + 1, 1)
 
     def clear(self):
+        self._image_paths = []
+        self._current_index = 0
+        self._clear_grid()
+        self.title_label.clear()
+        self.path_label.clear()
+        self.main_image_label.clear()
+
+    def _clear_grid(self):
         while self.grid_layout.count():
             item = self.grid_layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._image_paths and self._column_count() != self._last_columns:
+            self._populate_images()
+        if self._image_paths:
+            self._show_current_image()
+
+    def select_image(self, index: int):
+        if not self._image_paths:
+            return
+        self._current_index = max(0, min(index, len(self._image_paths) - 1))
+        self._show_current_image()
+
+    def show_previous(self):
+        if not self._image_paths:
+            return
+        self._current_index = (self._current_index - 1) % len(self._image_paths)
+        self._show_current_image()
+
+    def show_next(self):
+        if not self._image_paths:
+            return
+        self._current_index = (self._current_index + 1) % len(self._image_paths)
+        self._show_current_image()
+
+    def _show_current_image(self):
+        if not self._image_paths:
+            self.main_image_label.setText("")
+            return
+        path = self._image_paths[self._current_index]
+        pixmap = QPixmap(path)
+        self.path_label.setText(
+            f"{self._current_index + 1}/{len(self._image_paths)}  {path}"
+        )
+        if pixmap.isNull():
+            self.main_image_label.setText(os.path.basename(path))
+            return
+        max_size = self.main_image_label.size()
+        self.main_image_label.setPixmap(
+            pixmap.scaled(
+                max(1, max_size.width() - 24),
+                max(1, max_size.height() - 24),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+        )
 
 
 class Live2DSettingsPanel(QFrame):
@@ -364,14 +603,18 @@ class Live2DSettingsPanel(QFrame):
 
     def setupUI(self):
         """设置面板UI"""
+        self.setMinimumWidth(300)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 20, 0)
-        layout.setSpacing(15)
+        layout.setContentsMargins(8, 0, 0, 0)
+        layout.setSpacing(10)
 
         # 创建滚动区域
         scroll = SingleDirectionScrollArea(orient=Qt.Vertical)
         scroll_widget = QWidget()
         scroll_layout = QVBoxLayout(scroll_widget)
+        scroll_layout.setContentsMargins(0, 0, 0, 0)
+        scroll_layout.setSpacing(10)
 
         # 窗口设置组
         window_group = self.create_window_settings_group()
@@ -403,35 +646,39 @@ class Live2DSettingsPanel(QFrame):
         """创建窗口设置组"""
         group = CardWidget(self)
         layout = QVBoxLayout(group)
-        layout.setContentsMargins(15, 15, 15, 15)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
 
         # 组标题
         self.window_group_title = SubtitleLabel("", group)
         layout.addWidget(self.window_group_title)
 
         # 窗口大小设置
-        size_layout = QHBoxLayout()
+        size_layout = QGridLayout()
+        size_layout.setHorizontalSpacing(8)
+        size_layout.setVerticalSpacing(8)
         self.window_size_label = BodyLabel("", group)
-        size_layout.addWidget(self.window_size_label)
+        size_layout.addWidget(self.window_size_label, 0, 0, 1, 4)
 
         self.width_spinbox = SpinBox(group)
-        self.width_spinbox.setRange(200, 1920)
-        self.width_spinbox.setValue(400)
+        self.width_spinbox.setRange(240, 2560)
+        self.width_spinbox.setValue(720)
         self.width_spinbox.setSuffix(" px")
+        self.width_spinbox.setMinimumWidth(112)
 
         self.width_label = BodyLabel("", group)
-        size_layout.addWidget(self.width_label)
-        size_layout.addWidget(self.width_spinbox)
+        size_layout.addWidget(self.width_label, 1, 0)
+        size_layout.addWidget(self.width_spinbox, 1, 1)
 
         self.height_spinbox = SpinBox(group)
-        self.height_spinbox.setRange(200, 1080)
-        self.height_spinbox.setValue(300)
+        self.height_spinbox.setRange(240, 1600)
+        self.height_spinbox.setValue(720)
         self.height_spinbox.setSuffix(" px")
+        self.height_spinbox.setMinimumWidth(112)
 
         self.height_label = BodyLabel("", group)
-        size_layout.addWidget(self.height_label)
-        size_layout.addWidget(self.height_spinbox)
-        size_layout.addStretch()
+        size_layout.addWidget(self.height_label, 1, 2)
+        size_layout.addWidget(self.height_spinbox, 1, 3)
 
         layout.addLayout(size_layout)
 
@@ -471,7 +718,8 @@ class Live2DSettingsPanel(QFrame):
         """创建模型设置组"""
         group = CardWidget(self)
         layout = QVBoxLayout(group)
-        layout.setContentsMargins(15, 15, 15, 15)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
 
         # 组标题
         self.model_group_title = SubtitleLabel("", group)
@@ -539,7 +787,8 @@ class Live2DSettingsPanel(QFrame):
         """创建交互设置组"""
         group = CardWidget(self)
         layout = QVBoxLayout(group)
-        layout.setContentsMargins(15, 15, 15, 15)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
 
         # 组标题
         self.interaction_group_title = SubtitleLabel("", group)
@@ -567,7 +816,8 @@ class Live2DSettingsPanel(QFrame):
         """创建高级设置组的容器；具体参数根据模型动态生成"""
         group = CardWidget(self)
         layout = QVBoxLayout(group)
-        layout.setContentsMargins(15, 15, 15, 15)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
 
         self.advanced_group_title = SubtitleLabel("", group)
         layout.addWidget(self.advanced_group_title)
@@ -806,6 +1056,19 @@ class PreviewPage(QFrame):
         self.close_all_btn = None
         self.model_info_text_box = None
         self.image_preview_panel = None
+        self.preview_stage_title = None
+        self.preview_stage = None
+        self.preview_stage_layout = None
+        self.preview_stage_close_btn = None
+        self.export_preview_btn = None
+        self.preview_dock_area = None
+        self.preview_dock_layout = None
+        self.preview_placeholder = None
+        self.motion_group_title = None
+        self.motion_combo = None
+        self.play_motion_btn = None
+        self.motion_hint_label = None
+        self._motion_items = []
         self.drag_drop_area = None
         self.title_label = None
         self.main_layout = None
@@ -813,16 +1076,25 @@ class PreviewPage(QFrame):
         self.setObjectName('previewPage')
         self.i18n = get_i18n()
         self.settings_manager = SettingsManager()
-        self.preview_window = None
+        self.preview_process = None
         # 新增：预览按钮冷却
         self._preview_cooldown_timer = None
         self._preview_cooldown_ms = 1500  # 冷却时长（毫秒）
+        self._preview_process_poll_timer = None
+        self._preview_dock_timer = None
+        self._last_preview_dock_rect = None
         # 新增：记录临时美化的 model json 文件（在新文件载入时清理）
         self._temp_model_json_path = None
         self._model_preview_thread = None
         self._model_preview_temp_dirs = []
         self._image_preview_thread = None
         self._image_preview_temp_dirs = []
+        self._preview_export_thread = None
+        self._preview_export_kind = None
+        self._preview_export_source_dir = None
+        self._preview_export_files = []
+        self._preview_export_label = ""
+        self._pending_unity_preview_source_path = None
 
         self.setupUI()
         self.retranslate_ui()
@@ -831,6 +1103,7 @@ class PreviewPage(QFrame):
         try:
             app = QCoreApplication.instance()
             if app is not None:
+                app.aboutToQuit.connect(self._terminate_preview_process)
                 app.aboutToQuit.connect(self._cleanup_temp_model_json)
                 app.aboutToQuit.connect(self._cleanup_model_preview_temp_dirs)
                 app.aboutToQuit.connect(self._cleanup_image_preview_temp_dirs)
@@ -839,8 +1112,8 @@ class PreviewPage(QFrame):
 
     def setupUI(self):
         self.main_layout = QVBoxLayout(self)
-        self.main_layout.setContentsMargins(20, 20, 20, 20)
-        self.main_layout.setSpacing(10)
+        self.main_layout.setContentsMargins(20, 18, 20, 20)
+        self.main_layout.setSpacing(12)
 
         # 标题
         self.title_label = SubtitleLabel("", self)
@@ -848,12 +1121,26 @@ class PreviewPage(QFrame):
 
         # 创建分割器
         splitter = QSplitter(Qt.Horizontal, self)
+        splitter.setChildrenCollapsible(False)
+        splitter.setOpaqueResize(True)
+        splitter.setHandleWidth(8)
+        splitter.setStyleSheet("""
+            QSplitter::handle {
+                background: #E6EAF0;
+                border-radius: 3px;
+            }
+            QSplitter::handle:hover {
+                background: #BFC7D4;
+            }
+        """)
 
-        # 左侧：拖拽区域和控制按钮
+        # 左侧：导入、设置和控制按钮
         left_widget = QWidget()
+        left_widget.setMinimumWidth(320)
+        left_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         left_layout = QVBoxLayout(left_widget)
-        left_layout.setContentsMargins(0, 10, 10, 0)
-        left_layout.setSpacing(10)
+        left_layout.setContentsMargins(0, 10, 12, 0)
+        left_layout.setSpacing(12)
 
         # 拖拽区域
         self.drag_drop_area = DragDropArea(self)
@@ -862,45 +1149,156 @@ class PreviewPage(QFrame):
 
         # 当前模型信息
         self.model_info_text_box = TextBrowser(self)
+        self.model_info_text_box.setMinimumHeight(120)
+        self.model_info_text_box.setMaximumHeight(170)
+        self.model_info_text_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.model_info_text_box.setStyleSheet("""
+            TextBrowser {
+                border: 1px solid #E3E6EA;
+                border-radius: 8px;
+                background: #FFFFFF;
+                padding: 8px;
+            }
+        """)
 
         left_layout.addWidget(self.model_info_text_box)
 
-        self.image_preview_panel = ImagePreviewPanel(self)
-        self.image_preview_panel.setVisible(False)
-        left_layout.addWidget(self.image_preview_panel)
+        motion_group = CardWidget(self)
+        motion_layout = QVBoxLayout(motion_group)
+        motion_layout.setContentsMargins(12, 12, 12, 12)
+        motion_layout.setSpacing(8)
+        self.motion_group_title = SubtitleLabel("", motion_group)
+        motion_layout.addWidget(self.motion_group_title)
+        motion_row = QHBoxLayout()
+        motion_row.setSpacing(8)
+        self.motion_combo = ComboBox(motion_group)
+        self.motion_combo.setMinimumWidth(180)
+        self.play_motion_btn = PushButton("", motion_group)
+        self.play_motion_btn.setIcon(FluentIcon.PLAY)
+        self.play_motion_btn.clicked.connect(self.play_selected_motion)
+        motion_row.addWidget(self.motion_combo, 1)
+        motion_row.addWidget(self.play_motion_btn)
+        motion_layout.addLayout(motion_row)
+        self.motion_hint_label = BodyLabel("", motion_group)
+        self.motion_hint_label.setWordWrap(True)
+        motion_layout.addWidget(self.motion_hint_label)
+        left_layout.addWidget(motion_group)
+
+        # 设置面板
+        self.settings_panel = Live2DSettingsPanel(self)
+        self.settings_panel.settingsChanged.connect(self.on_settings_changed)
+        self.settings_panel.requestRefreshParams.connect(self.on_request_refresh_params)
+        left_layout.addWidget(self.settings_panel, 1)
 
         # 控制按钮区域
         button_layout = QHBoxLayout()
-        button_layout.setSpacing(30)
-        button_layout.addStretch()
+        button_layout.setSpacing(10)
         self.preview_btn = PushButton("", self)
+        self.preview_btn.setIcon(FluentIcon.PLAY)
         self.preview_btn.setEnabled(False)
         # 修改：接入冷却逻辑
         self.preview_btn.clicked.connect(self._on_preview_clicked)
 
         self.close_all_btn = PushButton("", self)
+        self.close_all_btn.setIcon(FluentIcon.CLOSE)
         self.close_all_btn.clicked.connect(self.close_preview_window)
 
-        button_layout.addWidget(self.preview_btn)
-        button_layout.addWidget(self.close_all_btn)
-        button_layout.addStretch()
+        button_layout.addWidget(self.preview_btn, 1)
+        button_layout.addWidget(self.close_all_btn, 1)
 
         left_layout.addLayout(button_layout)
 
-        left_layout.addStretch()
+        # 右侧：大预览舞台
+        right_widget = QWidget()
+        right_widget.setMinimumWidth(520)
+        right_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(12, 10, 0, 0)
+        right_layout.setSpacing(10)
 
-        # 右侧：设置面板
-        self.settings_panel = Live2DSettingsPanel(self)
-        # Connect live update signals
-        self.settings_panel.settingsChanged.connect(self.on_settings_changed)
-        self.settings_panel.requestRefreshParams.connect(self.on_request_refresh_params)
+        self.preview_stage_title = SubtitleLabel("", self)
+        right_layout.addWidget(self.preview_stage_title)
+
+        self.preview_stage = QFrame(self)
+        self.preview_stage.setObjectName("previewStage")
+        self.preview_stage.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.preview_stage.setStyleSheet("""
+            QFrame#previewStage {
+                border: 1px solid #DDE2EA;
+                border-radius: 8px;
+                background: #FAFBFD;
+            }
+        """)
+        self.preview_stage_layout = QVBoxLayout(self.preview_stage)
+        self.preview_stage_layout.setContentsMargins(12, 10, 12, 12)
+        self.preview_stage_layout.setSpacing(8)
+
+        stage_toolbar = QHBoxLayout()
+        stage_toolbar.setContentsMargins(0, 0, 0, 0)
+        stage_toolbar.setSpacing(8)
+        stage_toolbar.addStretch(1)
+
+        self.export_preview_btn = PushButton("", self.preview_stage)
+        self.export_preview_btn.setIcon(FluentIcon.DOWNLOAD)
+        self.export_preview_btn.setEnabled(False)
+        self.export_preview_btn.clicked.connect(self.export_preview_resources)
+        stage_toolbar.addWidget(self.export_preview_btn, 0, Qt.AlignRight)
+
+        self.preview_stage_close_btn = PushButton("", self.preview_stage)
+        self.preview_stage_close_btn.setText("X")
+        self.preview_stage_close_btn.setFixedSize(34, 30)
+        self.preview_stage_close_btn.setStyleSheet("""
+            PushButton {
+                border: 1px solid #D0D7E2;
+                border-radius: 6px;
+                background: #FFFFFF;
+                color: #31363F;
+                font-size: 18px;
+                font-weight: 600;
+            }
+            PushButton:hover {
+                border-color: #F1A7A7;
+                background: #FDEBEC;
+                color: #C42B1C;
+            }
+        """)
+        self.preview_stage_close_btn.clicked.connect(self.close_preview_window)
+        stage_toolbar.addWidget(self.preview_stage_close_btn, 0, Qt.AlignRight)
+        self.preview_stage_layout.addLayout(stage_toolbar)
+
+        self.preview_dock_area = QFrame(self.preview_stage)
+        self.preview_dock_area.setObjectName("previewDockArea")
+        self.preview_dock_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.preview_dock_area.setStyleSheet("""
+            QFrame#previewDockArea {
+                border: none;
+                background: transparent;
+            }
+        """)
+        self.preview_dock_layout = QVBoxLayout(self.preview_dock_area)
+        self.preview_dock_layout.setContentsMargins(0, 0, 0, 0)
+        self.preview_dock_layout.setSpacing(0)
+
+        self.preview_placeholder = BodyLabel("", self.preview_dock_area)
+        self.preview_placeholder.setAlignment(Qt.AlignCenter)
+        self.preview_placeholder.setStyleSheet("color: #68707D;")
+        self.preview_dock_layout.addWidget(self.preview_placeholder, 1)
+
+        self.image_preview_panel = ImagePreviewPanel(self.preview_dock_area)
+        self.image_preview_panel.setVisible(False)
+        self.preview_dock_layout.addWidget(self.image_preview_panel, 1)
+        self.preview_stage_layout.addWidget(self.preview_dock_area, 1)
+
+        right_layout.addWidget(self.preview_stage, 1)
 
         # 添加到分割器
         splitter.addWidget(left_widget)
-        splitter.addWidget(self.settings_panel)
-        splitter.setSizes([250, 450])  # 设置初始比例
+        splitter.addWidget(right_widget)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([380, 1040])  # 设置初始比例
 
-        self.main_layout.addWidget(splitter)
+        self.main_layout.addWidget(splitter, 1)
         self.main_layout.setStretch(0, 0)
         self.main_layout.setStretch(1, 1)
 
@@ -912,10 +1310,33 @@ class PreviewPage(QFrame):
         self._preview_cooldown_timer.setSingleShot(True)
         self._preview_cooldown_timer.timeout.connect(self._on_preview_cooldown_end)
 
+        self._preview_process_poll_timer = QTimer(self)
+        self._preview_process_poll_timer.setInterval(1000)
+        self._preview_process_poll_timer.timeout.connect(self._poll_preview_process)
+
+        self._preview_dock_timer = QTimer(self)
+        self._preview_dock_timer.setInterval(250)
+        self._preview_dock_timer.timeout.connect(self._send_preview_dock_geometry)
+
     def retranslate_ui(self):
         self.title_label.setText(tr("preview.title"))
+        if self.preview_stage_title:
+            self.preview_stage_title.setText(tr("preview.stage_title"))
+        if self.preview_placeholder:
+            self.preview_placeholder.setText(tr("preview.stage_empty"))
         self.preview_btn.setText(tr("preview.preview_model"))
         self.close_all_btn.setText(tr("preview.close_window"))
+        if self.export_preview_btn:
+            self.export_preview_btn.setText(tr("preview.export_preview"))
+            self.export_preview_btn.setToolTip(tr("preview.export_preview_tooltip"))
+        if self.preview_stage_close_btn:
+            self.preview_stage_close_btn.setToolTip(tr("preview.close_window"))
+        if self.motion_group_title:
+            self.motion_group_title.setText(tr("preview.motion_debug"))
+        if self.play_motion_btn:
+            self.play_motion_btn.setText(tr("preview.play_motion"))
+        if self.motion_hint_label:
+            self.motion_hint_label.setText(tr("preview.motion_hint"))
 
         if hasattr(self, "drag_drop_area") and self.drag_drop_area:
             self.drag_drop_area.retranslate_ui()
@@ -926,6 +1347,11 @@ class PreviewPage(QFrame):
             self.image_preview_panel and self.image_preview_panel.isVisible()
         ):
             self.model_info_text_box.setMarkdown(tr("preview.model_info_empty"))
+        if self.motion_combo and not self._motion_items:
+            self.motion_combo.clear()
+            self.motion_combo.addItem(tr("preview.motion_none"))
+            self.motion_combo.setEnabled(False)
+            self.play_motion_btn.setEnabled(False)
 
     # 新增：预览按钮点击（带冷却）
     def _on_preview_clicked(self):
@@ -972,6 +1398,269 @@ class PreviewPage(QFrame):
             except Exception:
                 pass
 
+    @staticmethod
+    def _load_motions_from_model_json(model_json_path: str) -> list[dict]:
+        motions = []
+        if not model_json_path:
+            return motions
+        base_dir = os.path.dirname(model_json_path)
+        try:
+            with open(model_json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return motions
+        refs = (data or {}).get("FileReferences") or {}
+        motion_groups = refs.get("Motions") or {}
+        for group, items in motion_groups.items():
+            if not isinstance(items, list):
+                continue
+            for index, item in enumerate(items):
+                if not isinstance(item, dict):
+                    continue
+                rel = item.get("File") or ""
+                if not rel:
+                    continue
+                full_path = os.path.normpath(os.path.join(base_dir, rel))
+                motions.append({
+                    "group": str(group),
+                    "index": int(index),
+                    "file": full_path,
+                    "rel": rel,
+                    "display": f"{group}[{index}] - {os.path.basename(rel)}",
+                })
+        return motions
+
+    @staticmethod
+    def _serialize_preview_settings(settings: dict) -> dict:
+        serialized = dict(settings or {})
+        bg_color = serialized.get("bg_color")
+        if isinstance(bg_color, QColor):
+            serialized["bg_color"] = bg_color.name()
+        elif bg_color is not None:
+            serialized["bg_color"] = str(bg_color)
+        if "window_size" in serialized:
+            try:
+                w, h = serialized["window_size"]
+                serialized["window_size"] = [int(w), int(h)]
+            except Exception:
+                serialized.pop("window_size", None)
+        return serialized
+
+    def _preview_command_args(self) -> list[str]:
+        language = getattr(self.i18n, "language", "en_US")
+        if getattr(sys, "frozen", False):
+            return [
+                sys.executable,
+                "--preview-process",
+                "--model",
+                self.current_model_path,
+                "--language",
+                language,
+            ]
+        return [
+            sys.executable,
+            "-m",
+            "app.preview_process",
+            "--model",
+            self.current_model_path,
+            "--language",
+            language,
+        ]
+
+    def _send_preview_command(self, payload: dict) -> bool:
+        process = self.preview_process
+        if process is None or process.poll() is not None or process.stdin is None:
+            self.preview_process = None
+            return False
+        try:
+            process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            process.stdin.flush()
+            return True
+        except Exception:
+            self.preview_process = None
+            return False
+
+    def _preview_dock_rect(self) -> dict | None:
+        if self.preview_dock_area is None or not self.preview_dock_area.isVisible():
+            return None
+        try:
+            origin = self.preview_dock_area.mapToGlobal(QPoint(0, 0))
+            rect = self.preview_dock_area.rect()
+            margin = 4
+            return {
+                "x": int(origin.x() + margin),
+                "y": int(origin.y() + margin),
+                "w": max(240, int(rect.width() - margin * 2)),
+                "h": max(240, int(rect.height() - margin * 2)),
+            }
+        except Exception:
+            return None
+
+    def _send_preview_dock_geometry(self):
+        rect = self._preview_dock_rect()
+        if not rect:
+            return
+        if rect == self._last_preview_dock_rect:
+            return
+        if self._send_preview_command({"type": "dock", "rect": rect}):
+            self._last_preview_dock_rect = rect
+
+    def _terminate_preview_process(self):
+        process = self.preview_process
+        self.preview_process = None
+        if self._preview_process_poll_timer is not None:
+            self._preview_process_poll_timer.stop()
+        if self._preview_dock_timer is not None:
+            self._preview_dock_timer.stop()
+        self._last_preview_dock_rect = None
+        if process is None:
+            return
+        try:
+            if process.poll() is None and process.stdin is not None:
+                process.stdin.write(json.dumps({"type": "close"}, ensure_ascii=False) + "\n")
+                process.stdin.flush()
+        except Exception:
+            pass
+        try:
+            if process.poll() is None:
+                process.terminate()
+        except Exception:
+            pass
+
+    def _poll_preview_process(self):
+        process = self.preview_process
+        if process is None:
+            if self._preview_process_poll_timer is not None:
+                self._preview_process_poll_timer.stop()
+            if self._preview_dock_timer is not None:
+                self._preview_dock_timer.stop()
+            return
+        if process.poll() is None:
+            self._send_preview_dock_geometry()
+            return
+        self.preview_process = None
+        if self._preview_process_poll_timer is not None:
+            self._preview_process_poll_timer.stop()
+        if self._preview_dock_timer is not None:
+            self._preview_dock_timer.stop()
+        self._last_preview_dock_rect = None
+
+    def _show_stage_placeholder(self, text: str | None = None):
+        if self.image_preview_panel:
+            self.image_preview_panel.setVisible(False)
+        if self.preview_placeholder:
+            self.preview_placeholder.setText(text or tr("preview.stage_empty"))
+            self.preview_placeholder.setVisible(True)
+
+    def _show_image_stage(self):
+        if self.preview_placeholder:
+            self.preview_placeholder.setVisible(False)
+        if self.image_preview_panel:
+            self.image_preview_panel.setVisible(True)
+
+    def _set_preview_export_payload(
+        self,
+        kind: str | None,
+        source_dir: str | None = None,
+        files: list[str] | None = None,
+        label: str | None = None,
+    ):
+        self._preview_export_kind = kind
+        self._preview_export_source_dir = os.path.abspath(source_dir) if source_dir else None
+        self._preview_export_files = [os.path.abspath(path) for path in (files or [])]
+        self._preview_export_label = label or source_dir or (self._preview_export_files[0] if self._preview_export_files else "")
+        enabled = bool(kind and (self._preview_export_source_dir or self._preview_export_files))
+        if self.export_preview_btn:
+            self.export_preview_btn.setEnabled(enabled)
+
+    def _clear_preview_export_payload(self):
+        self._set_preview_export_payload(None)
+
+    def export_preview_resources(self):
+        if self._preview_export_thread is not None and self._preview_export_thread.isRunning():
+            return
+        if not self._preview_export_kind:
+            self.show_error(tr("common.error"), tr("preview.export_no_resources"))
+            return
+
+        default_type = "textures" if self._preview_export_kind == "textures" else "live2d"
+        default_dir = self.settings_manager.get_output_dir(default_type)
+        output_dir = QFileDialog.getExistingDirectory(
+            self,
+            tr("preview.export_select_directory"),
+            default_dir,
+        )
+        if not output_dir:
+            return
+
+        image_only = self._preview_export_kind == "textures"
+        folder_suffix = "textures" if image_only else "live2d"
+        folder_name = f"{_safe_export_name(self._preview_export_label, 'preview_export')}_{folder_suffix}"
+
+        self.export_preview_btn.setEnabled(False)
+        self._preview_export_thread = PreviewExportThread(
+            output_dir,
+            folder_name,
+            source_dir=self._preview_export_source_dir,
+            files=self._preview_export_files,
+            image_only=image_only,
+            parent=self,
+        )
+        self._preview_export_thread.exported.connect(self.on_preview_export_finished)
+        self._preview_export_thread.failed.connect(self.on_preview_export_failed)
+        self._preview_export_thread.start()
+
+    def on_preview_export_finished(self, output_dir: str, count: int):
+        if self.export_preview_btn:
+            self.export_preview_btn.setEnabled(bool(self._preview_export_kind))
+        self._preview_export_thread = None
+        InfoBar.success(
+            title=tr("common.success"),
+            content=tr("preview.export_success_content", count=count, output=output_dir),
+            orient=Qt.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP,
+            duration=5000,
+            parent=self,
+        )
+
+    def on_preview_export_failed(self, error: str):
+        if self.export_preview_btn:
+            self.export_preview_btn.setEnabled(bool(self._preview_export_kind))
+        self._preview_export_thread = None
+        self.show_error(
+            tr("preview.export_failed_title"),
+            tr("preview.export_failed_content", error=error),
+        )
+
+    def _populate_motion_controls(self, motions: list[dict]):
+        self._motion_items = list(motions or [])
+        if not self.motion_combo or not self.play_motion_btn:
+            return
+        self.motion_combo.clear()
+        if not self._motion_items:
+            self.motion_combo.addItem(tr("preview.motion_none"))
+            self.motion_combo.setEnabled(False)
+            self.play_motion_btn.setEnabled(False)
+            return
+        for motion in self._motion_items:
+            self.motion_combo.addItem(str(motion.get("display") or motion.get("group") or "motion"))
+        self.motion_combo.setEnabled(True)
+        self.play_motion_btn.setEnabled(True)
+
+    def play_selected_motion(self):
+        if not self._motion_items or not self.motion_combo:
+            return
+        index = self.motion_combo.currentIndex()
+        if index < 0 or index >= len(self._motion_items):
+            index = 0
+        motion = self._motion_items[index]
+        self._send_preview_command({
+            "type": "play_motion",
+            "group": str(motion.get("group", "")),
+            "index": int(motion.get("index", 0)),
+        })
+
     def _cleanup_temp_model_json(self):
         """删除上一次创建的临时美化 model json（若存在）。"""
         try:
@@ -988,6 +1677,8 @@ class PreviewPage(QFrame):
             except Exception:
                 pass
         self._image_preview_temp_dirs = []
+        if self._preview_export_kind == "textures":
+            self._clear_preview_export_payload()
 
     def _cleanup_model_preview_temp_dirs(self):
         for temp_dir in list(self._model_preview_temp_dirs):
@@ -997,6 +1688,8 @@ class PreviewPage(QFrame):
             except Exception:
                 pass
         self._model_preview_temp_dirs = []
+        if self._preview_export_kind == "live2d":
+            self._clear_preview_export_payload()
 
     def on_file_dropped(self, file_path):
         """处理文件拖拽"""
@@ -1004,6 +1697,13 @@ class PreviewPage(QFrame):
             self.show_error(
                 tr("preview.file_not_found_title"),
                 tr("preview.file_not_found_content", file=file_path)
+            )
+            return
+
+        if _is_spine_preview_source(file_path):
+            self.show_error(
+                tr("preview.spine_not_supported_title"),
+                tr("preview.spine_not_supported_content"),
             )
             return
 
@@ -1042,8 +1742,7 @@ class PreviewPage(QFrame):
         self._cleanup_temp_model_json()
         self._cleanup_model_preview_temp_dirs()
         self._cleanup_image_preview_temp_dirs()
-        if self.image_preview_panel:
-            self.image_preview_panel.setVisible(False)
+        self._show_stage_placeholder(tr("preview.stage_loading"))
         self.current_model_path = None
         self.preview_btn.setEnabled(False)
         self.model_info_text_box.setMarkdown(
@@ -1084,6 +1783,13 @@ class PreviewPage(QFrame):
         self.model_info_text_box.setMarkdown(
             tr("preview.model_info_loaded", file=model_name, directory=model_dir)
         )
+        self._show_stage_placeholder(tr("preview.stage_loading"))
+        self._set_preview_export_payload(
+            "live2d",
+            source_dir=model_dir,
+            label=source_path or model_dir,
+        )
+        QTimer.singleShot(50, self.preview_current_model)
         if not (self._preview_cooldown_timer and self._preview_cooldown_timer.isActive()):
             self.preview_btn.setEnabled(True)
 
@@ -1106,7 +1812,14 @@ class PreviewPage(QFrame):
         self.preview_btn.setEnabled(False)
         if self.image_preview_panel:
             self.image_preview_panel.load_images(image_paths)
-            self.image_preview_panel.setVisible(True)
+        self._show_image_stage()
+        export_label = self._pending_unity_preview_source_path or source_path
+        self._set_preview_export_payload(
+            "textures",
+            source_dir=source_path if os.path.isdir(source_path) else None,
+            files=image_paths,
+            label=export_label,
+        )
         self.model_info_text_box.setMarkdown(
             tr(
                 "preview.image_info_loaded",
@@ -1132,10 +1845,11 @@ class PreviewPage(QFrame):
         self.preview_btn.setEnabled(False)
         if self.image_preview_panel:
             self.image_preview_panel.clear()
-            self.image_preview_panel.setVisible(True)
+        self._show_stage_placeholder(tr("preview.stage_loading"))
         self.model_info_text_box.setMarkdown(
             tr("preview.unity_preview_loading", source=source_path)
         )
+        self._pending_unity_preview_source_path = source_path
         temp_dir = tempfile.mkdtemp(
             prefix="lpk_preview_unity_",
             dir=self.settings_manager.get_temp_dir(),
@@ -1155,8 +1869,10 @@ class PreviewPage(QFrame):
             return
         self._image_preview_temp_dirs.append(temp_dir)
         self.load_image_preview(image_paths, temp_dir, temporary=True)
+        self._pending_unity_preview_source_path = None
 
     def on_unity_image_preview_failed(self, error: str, temp_dir: str):
+        self._pending_unity_preview_source_path = None
         shutil.rmtree(temp_dir, ignore_errors=True)
         self.show_error(
             tr("preview.unity_preview_failed_title"),
@@ -1164,60 +1880,64 @@ class PreviewPage(QFrame):
         )
 
     def preview_current_model(self):
-        """预览当前模型"""
+        """在独立进程中预览当前模型，避免 Cubism/OpenGL 卡住主 GUI。"""
         if not self.current_model_path:
             self.show_error(
                 tr("preview.no_model_selected_title"),
                 tr("preview.no_model_selected_content")
             )
-            return
+            return False
 
-        # 保证同时仅有一个预览窗口
-        if self.preview_window is not None:
-            self.close_preview_window()
-
-        # 创建预览窗口
-        preview_window = Live2DPreviewWindow(self.current_model_path)
-
-        # 通过预览窗口枚举参数并重建高级设置UI
         try:
-            meta = preview_window.live2d_canvas.getParameterMetaList() if preview_window.live2d_canvas else []
-            if hasattr(self.settings_panel, 'rebuild_advanced_params'):
-                self.settings_panel.rebuild_advanced_params(meta)
-            parts = preview_window.live2d_canvas.getPartIds() if preview_window.live2d_canvas else []
-            if hasattr(self.settings_panel, 'rebuild_parts_opacity'):
-                self.settings_panel.rebuild_parts_opacity(parts)
-        except Exception:
-            pass
+            self._terminate_preview_process()
+            motions = self._load_motions_from_model_json(self.current_model_path)
+            self._populate_motion_controls(motions)
 
-        # 连接关闭信号
-        preview_window.closed.connect(lambda: self.on_preview_window_closed(preview_window))
-
-        # 只保存一个窗口并显示
-        self.preview_window = preview_window
-        preview_window.show()
-
-        # 获取（可能被重建后的）设置并应用
-        settings = self.settings_panel.get_settings()
-        preview_window.apply_settings(settings)
-
-        # 显示控制面板
-        if settings['show_controls']:
-            preview_window.toggle_control_panel()
+            creationflags = 0
+            if os.name == "nt" and hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+            self.preview_process = subprocess.Popen(
+                self._preview_command_args(),
+                cwd=str(PROJECT_ROOT),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=creationflags,
+            )
+            self._send_preview_dock_geometry()
+            self._send_preview_command({
+                "type": "settings",
+                "settings": self._serialize_preview_settings(self.settings_panel.get_settings()),
+            })
+            if self._preview_process_poll_timer is not None:
+                self._preview_process_poll_timer.start()
+            if self._preview_dock_timer is not None:
+                self._preview_dock_timer.start()
+            self._show_stage_placeholder(tr("preview.external_running"))
+            return True
+        except Exception as exc:
+            self._terminate_preview_process()
+            self._show_stage_placeholder(tr("preview.stage_empty"))
+            self.show_error(
+                tr("common.error"),
+                tr("preview_window.error_model_load_failed", error_type=type(exc).__name__, error=exc),
+            )
+            return False
 
     def on_preview_window_closed(self, window):
         """预览窗口关闭处理"""
-        if self.preview_window is window:
-            self.preview_window = None
+        if self.preview_process is not None and self.preview_process.poll() is not None:
+            self.preview_process = None
 
     def close_preview_window(self):
-        """关闭当前预览窗口"""
-        if self.preview_window is not None:
-            try:
-                self.preview_window.close()
-            except Exception:
-                pass
-            self.preview_window = None
+        """关闭独立预览进程"""
+        self._terminate_preview_process()
+        self._populate_motion_controls([])
+        self._clear_preview_export_payload()
+        self._show_stage_placeholder()
 
     def show_error(self, title, message):
         """显示错误信息"""
@@ -1232,26 +1952,15 @@ class PreviewPage(QFrame):
         )
 
     def on_settings_changed(self, settings: dict):
-        """应用更新的设置到打开的预览窗口（实时更新）"""
-        w = self.preview_window
-        if w is None:
-            return
-        try:
-            w.apply_settings(settings)
-        except Exception:
-            pass
+        """实时发送设置到独立预览进程"""
+        self._send_preview_command({
+            "type": "settings",
+            "settings": self._serialize_preview_settings(settings),
+        })
 
     def on_request_refresh_params(self):
-        """重新从最新打开的预览窗口枚举参数和部件并重建UI"""
-        latest = self.preview_window
-        if latest is None:
-            return
-        try:
-            canvas = latest.live2d_canvas
-            meta = canvas.getParameterMetaList() if canvas else []
-            self.settings_panel.rebuild_advanced_params(meta)
-            parts = canvas.getPartIds() if canvas else []
-            if hasattr(self.settings_panel, 'rebuild_parts_opacity'):
-                self.settings_panel.rebuild_parts_opacity(parts)
-        except Exception:
-            pass
+        """主进程不再加载 Cubism；这里只刷新 model3.json 内的动作列表。"""
+        if self.current_model_path:
+            self._populate_motion_controls(self._load_motions_from_model_json(self.current_model_path))
+        else:
+            self._populate_motion_controls([])

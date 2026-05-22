@@ -3,6 +3,7 @@ from PySide6.QtCore import Qt, QCoreApplication
 from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QIcon
 from app.paths import APP_ICON
+from app.core.app_logging import setup_runtime_logging
 from app.core.settings_manager import SettingsManager
 from app.i18n import get_i18n, normalize_language_code
 
@@ -12,6 +13,9 @@ if hasattr(Qt.ApplicationAttribute, "AA_ShareOpenGLContexts"):
 QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
 
 def run_application():
+    log_path = setup_runtime_logging()
+    print(f"Runtime log: {log_path}")
+
     # 创建QApplication实例
     app = QApplication(sys.argv)
 
@@ -47,5 +51,13 @@ def run_application():
         traceback.print_exc()
         return 1
 
+def main():
+    if "--preview-process" in sys.argv:
+        args = [arg for arg in sys.argv[1:] if arg != "--preview-process"]
+        from app.preview_process import run_preview_process
+
+        return run_preview_process(args)
+    return run_application()
+
 if __name__ == "__main__":
-    sys.exit(run_application())
+    sys.exit(main())

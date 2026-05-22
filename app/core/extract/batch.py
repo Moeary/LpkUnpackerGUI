@@ -104,17 +104,6 @@ def _extract_one(
                 config_files,
             )
         if source_type in {ExtractSourceType.UNITY, ExtractSourceType.FOLDER}:
-            if mode == ExtractMode.TEXTURES:
-                return ExtractItemResult(
-                    source=source,
-                    source_type=source_type,
-                    success=False,
-                    output_dir=output_dir,
-                    error=(
-                        "Unity texture export is preview-only. Use the Preview page to inspect "
-                        "images from non-Live2D Unity sources."
-                    ),
-                )
             unity_mode = ExtractMode.LIVE2D if mode == ExtractMode.FULL else mode
             return extract_unity(
                 source,
