@@ -9,6 +9,9 @@ dist/
 *.exe
 *.spec
 app/tools/AssetStudioCLI/
+app/tools/CubismCore/*
+!app/tools/CubismCore/README.txt
+.codex-temp/
 
 # Python
 __pycache__/

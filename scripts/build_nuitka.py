@@ -80,7 +80,7 @@ def build_nuitka_args(compiler: str) -> list[str]:
         "--output-filename=LpkUnpackerGUI.exe",
         "--windows-console-mode=disable",
         "--include-data-dir=./assets=assets",
-        "--include-data-dir=./app/tools=tools",
+        "--include-data-dir=./app/tools/AssetStudioCLI=tools/AssetStudioCLI",
         "--include-data-dir=./app/i18n/locales=app/i18n/locales",
         "--include-package=qfluentwidgets",
         "--include-package=filetype",

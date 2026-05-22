@@ -7,6 +7,7 @@ from PySide6.QtWidgets import QApplication, QFileDialog, QFrame, QHBoxLayout, QS
 from qfluentwidgets import (
     BodyLabel,
     CaptionLabel,
+    ComboBox,
     FluentIcon,
     InfoBar,
     InfoBarPosition,
@@ -17,7 +18,11 @@ from qfluentwidgets import (
     TextEdit,
 )
 
-from app.core.psd_reconstructor import ReconstructionResult, reconstruct_live2d_psd
+from app.core.psd_reconstructor import (
+    ReconstructionResult,
+    reconstruct_live2d_psd,
+    repack_atlas_png_from_psd,
+)
 from app.i18n import get_i18n, tr
 
 
@@ -26,18 +31,27 @@ class PsdReconstructionThread(QThread):
     reconstructionFinished = Signal(object)
     reconstructionError = Signal(str)
 
-    def __init__(self, source_path: str, output_dir: str):
+    def __init__(self, source_path: str, output_dir: str, mode: str):
         super().__init__()
         self.source_path = source_path
         self.output_dir = output_dir
+        self.mode = mode
 
     def run(self):
         try:
-            result = reconstruct_live2d_psd(
-                self.source_path,
-                self.output_dir,
-                progress=lambda value, message: self.progressUpdated.emit(value, message),
-            )
+            if self.mode == "repack-atlas":
+                result = repack_atlas_png_from_psd(
+                    self.source_path,
+                    self.output_dir,
+                    progress=lambda value, message: self.progressUpdated.emit(value, message),
+                )
+            else:
+                result = reconstruct_live2d_psd(
+                    self.source_path,
+                    self.output_dir,
+                    progress=lambda value, message: self.progressUpdated.emit(value, message),
+                    mode=self.mode,
+                )
             self.reconstructionFinished.emit(result)
         except Exception as exc:
             self.reconstructionError.emit(str(exc))
@@ -108,6 +122,16 @@ class PsdReconstructionPage(QFrame):
         self.source_layout.addWidget(self.source_folder_button)
         self.main_layout.addLayout(self.source_layout)
 
+        self.mode_layout = QHBoxLayout()
+        self.mode_label = SubtitleLabel("", self)
+        self.mode_combo = ComboBox(self)
+        self.mode_combo.addItem("", userData="mesh")
+        self.mode_combo.addItem("", userData="atlas-components")
+        self.mode_combo.addItem("", userData="repack-atlas")
+        self.mode_layout.addWidget(self.mode_label)
+        self.mode_layout.addWidget(self.mode_combo, 1)
+        self.main_layout.addLayout(self.mode_layout)
+
         self.output_layout = QHBoxLayout()
         self.output_label = SubtitleLabel("", self)
         self.output_edit = LineEdit(self)
@@ -161,6 +185,10 @@ class PsdReconstructionPage(QFrame):
         self.source_edit.setPlaceholderText(tr("psd.placeholder_source"))
         self.source_file_button.setText(tr("psd.browse_file"))
         self.source_folder_button.setText(tr("psd.browse_folder"))
+        self.mode_label.setText(tr("psd.mode"))
+        self.mode_combo.setItemText(0, tr("psd.mode.mesh_pose"))
+        self.mode_combo.setItemText(1, tr("psd.mode.editable_atlas"))
+        self.mode_combo.setItemText(2, tr("psd.mode.repack_atlas"))
         self.output_label.setText(tr("psd.output_directory"))
         self.output_edit.setPlaceholderText(tr("psd.placeholder_output"))
         self.output_button.setText(tr("common.browse"))
@@ -231,12 +259,13 @@ class PsdReconstructionPage(QFrame):
 
         self.last_output_dir = os.path.abspath(output_dir)
         self.output_edit.setText(self.last_output_dir)
+        mode = self.mode_combo.currentData() or "mesh"
         self.set_busy(True)
         self.progress_bar.setValue(0)
         self.log_text.clear()
-        self.append_log(tr("psd.started"))
+        self.append_log(tr("psd.started", mode=self.mode_combo.currentText()))
 
-        self.worker = PsdReconstructionThread(source, self.last_output_dir)
+        self.worker = PsdReconstructionThread(source, self.last_output_dir, mode)
         self.worker.progressUpdated.connect(self.on_progress_updated)
         self.worker.reconstructionFinished.connect(self.on_reconstruction_finished)
         self.worker.reconstructionError.connect(self.on_reconstruction_error)
@@ -255,17 +284,22 @@ class PsdReconstructionPage(QFrame):
         for warning in result.warnings:
             self.append_log(tr("psd.warning_prefix", message=warning))
 
+        if result.metadata_path:
+            self.append_log(tr("psd.metadata_log", path=str(result.metadata_path)))
+        if result.output_paths:
+            self.append_log(tr("psd.output_count_log", count=len(result.output_paths)))
+
         self.append_log(
             tr(
                 "psd.finished_log",
-                path=str(result.psd_path),
+                path=str(result.primary_path),
                 count=result.layer_count,
                 mode=result.mode,
             )
         )
         InfoBar.success(
             title=tr("common.success"),
-            content=tr("psd.success_content", path=str(result.psd_path)),
+            content=tr("psd.success_content", path=str(result.primary_path)),
             parent=self,
             position=InfoBarPosition.TOP,
             duration=5000,
@@ -288,6 +322,7 @@ class PsdReconstructionPage(QFrame):
         self.source_file_button.setEnabled(not busy)
         self.source_folder_button.setEnabled(not busy)
         self.output_button.setEnabled(not busy)
+        self.mode_combo.setEnabled(not busy)
 
     def open_output_folder(self):
         if os.path.isdir(self.last_output_dir):
@@ -303,7 +338,7 @@ class PsdReconstructionPage(QFrame):
         if not path:
             return False
         p = Path(path)
-        return p.is_dir() or p.suffix.lower() in {".json", ".moc3"}
+        return p.is_dir() or p.suffix.lower() in {".json", ".moc3", ".psd"}
 
     def updateUIScale(self, window_width, window_height):
         scale_factor = max(1.0, window_width / 1000.0)
