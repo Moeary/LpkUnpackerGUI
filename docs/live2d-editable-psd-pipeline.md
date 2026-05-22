@@ -38,6 +38,10 @@ For `mesh` mode:
 - If no sidecar exists, the tool tries the optional Cubism Core backend and exports one first.
 - Cubism UVs are converted to PNG pixel coordinates with the V axis flipped.
 - Drawable visibility, opacity, and clipping masks are applied before a layer is written.
+- Drawable layers are grouped into PSD folders using available Cubism runtime data:
+  first broad semantic rules such as background/effects/hit areas, then the
+  drawable parent Part ID. This is only an approximate runtime grouping, not
+  the original authoring PSD tree.
 - Each rendered ArtMesh layer is cropped to its alpha bounding box while keeping its PSD `left`/`top` offset, so Photoshop does not have to load hundreds of full-canvas pixel layers.
 - Full-character PSD output uses a simple RAW RGBA PSD writer to avoid slow `psd-tools` RLE encoding on large multi-layer models.
 - Mesh PSD output is the preferred editing view, but it is not treated as repackable yet.
@@ -79,6 +83,28 @@ The sidecar format is intentionally simple:
 ```
 
 The reverse packer trusts layer names and current PSD layer offsets. Moving a layer in Photoshop will move that painted island in the output atlas. That can be useful for atlas editing, but it can also break UV sampling if the model expects the old coordinates.
+
+## Mesh PSD round-trip limits
+
+The full-character/scene PSD is a pose-space editing view. Returning edits from
+that PSD to the atlas requires inverse triangle warping:
+
+1. Read every drawable layer by name from the PSD.
+2. Use the `.lpkpsd.json` sidecar to recover the drawable vertices, UVs,
+   texture index, and layer offset.
+3. For every triangle, map pixels from posed canvas space back into the atlas
+   UV triangle.
+4. Merge all edited drawables into the original atlas canvas.
+
+This is possible but not lossless. Overlapping drawables, clipping masks,
+semi-transparent effects, blend modes, antialiasing, and pixels that were
+hidden in the posed view all need policy decisions. The current implementation
+therefore only treats `atlas-components` PSD files as repackable.
+
+Texture format note: official Cubism model setting documentation describes
+`.model3.json` as linking texture data with `.png`. Runtime integrations can
+load other image formats only if their host loader and renderer support them,
+but WebP is not a portable Cubism texture assumption.
 
 ## Cubism v3 geometry extraction
 

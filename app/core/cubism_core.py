@@ -103,6 +103,7 @@ class CubismCoreModel:
 
         offscreen_count = self.core.get_offscreen_count(model)
         canvas = self._read_canvas()
+        parts = self._read_parts()
 
         ids = dll.csmGetDrawableIds(model)
         constant_flags = dll.csmGetDrawableConstantFlags(model)
@@ -173,6 +174,10 @@ class CubismCoreModel:
                     "parent_part_index": int(parent_part_indices[index])
                     if parent_part_indices
                     else -1,
+                    "parent_part_id": self._part_id_at(
+                        parts,
+                        int(parent_part_indices[index]) if parent_part_indices else -1,
+                    ),
                 }
             )
 
@@ -191,9 +196,38 @@ class CubismCoreModel:
                 "moc_version_raw": self.moc_version,
             },
             "canvas": canvas,
+            "parts": parts,
             "offscreen_count": offscreen_count,
             "drawables": drawables,
         }
+
+    def _read_parts(self) -> list[dict[str, Any]]:
+        dll = self.core.dll
+        model = self.model_pointer
+        count = self.core.get_part_count(model)
+        if count <= 0:
+            return []
+
+        ids = self.core.get_part_ids(model)
+        opacities = self.core.get_part_opacities(model)
+        parents = self.core.get_part_parent_indices(model)
+        offscreens = self.core.get_part_offscreen_indices(model)
+        parts = []
+        for index in range(count):
+            part_id = ids[index].decode("utf-8", errors="replace") if ids else f"Part{index}"
+            parent_index = int(parents[index]) if parents else -1
+            parts.append(
+                {
+                    "index": index,
+                    "id": part_id,
+                    "opacity": float(opacities[index]) if opacities else 1.0,
+                    "parent_part_index": parent_index,
+                    "offscreen_index": int(offscreens[index]) if offscreens else -1,
+                }
+            )
+        for part in parts:
+            part["parent_part_id"] = self._part_id_at(parts, int(part["parent_part_index"]))
+        return parts
 
     def _read_canvas(self) -> dict[str, float]:
         size = CsmVector2()
@@ -236,6 +270,12 @@ class CubismCoreModel:
             return None
         color = array[index]
         return [float(color.X), float(color.Y), float(color.Z), float(color.W)]
+
+    @staticmethod
+    def _part_id_at(parts: list[dict[str, Any]], index: int) -> Optional[str]:
+        if index < 0 or index >= len(parts):
+            return None
+        return str(parts[index]["id"])
 
 
 class CubismCore:
@@ -307,6 +347,31 @@ class CubismCore:
             return 0
         return max(0, int(self.dll.csmGetOffscreenCount(model)))
 
+    def get_part_count(self, model) -> int:
+        if not hasattr(self.dll, "csmGetPartCount"):
+            return 0
+        return max(0, int(self.dll.csmGetPartCount(model)))
+
+    def get_part_ids(self, model) -> Optional[Any]:
+        if not hasattr(self.dll, "csmGetPartIds"):
+            return None
+        return self.dll.csmGetPartIds(model)
+
+    def get_part_opacities(self, model) -> Optional[Any]:
+        if not hasattr(self.dll, "csmGetPartOpacities"):
+            return None
+        return self.dll.csmGetPartOpacities(model)
+
+    def get_part_parent_indices(self, model) -> Optional[Any]:
+        if not hasattr(self.dll, "csmGetPartParentPartIndices"):
+            return None
+        return self.dll.csmGetPartParentPartIndices(model)
+
+    def get_part_offscreen_indices(self, model) -> Optional[Any]:
+        if not hasattr(self.dll, "csmGetPartOffscreenIndices"):
+            return None
+        return self.dll.csmGetPartOffscreenIndices(model)
+
     def get_optional_int_array(self, name: str, model) -> Optional[Any]:
         if not hasattr(self.dll, name):
             return None
@@ -361,6 +426,16 @@ class CubismCore:
         self.dll.csmGetParameterDefaultValues.restype = ctypes.POINTER(c_float)
         self.dll.csmGetParameterValues.argtypes = [c_void_p]
         self.dll.csmGetParameterValues.restype = ctypes.POINTER(c_float)
+
+        self._bind_optional("csmGetPartCount", [c_void_p], c_int)
+        self._bind_optional("csmGetPartIds", [c_void_p], ctypes.POINTER(ctypes.c_char_p))
+        self._bind_optional("csmGetPartOpacities", [c_void_p], ctypes.POINTER(c_float))
+        self._bind_optional(
+            "csmGetPartParentPartIndices",
+            [c_void_p],
+            ctypes.POINTER(c_int),
+        )
+        self._bind_optional("csmGetPartOffscreenIndices", [c_void_p], ctypes.POINTER(c_int))
 
         self.dll.csmGetDrawableCount.argtypes = [c_void_p]
         self.dll.csmGetDrawableCount.restype = c_int

@@ -54,6 +54,7 @@ class PsdLayer:
     image: Image.Image
     left: int = 0
     top: int = 0
+    group: Optional[str] = None
 
 
 def reconstruct_live2d_psd(
@@ -387,15 +388,17 @@ def _render_mesh_layers(
         top = layer_top + crop_top
 
         layer_name = _safe_layer_name(drawable["id"])
+        group_name = _drawable_group_name(drawable)
         image = Image.fromarray(
             layer[crop_top : crop_top + height, crop_left : crop_left + width],
             "RGBA",
         )
-        layers.append(PsdLayer(layer_name, image, left, top))
+        layers.append(PsdLayer(layer_name, image, left, top, group_name))
         layer_metadata.append(
             {
                 "kind": "drawable-mesh",
                 "name": layer_name,
+                "group": group_name,
                 "drawable_id": drawable["id"],
                 "texture_index": texture_index,
                 "left": left,
@@ -522,6 +525,10 @@ def _normalize_drawable(item: dict[str, Any]) -> Optional[dict[str, Any]]:
         "inverted_mask": bool(item.get("inverted_mask", False)),
         "dynamic_flags": int(item.get("dynamic_flags", 1)),
         "constant_flags": int(item.get("constant_flags", 0)),
+        "parent_part_index": int(item.get("parent_part_index", -1)),
+        "parent_part_id": item.get("parent_part_id"),
+        "blend_mode": str(item.get("blend_mode", "normal")),
+        "blend_mode_value": int(item.get("blend_mode_value", 0)),
         "render_order": int(item.get("render_order", item.get("draw_order", 0))),
         "draw_order": int(item.get("draw_order", item.get("render_order", 0))),
     }
@@ -533,6 +540,62 @@ def _drawable_visible(item: dict[str, Any]) -> bool:
     if "dynamic_flags" in item:
         return bool(int(item["dynamic_flags"]) & 1)
     return True
+
+
+def _drawable_group_name(drawable: dict[str, Any]) -> str:
+    group = _semantic_group_name(drawable)
+    if group:
+        return group
+
+    part_id = drawable.get("parent_part_id")
+    if part_id:
+        return _part_group_name(str(part_id))
+    return "Character / Unassigned"
+
+
+def _semantic_group_name(drawable: dict[str, Any]) -> Optional[str]:
+    text = " ".join(
+        str(value)
+        for value in (
+            drawable.get("id", ""),
+            drawable.get("parent_part_id", ""),
+            drawable.get("blend_mode", ""),
+        )
+    ).lower()
+    if re.search(r"\b(touch|hit|drag)\b|touch|hitarea", text):
+        return "Hit Areas"
+    if re.search(r"sky|bg|back|background|haikei|ground|floor|sand|beach", text):
+        return "Background"
+    if re.search(
+        r"effect|fx|water|shui|soda|splash|ice|snow|smoke|fire|spark|light|glow|"
+        r"particle|kirakira|bubble|wave|star|shine",
+        text,
+    ):
+        return "Effects"
+
+    blend_mode = str(drawable.get("blend_mode", "normal")).lower()
+    opacity = float(drawable.get("opacity", 1.0))
+    if blend_mode not in {"normal", "0"} or opacity < 0.95:
+        return "Effects"
+    return None
+
+
+def _part_group_name(part_id: str) -> str:
+    key = part_id.lower()
+    if re.search(r"hair|kami|bang|tail|twin", key):
+        return "Character / Hair"
+    if re.search(r"eye|mabuta|mayu|brow|hitomi|pupil|face|head|mouth|nose", key):
+        return "Character / Head"
+    if re.search(r"arm|hand|ude|te|finger|yubi", key):
+        return "Character / Arms"
+    if re.search(r"leg|foot|ashi|knee", key):
+        return "Character / Legs"
+    if re.search(r"cloth|dress|skirt|shirt|body|mune|torso", key):
+        return "Character / Body & Clothes"
+    if re.search(r"accessory|acc|ribbon|hat|weapon|gun|sword|dao", key):
+        return "Character / Accessories"
+    clean = _safe_layer_name(part_id)
+    return f"Character / {clean}"
 
 
 def _resolve_canvas(
@@ -826,41 +889,18 @@ def _save_fast_rgba_psd(path: Path, size: tuple[int, int], layers: list[PsdLayer
     if len(visible_layers) > 32767:
         raise PsdReconstructionError("PSD layer count exceeds the PSD format limit.")
 
+    record_specs = _build_psd_record_specs(visible_layers)
     records = []
-    channel_data_lengths = []
-    for layer in reversed(visible_layers):
-        layer_width, layer_height = layer.image.size
-        top = int(layer.top)
-        left = int(layer.left)
-        bottom = top + layer_height
-        right = left + layer_width
-        channel_length = 2 + layer_width * layer_height
-        channel_data_lengths.append((layer, channel_length))
-        record = [
-            struct.pack(">iiii", top, left, bottom, right),
-            struct.pack(">H", 4),
-        ]
-        for channel_id in (0, 1, 2, -1):
-            record.append(struct.pack(">hI", channel_id, channel_length))
-        record.extend(
-            [
-                b"8BIM",
-                b"norm",
-                struct.pack(">BBBB", 255, 0, 8, 0),
-            ]
-        )
-        extra = b"".join(
-            [
-                struct.pack(">I", 0),
-                struct.pack(">I", 0),
-                _pack_pascal_string(layer.name),
-            ]
-        )
-        record.extend([struct.pack(">I", len(extra)), extra])
-        records.append(b"".join(record))
+    for spec in record_specs:
+        if spec["kind"] == "layer":
+            records.append(_pack_pixel_layer_record(spec["layer"]))
+        elif spec["kind"] == "group_start":
+            records.append(_pack_group_marker_record(str(spec["name"]), 1))
+        else:
+            records.append(_pack_group_marker_record("</Layer group>", 3))
 
     layer_records = b"".join(records)
-    layer_pixels_length = sum(channel_length * 4 for _, channel_length in channel_data_lengths)
+    layer_pixels_length = sum(_record_channel_data_length(spec) for spec in record_specs)
     layer_info_data_length = 2 + len(layer_records) + layer_pixels_length
     layer_info_padding = layer_info_data_length % 2
     layer_info_section_length = layer_info_data_length + layer_info_padding
@@ -875,14 +915,18 @@ def _save_fast_rgba_psd(path: Path, size: tuple[int, int], layers: list[PsdLayer
         f.write(struct.pack(">I", 0))
         f.write(struct.pack(">I", layer_and_mask_length))
         f.write(struct.pack(">I", layer_info_section_length))
-        f.write(struct.pack(">h", len(visible_layers)))
+        f.write(struct.pack(">h", len(record_specs)))
         f.write(layer_records)
 
-        for layer, _ in channel_data_lengths:
-            rgba = np.asarray(layer.image.convert("RGBA"))
-            for channel in (0, 1, 2, 3):
-                f.write(struct.pack(">H", 0))
-                f.write(np.ascontiguousarray(rgba[:, :, channel]).tobytes())
+        for spec in record_specs:
+            if spec["kind"] == "layer":
+                rgba = np.asarray(spec["layer"].image.convert("RGBA"))
+                for channel in (3, 0, 1, 2):
+                    f.write(struct.pack(">H", 0))
+                    f.write(np.ascontiguousarray(rgba[:, :, channel]).tobytes())
+            else:
+                for _ in range(4):
+                    f.write(struct.pack(">H", 0))
 
         if layer_info_padding:
             f.write(b"\0")
@@ -895,6 +939,101 @@ def _save_fast_rgba_psd(path: Path, size: tuple[int, int], layers: list[PsdLayer
         f.write(struct.pack(">H", 0))
         for channel in (0, 1, 2, 3):
             f.write(np.ascontiguousarray(flat_rgba[:, :, channel]).tobytes())
+
+
+def _build_psd_record_specs(layers: list[PsdLayer]) -> list[dict[str, Any]]:
+    runs = []
+    current_group = None
+    current_layers = []
+    for layer in layers:
+        group = layer.group or "Ungrouped"
+        if current_group is None:
+            current_group = group
+        if group != current_group:
+            runs.append((current_group, current_layers))
+            current_group = group
+            current_layers = []
+        current_layers.append(layer)
+    if current_layers:
+        runs.append((current_group or "Ungrouped", current_layers))
+
+    specs: list[dict[str, Any]] = []
+    group_counts: dict[str, int] = {}
+    for group_name, group_layers in runs:
+        group_counts[group_name] = group_counts.get(group_name, 0) + 1
+        display_name = group_name
+        if group_counts[group_name] > 1:
+            display_name = f"{group_name} #{group_counts[group_name]}"
+        specs.append({"kind": "group_end", "name": "</Layer group>"})
+        specs.extend({"kind": "layer", "layer": layer} for layer in group_layers)
+        specs.append({"kind": "group_start", "name": display_name})
+    return specs
+
+
+def _pack_pixel_layer_record(layer: PsdLayer) -> bytes:
+    layer_width, layer_height = layer.image.size
+    top = int(layer.top)
+    left = int(layer.left)
+    bottom = top + layer_height
+    right = left + layer_width
+    channel_length = 2 + layer_width * layer_height
+    record = [
+        struct.pack(">iiii", top, left, bottom, right),
+        struct.pack(">H", 4),
+    ]
+    for channel_id in (-1, 0, 1, 2):
+        record.append(struct.pack(">hI", channel_id, channel_length))
+    record.extend([b"8BIM", b"norm", struct.pack(">BBBB", 255, 0, 8, 0)])
+    extra = _pack_layer_extra(layer.name)
+    record.extend([struct.pack(">I", len(extra)), extra])
+    return b"".join(record)
+
+
+def _pack_group_marker_record(name: str, section_kind: int) -> bytes:
+    record = [
+        struct.pack(">iiii", 0, 0, 0, 0),
+        struct.pack(">H", 4),
+    ]
+    for channel_id in (-1, 0, 1, 2):
+        record.append(struct.pack(">hI", channel_id, 2))
+    record.extend([b"8BIM", b"norm", struct.pack(">BBBB", 255, 0, 8, 0)])
+    extra = _pack_layer_extra(name, section_kind=section_kind)
+    record.extend([struct.pack(">I", len(extra)), extra])
+    return b"".join(record)
+
+
+def _record_channel_data_length(spec: dict[str, Any]) -> int:
+    if spec["kind"] != "layer":
+        return 8
+    width, height = spec["layer"].image.size
+    return (2 + width * height) * 4
+
+
+def _pack_layer_extra(name: str, section_kind: Optional[int] = None) -> bytes:
+    blocks = []
+    if section_kind is not None:
+        blocks.append(_pack_tagged_block(b"lsct", struct.pack(">I", section_kind)))
+        blocks.append(_pack_tagged_block(b"luni", _pack_unicode_name(name)))
+    return b"".join(
+        [
+            struct.pack(">I", 0),
+            struct.pack(">I", 0),
+            _pack_pascal_string(name),
+            b"".join(blocks),
+        ]
+    )
+
+
+def _pack_tagged_block(key: bytes, data: bytes) -> bytes:
+    if len(key) != 4:
+        raise ValueError("PSD tagged block keys must be 4 bytes")
+    padding = b"\0" if len(data) % 2 else b""
+    return b"8BIM" + key + struct.pack(">I", len(data)) + data + padding
+
+
+def _pack_unicode_name(name: str) -> bytes:
+    raw = name.encode("utf-16be", errors="replace")
+    return struct.pack(">I", len(raw) // 2) + raw
 
 
 def _pack_pascal_string(name: str) -> bytes:

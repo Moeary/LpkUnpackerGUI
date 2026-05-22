@@ -42,6 +42,8 @@ initializes a model, resets parameters to defaults, updates it once, then writes
 The sidecar contains:
 
 - canvas size, origin, and pixels-per-unit;
+- Cubism Part IDs, parent Part indices, opacity, and offscreen indices when
+  exposed by the Core version;
 - drawable id;
 - texture index;
 - pixel-space vertices;
@@ -56,9 +58,15 @@ The sidecar contains:
 
 The PSD full-character mode consumes this sidecar directly. It flips Cubism UVs
 into PNG pixel coordinates, applies drawable visibility, opacity, and clipping
-masks, then crops rendered layers to their visible alpha bounds while preserving
-PSD offsets. Large model PSDs are written with a simple RAW RGBA PSD writer to
-avoid slow `psd-tools` RLE encoding on hundreds of layers.
+masks, groups drawables by broad semantic category and parent Part ID, then
+crops rendered layers to their visible alpha bounds while preserving PSD offsets.
+Large model PSDs are written with a simple RAW RGBA PSD writer to avoid slow
+`psd-tools` RLE encoding on hundreds of layers.
+
+Cubism Core does not expose the original authoring PSD folder tree. Grouping in
+exported PSD files is therefore approximate and based on runtime metadata such
+as Part IDs, drawable parent Part indices, blend mode, opacity, and drawable
+names.
 
 ## Command-line check
 
