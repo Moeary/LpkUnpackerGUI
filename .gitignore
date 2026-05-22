@@ -1,6 +1,7 @@
 output/
 input/
 Resources/
+runtime/
 .pixi/
 
 # Build outputs

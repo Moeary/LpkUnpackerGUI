@@ -8,12 +8,14 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.core.assetstudio_cli import AssetStudioCLI
+from app.paths import ensure_runtime_dirs, runtime_output_dir
 
 
 def main():
+    ensure_runtime_dirs()
     parser = argparse.ArgumentParser(description="Extract Unity assets through AssetStudio CLI.")
     parser.add_argument("input", nargs="+", help="Input files or folders")
-    parser.add_argument("-o", "--output", default="output/unity_assets", help="Output directory")
+    parser.add_argument("-o", "--output", default=str(runtime_output_dir("unity")), help="Output directory")
     parser.add_argument(
         "-m",
         "--mode",

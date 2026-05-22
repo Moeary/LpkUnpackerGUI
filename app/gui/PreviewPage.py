@@ -1,110 +1,83 @@
 import os
-import re
-import json
+import shutil
+import tempfile
 
-from PySide6.QtWidgets import QFrame, QVBoxLayout, QHBoxLayout, QFileDialog, QWidget, QSplitter
-from PySide6.QtCore import Qt, Signal, QTimer, QCoreApplication
-from PySide6.QtGui import QDragEnterEvent, QDropEvent, QColor
+from PySide6.QtWidgets import (
+    QFrame,
+    QVBoxLayout,
+    QHBoxLayout,
+    QFileDialog,
+    QWidget,
+    QSplitter,
+    QGridLayout,
+    QLabel,
+    QScrollArea,
+)
+from PySide6.QtCore import Qt, Signal, QTimer, QCoreApplication, QThread
+from PySide6.QtGui import QDragEnterEvent, QDropEvent, QColor, QPixmap
 from qfluentwidgets import (SubtitleLabel, BodyLabel, PushButton, Slider, CheckBox, SpinBox, InfoBar, InfoBarPosition,
-                           CardWidget, SingleDirectionScrollArea, TextBrowser, ColorDialog)
+                           CardWidget, SingleDirectionScrollArea, TextBrowser, ColorDialog, FluentIcon, IconWidget)
 
+from app.core.assetstudio_cli import AssetStudioCLI
+from app.core.model import is_model_json_path, resolve_live2d_package
+from app.core.preview import prepare_preview_import
+from app.core.settings_manager import SettingsManager
 from app.gui.Live2DPreviewWindow import Live2DPreviewWindow
 from app.i18n import get_i18n, tr
-# Try to import motion fixer utilities
-from app.core import motion_fixed
-
-
-# Helper to check *model*.json pattern
-_def_model_json_pattern = re.compile(r"model\d*\.json$", re.IGNORECASE)
+IMAGE_PREVIEW_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tga"}
+PACKAGE_PREVIEW_EXTENSIONS = {".lpk", ".wpk"}
+UNITY_PREVIEW_EXTENSIONS = {
+    "",
+    ".assets",
+    ".sharedassets",
+    ".bundle",
+    ".unity3d",
+    ".resource",
+    ".ress",
+    ".resss",
+}
 
 def _is_model_json(path: str) -> bool:
-    try:
-        return bool(_def_model_json_pattern.search(path or ""))
-    except Exception:
+    return is_model_json_path(path)
+
+
+def _is_image_file(path: str) -> bool:
+    return os.path.isfile(path) and os.path.splitext(path)[1].lower() in IMAGE_PREVIEW_EXTENSIONS
+
+
+def _is_unity_preview_source(path: str) -> bool:
+    if not os.path.exists(path):
         return False
+    if os.path.isdir(path):
+        return True
+    return os.path.splitext(path)[1].lower() in UNITY_PREVIEW_EXTENSIONS
 
-# --- Live2D v3 model json helpers ---
 
-def _is_live2d_v3_json(data: dict) -> bool:
-    try:
-        if not isinstance(data, dict):
-            return False
-        # Common v3 structure: FileReferences with Moc ending in .moc3
-        refs = data.get('FileReferences') or {}
-        if isinstance(refs, dict):
-            moc = refs.get('Moc')
-            if isinstance(moc, str) and moc.lower().endswith('.moc3'):
-                return True
-        # Optional: Version >= 3
-        ver = data.get('Version')
-        if isinstance(ver, int) and ver == 3:
-            return True
-    except Exception:
-        return False
-    return False
+def _is_supported_preview_source(path: str) -> bool:
+    suffix = os.path.splitext(path)[1].lower()
+    return (
+        _is_model_json(path)
+        or _is_image_file(path)
+        or suffix in PACKAGE_PREVIEW_EXTENSIONS
+        or os.path.isdir(path)
+        or _is_unity_preview_source(path)
+    )
 
-def _fix_model_motions(model_json: dict, base_dir: str):
-    """Fix motion3.json files referenced by the model json in-place using motion_fixed.
-    base_dir: absolute directory containing the model json; motions are resolved relative to this.
-    """
-    if not isinstance(model_json, dict):
-        return
-    refs = model_json.get('FileReferences') or {}
-    motions = refs.get('Motions') or {}
-    if not isinstance(motions, dict):
-        return
-    for _group, items in motions.items():
-        if not isinstance(items, list):
-            continue
-        for it in items:
-            try:
-                if not isinstance(it, dict):
-                    continue
-                rel = it.get('File') or ''
-                if not rel or not isinstance(rel, str):
-                    continue
-                motion_path = os.path.normpath(os.path.join(base_dir, rel))
-                # Only process .json files; skip if not exists
-                if not motion_path.lower().endswith('.json') or not os.path.isfile(motion_path):
-                    continue
-                # Overwrite in place by using its directory as save_root
-                motion_fixed.copy_modify_from_motion(motion_path, save_root=os.path.dirname(motion_path))
-            except Exception:
-                # Best effort: ignore single motion failures
-                continue
 
-def _prepare_and_validate_model_json(path: str) -> str:
-    """
-    Validate json is Live2D v3, then pretty-print to a sibling *.pretty.json file.
-    Also fix referenced motions in-place using motion_fixed if available.
-    Returns the path to the pretty-printed file.
-    Raises on validation failure or json parse error.
-    """
-    with open(path, 'r', encoding='utf-8') as f:
-        text = f.read()
-    data = json.loads(text)
-    if not _is_live2d_v3_json(data):
-        raise ValueError('Not a valid Live2D v3 model json (expect FileReferences.Moc *.moc3 or Version>=3)')
-    # Attempt to fix motions before creating the pretty json copy
-    try:
-        _fix_model_motions(data, os.path.dirname(os.path.abspath(path)))
-    except Exception:
-        pass
-    base_dir = os.path.dirname(os.path.abspath(path))
-    name, ext = os.path.splitext(os.path.basename(path))
-    pretty = os.path.join(base_dir, f"{name}.pretty{ext or '.json'}")
-    if os.path.exists(pretty):
-        i = 1
-        while True:
-            alt = os.path.join(base_dir, f"{name}.pretty{i}{ext or '.json'}")
-            if not os.path.exists(alt):
-                pretty = alt
-                break
-            i += 1
-    with open(pretty, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        f.write('\n')
-    return pretty
+def _collect_preview_images(path: str, limit: int = 48) -> list[str]:
+    if _is_image_file(path):
+        return [path]
+    if not os.path.isdir(path):
+        return []
+    images = []
+    for root, _dirs, filenames in os.walk(path):
+        for filename in sorted(filenames):
+            full_path = os.path.join(root, filename)
+            if os.path.splitext(filename)[1].lower() in IMAGE_PREVIEW_EXTENSIONS:
+                images.append(full_path)
+                if len(images) >= limit:
+                    return images
+    return images
 
 class DragDropArea(QFrame):
     """拖拽区域组件"""
@@ -138,8 +111,8 @@ class DragDropArea(QFrame):
         layout.setAlignment(Qt.AlignCenter)
 
         # 拖拽图标
-        icon_label = SubtitleLabel("📁", self)
-        icon_label.setAlignment(Qt.AlignCenter)
+        icon_label = IconWidget(FluentIcon.FOLDER, self)
+        icon_label.setFixedSize(32, 32)
 
         # 主要提示文字
         self.main_text = SubtitleLabel("", self)
@@ -173,11 +146,10 @@ class DragDropArea(QFrame):
     def dragEnterEvent(self, event: QDragEnterEvent):
         """拖拽进入事件"""
         if event.mimeData().hasUrls():
-            # 检查是否为Live2D模型文件
             urls = event.mimeData().urls()
             if urls and len(urls) == 1:
                 file_path = urls[0].toLocalFile()
-                if _is_model_json(file_path):
+                if _is_supported_preview_source(file_path):
                     event.acceptProposedAction()
                     self.setStyleSheet("""
                         DragDropArea {
@@ -212,7 +184,7 @@ class DragDropArea(QFrame):
         urls = event.mimeData().urls()
         if urls and len(urls) == 1:
             file_path = urls[0].toLocalFile()
-            if _is_model_json(file_path) and os.path.exists(file_path):
+            if _is_supported_preview_source(file_path) and os.path.exists(file_path):
                 self.fileDropped.emit(file_path)
                 event.acceptProposedAction()
 
@@ -225,12 +197,11 @@ class DragDropArea(QFrame):
             self,
             tr("dialog.select_live2d_model_file"),
             "",
-            tr("dialog.filter_live2d_model_files")
+            tr("dialog.filter_preview_sources")
         )
 
         if file_path and os.path.exists(file_path):
-            # 严格校验是否为 *model*.json
-            if _is_model_json(file_path):
+            if _is_supported_preview_source(file_path):
                 self.fileDropped.emit(file_path)
             else:
                 InfoBar.warning(
@@ -242,6 +213,97 @@ class DragDropArea(QFrame):
                     duration=2500,
                     parent=self
                 )
+
+
+class UnityTexturePreviewThread(QThread):
+    previewReady = Signal(list, str)
+    failed = Signal(str, str)
+
+    def __init__(self, source_path: str, temp_dir: str, parent=None):
+        super().__init__(parent)
+        self.source_path = source_path
+        self.temp_dir = temp_dir
+
+    def run(self):
+        try:
+            result = AssetStudioCLI().export_textures(self.source_path, self.temp_dir)
+            images = [str(path) for path in result.exported_files]
+            if not images:
+                images = _collect_preview_images(self.temp_dir)
+            self.previewReady.emit(images[:48], self.temp_dir)
+        except Exception as exc:
+            self.failed.emit(str(exc), self.temp_dir)
+
+
+class ModelPreviewImportThread(QThread):
+    modelReady = Signal(str, str, str)
+    failed = Signal(str, str)
+
+    def __init__(self, source_path: str, temp_root: str, parent=None):
+        super().__init__(parent)
+        self.source_path = source_path
+        self.temp_root = temp_root
+
+    def run(self):
+        try:
+            result = prepare_preview_import(self.source_path, self.temp_root)
+            self.modelReady.emit(
+                str(result.preview_model_json),
+                str(result.temp_dir or ""),
+                self.source_path,
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc), self.source_path)
+
+
+class ImagePreviewPanel(QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.title_label = BodyLabel("", self)
+        self.grid_widget = QWidget(self)
+        self.grid_layout = QGridLayout(self.grid_widget)
+        self.grid_layout.setContentsMargins(8, 8, 8, 8)
+        self.grid_layout.setSpacing(10)
+
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(self.grid_widget)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.title_label)
+        layout.addWidget(scroll)
+        self.setMinimumHeight(220)
+
+    def load_images(self, image_paths: list[str]):
+        self.clear()
+        self.title_label.setText(tr("preview.image_preview_title", count=len(image_paths)))
+        for index, path in enumerate(image_paths):
+            thumb = QLabel(self.grid_widget)
+            thumb.setFixedSize(124, 124)
+            thumb.setAlignment(Qt.AlignCenter)
+            thumb.setToolTip(path)
+            pixmap = QPixmap(path)
+            if pixmap.isNull():
+                thumb.setText(os.path.basename(path))
+            else:
+                thumb.setPixmap(
+                    pixmap.scaled(
+                        120,
+                        120,
+                        Qt.KeepAspectRatio,
+                        Qt.SmoothTransformation,
+                    )
+                )
+            self.grid_layout.addWidget(thumb, index // 4, index % 4)
+
+    def clear(self):
+        while self.grid_layout.count():
+            item = self.grid_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
 
 class Live2DSettingsPanel(QFrame):
     """Live2D设置面板"""
@@ -743,18 +805,24 @@ class PreviewPage(QFrame):
         self.preview_btn = None
         self.close_all_btn = None
         self.model_info_text_box = None
+        self.image_preview_panel = None
         self.drag_drop_area = None
         self.title_label = None
         self.main_layout = None
         self.current_model_path = None
         self.setObjectName('previewPage')
         self.i18n = get_i18n()
+        self.settings_manager = SettingsManager()
         self.preview_window = None
         # 新增：预览按钮冷却
         self._preview_cooldown_timer = None
         self._preview_cooldown_ms = 1500  # 冷却时长（毫秒）
         # 新增：记录临时美化的 model json 文件（在新文件载入时清理）
         self._temp_model_json_path = None
+        self._model_preview_thread = None
+        self._model_preview_temp_dirs = []
+        self._image_preview_thread = None
+        self._image_preview_temp_dirs = []
 
         self.setupUI()
         self.retranslate_ui()
@@ -764,6 +832,8 @@ class PreviewPage(QFrame):
             app = QCoreApplication.instance()
             if app is not None:
                 app.aboutToQuit.connect(self._cleanup_temp_model_json)
+                app.aboutToQuit.connect(self._cleanup_model_preview_temp_dirs)
+                app.aboutToQuit.connect(self._cleanup_image_preview_temp_dirs)
         except Exception:
             pass
 
@@ -794,6 +864,10 @@ class PreviewPage(QFrame):
         self.model_info_text_box = TextBrowser(self)
 
         left_layout.addWidget(self.model_info_text_box)
+
+        self.image_preview_panel = ImagePreviewPanel(self)
+        self.image_preview_panel.setVisible(False)
+        left_layout.addWidget(self.image_preview_panel)
 
         # 控制按钮区域
         button_layout = QHBoxLayout()
@@ -848,7 +922,9 @@ class PreviewPage(QFrame):
         if hasattr(self, "settings_panel") and self.settings_panel:
             self.settings_panel.retranslate_ui()
 
-        if not self.current_model_path:
+        if not self.current_model_path and not (
+            self.image_preview_panel and self.image_preview_panel.isVisible()
+        ):
             self.model_info_text_box.setMarkdown(tr("preview.model_info_empty"))
 
     # 新增：预览按钮点击（带冷却）
@@ -904,6 +980,24 @@ class PreviewPage(QFrame):
         except Exception:
             pass
 
+    def _cleanup_image_preview_temp_dirs(self):
+        for temp_dir in list(self._image_preview_temp_dirs):
+            try:
+                if temp_dir and os.path.isdir(temp_dir):
+                    shutil.rmtree(temp_dir)
+            except Exception:
+                pass
+        self._image_preview_temp_dirs = []
+
+    def _cleanup_model_preview_temp_dirs(self):
+        for temp_dir in list(self._model_preview_temp_dirs):
+            try:
+                if temp_dir and os.path.isdir(temp_dir):
+                    shutil.rmtree(temp_dir)
+            except Exception:
+                pass
+        self._model_preview_temp_dirs = []
+
     def on_file_dropped(self, file_path):
         """处理文件拖拽"""
         if not os.path.exists(file_path):
@@ -913,44 +1007,86 @@ class PreviewPage(QFrame):
             )
             return
 
-        # 检查文件扩展名，支持*model*.json文件
-        file_ext = file_path.lower()
-        if not _is_model_json(file_ext):
-            self.show_error(
-                tr("preview.invalid_file_type_title"),
-                tr("preview.invalid_file_type_content")
-            )
+        if _is_model_json(file_path) or os.path.isdir(file_path):
+            try:
+                resolve_live2d_package(file_path)
+                self.start_model_preview_import(file_path)
+                return
+            except Exception:
+                pass
+
+        suffix = os.path.splitext(file_path)[1].lower()
+        if suffix in PACKAGE_PREVIEW_EXTENSIONS or (
+            _is_unity_preview_source(file_path) and not os.path.isdir(file_path)
+        ):
+            self.start_model_preview_import(file_path)
             return
 
-        # 预处理与校验：确保为 Live2D v3 的 json，生成美化副本
-        try:
-            safe_path = _prepare_and_validate_model_json(file_path)
-        except Exception as e:
-            self.show_error(
-                tr("preview.invalid_live2d_title"),
-                tr("preview.invalid_live2d_content", file=os.path.basename(file_path), error=str(e))
-            )
+        if _is_image_file(file_path) or os.path.isdir(file_path):
+            local_images = _collect_preview_images(file_path)
+            if local_images:
+                self.load_image_preview(local_images, file_path, temporary=False)
+                return
+
+        if _is_unity_preview_source(file_path) and not _is_model_json(file_path):
+            self.start_unity_image_preview(file_path)
             return
 
-        # 清理旧的临时文件并保存新的
+        self.show_error(
+            tr("preview.invalid_file_type_title"),
+            tr("preview.invalid_file_type_content")
+        )
+
+    def start_model_preview_import(self, source_path: str):
+        self.close_preview_window()
         self._cleanup_temp_model_json()
-        self._temp_model_json_path = safe_path
+        self._cleanup_model_preview_temp_dirs()
+        self._cleanup_image_preview_temp_dirs()
+        if self.image_preview_panel:
+            self.image_preview_panel.setVisible(False)
+        self.current_model_path = None
+        self.preview_btn.setEnabled(False)
+        self.model_info_text_box.setMarkdown(
+            tr("preview.model_import_loading", source=source_path)
+        )
+        self._model_preview_thread = ModelPreviewImportThread(
+            source_path,
+            self.settings_manager.get_temp_dir(),
+            self,
+        )
+        self._model_preview_thread.modelReady.connect(self.on_model_preview_import_ready)
+        self._model_preview_thread.failed.connect(self.on_model_preview_import_failed)
+        self._model_preview_thread.start()
 
-        # 更新当前模型使用美化后的副本
-        self.current_model_path = safe_path
+    def on_model_preview_import_ready(self, model_json_path: str, temp_dir: str, source_path: str):
+        if temp_dir:
+            self._model_preview_temp_dirs.append(temp_dir)
+        self.load_model_preview(model_json_path, source_path)
 
-        # 显示模型信息
+    def on_model_preview_import_failed(self, error: str, source_path: str):
+        if _is_unity_preview_source(source_path):
+            self.start_unity_image_preview(source_path)
+            return
+        self.show_error(
+            tr("preview.model_import_failed_title"),
+            tr("preview.model_import_failed_content", error=error),
+        )
+
+    def load_model_preview(self, model_json_path: str, source_path: str | None = None):
+        self.current_model_path = os.path.abspath(model_json_path)
+        self._temp_model_json_path = self.current_model_path
+        self._cleanup_image_preview_temp_dirs()
+        if self.image_preview_panel:
+            self.image_preview_panel.setVisible(False)
+
         model_name = os.path.basename(self.current_model_path)
         model_dir = os.path.dirname(self.current_model_path)
-
-        info_text = tr("preview.model_info_loaded", file=model_name, directory=model_dir)
-
-        self.model_info_text_box.setMarkdown(info_text)
-        # 仅在未处于冷却中时启用预览按钮
+        self.model_info_text_box.setMarkdown(
+            tr("preview.model_info_loaded", file=model_name, directory=model_dir)
+        )
         if not (self._preview_cooldown_timer and self._preview_cooldown_timer.isActive()):
             self.preview_btn.setEnabled(True)
 
-        # 显示成功信息
         InfoBar.success(
             title=tr("preview.model_loaded_title"),
             content=tr("preview.model_loaded_content", model=model_name),
@@ -958,7 +1094,73 @@ class PreviewPage(QFrame):
             isClosable=True,
             position=InfoBarPosition.TOP,
             duration=2000,
-            parent=self
+            parent=self,
+        )
+
+    def load_image_preview(self, image_paths: list[str], source_path: str, temporary: bool):
+        self.close_preview_window()
+        self._cleanup_temp_model_json()
+        if not temporary:
+            self._cleanup_image_preview_temp_dirs()
+        self.current_model_path = None
+        self.preview_btn.setEnabled(False)
+        if self.image_preview_panel:
+            self.image_preview_panel.load_images(image_paths)
+            self.image_preview_panel.setVisible(True)
+        self.model_info_text_box.setMarkdown(
+            tr(
+                "preview.image_info_loaded",
+                count=len(image_paths),
+                source=source_path,
+            )
+        )
+        InfoBar.success(
+            title=tr("preview.image_loaded_title"),
+            content=tr("preview.image_loaded_content", count=len(image_paths)),
+            orient=Qt.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP,
+            duration=2000,
+            parent=self,
+        )
+
+    def start_unity_image_preview(self, source_path: str):
+        self.close_preview_window()
+        self._cleanup_temp_model_json()
+        self._cleanup_image_preview_temp_dirs()
+        self.current_model_path = None
+        self.preview_btn.setEnabled(False)
+        if self.image_preview_panel:
+            self.image_preview_panel.clear()
+            self.image_preview_panel.setVisible(True)
+        self.model_info_text_box.setMarkdown(
+            tr("preview.unity_preview_loading", source=source_path)
+        )
+        temp_dir = tempfile.mkdtemp(
+            prefix="lpk_preview_unity_",
+            dir=self.settings_manager.get_temp_dir(),
+        )
+        self._image_preview_thread = UnityTexturePreviewThread(source_path, temp_dir, self)
+        self._image_preview_thread.previewReady.connect(self.on_unity_image_preview_ready)
+        self._image_preview_thread.failed.connect(self.on_unity_image_preview_failed)
+        self._image_preview_thread.start()
+
+    def on_unity_image_preview_ready(self, image_paths: list[str], temp_dir: str):
+        if not image_paths:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            self.show_error(
+                tr("preview.no_images_title"),
+                tr("preview.no_images_content"),
+            )
+            return
+        self._image_preview_temp_dirs.append(temp_dir)
+        self.load_image_preview(image_paths, temp_dir, temporary=True)
+
+    def on_unity_image_preview_failed(self, error: str, temp_dir: str):
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        self.show_error(
+            tr("preview.unity_preview_failed_title"),
+            tr("preview.unity_preview_failed_content", error=error),
         )
 
     def preview_current_model(self):

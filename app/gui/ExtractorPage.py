@@ -18,8 +18,21 @@ from qfluentwidgets import (
 )
 
 from app.core.config_manager import ConfigManager
+from app.core.extract import scan_package_folder
 from app.core.extractor_thread import ExtractorThread
 from app.i18n import get_i18n, tr
+
+
+UNITY_SOURCE_EXTENSIONS = {
+    "",
+    ".assets",
+    ".sharedassets",
+    ".bundle",
+    ".unity3d",
+    ".resource",
+    ".ress",
+    ".resss",
+}
 
 
 class QTextEditLogger(logging.Handler):
@@ -43,7 +56,7 @@ class ExtractorPage(QFrame):
         self.setAcceptDrops(True)
 
         self.config_manager = ConfigManager()
-        self.default_output_dir = os.path.join(os.getcwd(), "output")
+        self.default_output_dir = self.config_manager.get_last_output_dir()
         self.i18n = get_i18n()
 
         self.selected_files = []
@@ -104,6 +117,10 @@ class ExtractorPage(QFrame):
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.main_layout.addWidget(self.progress_bar)
+
+        self.summary_label = SubtitleLabel("", self)
+        self.summary_label.setVisible(False)
+        self.main_layout.addWidget(self.summary_label)
 
         self.extract_button = PushButton("", self)
         self.extract_button.setIcon(FluentIcon.PLAY)
@@ -170,11 +187,14 @@ class ExtractorPage(QFrame):
 
             if os.path.isdir(path):
                 folder_files, folder_configs = self.scan_folder(path)
-                files.extend(folder_files)
+                if folder_files:
+                    files.extend(folder_files)
+                else:
+                    files.append(path)
                 configs.extend(folder_configs)
             elif os.path.isfile(path):
                 ext = os.path.splitext(path)[1].lower()
-                if ext in [".lpk", ".wpk"]:
+                if self.is_supported_source_file(path):
                     files.append(path)
                     config_path = os.path.join(os.path.dirname(path), "config.json")
                     if os.path.exists(config_path) and config_path not in configs:
@@ -197,7 +217,10 @@ class ExtractorPage(QFrame):
             "",
             tr(
                 "dialog.filter_package_files",
-                default="Package Files (*.lpk *.wpk);;All Files (*.*)",
+                default=(
+                    "Live2D Sources (*.lpk *.wpk *.assets *.sharedassets *.bundle *.unity3d);;"
+                    "All Files (*.*)"
+                ),
             ),
         )
         if file_paths:
@@ -219,25 +242,16 @@ class ExtractorPage(QFrame):
         )
         if folder_path:
             files, configs = self.scan_folder(folder_path)
-            self.selected_files = files
+            self.selected_files = files or [os.path.abspath(folder_path)]
             self.selected_configs = configs
             self.update_file_display()
 
     def scan_folder(self, folder_path):
-        files = []
-        configs = []
+        return scan_package_folder(folder_path)
 
-        for root, dirs, filenames in os.walk(folder_path):
-            for filename in filenames:
-                full_path = os.path.join(root, filename)
-                ext = os.path.splitext(filename)[1].lower()
-
-                if ext in [".lpk", ".wpk"]:
-                    files.append(full_path)
-                elif filename.lower() == "config.json":
-                    configs.append(full_path)
-
-        return files, configs
+    def is_supported_source_file(self, file_path):
+        ext = os.path.splitext(file_path)[1].lower()
+        return ext in {".lpk", ".wpk"} or ext in UNITY_SOURCE_EXTENSIONS
 
     def update_file_display(self):
         if not self.selected_files:
@@ -306,9 +320,12 @@ class ExtractorPage(QFrame):
         self.extract_button.setEnabled(False)
         self.file_button.setEnabled(False)
         self.folder_button.setEnabled(False)
+        self.output_button.setEnabled(False)
 
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
+        self.summary_label.clear()
+        self.summary_label.setVisible(False)
         self.log_text.clear()
 
         self.extractor_thread = ExtractorThread(
@@ -339,13 +356,41 @@ class ExtractorPage(QFrame):
         log_level = level_map.get(level, logging.INFO)
         logging.getLogger().log(log_level, message)
 
-    def extraction_finished(self, output_dir):
+    def extraction_finished(self, result):
+        output_dir = str(result.output_dir) if hasattr(result, "output_dir") else str(result)
         self.extract_button.setEnabled(True)
         self.file_button.setEnabled(True)
         self.folder_button.setEnabled(True)
+        self.output_button.setEnabled(True)
         self.progress_bar.setValue(100)
         self.open_folder_button.setEnabled(True)
         self.last_output_dir = output_dir
+        self.summary_label.setText(self.format_result_summary(result))
+        self.summary_label.setVisible(True)
+
+        if hasattr(result, "failed_items"):
+            self.log_failed_items(result.failed_items)
+
+        if hasattr(result, "has_failures") and result.has_failures:
+            InfoBar.warning(
+                title=tr("common.warning"),
+                content=tr(
+                    "extractor.partial_batch_extracted",
+                    default="Extraction finished with {failed} failed item(s). Files saved to {output}",
+                    failed=result.failure_count,
+                    output=output_dir,
+                ),
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=6000,
+            )
+            logging.warning(
+                "Extraction finished with failures. Success: %s/%s, output: %s",
+                result.success_count,
+                result.total_count,
+                output_dir,
+            )
+            return
 
         InfoBar.success(
             title=tr("common.success"),
@@ -365,6 +410,7 @@ class ExtractorPage(QFrame):
         self.extract_button.setEnabled(True)
         self.file_button.setEnabled(True)
         self.folder_button.setEnabled(True)
+        self.output_button.setEnabled(True)
         self.progress_bar.setValue(0)
 
         MessageBox(
@@ -374,6 +420,30 @@ class ExtractorPage(QFrame):
         ).exec()
 
         logging.error(f"Extraction failed: {error_message}")
+
+    def format_result_summary(self, result):
+        if not hasattr(result, "total_count"):
+            return ""
+        return tr(
+            "extractor.summary",
+            default=(
+                "Summary: {success}/{total} succeeded, {failed} failed, "
+                "{exported} exported, {skipped} skipped"
+            ),
+            success=result.success_count,
+            total=result.total_count,
+            failed=result.failure_count,
+            exported=result.exported_count,
+            skipped=result.skipped_count,
+        )
+
+    def log_failed_items(self, failed_items):
+        for item in failed_items:
+            logging.error(
+                "Extraction failed for %s: %s",
+                item.source,
+                item.error or item.message,
+            )
 
     def open_output_folder(self):
         output_dir = self.last_output_dir or self.output_edit.text()

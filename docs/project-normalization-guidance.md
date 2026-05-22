@@ -96,6 +96,24 @@ SourceInput -> ImportPlan -> Live2DPackage -> PreviewSession/PsdExport/EditSessi
 
 这样 GUI 页面只处理用户交互，core 负责判断“这个输入是什么、需要怎样解包、产物在哪里、何时清理”。
 
+当前第一阶段已经按这个方向落地：
+
+- `app/core/extract/models.py`：定义 `ExtractSourceType`、`ExtractMode`、单项结果和批处理结果，统一记录成功数、失败数、导出数和跳过数。
+- `app/core/extract/detector.py`：集中识别 `.lpk`、`.wpk`、Unity 文件和文件夹来源，并提供包目录扫描。
+- `app/core/extract/lpk.py`、`wpk.py`、`unity.py`：分别封装 LPK、WPK、AssetStudio/Unity 来源处理。
+- `app/core/extract/folder.py`：封装文件夹来源扫描和包目录批处理入口。
+- `app/core/extract/batch.py`：作为调度层，按来源类型和模式派发到具体处理器，并输出统一批处理统计。
+- `app/core/extractor_thread.py`：保留 Qt 线程壳，但不再直接承载解包业务逻辑。
+- `app/gui/ExtractorPage.py`、`UnityExtractorPage.py`：开始读取统一批处理结果，显示成功/失败/导出/跳过统计，并把失败项写入日志。
+- `app/gui/MainWindow.py`：一级导航先收敛到解包、预览、PSD 图层、魔改、设置；Unity、Steam、Web 预览、加密页保留代码但不再创建为主界面实例，避免隐藏页面启动无关服务。
+- `app/gui/PreviewPage.py`：原生预览页开始承担轻量图片检查能力；普通图片/文件夹直接缩略图预览，Unity 来源只导出到临时目录用于查看，不写入解包输出目录。
+- `app/core/model/resolver.py`：新增 `Live2DPackageResolver` 雏形，集中发现 `model3.json`/`model.json`、校验 moc 引用、收集贴图路径，并生成预览用 pretty JSON。
+- `app/core/preview/session.py`：新增预览导入会话，优先直接加载模型目录或模型 JSON；对 `.lpk`、`.wpk`、Unity 文件/文件夹会先解包到 `runtime/temp` 再解析模型包。
+- `app/gui/PreviewPage.py`：预览页已接入 `core/model` 和 `core/preview`，可直接拖入 LPK/WPK、Unity 来源、模型目录、模型 JSON 或普通图片；非 Live2D 的 Unity 来源会退回到程序内临时图片预览。
+- `app/paths.py`、`app/core/settings_manager.py`：新增 `runtime/` 作为运行期数据根目录，默认使用 `runtime/temp`、`runtime/output/<type>` 和 `runtime/setting.json`；设置页可修改输出根目录。
+
+下一步建议把 Steam 工坊扫描、加密/未加密 Unity 来源探测继续接入同一个 `core/extract` 或后续 `core/sources -> core/model` 流程，而不是继续在页面类里新增分支。
+
 ### `gui`
 
 `gui` 应按页面和共享控件拆分，避免页面直接承担大量业务逻辑：
@@ -227,9 +245,9 @@ SourceInput -> ImportPlan -> Live2DPackage -> PreviewSession/PsdExport/EditSessi
 建议 1-3 个迭代内完成：
 
 - 合并预览导航：保留一个 `Live2D 预览` 页面，页面内提供原生/Web 渲染器切换。
-- 建立 `Live2DPackageResolver`：统一查找 `model3.json`、`model.json`、纹理、动作、物理文件。
+- 建立 `Live2DPackageResolver`：统一查找 `model3.json`、`model.json`、纹理、动作、物理文件。基础 resolver 已落地，后续应补充物理、动作、HitArea、模型版本和依赖缺失诊断。
 - 建立 `SourceDetector`：统一识别 `.lpk`、`.wpk`、Unity 文件、目录、模型 JSON、PSD。
-- 让预览页支持直接拖入 LPK/WPK/Unity 文件：先落到临时工作区，完成后加载模型。
+- 让预览页支持直接拖入 LPK/WPK/Unity 文件：先落到临时工作区，完成后加载模型。基础流程已落地，后续需要补进取消、进度和临时目录异常清理。
 - 删除或隐藏 `EncryptionPage` 一级导航，把目标能力并入解包页。
 - 把 Steam 工坊扫描降级为解包页中的“扫描来源”入口。
 - 为 Web 预览增加模型挂载释放/过期机制。

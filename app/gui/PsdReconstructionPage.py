@@ -23,6 +23,7 @@ from app.core.psd_reconstructor import (
     reconstruct_live2d_psd,
     repack_atlas_png_from_psd,
 )
+from app.core.settings_manager import SettingsManager
 from app.i18n import get_i18n, tr
 
 
@@ -64,8 +65,9 @@ class PsdReconstructionPage(QFrame):
         self.setAcceptDrops(True)
 
         self.i18n = get_i18n()
+        self.settings_manager = SettingsManager()
         self.selected_source = ""
-        self.last_output_dir = os.path.abspath(os.path.join(os.getcwd(), "output", "psd"))
+        self.last_output_dir = self.settings_manager.get_output_dir("psd")
         self.worker: PsdReconstructionThread | None = None
 
         self.setupUI()
@@ -236,7 +238,9 @@ class PsdReconstructionPage(QFrame):
             self.output_edit.text(),
         )
         if path:
-            self.output_edit.setText(os.path.abspath(path))
+            output_path = os.path.abspath(path)
+            self.output_edit.setText(output_path)
+            self.settings_manager.set_output_dir("psd", output_path)
 
     def set_source(self, path: str):
         self.selected_source = os.path.abspath(path)
@@ -259,6 +263,7 @@ class PsdReconstructionPage(QFrame):
 
         self.last_output_dir = os.path.abspath(output_dir)
         self.output_edit.setText(self.last_output_dir)
+        self.settings_manager.set_output_dir("psd", self.last_output_dir)
         mode = self.mode_combo.currentData() or "mesh"
         self.set_busy(True)
         self.progress_bar.setValue(0)

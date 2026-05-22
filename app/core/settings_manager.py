@@ -1,23 +1,51 @@
 import os
 import json
 import logging
+from pathlib import Path
 from typing import Dict, Any, Optional
+
+from app.paths import (
+    OUTPUT_DIR_NAMES,
+    PROJECT_ROOT,
+    RUNTIME_DIR,
+    RUNTIME_OUTPUT_DIR,
+    RUNTIME_SETTINGS_FILE,
+    RUNTIME_TEMP_DIR,
+    ensure_runtime_dirs,
+    runtime_output_dir,
+)
 
 logger = logging.getLogger("SettingsManager")
 
 class SettingsManager:
     """Manages application settings and user preferences"""
     
-    def __init__(self, settings_file: str = "settings.json"):
-        self.settings_file = os.path.join(os.getcwd(), settings_file)
+    def __init__(self, settings_file: Optional[str] = None):
+        ensure_runtime_dirs()
+        if settings_file:
+            self.settings_file = str(Path(settings_file).resolve())
+        else:
+            self.settings_file = str(RUNTIME_SETTINGS_FILE)
+        settings_exists = os.path.exists(self.settings_file)
         self.settings = self.load_settings()
+        if not settings_exists:
+            self.save_settings()
     
-    def load_settings(self) -> Dict[str, Any]:
-        """Load settings from file"""
-        default_settings = {
+    def get_default_settings(self) -> Dict[str, Any]:
+        output_paths = {
+            key: str(runtime_output_dir(key))
+            for key in OUTPUT_DIR_NAMES
+        }
+        return {
+            "runtime": {
+                "dir": str(RUNTIME_DIR),
+                "temp_dir": str(RUNTIME_TEMP_DIR),
+                "output_root": str(RUNTIME_OUTPUT_DIR),
+            },
+            "output_paths": output_paths,
             "last_lpk_path": "",
             "last_config_path": "",
-            "last_output_path": os.path.join(os.getcwd(), "output"),
+            "last_output_path": output_paths["live2d"],
             "steam_path": "",
             "auto_detect_steam": True,
             "remember_paths": True,
@@ -32,22 +60,29 @@ class SettingsManager:
             "extraction_settings": {
                 "create_subfolders": True,
                 "overwrite_existing": False,
-                "log_level": "INFO"
+                "log_level": "INFO",
+                "extract_images_only": False,
             }
         }
+
+    def load_settings(self) -> Dict[str, Any]:
+        """Load settings from file"""
+        default_settings = self.get_default_settings()
         
         if not os.path.exists(self.settings_file):
+            legacy_settings = self._load_legacy_settings()
+            if legacy_settings:
+                settings = self._merge_defaults(legacy_settings, default_settings)
+                self.settings = settings
+                self.save_settings()
+                return settings
             logger.info("Settings file not found, using defaults")
             return default_settings
         
         try:
             with open(self.settings_file, 'r', encoding='utf-8') as f:
                 loaded_settings = json.load(f)
-                # Merge with defaults to ensure all keys exist
-                for key, value in default_settings.items():
-                    if key not in loaded_settings:
-                        loaded_settings[key] = value
-                return loaded_settings
+                return self._merge_defaults(loaded_settings, default_settings)
         except Exception as e:
             logger.error(f"Failed to load settings: {e}")
             return default_settings
@@ -55,6 +90,7 @@ class SettingsManager:
     def save_settings(self) -> bool:
         """Save current settings to file"""
         try:
+            os.makedirs(os.path.dirname(self.settings_file), exist_ok=True)
             with open(self.settings_file, 'w', encoding='utf-8') as f:
                 json.dump(self.settings, f, indent=2, ensure_ascii=False)
             logger.debug("Settings saved successfully")
@@ -104,6 +140,41 @@ class SettingsManager:
             self.set("last_config_path", config_path)
         if output_path:
             self.set("last_output_path", output_path)
+
+    def get_output_root(self) -> str:
+        return str(Path(self.get("runtime.output_root", str(RUNTIME_OUTPUT_DIR))).resolve())
+
+    def set_output_root(self, path: str):
+        output_root = str(Path(path).resolve())
+        self.set("runtime.output_root", output_root)
+        self.settings["output_paths"] = {
+            key: str(Path(output_root) / dirname)
+            for key, dirname in OUTPUT_DIR_NAMES.items()
+        }
+        self.settings["last_output_path"] = self.settings["output_paths"]["live2d"]
+        self.save_settings()
+
+    def get_temp_dir(self) -> str:
+        temp_dir = self.get("runtime.temp_dir", str(RUNTIME_TEMP_DIR))
+        path = Path(temp_dir).resolve()
+        path.mkdir(parents=True, exist_ok=True)
+        return str(path)
+
+    def get_output_dir(self, output_type: str = "live2d") -> str:
+        output_paths = self.get("output_paths", {})
+        output_path = output_paths.get(output_type)
+        if not output_path:
+            output_path = str(Path(self.get_output_root()) / OUTPUT_DIR_NAMES.get(output_type, output_type))
+        path = Path(output_path).resolve()
+        path.mkdir(parents=True, exist_ok=True)
+        return str(path)
+
+    def set_output_dir(self, output_type: str, path: str):
+        output_paths = self.settings.setdefault("output_paths", {})
+        output_paths[output_type] = str(Path(path).resolve())
+        if output_type == "live2d":
+            self.settings["last_output_path"] = output_paths[output_type]
+        self.save_settings()
     
     def update_window_geometry(self, width: int, height: int, x: int, y: int):
         """Update window geometry"""
@@ -143,10 +214,27 @@ class SettingsManager:
     
     def reset_to_defaults(self):
         """Reset all settings to defaults"""
-        self.settings = self.load_settings()
-        # Force reload defaults by removing the file temporarily
         if os.path.exists(self.settings_file):
             os.remove(self.settings_file)
-        self.settings = self.load_settings()
+        self.settings = self.get_default_settings()
         self.save_settings()
         logger.info("Settings reset to defaults")
+
+    def _load_legacy_settings(self) -> Optional[Dict[str, Any]]:
+        legacy_file = PROJECT_ROOT / "settings.json"
+        if Path(self.settings_file) == RUNTIME_SETTINGS_FILE and legacy_file.exists():
+            try:
+                with open(legacy_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as exc:
+                logger.warning("Failed to load legacy settings.json: %s", exc)
+        return None
+
+    def _merge_defaults(self, loaded: Dict[str, Any], defaults: Dict[str, Any]) -> Dict[str, Any]:
+        merged = dict(defaults)
+        for key, value in loaded.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key] = self._merge_defaults(value, merged[key])
+            else:
+                merged[key] = value
+        return merged

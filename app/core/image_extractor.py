@@ -223,11 +223,9 @@ class ImageExtractor:
     def extract_from_wpk(self, output_dir):
         """Extract textures from WPK file"""
         from app.core.wpk_handler import WPKHandler
-        import tempfile
         import shutil
         
-        # Extract WPK to temporary directory
-        temp_dir = tempfile.mkdtemp(prefix='wpk_extract_')
+        temp_dir = None
         
         try:
             print(f"  Extracting WPK to temporary directory...")

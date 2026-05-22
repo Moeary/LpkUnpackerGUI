@@ -160,11 +160,11 @@ class MainWindow(FluentWindow):
         )
 
         self.extractorPage = self._create_page(ExtractorPage, "extractorPage")
-        self.unityExtractorPage = self._create_page(UnityExtractorPage, "unityExtractorPage")
+        self.unityExtractorPage = None
         self.previewPage = self._create_page(PreviewPage, "previewPage")
-        self.encryptionPage = self._create_page(EncryptionPage, "encryptionPage")
-        self.steamWorkshopPage = self._create_page(SteamWorkshopPage, "steamWorkshopPage")
-        self.webPreviewPage = self._create_page(WebPreviewPage, "webPreviewPage")
+        self.encryptionPage = None
+        self.steamWorkshopPage = None
+        self.webPreviewPage = None
         self.live2dModPage = self._create_page(Live2DModPage, "live2dModPage")
         self.psdReconstructionPage = self._create_page(
             PsdReconstructionPage, "psdReconstructionPage"
@@ -207,37 +207,10 @@ class MainWindow(FluentWindow):
             print(f"Error adding ExtractorPage to navigation: {e}")
 
         try:
-            self.addSubInterface(self.unityExtractorPage, FIF.PHOTO, tr("main.nav.unity"))
-        except Exception as e:
-            print(f"Error adding UnityExtractorPage to navigation: {e}")
-
-        try:
-            self.addSubInterface(self.steamWorkshopPage, FIF.GAME, tr("main.nav.steam"))
-        except Exception as e:
-            print(f"Error adding SteamWorkshopPage to navigation: {e}")
-
-        try:
             if not _DISABLE_NATIVE_PREVIEW:
                 self.addSubInterface(self.previewPage, FIF.MOVIE, tr("main.nav.preview_native"))
         except Exception as e:
             print(f"Error adding PreviewPage to navigation: {e}")
-
-        try:
-            self.addSubInterface(self.webPreviewPage, FIF.GLOBE, tr("main.nav.preview_web"))
-        except Exception as e:
-            print(f"Error adding WebPreviewPage to navigation: {e}")
-
-        self.navigationInterface.addSeparator()
-
-        try:
-            self.addSubInterface(
-                self.live2dModPage,
-                FIF.EDIT,
-                tr("main.nav.live2d_mod"),
-                NavigationItemPosition.SCROLL,
-            )
-        except Exception as e:
-            print(f"Error adding Live2DModPage to navigation: {e}")
 
         try:
             self.addSubInterface(
@@ -251,13 +224,13 @@ class MainWindow(FluentWindow):
 
         try:
             self.addSubInterface(
-                self.encryptionPage,
-                FIF.DOWNLOAD,
-                tr("main.nav.encryption"),
+                self.live2dModPage,
+                FIF.EDIT,
+                tr("main.nav.live2d_mod"),
                 NavigationItemPosition.SCROLL,
             )
         except Exception as e:
-            print(f"Error adding EncryptionPage to navigation: {e}")
+            print(f"Error adding Live2DModPage to navigation: {e}")
 
         try:
             self.addSubInterface(

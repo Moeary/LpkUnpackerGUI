@@ -1,6 +1,6 @@
 import os
 
-from PySide6.QtCore import QThread, QUrl
+from PySide6.QtCore import QThread, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import QApplication, QFileDialog, QFrame, QHBoxLayout, QSizePolicy, QVBoxLayout
 from qfluentwidgets import (
@@ -14,16 +14,16 @@ from qfluentwidgets import (
     SubtitleLabel,
     TextEdit,
 )
-from PySide6.QtCore import Signal
 
-from app.core.assetstudio_cli import AssetStudioCLI, AssetStudioCLIError
+from app.core.extract import ExtractMode, run_extraction_batch
+from app.core.settings_manager import SettingsManager
 from app.i18n import get_i18n, tr
 
 
 class AssetStudioExportThread(QThread):
     progressUpdated = Signal(int)
     logMessage = Signal(str, str)
-    extractionFinished = Signal(str)
+    extractionFinished = Signal(object)
     extractionError = Signal(str)
 
     def __init__(self, inputs: list[str], output_dir: str, mode: str):
@@ -34,38 +34,20 @@ class AssetStudioExportThread(QThread):
 
     def run(self):
         try:
-            cli = AssetStudioCLI()
-            self.logMessage.emit("INFO", f"AssetStudio CLI: {cli.executable}")
-
-            total_count = 0
-            for index, input_path in enumerate(self.inputs):
-                self.logMessage.emit("INFO", f"Processing: {input_path}")
-                if self.mode == "live2d":
-                    result = cli.export_live2d(input_path, self.output_dir)
-                else:
-                    result = cli.export_textures(input_path, self.output_dir)
-
-                total_count += result.exported_count
-                self._emit_cli_output(result.stdout)
-                self._emit_cli_output(result.stderr, level="WARNING")
-                self.logMessage.emit(
-                    "INFO",
-                    f"Exported {result.exported_count} file(s) from {os.path.basename(input_path)}",
-                )
-                self.progressUpdated.emit(int((index + 1) / max(1, len(self.inputs)) * 100))
-
-            self.logMessage.emit("INFO", f"Total exported files: {total_count}")
-            self.extractionFinished.emit(self.output_dir)
-        except AssetStudioCLIError as exc:
-            self.extractionError.emit(str(exc))
+            mode = ExtractMode.LIVE2D if self.mode == "live2d" else ExtractMode.TEXTURES
+            result = run_extraction_batch(
+                self.inputs,
+                self.output_dir,
+                mode,
+                progress=self._on_progress,
+                log=self.logMessage.emit,
+            )
+            self.extractionFinished.emit(result)
         except Exception as exc:
             self.extractionError.emit(str(exc))
 
-    def _emit_cli_output(self, text: str, level: str = "INFO"):
-        for line in text.splitlines():
-            line = line.strip()
-            if line:
-                self.logMessage.emit(level, line)
+    def _on_progress(self, done: int, total: int):
+        self.progressUpdated.emit(int(done / max(1, total) * 100))
 
 
 class UnityExtractorPage(QFrame):
@@ -75,7 +57,8 @@ class UnityExtractorPage(QFrame):
         self.setAcceptDrops(True)
 
         self.i18n = get_i18n()
-        self.default_output_dir = os.path.join(os.getcwd(), "output", "unity_assets")
+        self.settings_manager = SettingsManager()
+        self.default_output_dir = self.settings_manager.get_output_dir("unity")
         self.selected_paths: list[str] = []
         self.last_output_dir = self.default_output_dir
         self.thread: AssetStudioExportThread | None = None
@@ -112,7 +95,6 @@ class UnityExtractorPage(QFrame):
         self.mode_layout = QHBoxLayout()
         self.mode_label = SubtitleLabel("", self)
         self.mode_combo = ComboBox(self)
-        self.mode_combo.addItem("", userData="textures")
         self.mode_combo.addItem("", userData="live2d")
         self.mode_layout.addWidget(self.mode_label)
         self.mode_layout.addWidget(self.mode_combo, 1)
@@ -134,6 +116,10 @@ class UnityExtractorPage(QFrame):
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.main_layout.addWidget(self.progress_bar)
+
+        self.summary_label = SubtitleLabel("", self)
+        self.summary_label.setVisible(False)
+        self.main_layout.addWidget(self.summary_label)
 
         self.extract_button = PushButton("", self)
         self.extract_button.setIcon(FluentIcon.IMAGE_EXPORT)
@@ -167,8 +153,7 @@ class UnityExtractorPage(QFrame):
         self.file_button.setText(tr("unity.browse_files"))
         self.folder_button.setText(tr("unity.browse_folder"))
         self.mode_label.setText(tr("unity.mode"))
-        self.mode_combo.setItemText(0, tr("unity.mode.textures"))
-        self.mode_combo.setItemText(1, tr("unity.mode.live2d"))
+        self.mode_combo.setItemText(0, tr("unity.mode.live2d"))
         self.output_label.setText(tr("unity.output_directory"))
         self.output_edit.setPlaceholderText(tr("unity.placeholder_output"))
         self.output_button.setText(tr("common.browse"))
@@ -248,12 +233,15 @@ class UnityExtractorPage(QFrame):
         output_dir = os.path.abspath(self.output_edit.text() or self.default_output_dir)
         os.makedirs(output_dir, exist_ok=True)
         self.last_output_dir = output_dir
+        self.settings_manager.set_output_dir("unity", output_dir)
         self.output_edit.setText(output_dir)
 
-        mode = self.mode_combo.currentData() or "textures"
+        mode = self.mode_combo.currentData() or "live2d"
         self.set_busy(True)
         self.log_text.clear()
         self.progress_bar.setValue(0)
+        self.summary_label.clear()
+        self.summary_label.setVisible(False)
         self.append_log(tr("unity.started"))
 
         self.thread = AssetStudioExportThread(self.selected_paths, output_dir, mode)
@@ -267,10 +255,32 @@ class UnityExtractorPage(QFrame):
         prefix = f"[{level}] " if level else ""
         self.append_log(prefix + message)
 
-    def on_finished(self, output_dir: str):
+    def on_finished(self, result):
+        output_dir = str(result.output_dir) if hasattr(result, "output_dir") else str(result)
         self.set_busy(False)
         self.progress_bar.setValue(100)
         self.open_folder_button.setEnabled(True)
+
+        self.summary_label.setText(self.format_result_summary(result))
+        self.summary_label.setVisible(True)
+        if hasattr(result, "failed_items"):
+            for item in result.failed_items:
+                self.append_log(f"[ERROR] {item.source}: {item.error or item.message}")
+
+        if hasattr(result, "has_failures") and result.has_failures:
+            InfoBar.warning(
+                title=tr("common.warning"),
+                content=tr(
+                    "unity.partial_content",
+                    failed=result.failure_count,
+                    output=output_dir,
+                ),
+                position=InfoBarPosition.TOP,
+                duration=6000,
+                parent=self,
+            )
+            return
+
         InfoBar.success(
             title=tr("common.success"),
             content=tr("unity.success_content", output=output_dir),
@@ -300,6 +310,18 @@ class UnityExtractorPage(QFrame):
         self.log_text.append(message)
         scrollbar = self.log_text.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
+
+    def format_result_summary(self, result):
+        if not hasattr(result, "total_count"):
+            return ""
+        return tr(
+            "unity.summary",
+            success=result.success_count,
+            total=result.total_count,
+            failed=result.failure_count,
+            exported=result.exported_count,
+            skipped=result.skipped_count,
+        )
 
     def updateUIScale(self, window_width, window_height):
         scale_factor = max(1.0, window_width / 1000.0)

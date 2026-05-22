@@ -1,6 +1,17 @@
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import QFrame, QVBoxLayout, QHBoxLayout
-from qfluentwidgets import CardWidget, SubtitleLabel, BodyLabel, CaptionLabel, ComboBox, InfoBar, InfoBarPosition
+from PySide6.QtWidgets import QFileDialog, QFrame, QVBoxLayout, QHBoxLayout
+from qfluentwidgets import (
+    CardWidget,
+    SubtitleLabel,
+    BodyLabel,
+    CaptionLabel,
+    ComboBox,
+    FluentIcon,
+    InfoBar,
+    InfoBarPosition,
+    LineEdit,
+    PushButton,
+)
 
 from app.core.settings_manager import SettingsManager
 from app.i18n import get_i18n, normalize_language_code, tr
@@ -34,6 +45,13 @@ class SettingsPage(QFrame):
         self.theme_label = None
         self.theme_desc = None
         self.theme_combo = None
+
+        self.runtime_section_title = None
+        self.output_root_label = None
+        self.output_root_desc = None
+        self.output_root_edit = None
+        self.output_root_button = None
+        self.setting_file_note = None
 
         self.setup_ui()
         self.retranslate_ui()
@@ -109,6 +127,42 @@ class SettingsPage(QFrame):
         theme_layout.addLayout(theme_row)
 
         main_layout.addWidget(theme_card)
+
+        runtime_card = CardWidget(self)
+        runtime_layout = QVBoxLayout(runtime_card)
+        runtime_layout.setContentsMargins(16, 16, 16, 16)
+        runtime_layout.setSpacing(10)
+
+        self.runtime_section_title = SubtitleLabel("", runtime_card)
+        runtime_layout.addWidget(self.runtime_section_title)
+
+        output_row = QHBoxLayout()
+        output_row.setSpacing(12)
+
+        output_text_layout = QVBoxLayout()
+        output_text_layout.setSpacing(4)
+        self.output_root_label = BodyLabel("", runtime_card)
+        self.output_root_desc = CaptionLabel("", runtime_card)
+        self.output_root_desc.setWordWrap(True)
+        output_text_layout.addWidget(self.output_root_label)
+        output_text_layout.addWidget(self.output_root_desc)
+
+        self.output_root_edit = LineEdit(runtime_card)
+        self.output_root_edit.setReadOnly(True)
+        self.output_root_button = PushButton("", runtime_card)
+        self.output_root_button.setIcon(FluentIcon.FOLDER)
+        self.output_root_button.clicked.connect(self.browse_output_root)
+
+        output_row.addLayout(output_text_layout, 1)
+        output_row.addWidget(self.output_root_edit, 2)
+        output_row.addWidget(self.output_root_button)
+        runtime_layout.addLayout(output_row)
+
+        self.setting_file_note = CaptionLabel("", runtime_card)
+        self.setting_file_note.setWordWrap(True)
+        runtime_layout.addWidget(self.setting_file_note)
+
+        main_layout.addWidget(runtime_card)
         main_layout.addStretch(1)
 
     def load_current_settings(self):
@@ -121,6 +175,9 @@ class SettingsPage(QFrame):
             if theme not in self._theme_values:
                 theme = "auto"
             self._set_combo_by_value(self.theme_combo, self._theme_values, theme)
+
+            if self.output_root_edit:
+                self.output_root_edit.setText(self.settings_manager.get_output_root())
         finally:
             self._syncing_ui = False
 
@@ -161,6 +218,15 @@ class SettingsPage(QFrame):
                     label = tr("settings.theme.dark")
                 self.theme_combo.addItem(label)
             self._set_combo_by_value(self.theme_combo, self._theme_values, current_theme)
+
+            self.runtime_section_title.setText(tr("settings.section.runtime"))
+            self.output_root_label.setText(tr("settings.output_root_label"))
+            self.output_root_desc.setText(tr("settings.output_root_desc"))
+            self.output_root_button.setText(tr("common.browse"))
+            self.output_root_edit.setText(self.settings_manager.get_output_root())
+            self.setting_file_note.setText(
+                tr("settings.setting_file_note", path=self.settings_manager.settings_file)
+            )
         finally:
             self._syncing_ui = False
 
@@ -203,6 +269,29 @@ class SettingsPage(QFrame):
             position=InfoBarPosition.TOP,
             duration=2500,
             parent=self
+        )
+
+    def browse_output_root(self):
+        path = QFileDialog.getExistingDirectory(
+            self,
+            tr("dialog.select_output_directory"),
+            self.output_root_edit.text() or self.settings_manager.get_output_root(),
+        )
+        if not path:
+            return
+        self.settings_manager.set_output_root(path)
+        self.output_root_edit.setText(self.settings_manager.get_output_root())
+        self.setting_file_note.setText(
+            tr("settings.setting_file_note", path=self.settings_manager.settings_file)
+        )
+        InfoBar.success(
+            title=tr("common.success"),
+            content=tr("settings.output_root_saved"),
+            orient=Qt.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP,
+            duration=2500,
+            parent=self,
         )
 
     @staticmethod
