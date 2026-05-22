@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 
 from PySide6.QtWidgets import (
     QFrame,
@@ -31,6 +32,7 @@ from app.i18n import get_i18n, tr
 from app.paths import PROJECT_ROOT
 IMAGE_PREVIEW_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tga"}
 PACKAGE_PREVIEW_EXTENSIONS = {".lpk", ".wpk"}
+ARCHIVE_PREVIEW_EXTENSIONS = {".zip"}
 SPINE_PREVIEW_EXTENSIONS = {".skel", ".atlas"}
 UNITY_PREVIEW_EXTENSIONS = {
     "",
@@ -75,11 +77,16 @@ def _is_spine_preview_source(path: str) -> bool:
     return False
 
 
+def _is_archive_preview_source(path: str) -> bool:
+    return os.path.isfile(path) and os.path.splitext(path)[1].lower() in ARCHIVE_PREVIEW_EXTENSIONS
+
+
 def _is_supported_preview_source(path: str) -> bool:
     suffix = os.path.splitext(path)[1].lower()
     return (
         _is_model_json(path)
         or _is_image_file(path)
+        or _is_archive_preview_source(path)
         or _is_spine_preview_source(path)
         or suffix in PACKAGE_PREVIEW_EXTENSIONS
         or os.path.isdir(path)
@@ -125,6 +132,16 @@ def _unique_path(path: str) -> str:
 
 def _unique_dir(path: str) -> str:
     return _unique_path(path)
+
+
+def _safe_extract_zip(zip_path: str, target_dir: str):
+    target_root = os.path.abspath(target_dir)
+    with zipfile.ZipFile(zip_path, "r") as zip_ref:
+        for member in zip_ref.infolist():
+            target_path = os.path.abspath(os.path.join(target_root, member.filename))
+            if os.path.commonpath([target_root, target_path]) != target_root:
+                raise RuntimeError(f"Unsafe archive path: {member.filename}")
+        zip_ref.extractall(target_root)
 
 
 class DragDropArea(QFrame):
@@ -287,6 +304,28 @@ class UnityTexturePreviewThread(QThread):
             self.previewReady.emit(images[:48], self.temp_dir)
         except Exception as exc:
             self.failed.emit(str(exc), self.temp_dir)
+
+
+class ArchivePreviewImportThread(QThread):
+    archiveReady = Signal(str, str)
+    failed = Signal(str, str)
+
+    def __init__(self, archive_path: str, temp_root: str, parent=None):
+        super().__init__(parent)
+        self.archive_path = archive_path
+        self.temp_root = temp_root
+
+    def run(self):
+        temp_dir = ""
+        try:
+            os.makedirs(self.temp_root, exist_ok=True)
+            temp_dir = tempfile.mkdtemp(prefix="lpk_preview_archive_", dir=self.temp_root)
+            _safe_extract_zip(self.archive_path, temp_dir)
+            self.archiveReady.emit(temp_dir, self.archive_path)
+        except Exception as exc:
+            if temp_dir:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            self.failed.emit(str(exc), self.archive_path)
 
 
 class PreviewExportThread(QThread):
@@ -1089,6 +1128,8 @@ class PreviewPage(QFrame):
         self._model_preview_temp_dirs = []
         self._image_preview_thread = None
         self._image_preview_temp_dirs = []
+        self._archive_preview_thread = None
+        self._archive_preview_temp_dirs = []
         self._preview_export_thread = None
         self._preview_export_kind = None
         self._preview_export_source_dir = None
@@ -1107,6 +1148,7 @@ class PreviewPage(QFrame):
                 app.aboutToQuit.connect(self._cleanup_temp_model_json)
                 app.aboutToQuit.connect(self._cleanup_model_preview_temp_dirs)
                 app.aboutToQuit.connect(self._cleanup_image_preview_temp_dirs)
+                app.aboutToQuit.connect(self._cleanup_archive_preview_temp_dirs)
         except Exception:
             pass
 
@@ -1691,6 +1733,15 @@ class PreviewPage(QFrame):
         if self._preview_export_kind == "live2d":
             self._clear_preview_export_payload()
 
+    def _cleanup_archive_preview_temp_dirs(self):
+        for temp_dir in list(self._archive_preview_temp_dirs):
+            try:
+                if temp_dir and os.path.isdir(temp_dir):
+                    shutil.rmtree(temp_dir)
+            except Exception:
+                pass
+        self._archive_preview_temp_dirs = []
+
     def on_file_dropped(self, file_path):
         """处理文件拖拽"""
         if not os.path.exists(file_path):
@@ -1705,6 +1756,10 @@ class PreviewPage(QFrame):
                 tr("preview.spine_not_supported_title"),
                 tr("preview.spine_not_supported_content"),
             )
+            return
+
+        if _is_archive_preview_source(file_path):
+            self.start_archive_preview_import(file_path)
             return
 
         if _is_model_json(file_path) or os.path.isdir(file_path):
@@ -1737,11 +1792,62 @@ class PreviewPage(QFrame):
             tr("preview.invalid_file_type_content")
         )
 
+    def start_archive_preview_import(self, archive_path: str):
+        self.close_preview_window()
+        self._cleanup_temp_model_json()
+        self._cleanup_model_preview_temp_dirs()
+        self._cleanup_image_preview_temp_dirs()
+        self._cleanup_archive_preview_temp_dirs()
+        self.current_model_path = None
+        self.preview_btn.setEnabled(False)
+        if self.image_preview_panel:
+            self.image_preview_panel.clear()
+        self._show_stage_placeholder(tr("preview.stage_loading"))
+        self.model_info_text_box.setMarkdown(
+            tr("preview.archive_import_loading", source=archive_path)
+        )
+        self._archive_preview_thread = ArchivePreviewImportThread(
+            archive_path,
+            self.settings_manager.get_temp_dir(),
+            self,
+        )
+        self._archive_preview_thread.archiveReady.connect(self.on_archive_preview_ready)
+        self._archive_preview_thread.failed.connect(self.on_archive_preview_failed)
+        self._archive_preview_thread.start()
+
+    def on_archive_preview_ready(self, temp_dir: str, source_path: str):
+        self._archive_preview_temp_dirs.append(temp_dir)
+
+        try:
+            result = prepare_preview_import(temp_dir, self.settings_manager.get_temp_dir())
+            if result.temp_dir:
+                self._model_preview_temp_dirs.append(str(result.temp_dir))
+            self.load_model_preview(str(result.preview_model_json), source_path)
+            return
+        except Exception:
+            pass
+
+        local_images = _collect_preview_images(temp_dir)
+        if local_images:
+            self._pending_unity_preview_source_path = source_path
+            self.load_image_preview(local_images, temp_dir, temporary=True)
+            self._pending_unity_preview_source_path = None
+            return
+
+        self.start_unity_image_preview(temp_dir, display_source=source_path, keep_archive_dirs=True)
+
+    def on_archive_preview_failed(self, error: str, source_path: str):
+        self.show_error(
+            tr("preview.archive_import_failed_title"),
+            tr("preview.archive_import_failed_content", error=error),
+        )
+
     def start_model_preview_import(self, source_path: str):
         self.close_preview_window()
         self._cleanup_temp_model_json()
         self._cleanup_model_preview_temp_dirs()
         self._cleanup_image_preview_temp_dirs()
+        self._cleanup_archive_preview_temp_dirs()
         self._show_stage_placeholder(tr("preview.stage_loading"))
         self.current_model_path = None
         self.preview_btn.setEnabled(False)
@@ -1808,6 +1914,7 @@ class PreviewPage(QFrame):
         self._cleanup_temp_model_json()
         if not temporary:
             self._cleanup_image_preview_temp_dirs()
+            self._cleanup_archive_preview_temp_dirs()
         self.current_model_path = None
         self.preview_btn.setEnabled(False)
         if self.image_preview_panel:
@@ -1837,10 +1944,17 @@ class PreviewPage(QFrame):
             parent=self,
         )
 
-    def start_unity_image_preview(self, source_path: str):
+    def start_unity_image_preview(
+        self,
+        source_path: str,
+        display_source: str | None = None,
+        keep_archive_dirs: bool = False,
+    ):
         self.close_preview_window()
         self._cleanup_temp_model_json()
         self._cleanup_image_preview_temp_dirs()
+        if not keep_archive_dirs:
+            self._cleanup_archive_preview_temp_dirs()
         self.current_model_path = None
         self.preview_btn.setEnabled(False)
         if self.image_preview_panel:
@@ -1849,7 +1963,7 @@ class PreviewPage(QFrame):
         self.model_info_text_box.setMarkdown(
             tr("preview.unity_preview_loading", source=source_path)
         )
-        self._pending_unity_preview_source_path = source_path
+        self._pending_unity_preview_source_path = display_source or source_path
         temp_dir = tempfile.mkdtemp(
             prefix="lpk_preview_unity_",
             dir=self.settings_manager.get_temp_dir(),
