@@ -4,6 +4,7 @@ from pathlib import Path
 
 from app.core.extract.lpk import extract_lpk
 from app.core.extract.models import ExtractItemResult, ExtractMode, ExtractSourceType
+from app.core.extract.package_classifier import output_subdir_for_lpk
 from app.core.image_extractor import ImageExtractor
 from app.core.wpk_handler import WPKHandler
 
@@ -68,7 +69,8 @@ def extract_wpk_full(
 
         combined_configs = [*internal_configs, *(config_files or [])]
         for lpk_file in lpk_files:
-            children.append(extract_lpk(lpk_file, output_dir, ExtractMode.FULL, combined_configs))
+            target = output_dir / output_subdir_for_lpk(lpk_file, combined_configs)
+            children.append(extract_lpk(lpk_file, target, ExtractMode.FULL, combined_configs))
     finally:
         WPKHandler.cleanup_temp_dir(temp_dir)
 

@@ -45,12 +45,15 @@ class SettingsManager:
             "output_paths": output_paths,
             "last_lpk_path": "",
             "last_config_path": "",
-            "last_output_path": output_paths["live2d"],
+            "last_output_path": str(RUNTIME_OUTPUT_DIR),
             "steam_path": "",
             "auto_detect_steam": True,
             "remember_paths": True,
             "theme": "auto",
             "language": "en_US",
+            "tools": {
+                "archive_extractor_path": "",
+            },
             "window_geometry": {
                 "width": 1000,
                 "height": 700,
@@ -151,7 +154,7 @@ class SettingsManager:
             key: str(Path(output_root) / dirname)
             for key, dirname in OUTPUT_DIR_NAMES.items()
         }
-        self.settings["last_output_path"] = self.settings["output_paths"]["live2d"]
+        self.settings["last_output_path"] = output_root
         self.save_settings()
 
     def get_temp_dir(self) -> str:
@@ -175,6 +178,12 @@ class SettingsManager:
         if output_type == "live2d":
             self.settings["last_output_path"] = output_paths[output_type]
         self.save_settings()
+
+    def get_archive_extractor_path(self) -> str:
+        return str(self.get("tools.archive_extractor_path", "") or "").strip()
+
+    def set_archive_extractor_path(self, path: str):
+        self.set("tools.archive_extractor_path", str(path or "").strip())
     
     def update_window_geometry(self, width: int, height: int, x: int, y: int):
         """Update window geometry"""

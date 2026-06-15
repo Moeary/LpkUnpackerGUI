@@ -49,7 +49,7 @@ pixi install
 If you want to use the GUI version, run the following command:
 
 ```
-pixi run start
+pixi run dev
 ```
 
 ### Cmdline

@@ -95,8 +95,9 @@ class Live2DPreviewWindow(QWidget):
         self._selected_motion = None
         self._motion_items = []
         self._dock_rect = None
+        self._fit_to_dock = False
         self._requested_canvas_size = (400, 300)
-        self._show_hit_areas = True
+        self._show_hit_areas = False
         self._resize_margin = 12
         self._resizing = False
         self._resize_edges = set()
@@ -190,7 +191,7 @@ class Live2DPreviewWindow(QWidget):
         self.hit_area_overlay = HitAreaOverlay(self.live2d_canvas)
         self.hit_area_overlay.setGeometry(self.live2d_canvas.rect())
         self.hit_area_overlay.set_regions(self._load_hit_regions())
-        self.hit_area_overlay.setVisible(self._show_hit_areas and bool(self.hit_area_overlay.regions()))
+        self.hit_area_overlay.setVisible(False)
         self.hit_area_overlay.raise_()
         # 创建控制面板（可隐藏）
         self.control_panel = self.create_control_panel()
@@ -238,10 +239,6 @@ class Live2DPreviewWindow(QWidget):
         self.toggle_controls_btn = PushButton("", panel)
         self.toggle_controls_btn.clicked.connect(self.toggle_control_panel)
         button_layout.addWidget(self.toggle_controls_btn)
-
-        self.hit_area_toggle_btn = PushButton("", panel)
-        self.hit_area_toggle_btn.clicked.connect(self._toggle_hit_area_overlay)
-        button_layout.addWidget(self.hit_area_toggle_btn)
 
         # 关闭按钮
         self.close_btn = PushButton("", panel)
@@ -413,16 +410,16 @@ class Live2DPreviewWindow(QWidget):
         if not self.hit_area_overlay or not self.live2d_canvas:
             return
         self.hit_area_overlay.setGeometry(self.live2d_canvas.rect())
-        self.hit_area_overlay.setVisible(self._show_hit_areas and bool(self.hit_area_overlay.regions()))
+        self.hit_area_overlay.setVisible(False)
         self.hit_area_overlay.raise_()
 
     def _toggle_hit_area_overlay(self):
-        self._show_hit_areas = not self._show_hit_areas
+        self._show_hit_areas = False
         self._sync_overlay_geometry()
         self.retranslate_ui()
 
     def _resize_edges_at_pos(self, pos: QPoint) -> set[str]:
-        if not self.live2d_canvas:
+        if self._fit_to_dock or not self.live2d_canvas:
             return set()
         width = max(1, self.live2d_canvas.width())
         height = max(1, self.live2d_canvas.height())
@@ -601,13 +598,16 @@ class Live2DPreviewWindow(QWidget):
         if not settings:
             return
 
+        if 'fit_to_dock' in settings:
+            self._fit_to_dock = bool(settings.get('fit_to_dock'))
+
         if 'show_controls' in settings and self.control_panel:
             should_show = bool(settings.get('show_controls'))
             if self.control_panel.isVisible() != should_show:
                 self.toggle_control_panel()
 
         # 应用窗口设置
-        if 'window_size' in settings:
+        if 'window_size' in settings and not self._fit_to_dock:
             w, h = settings['window_size']
             self._requested_canvas_size = (int(w), int(h))
             # 当控制面板可见时，窗口总高度 = 目标画布高度 + 控制面板高度
@@ -685,12 +685,9 @@ class Live2DPreviewWindow(QWidget):
         except Exception:
             return
         self._dock_rect = {"x": x, "y": y, "w": w, "h": h}
+        self._fit_to_dock = True
         self.setMaximumSize(w, h)
-        self.move(x, y)
-        target_w = min(self.width(), w)
-        target_h = min(self.height(), h)
-        if target_w != self.width() or target_h != self.height():
-            self.resize(target_w, target_h)
+        self.setGeometry(x, y, w, h)
         self._sync_overlay_geometry()
         self.raise_()
 

@@ -8,6 +8,7 @@ from app.core.extract.models import (
     ExtractMode,
     ExtractSourceType,
 )
+from app.core.extract.planner import ExtractTaskPlan, analyze_file, analyze_folder, analyze_sources
 
 __all__ = [
     "ExtractBatchResult",
@@ -15,6 +16,10 @@ __all__ = [
     "ExtractItemResult",
     "ExtractMode",
     "ExtractSourceType",
+    "ExtractTaskPlan",
+    "analyze_file",
+    "analyze_folder",
+    "analyze_sources",
     "collect_package_sources",
     "detect_source_type",
     "extract_package_folder",

@@ -45,6 +45,7 @@ class LpkLoader():
     
     def extract(self, outputdir: str):
         subdir = ""
+        created_dirs = []
         try:
             if self.lpkType in ["STD2_0", "STM_1_0"]:
                 for chara in self.mlve_config["list"]:
@@ -54,6 +55,7 @@ class LpkLoader():
                         chara_name = chara["character"] if chara["character"] != "" else "character"
                     subdir =  os.path.join(outputdir, normalize(chara_name))
                     safe_mkdir(subdir)
+                    created_dirs.append(subdir)
 
                     for i in range(len(chara["costume"])):
                         logger.info(f"extracting {chara_name}_costume_{i}")
@@ -72,7 +74,7 @@ class LpkLoader():
                 if self.encrypted == "false":
                     print("lpk is not encrypted, extracting all files...")
                     self.lpkfile.extractall(outputdir)
-                    return
+                    return [outputdir]
                 # For STD_1_0 and earlier
                 for file in self.lpkfile.namelist():
                     if os.path.splitext(file)[-1] == '':
@@ -88,6 +90,7 @@ class LpkLoader():
                         decryptedData = self.decrypt_file(file)
                         with open(outputFilePath, "wb") as outputFile:
                             outputFile.write(decryptedData)
+                return [outputdir]
         except Exception as e:
             logger.fatal(f"Failed to decrypt {self.lpkpath} for:{e}")
             try:
@@ -97,6 +100,7 @@ class LpkLoader():
             except Exception as de:
                 logging.error(f"Failed to clean up empty directories created by error unpacking: {de}")
             raise e
+        return created_dirs
 
     def extract_costume(self, costume: dict, dir: str):
         if costume["path"] == "":

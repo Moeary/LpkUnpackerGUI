@@ -11,6 +11,7 @@ from app.core.extract.models import (
     ExtractMode,
     ExtractSourceType,
 )
+from app.core.extract.package_classifier import output_subdir_for_lpk
 from app.core.extract.unity import extract_unity
 from app.core.extract.wpk import extract_wpk
 
@@ -92,14 +93,28 @@ def _extract_one(
         if source_type == ExtractSourceType.LPK:
             return extract_lpk(
                 source,
-                _target_dir(output_dir, source, source_type, mode, texture_output_subdir),
+                _target_dir(
+                    output_dir,
+                    source,
+                    source_type,
+                    mode,
+                    texture_output_subdir,
+                    config_files,
+                ),
                 mode,
                 config_files,
             )
         if source_type == ExtractSourceType.WPK:
             return extract_wpk(
                 source,
-                _target_dir(output_dir, source, source_type, mode, texture_output_subdir),
+                _target_dir(
+                    output_dir,
+                    source,
+                    source_type,
+                    mode,
+                    texture_output_subdir,
+                    config_files,
+                ),
                 mode,
                 config_files,
             )
@@ -107,7 +122,14 @@ def _extract_one(
             unity_mode = ExtractMode.LIVE2D if mode == ExtractMode.FULL else mode
             return extract_unity(
                 source,
-                _target_dir(output_dir, source, source_type, unity_mode, texture_output_subdir),
+                _target_dir(
+                    output_dir,
+                    source,
+                    source_type,
+                    unity_mode,
+                    texture_output_subdir,
+                    config_files,
+                ),
                 unity_mode,
                 log=log,
             )
@@ -135,13 +157,28 @@ def _target_dir(
     source_type: ExtractSourceType,
     mode: ExtractMode,
     texture_output_subdir: bool,
+    config_files: list[str | Path] | None = None,
 ) -> Path:
-    if mode != ExtractMode.TEXTURES or not texture_output_subdir:
-        return output_dir
+    if mode == ExtractMode.TEXTURES:
+        texture_root = output_dir / "textures"
+        if not texture_output_subdir:
+            return texture_root
+
+        if source_type in {ExtractSourceType.UNITY, ExtractSourceType.FOLDER}:
+            return texture_root / source.name
+        return texture_root
+
+    if mode in {ExtractMode.FULL, ExtractMode.LIVE2D}:
+        if source_type == ExtractSourceType.LPK:
+            return output_dir / output_subdir_for_lpk(source, config_files)
+        if source_type == ExtractSourceType.WPK:
+            return output_dir
+        return output_dir / "live2d"
 
     if source_type in {ExtractSourceType.UNITY, ExtractSourceType.FOLDER}:
-        return output_dir / "images" / source.name
-    return output_dir / "images"
+        return output_dir / "unity"
+
+    return output_dir
 
 
 def _log_item(log: LogCallback | None, item: ExtractItemResult) -> None:

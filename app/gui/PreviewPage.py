@@ -18,11 +18,11 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
 )
-from PySide6.QtCore import Qt, Signal, QTimer, QCoreApplication, QThread, QPoint
+from PySide6.QtCore import Qt, Signal, QTimer, QCoreApplication, QThread, QPoint, QEvent
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QColor, QPixmap
 from qfluentwidgets import (SubtitleLabel, BodyLabel, PushButton, Slider, CheckBox, SpinBox, InfoBar, InfoBarPosition,
                            CardWidget, SingleDirectionScrollArea, TextBrowser, ColorDialog, FluentIcon, IconWidget,
-                           ComboBox)
+                           ComboBox, LineEdit)
 
 from app.core.assetstudio_cli import AssetStudioCLI
 from app.core.model import is_model_json_path, resolve_live2d_package
@@ -32,7 +32,7 @@ from app.i18n import get_i18n, tr
 from app.paths import PROJECT_ROOT
 IMAGE_PREVIEW_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tga"}
 PACKAGE_PREVIEW_EXTENSIONS = {".lpk", ".wpk"}
-ARCHIVE_PREVIEW_EXTENSIONS = {".zip"}
+ARCHIVE_PREVIEW_EXTENSIONS = {".zip", ".7z", ".rar"}
 SPINE_PREVIEW_EXTENSIONS = {".skel", ".atlas"}
 UNITY_PREVIEW_EXTENSIONS = {
     "",
@@ -144,6 +144,90 @@ def _safe_extract_zip(zip_path: str, target_dir: str):
         zip_ref.extractall(target_root)
 
 
+def _safe_extract_archive(archive_path: str, target_dir: str, extractor_path: str = ""):
+    suffix = os.path.splitext(archive_path)[1].lower()
+    if suffix == ".zip":
+        try:
+            _safe_extract_zip(archive_path, target_dir)
+            return
+        except zipfile.BadZipFile:
+            pass
+    _extract_archive_with_external_tool(archive_path, target_dir, extractor_path)
+
+
+def _extract_archive_with_external_tool(archive_path: str, target_dir: str, extractor_path: str = ""):
+    target_root = os.path.abspath(target_dir)
+    os.makedirs(target_root, exist_ok=True)
+
+    commands = _archive_extract_commands(archive_path, target_root, extractor_path)
+    if not commands:
+        raise RuntimeError(
+            "No archive extractor found. Set bz.exe, 7z.exe, WinRAR.exe, or UnRAR.exe in Settings, or make one available in PATH."
+        )
+
+    errors = []
+    for command in commands:
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
+            )
+        except Exception as exc:
+            errors.append(f"{command[0]}: {exc}")
+            continue
+        if completed.returncode == 0:
+            return
+        message = (completed.stderr or completed.stdout or "").strip()
+        errors.append(f"{command[0]} exited with {completed.returncode}: {message}")
+
+    raise RuntimeError("Archive extraction failed. " + " | ".join(errors))
+
+
+def _archive_extract_commands(archive_path: str, target_dir: str, extractor_path: str = "") -> list[list[str]]:
+    commands: list[list[str]] = []
+
+    configured = (extractor_path or "").strip().strip('"')
+    if configured:
+        commands.extend(_archive_commands_for_executable(configured, archive_path, target_dir))
+
+    bz = shutil.which("bz")
+    if bz:
+        commands.append([bz, "x", "-y", "-aoa", f"-o:{target_dir}", archive_path])
+
+    for name in ("7z", "7za", "7zr"):
+        exe = shutil.which(name)
+        if exe:
+            commands.append([exe, "x", "-y", f"-o{target_dir}", archive_path])
+
+    for name in ("WinRAR", "UnRAR"):
+        exe = shutil.which(name)
+        if exe:
+            commands.append([exe, "x", "-y", archive_path, target_dir + os.sep])
+
+    return commands
+
+
+def _archive_commands_for_executable(exe: str, archive_path: str, target_dir: str) -> list[list[str]]:
+    if not os.path.isfile(exe):
+        return []
+    name = os.path.splitext(os.path.basename(exe))[0].lower()
+    if name in {"bz", "bandizip"}:
+        return [[exe, "x", "-y", "-aoa", f"-o:{target_dir}", archive_path]]
+    if name in {"7z", "7za", "7zr"}:
+        return [[exe, "x", "-y", f"-o{target_dir}", archive_path]]
+    if name in {"winrar", "unrar", "rar"}:
+        return [[exe, "x", "-y", archive_path, target_dir + os.sep]]
+    return [
+        [exe, "x", "-y", "-aoa", f"-o:{target_dir}", archive_path],
+        [exe, "x", "-y", f"-o{target_dir}", archive_path],
+        [exe, "x", "-y", archive_path, target_dir + os.sep],
+    ]
+
+
 class DragDropArea(QFrame):
     """拖拽区域组件"""
     fileDropped = Signal(str)  # 文件拖拽信号
@@ -206,7 +290,27 @@ class DragDropArea(QFrame):
         layout.addWidget(self.sub_text)
         layout.addWidget(self.browse_text)
         layout.addWidget(self.browse_btn)
+        self._install_drag_event_forwarders()
         self.retranslate_ui()
+
+    def _install_drag_event_forwarders(self):
+        for widget in self.findChildren(QWidget):
+            if widget is self:
+                continue
+            widget.setAcceptDrops(True)
+            widget.installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.DragEnter:
+            self.dragEnterEvent(event)
+            return event.isAccepted()
+        if event.type() == QEvent.Type.DragMove:
+            self.dragMoveEvent(event)
+            return event.isAccepted()
+        if event.type() == QEvent.Type.Drop:
+            self.dropEvent(event)
+            return event.isAccepted()
+        return super().eventFilter(obj, event)
 
     def retranslate_ui(self):
         self.main_text.setText(tr("preview.drag_main"))
@@ -216,25 +320,43 @@ class DragDropArea(QFrame):
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         """拖拽进入事件"""
-        if event.mimeData().hasUrls():
-            urls = event.mimeData().urls()
-            if urls and len(urls) == 1:
-                file_path = urls[0].toLocalFile()
-                if _is_supported_preview_source(file_path):
-                    event.acceptProposedAction()
-                    self.setStyleSheet("""
-                        DragDropArea {
-                            border: 2px solid #00A6B3;
-                            border-radius: 8px;
-                            background: #EFFBFC;
-                        }
-                        DragDropArea:hover {
-                            border-color: #00A6B3;
-                            background: #EFFBFC;
-                        }
-                    """)
-                    return
+        mime_data = event.mimeData()
+        if self._accepts_mime_data(mime_data):
+            event.acceptProposedAction()
+            self._set_drag_active_style()
+            return
         event.ignore()
+
+    def dragMoveEvent(self, event):
+        if self._accepts_mime_data(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def _accepts_mime_data(self, mime_data) -> bool:
+        if not mime_data.hasUrls():
+            return False
+        urls = mime_data.urls()
+        if not urls:
+            return False
+        return any(
+            _is_supported_preview_source(url.toLocalFile())
+            for url in urls
+            if url.toLocalFile()
+        )
+
+    def _set_drag_active_style(self):
+        self.setStyleSheet("""
+            DragDropArea {
+                border: 2px solid #00A6B3;
+                border-radius: 8px;
+                background: #EFFBFC;
+            }
+            DragDropArea:hover {
+                border-color: #00A6B3;
+                background: #EFFBFC;
+            }
+        """)
 
     def dragLeaveEvent(self, event):
         """拖拽离开事件"""
@@ -252,11 +374,17 @@ class DragDropArea(QFrame):
 
     def dropEvent(self, event: QDropEvent):
         """文件拖拽事件"""
-        urls = event.mimeData().urls()
-        if urls and len(urls) == 1:
-            file_path = urls[0].toLocalFile()
-            if _is_supported_preview_source(file_path) and os.path.exists(file_path):
-                self.fileDropped.emit(file_path)
+        mime_data = event.mimeData()
+        urls = mime_data.urls()
+        if urls:
+            emitted = False
+            for url in urls:
+                file_path = url.toLocalFile()
+                if _is_supported_preview_source(file_path) and os.path.exists(file_path):
+                    self.fileDropped.emit(file_path)
+                    emitted = True
+                    break
+            if emitted:
                 event.acceptProposedAction()
 
         # 恢复样式
@@ -284,6 +412,45 @@ class DragDropArea(QFrame):
                     duration=2500,
                     parent=self
                 )
+
+
+class PreviewPathLineEdit(LineEdit):
+    pathsDropped = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if self._accepts(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if self._accepts(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: QDropEvent):
+        urls = event.mimeData().urls() if event.mimeData().hasUrls() else []
+        for url in urls:
+            path = url.toLocalFile()
+            if path and os.path.exists(path) and _is_supported_preview_source(path):
+                self.pathsDropped.emit(path)
+                event.acceptProposedAction()
+                return
+        event.ignore()
+
+    def _accepts(self, event) -> bool:
+        mime = event.mimeData()
+        if not mime.hasUrls():
+            return False
+        return any(
+            path and os.path.exists(path) and _is_supported_preview_source(path)
+            for path in (url.toLocalFile() for url in mime.urls())
+        )
 
 
 class UnityTexturePreviewThread(QThread):
@@ -314,13 +481,14 @@ class ArchivePreviewImportThread(QThread):
         super().__init__(parent)
         self.archive_path = archive_path
         self.temp_root = temp_root
+        self.extractor_path = SettingsManager().get_archive_extractor_path()
 
     def run(self):
         temp_dir = ""
         try:
             os.makedirs(self.temp_root, exist_ok=True)
             temp_dir = tempfile.mkdtemp(prefix="lpk_preview_archive_", dir=self.temp_root)
-            _safe_extract_zip(self.archive_path, temp_dir)
+            _safe_extract_archive(self.archive_path, temp_dir, self.extractor_path)
             self.archiveReady.emit(temp_dir, self.archive_path)
         except Exception as exc:
             if temp_dir:
@@ -720,6 +888,14 @@ class Live2DSettingsPanel(QFrame):
         size_layout.addWidget(self.height_spinbox, 1, 3)
 
         layout.addLayout(size_layout)
+        for widget in (
+            self.window_size_label,
+            self.width_label,
+            self.width_spinbox,
+            self.height_label,
+            self.height_spinbox,
+        ):
+            widget.setVisible(False)
 
         # 模型透明度
         opacity_layout = QHBoxLayout()
@@ -1104,11 +1280,16 @@ class PreviewPage(QFrame):
         self.preview_dock_layout = None
         self.preview_placeholder = None
         self.motion_group_title = None
+        self.motion_group = None
         self.motion_combo = None
         self.play_motion_btn = None
         self.motion_hint_label = None
         self._motion_items = []
         self.drag_drop_area = None
+        self.source_label = None
+        self.source_edit = None
+        self.source_file_btn = None
+        self.source_folder_btn = None
         self.title_label = None
         self.main_layout = None
         self.current_model_path = None
@@ -1184,10 +1365,32 @@ class PreviewPage(QFrame):
         left_layout.setContentsMargins(0, 10, 12, 0)
         left_layout.setSpacing(12)
 
-        # 拖拽区域
-        self.drag_drop_area = DragDropArea(self)
-        self.drag_drop_area.fileDropped.connect(self.on_file_dropped)
-        left_layout.addWidget(self.drag_drop_area)
+        import_card = CardWidget(self)
+        import_layout = QVBoxLayout(import_card)
+        import_layout.setContentsMargins(12, 12, 12, 12)
+        import_layout.setSpacing(8)
+
+        import_label = BodyLabel("", import_card)
+        import_label.setObjectName("previewSourceLabel")
+        import_layout.addWidget(import_label)
+        self.source_label = import_label
+
+        source_row = QHBoxLayout()
+        source_row.setSpacing(8)
+        self.source_edit = PreviewPathLineEdit(import_card)
+        self.source_edit.setReadOnly(True)
+        self.source_edit.pathsDropped.connect(self.on_file_dropped)
+        self.source_file_btn = PushButton("", import_card)
+        self.source_file_btn.setIcon(FluentIcon.FOLDER)
+        self.source_file_btn.clicked.connect(self.browse_preview_file)
+        self.source_folder_btn = PushButton("", import_card)
+        self.source_folder_btn.setIcon(FluentIcon.FOLDER_ADD)
+        self.source_folder_btn.clicked.connect(self.browse_preview_folder)
+        source_row.addWidget(self.source_edit, 1)
+        source_row.addWidget(self.source_file_btn)
+        source_row.addWidget(self.source_folder_btn)
+        import_layout.addLayout(source_row)
+        left_layout.addWidget(import_card)
 
         # 当前模型信息
         self.model_info_text_box = TextBrowser(self)
@@ -1205,26 +1408,27 @@ class PreviewPage(QFrame):
 
         left_layout.addWidget(self.model_info_text_box)
 
-        motion_group = CardWidget(self)
-        motion_layout = QVBoxLayout(motion_group)
+        self.motion_group = CardWidget(self)
+        self.motion_group.setVisible(False)
+        motion_layout = QVBoxLayout(self.motion_group)
         motion_layout.setContentsMargins(12, 12, 12, 12)
         motion_layout.setSpacing(8)
-        self.motion_group_title = SubtitleLabel("", motion_group)
+        self.motion_group_title = SubtitleLabel("", self.motion_group)
         motion_layout.addWidget(self.motion_group_title)
         motion_row = QHBoxLayout()
         motion_row.setSpacing(8)
-        self.motion_combo = ComboBox(motion_group)
+        self.motion_combo = ComboBox(self.motion_group)
         self.motion_combo.setMinimumWidth(180)
-        self.play_motion_btn = PushButton("", motion_group)
+        self.play_motion_btn = PushButton("", self.motion_group)
         self.play_motion_btn.setIcon(FluentIcon.PLAY)
         self.play_motion_btn.clicked.connect(self.play_selected_motion)
         motion_row.addWidget(self.motion_combo, 1)
         motion_row.addWidget(self.play_motion_btn)
         motion_layout.addLayout(motion_row)
-        self.motion_hint_label = BodyLabel("", motion_group)
+        self.motion_hint_label = BodyLabel("", self.motion_group)
         self.motion_hint_label.setWordWrap(True)
         motion_layout.addWidget(self.motion_hint_label)
-        left_layout.addWidget(motion_group)
+        left_layout.addWidget(self.motion_group)
 
         # 设置面板
         self.settings_panel = Live2DSettingsPanel(self)
@@ -1362,6 +1566,14 @@ class PreviewPage(QFrame):
 
     def retranslate_ui(self):
         self.title_label.setText(tr("preview.title"))
+        if getattr(self, "source_label", None):
+            self.source_label.setText(tr("preview.source_label"))
+        if self.source_edit:
+            self.source_edit.setPlaceholderText(tr("preview.source_placeholder"))
+        if self.source_file_btn:
+            self.source_file_btn.setText(tr("preview.browse_files"))
+        if self.source_folder_btn:
+            self.source_folder_btn.setText(tr("preview.browse_folder"))
         if self.preview_stage_title:
             self.preview_stage_title.setText(tr("preview.stage_title"))
         if self.preview_placeholder:
@@ -1394,6 +1606,24 @@ class PreviewPage(QFrame):
             self.motion_combo.addItem(tr("preview.motion_none"))
             self.motion_combo.setEnabled(False)
             self.play_motion_btn.setEnabled(False)
+
+    def browse_preview_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            tr("dialog.select_live2d_model_file"),
+            "",
+            tr("dialog.filter_preview_sources"),
+        )
+        if file_path:
+            self.on_file_dropped(file_path)
+
+    def browse_preview_folder(self):
+        folder_path = QFileDialog.getExistingDirectory(
+            self,
+            tr("dialog.select_package_folder"),
+        )
+        if folder_path:
+            self.on_file_dropped(folder_path)
 
     # 新增：预览按钮点击（带冷却）
     def _on_preview_clicked(self):
@@ -1475,6 +1705,7 @@ class PreviewPage(QFrame):
     @staticmethod
     def _serialize_preview_settings(settings: dict) -> dict:
         serialized = dict(settings or {})
+        serialized["fit_to_dock"] = True
         bg_color = serialized.get("bg_color")
         if isinstance(bg_color, QColor):
             serialized["bg_color"] = bg_color.name()
@@ -1528,7 +1759,7 @@ class PreviewPage(QFrame):
         try:
             origin = self.preview_dock_area.mapToGlobal(QPoint(0, 0))
             rect = self.preview_dock_area.rect()
-            margin = 4
+            margin = 0
             return {
                 "x": int(origin.x() + margin),
                 "y": int(origin.y() + margin),
@@ -1555,6 +1786,7 @@ class PreviewPage(QFrame):
         if self._preview_dock_timer is not None:
             self._preview_dock_timer.stop()
         self._last_preview_dock_rect = None
+        self._set_motion_debug_visible(False)
         if process is None:
             return
         try:
@@ -1586,6 +1818,7 @@ class PreviewPage(QFrame):
         if self._preview_dock_timer is not None:
             self._preview_dock_timer.stop()
         self._last_preview_dock_rect = None
+        self._set_motion_debug_visible(False)
 
     def _show_stage_placeholder(self, text: str | None = None):
         if self.image_preview_panel:
@@ -1690,6 +1923,10 @@ class PreviewPage(QFrame):
         self.motion_combo.setEnabled(True)
         self.play_motion_btn.setEnabled(True)
 
+    def _set_motion_debug_visible(self, visible: bool):
+        if self.motion_group:
+            self.motion_group.setVisible(bool(visible))
+
     def play_selected_motion(self):
         if not self._motion_items or not self.motion_combo:
             return
@@ -1744,6 +1981,9 @@ class PreviewPage(QFrame):
 
     def on_file_dropped(self, file_path):
         """处理文件拖拽"""
+        if self.source_edit:
+            self.source_edit.setText(file_path)
+            self.source_edit.setCursorPosition(0)
         if not os.path.exists(file_path):
             self.show_error(
                 tr("preview.file_not_found_title"),
@@ -1800,6 +2040,7 @@ class PreviewPage(QFrame):
         self._cleanup_archive_preview_temp_dirs()
         self.current_model_path = None
         self.preview_btn.setEnabled(False)
+        self._set_motion_debug_visible(False)
         if self.image_preview_panel:
             self.image_preview_panel.clear()
         self._show_stage_placeholder(tr("preview.stage_loading"))
@@ -1817,6 +2058,9 @@ class PreviewPage(QFrame):
 
     def on_archive_preview_ready(self, temp_dir: str, source_path: str):
         self._archive_preview_temp_dirs.append(temp_dir)
+        self._preview_from_temp_directory(temp_dir, source_path)
+
+    def _preview_from_temp_directory(self, temp_dir: str, source_path: str):
 
         try:
             result = prepare_preview_import(temp_dir, self.settings_manager.get_temp_dir())
@@ -1850,6 +2094,7 @@ class PreviewPage(QFrame):
         self._cleanup_archive_preview_temp_dirs()
         self._show_stage_placeholder(tr("preview.stage_loading"))
         self.current_model_path = None
+        self._set_motion_debug_visible(False)
         self.preview_btn.setEnabled(False)
         self.model_info_text_box.setMarkdown(
             tr("preview.model_import_loading", source=source_path)
@@ -1916,6 +2161,7 @@ class PreviewPage(QFrame):
             self._cleanup_image_preview_temp_dirs()
             self._cleanup_archive_preview_temp_dirs()
         self.current_model_path = None
+        self._set_motion_debug_visible(False)
         self.preview_btn.setEnabled(False)
         if self.image_preview_panel:
             self.image_preview_panel.load_images(image_paths)
@@ -1956,6 +2202,7 @@ class PreviewPage(QFrame):
         if not keep_archive_dirs:
             self._cleanup_archive_preview_temp_dirs()
         self.current_model_path = None
+        self._set_motion_debug_visible(False)
         self.preview_btn.setEnabled(False)
         if self.image_preview_panel:
             self.image_preview_panel.clear()
@@ -2030,10 +2277,12 @@ class PreviewPage(QFrame):
                 self._preview_process_poll_timer.start()
             if self._preview_dock_timer is not None:
                 self._preview_dock_timer.start()
+            self._set_motion_debug_visible(True)
             self._show_stage_placeholder(tr("preview.external_running"))
             return True
         except Exception as exc:
             self._terminate_preview_process()
+            self._set_motion_debug_visible(False)
             self._show_stage_placeholder(tr("preview.stage_empty"))
             self.show_error(
                 tr("common.error"),
@@ -2050,6 +2299,7 @@ class PreviewPage(QFrame):
         """关闭独立预览进程"""
         self._terminate_preview_process()
         self._populate_motion_controls([])
+        self._set_motion_debug_visible(False)
         self._clear_preview_export_payload()
         self._show_stage_placeholder()
 

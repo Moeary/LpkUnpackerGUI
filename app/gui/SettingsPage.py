@@ -51,6 +51,11 @@ class SettingsPage(QFrame):
         self.output_root_desc = None
         self.output_root_edit = None
         self.output_root_button = None
+        self.archive_tool_label = None
+        self.archive_tool_desc = None
+        self.archive_tool_edit = None
+        self.archive_tool_button = None
+        self.archive_tool_auto_button = None
         self.setting_file_note = None
 
         self.setup_ui()
@@ -158,6 +163,31 @@ class SettingsPage(QFrame):
         output_row.addWidget(self.output_root_button)
         runtime_layout.addLayout(output_row)
 
+        archive_tool_row = QHBoxLayout()
+        archive_tool_row.setSpacing(12)
+
+        archive_tool_text_layout = QVBoxLayout()
+        archive_tool_text_layout.setSpacing(4)
+        self.archive_tool_label = BodyLabel("", runtime_card)
+        self.archive_tool_desc = CaptionLabel("", runtime_card)
+        self.archive_tool_desc.setWordWrap(True)
+        archive_tool_text_layout.addWidget(self.archive_tool_label)
+        archive_tool_text_layout.addWidget(self.archive_tool_desc)
+
+        self.archive_tool_edit = LineEdit(runtime_card)
+        self.archive_tool_edit.editingFinished.connect(self.on_archive_tool_edit_finished)
+        self.archive_tool_button = PushButton("", runtime_card)
+        self.archive_tool_button.setIcon(FluentIcon.FOLDER)
+        self.archive_tool_button.clicked.connect(self.browse_archive_tool)
+        self.archive_tool_auto_button = PushButton("", runtime_card)
+        self.archive_tool_auto_button.clicked.connect(self.clear_archive_tool)
+
+        archive_tool_row.addLayout(archive_tool_text_layout, 1)
+        archive_tool_row.addWidget(self.archive_tool_edit, 2)
+        archive_tool_row.addWidget(self.archive_tool_button)
+        archive_tool_row.addWidget(self.archive_tool_auto_button)
+        runtime_layout.addLayout(archive_tool_row)
+
         self.setting_file_note = CaptionLabel("", runtime_card)
         self.setting_file_note.setWordWrap(True)
         runtime_layout.addWidget(self.setting_file_note)
@@ -178,6 +208,8 @@ class SettingsPage(QFrame):
 
             if self.output_root_edit:
                 self.output_root_edit.setText(self.settings_manager.get_output_root())
+            if self.archive_tool_edit:
+                self.archive_tool_edit.setText(self.settings_manager.get_archive_extractor_path())
         finally:
             self._syncing_ui = False
 
@@ -224,6 +256,11 @@ class SettingsPage(QFrame):
             self.output_root_desc.setText(tr("settings.output_root_desc"))
             self.output_root_button.setText(tr("common.browse"))
             self.output_root_edit.setText(self.settings_manager.get_output_root())
+            self.archive_tool_label.setText(tr("settings.archive_tool_label"))
+            self.archive_tool_desc.setText(tr("settings.archive_tool_desc"))
+            self.archive_tool_edit.setPlaceholderText(tr("settings.archive_tool_placeholder"))
+            self.archive_tool_button.setText(tr("common.browse"))
+            self.archive_tool_auto_button.setText(tr("settings.archive_tool_auto"))
             self.setting_file_note.setText(
                 tr("settings.setting_file_note", path=self.settings_manager.settings_file)
             )
@@ -287,6 +324,39 @@ class SettingsPage(QFrame):
         InfoBar.success(
             title=tr("common.success"),
             content=tr("settings.output_root_saved"),
+            orient=Qt.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP,
+            duration=2500,
+            parent=self,
+        )
+
+    def browse_archive_tool(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            tr("settings.archive_tool_select"),
+            self.archive_tool_edit.text() or "",
+            tr("settings.archive_tool_filter"),
+        )
+        if not path:
+            return
+        self.archive_tool_edit.setText(path)
+        self.save_archive_tool(path)
+
+    def clear_archive_tool(self):
+        self.archive_tool_edit.clear()
+        self.save_archive_tool("")
+
+    def on_archive_tool_edit_finished(self):
+        if self._syncing_ui:
+            return
+        self.save_archive_tool(self.archive_tool_edit.text())
+
+    def save_archive_tool(self, path: str):
+        self.settings_manager.set_archive_extractor_path(path)
+        InfoBar.success(
+            title=tr("common.success"),
+            content=tr("settings.archive_tool_saved"),
             orient=Qt.Horizontal,
             isClosable=True,
             position=InfoBarPosition.TOP,

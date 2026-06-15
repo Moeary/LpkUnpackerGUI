@@ -54,12 +54,15 @@ def extract_lpk_full(
 ) -> ExtractItemResult:
     output_dir.mkdir(parents=True, exist_ok=True)
     loader = LpkLoader(str(lpk_path), str(config_path) if config_path else None)
-    loader.extract(str(output_dir))
+    created_dirs = loader.extract(str(output_dir)) or []
+    result_output_dir = output_dir
+    if len(created_dirs) == 1:
+        result_output_dir = Path(created_dirs[0])
     return ExtractItemResult(
         source=lpk_path,
         source_type=ExtractSourceType.LPK,
         success=True,
-        output_dir=output_dir,
+        output_dir=result_output_dir,
         exported_count=1,
         message=f"Extracted LPK: {lpk_path.name}",
     )
