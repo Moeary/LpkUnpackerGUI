@@ -589,166 +589,748 @@ class ModelPreviewImportThread(QThread):
             self.failed.emit(str(exc), self.source_path)
 
 
+class FolderPreviewScanThread(QThread):
+    itemFound = Signal(dict)
+    scanFinished = Signal(int, bool, str)
+    failed = Signal(str, str)
+
+    def __init__(self, source_path: str, temp_root: str, image_limit: int = 48, parent=None):
+        super().__init__(parent)
+        self.source_path = source_path
+        self.temp_root = temp_root
+        self.image_limit = max(1, int(image_limit or 48))
+        self.extractor_path = SettingsManager().get_archive_extractor_path()
+        self._image_count = 0
+        self._limited = False
+        self._emitted_paths = set()
+        self._temp_dirs = []
+
+    def run(self):
+        try:
+            source = os.path.abspath(self.source_path)
+            os.makedirs(self.temp_root, exist_ok=True)
+            count = 0
+
+            for item in self._iter_direct_model_items(source):
+                if self.isInterruptionRequested():
+                    return
+                self.itemFound.emit(item)
+                count += 1
+
+            for item in self._iter_folder_items(source):
+                if self.isInterruptionRequested():
+                    return
+                self.itemFound.emit(item)
+                count += 1
+
+            self.scanFinished.emit(count, self._limited, source)
+        except Exception as exc:
+            self.failed.emit(str(exc), self.source_path)
+
+    def _iter_direct_model_items(self, source: str):
+        if os.path.isfile(source):
+            candidates = [source] if _is_model_json(source) else []
+        else:
+            candidates = self._iter_model_json_files(source)
+        for candidate in candidates:
+            if self.isInterruptionRequested():
+                return
+            path = os.path.abspath(str(candidate))
+            if path in self._emitted_paths:
+                continue
+            try:
+                package = resolve_live2d_package(path)
+            except Exception:
+                continue
+            self._emitted_paths.add(path)
+            yield {
+                "kind": "model",
+                "path": path,
+                "source_path": path,
+                "source_dir": str(package.root_dir),
+                "label": package.name,
+                "detail": os.path.relpath(path, source),
+            }
+
+    def _iter_model_json_files(self, source: str):
+        for root, dirs, filenames in os.walk(source):
+            if self.isInterruptionRequested():
+                return
+            dirs.sort()
+            for filename in sorted(filenames):
+                if _is_model_json(filename):
+                    yield os.path.join(root, filename)
+
+    def _iter_folder_items(self, source: str):
+        for root, dirs, filenames in os.walk(source):
+            if self.isInterruptionRequested():
+                return
+            dirs.sort()
+            for filename in sorted(filenames):
+                if self.isInterruptionRequested():
+                    return
+                path = os.path.join(root, filename)
+                suffix = os.path.splitext(filename)[1].lower()
+
+                if suffix in IMAGE_PREVIEW_EXTENSIONS:
+                    item = self._image_item(path, source)
+                    if item:
+                        yield item
+                    continue
+
+                if _is_model_json(path):
+                    continue
+
+                if suffix in PACKAGE_PREVIEW_EXTENSIONS:
+                    for item in self._items_from_package(path, source):
+                        yield item
+                    continue
+
+                if _is_archive_preview_source(path):
+                    if self._image_count >= self.image_limit:
+                        self._limited = True
+                        continue
+                    for item in self._items_from_archive(path, source):
+                        yield item
+                    continue
+
+                if _is_unity_preview_source(path):
+                    if self._image_count >= self.image_limit:
+                        self._limited = True
+                        continue
+                    for item in self._items_from_unity(path, source):
+                        yield item
+
+    def _image_item(self, path: str, source: str):
+        if self._image_count >= self.image_limit:
+            self._limited = True
+            return None
+        abs_path = os.path.abspath(path)
+        if abs_path in self._emitted_paths:
+            return None
+        self._emitted_paths.add(abs_path)
+        self._image_count += 1
+        if self._image_count >= self.image_limit:
+            self._limited = True
+        return {
+            "kind": "image",
+            "path": abs_path,
+            "source_path": source,
+            "source_dir": source,
+            "label": os.path.basename(abs_path),
+            "detail": os.path.relpath(abs_path, source),
+        }
+
+    def _items_from_package(self, path: str, source: str):
+        try:
+            result = prepare_preview_import(path, self.temp_root)
+        except Exception:
+            return
+        temp_dir = str(result.temp_dir or "")
+        if temp_dir:
+            self._temp_dirs.append(temp_dir)
+        preview_path = os.path.abspath(str(result.preview_model_json))
+        if preview_path in self._emitted_paths:
+            return
+        self._emitted_paths.add(preview_path)
+        yield {
+            "kind": "model",
+            "path": preview_path,
+            "prepared_model_json": preview_path,
+            "source_path": os.path.abspath(path),
+            "source_dir": str(result.package.root_dir),
+            "temp_dir": temp_dir,
+            "label": result.package.name,
+            "detail": os.path.relpath(path, source),
+        }
+
+    def _items_from_archive(self, path: str, source: str):
+        temp_dir = tempfile.mkdtemp(prefix="lpk_preview_folder_archive_", dir=self.temp_root)
+        self._temp_dirs.append(temp_dir)
+        try:
+            _safe_extract_archive(path, temp_dir, self.extractor_path)
+        except Exception:
+            return
+
+        for item in self._iter_direct_model_items(temp_dir):
+            item["source_path"] = item.get("path")
+            item["temp_dir"] = temp_dir
+            item["detail"] = os.path.relpath(path, source)
+            yield item
+
+        if self._image_count >= self.image_limit:
+            self._limited = True
+            return
+
+        for image in _collect_preview_images(temp_dir, self.image_limit - self._image_count):
+            item = self._image_item(image, temp_dir)
+            if item:
+                item["source_path"] = os.path.abspath(path)
+                item["source_dir"] = temp_dir
+                item["temp_dir"] = temp_dir
+                item["detail"] = os.path.join(os.path.relpath(path, source), os.path.relpath(image, temp_dir))
+                yield item
+
+    def _items_from_unity(self, path: str, source: str):
+        try:
+            result = prepare_preview_import(path, self.temp_root)
+            temp_dir = str(result.temp_dir or "")
+            if temp_dir:
+                self._temp_dirs.append(temp_dir)
+            preview_path = os.path.abspath(str(result.preview_model_json))
+            if preview_path not in self._emitted_paths:
+                self._emitted_paths.add(preview_path)
+                yield {
+                    "kind": "model",
+                    "path": preview_path,
+                    "prepared_model_json": preview_path,
+                    "source_path": os.path.abspath(path),
+                    "source_dir": str(result.package.root_dir),
+                    "temp_dir": temp_dir,
+                    "label": result.package.name,
+                    "detail": os.path.relpath(path, source),
+                }
+            return
+        except Exception:
+            pass
+
+        if self._image_count >= self.image_limit:
+            self._limited = True
+            return
+        temp_dir = tempfile.mkdtemp(prefix="lpk_preview_folder_unity_", dir=self.temp_root)
+        self._temp_dirs.append(temp_dir)
+        try:
+            result = AssetStudioCLI().export_textures(path, temp_dir)
+            images = [str(item) for item in result.exported_files] or _collect_preview_images(temp_dir)
+        except Exception:
+            return
+        remaining = max(0, self.image_limit - self._image_count)
+        for image in images[:remaining]:
+            item = self._image_item(image, temp_dir)
+            if item:
+                item["source_path"] = os.path.abspath(path)
+                item["source_dir"] = temp_dir
+                item["temp_dir"] = temp_dir
+                item["detail"] = os.path.join(os.path.relpath(path, source), os.path.basename(image))
+                yield item
+
+    @property
+    def temp_dirs(self) -> list[str]:
+        return list(self._temp_dirs)
+
+
+class ImageZoomScrollArea(QScrollArea):
+    zoomRequested = Signal(float, QPoint)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.horizontalScrollBar().installEventFilter(self)
+        self.verticalScrollBar().installEventFilter(self)
+
+    def wheelEvent(self, event):
+        angle_delta = event.angleDelta().y()
+        pixel_delta = event.pixelDelta().y()
+        delta = angle_delta or pixel_delta
+        if delta:
+            steps = delta / (120.0 if angle_delta else 240.0)
+            self.zoomRequested.emit(1.25 ** steps, event.position().toPoint())
+        event.accept()
+
+    def eventFilter(self, watched, event):
+        if (
+            event.type() == QEvent.Type.Wheel
+            and watched in (self.horizontalScrollBar(), self.verticalScrollBar())
+        ):
+            event.accept()
+            return True
+        return super().eventFilter(watched, event)
+
+
 class ImagePreviewPanel(QFrame):
+    itemActivated = Signal(int)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._image_paths = []
+        self._preview_items = []
         self._current_index = 0
-        self._thumb_size = 168
-        self._last_columns = 0
+        self._thumb_size = 64
+        self._fit_to_window = True
+        self._zoom = 1.0
+        self._current_pixmap = QPixmap()
+        self._list_items = []
         self.title_label = BodyLabel("", self)
         self.main_image_label = QLabel(self)
+        self.image_scroll = ImageZoomScrollArea(self)
         self.path_label = BodyLabel("", self)
         self.prev_btn = PushButton("", self)
         self.next_btn = PushButton("", self)
-        self.grid_widget = QWidget(self)
-        self.grid_layout = QGridLayout(self.grid_widget)
-        self.grid_layout.setContentsMargins(4, 10, 4, 10)
-        self.grid_layout.setSpacing(12)
+        self.fit_btn = PushButton("", self)
+        self.actual_btn = PushButton("", self)
+        self.zoom_out_btn = PushButton("", self)
+        self.zoom_in_btn = PushButton("", self)
+        self.list_title_label = BodyLabel("", self)
+        self.limit_label = BodyLabel("", self)
+        self.list_widget = QWidget(self)
+        self.list_layout = QVBoxLayout(self.list_widget)
+        self.list_layout.setContentsMargins(6, 6, 6, 6)
+        self.list_layout.setSpacing(6)
 
-        scroll = QScrollArea(self)
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setWidget(self.grid_widget)
+        root_layout = QHBoxLayout(self)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(10)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
-        layout.addWidget(self.title_label)
+        preview_layout = QVBoxLayout()
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.setSpacing(8)
+        preview_layout.addWidget(self.title_label)
 
         self.main_image_label.setMinimumHeight(420)
         self.main_image_label.setAlignment(Qt.AlignCenter)
-        self.main_image_label.setStyleSheet("""
-            QLabel {
+        self.main_image_label.setStyleSheet("background: transparent; color: #68707D;")
+        self.image_scroll.setWidget(self.main_image_label)
+        self.image_scroll.setWidgetResizable(False)
+        self.image_scroll.setAlignment(Qt.AlignCenter)
+        self.image_scroll.setFrameShape(QFrame.NoFrame)
+        self.image_scroll.zoomRequested.connect(self.zoom_at_position)
+        self.image_scroll.setStyleSheet("""
+            QScrollArea {
                 border: 1px solid #DDE2EA;
                 border-radius: 8px;
                 background: #FFFFFF;
-                color: #68707D;
             }
         """)
-        layout.addWidget(self.main_image_label, 1)
+        preview_layout.addWidget(self.image_scroll, 1)
 
         nav_layout = QHBoxLayout()
+        nav_layout.setSpacing(6)
         self.prev_btn.setIcon(FluentIcon.LEFT_ARROW)
         self.prev_btn.clicked.connect(self.show_previous)
         self.next_btn.setIcon(FluentIcon.RIGHT_ARROW)
         self.next_btn.clicked.connect(self.show_next)
+        self.fit_btn.clicked.connect(self.fit_to_window)
+        self.actual_btn.clicked.connect(self.show_actual_size)
+        self.zoom_out_btn.clicked.connect(self.zoom_out)
+        self.zoom_in_btn.clicked.connect(self.zoom_in)
+        for button in (
+            self.prev_btn,
+            self.next_btn,
+            self.fit_btn,
+            self.actual_btn,
+            self.zoom_out_btn,
+            self.zoom_in_btn,
+        ):
+            button.setFixedHeight(32)
         self.path_label.setWordWrap(True)
         nav_layout.addWidget(self.prev_btn)
-        nav_layout.addWidget(self.path_label, 1)
         nav_layout.addWidget(self.next_btn)
-        layout.addLayout(nav_layout)
+        nav_layout.addWidget(self.fit_btn)
+        nav_layout.addWidget(self.actual_btn)
+        nav_layout.addWidget(self.zoom_out_btn)
+        nav_layout.addWidget(self.zoom_in_btn)
+        nav_layout.addWidget(self.path_label, 1)
+        preview_layout.addLayout(nav_layout)
 
-        scroll.setMaximumHeight(210)
-        layout.addWidget(scroll)
+        side_panel = QFrame(self)
+        side_panel.setObjectName("imagePreviewSidePanel")
+        side_panel.setMinimumWidth(210)
+        side_panel.setMaximumWidth(270)
+        side_panel.setStyleSheet("""
+            QFrame#imagePreviewSidePanel {
+                border: 1px solid #E3E6EA;
+                border-radius: 8px;
+                background: #FAFBFD;
+            }
+        """)
+        side_layout = QVBoxLayout(side_panel)
+        side_layout.setContentsMargins(10, 10, 10, 10)
+        side_layout.setSpacing(8)
+        self.limit_label.setWordWrap(True)
+        self.limit_label.setStyleSheet("color: #68707D;")
+        list_scroll = QScrollArea(side_panel)
+        list_scroll.setWidgetResizable(True)
+        list_scroll.setFrameShape(QFrame.NoFrame)
+        list_scroll.setWidget(self.list_widget)
+        side_layout.addWidget(self.list_title_label)
+        side_layout.addWidget(self.limit_label)
+        side_layout.addWidget(list_scroll, 1)
+
+        root_layout.addLayout(preview_layout, 1)
+        root_layout.addWidget(side_panel)
         self.setMinimumHeight(420)
+        self.retranslate_ui()
+
+    def retranslate_ui(self):
+        self.fit_btn.setText(tr("preview.image_fit"))
+        self.fit_btn.setToolTip(tr("preview.image_fit_tooltip"))
+        self.actual_btn.setText(tr("preview.image_actual"))
+        self.actual_btn.setToolTip(tr("preview.image_actual_tooltip"))
+        self.zoom_out_btn.setText("-")
+        self.zoom_out_btn.setToolTip(tr("preview.image_zoom_out_tooltip"))
+        self.zoom_in_btn.setText("+")
+        self.zoom_in_btn.setToolTip(tr("preview.image_zoom_in_tooltip"))
+        self.prev_btn.setToolTip(tr("preview.image_previous_tooltip"))
+        self.next_btn.setToolTip(tr("preview.image_next_tooltip"))
+        self.list_title_label.setText(tr("preview.preview_item_list_title"))
+        if self._preview_items:
+            self.title_label.setText(tr("preview.preview_item_title", count=len(self._preview_items)))
+            self.limit_label.setText(tr("preview.image_limited_note", count=len(self._image_paths)))
+            self._show_current_item()
 
     def load_images(self, image_paths: list[str]):
-        self._image_paths = list(image_paths)
-        self._current_index = 0
-        self.title_label.setText(tr("preview.image_preview_title", count=len(image_paths)))
-        self._populate_images()
-        self._show_current_image()
+        items = [
+            {
+                "kind": "image",
+                "path": path,
+                "source_path": path,
+                "source_dir": os.path.dirname(path),
+                "label": os.path.basename(path),
+                "detail": path,
+            }
+            for path in image_paths
+        ]
+        self.load_items(items)
 
-    def _column_count(self) -> int:
-        width = max(self.width(), self.grid_widget.width(), 720)
-        return max(2, min(7, width // (self._thumb_size + 18)))
+    def load_items(self, items: list[dict], current_index: int = 0):
+        self._preview_items = [dict(item) for item in (items or [])]
+        self._image_paths = [
+            str(item.get("path", ""))
+            for item in self._preview_items
+            if item.get("kind") == "image"
+        ]
+        self._current_index = max(0, min(current_index, len(self._preview_items) - 1)) if self._preview_items else 0
+        self._fit_to_window = True
+        self._zoom = 1.0
+        self.title_label.setText(tr("preview.preview_item_title", count=len(self._preview_items)))
+        self.limit_label.setVisible(len(self._image_paths) >= 48)
+        self.limit_label.setText(tr("preview.image_limited_note", count=len(self._image_paths)))
+        self._populate_items()
+        self._show_current_item()
 
-    def _populate_images(self):
-        self._clear_grid()
-        columns = self._column_count()
-        self._last_columns = columns
-        for index, path in enumerate(self._image_paths):
-            thumb = QLabel(self.grid_widget)
-            thumb.setFixedSize(self._thumb_size, self._thumb_size)
-            thumb.setAlignment(Qt.AlignCenter)
-            thumb.setToolTip(path)
-            thumb.setWordWrap(True)
-            thumb.setStyleSheet("""
-                QLabel {
-                    border: 1px solid #E3E6EA;
-                    border-radius: 8px;
-                    background: #FFFFFF;
-                    color: #30343B;
-                }
-            """)
-            pixmap = QPixmap(path)
+    def append_item(self, item: dict):
+        self._preview_items.append(dict(item))
+        if item.get("kind") == "image":
+            self._image_paths.append(str(item.get("path", "")))
+        self.title_label.setText(tr("preview.preview_item_title", count=len(self._preview_items)))
+        self.limit_label.setText(tr("preview.image_limited_note", count=len(self._image_paths)))
+        self._add_item_widget(len(self._preview_items) - 1, self._preview_items[-1])
+        self._update_list_styles()
+
+    def current_item(self) -> dict | None:
+        if not self._preview_items:
+            return None
+        if self._current_index < 0 or self._current_index >= len(self._preview_items):
+            return None
+        return self._preview_items[self._current_index]
+
+    def show_model_placeholder(self, text: str = ""):
+        self._current_pixmap = QPixmap()
+        self.main_image_label.setPixmap(QPixmap())
+        self.main_image_label.setText(text or tr("preview.model_stage_hint"))
+        self.main_image_label.adjustSize()
+
+    def preview_rect(self) -> dict | None:
+        try:
+            viewport = self.image_scroll.viewport()
+            origin = viewport.mapToGlobal(QPoint(0, 0))
+            rect = viewport.rect()
+            return {
+                "x": int(origin.x()),
+                "y": int(origin.y()),
+                "w": max(240, int(rect.width())),
+                "h": max(240, int(rect.height())),
+            }
+        except Exception:
+            return None
+
+    def is_model_item_selected(self) -> bool:
+        item = self.current_item()
+        return bool(item and item.get("kind") == "model")
+
+    def set_current_index(self, index: int, emit: bool = False):
+        if not self._preview_items:
+            return
+        self._current_index = max(0, min(index, len(self._preview_items) - 1))
+        self._fit_to_window = True
+        self._zoom = 1.0
+        self._show_current_item()
+        if emit:
+            self.itemActivated.emit(self._current_index)
+
+    def _populate_items(self):
+        self._clear_list()
+        for index, item in enumerate(self._preview_items):
+            self._add_item_widget(index, item)
+        self.list_layout.addStretch(1)
+        self._update_list_styles()
+
+    def _add_item_widget(self, index: int, item: dict):
+        frame = QFrame(self.list_widget)
+        frame.setObjectName("imagePreviewListItem")
+        frame.setToolTip(str(item.get("path") or item.get("source_path") or ""))
+        item_layout = QHBoxLayout(frame)
+        item_layout.setContentsMargins(6, 6, 6, 6)
+        item_layout.setSpacing(8)
+
+        thumb = QLabel(frame)
+        thumb.setFixedSize(self._thumb_size, self._thumb_size)
+        thumb.setAlignment(Qt.AlignCenter)
+        thumb.setStyleSheet("""
+            QLabel {
+                border: 1px solid #E3E6EA;
+                border-radius: 6px;
+                background: #FFFFFF;
+                color: #68707D;
+                font-weight: 600;
+            }
+        """)
+        if item.get("kind") == "model":
+            thumb.setText("L2D")
+        else:
+            image_path = str(item.get("path", ""))
+            pixmap = QPixmap(image_path)
             if pixmap.isNull():
-                thumb.setText(os.path.basename(path))
+                thumb.setText(os.path.splitext(os.path.basename(image_path))[1].lstrip(".").upper() or "?")
             else:
                 thumb.setPixmap(
                     pixmap.scaled(
-                        self._thumb_size - 12,
-                        self._thumb_size - 12,
+                        self._thumb_size - 8,
+                        self._thumb_size - 8,
                         Qt.KeepAspectRatio,
                         Qt.SmoothTransformation,
                     )
                 )
-            thumb.mousePressEvent = lambda _event, i=index: self.select_image(i)
-            self.grid_layout.addWidget(thumb, index // columns, index % columns)
-        self.grid_layout.setRowStretch((len(self._image_paths) // columns) + 1, 1)
+
+        text_box = QWidget(frame)
+        text_layout = QVBoxLayout(text_box)
+        text_layout.setContentsMargins(0, 0, 0, 0)
+        text_layout.setSpacing(2)
+        type_text = tr("preview.preview_item_model") if item.get("kind") == "model" else tr("preview.preview_item_image")
+        type_label = BodyLabel(type_text, text_box)
+        type_label.setStyleSheet("color: #00A6B3; font-weight: 600;")
+        name_label = BodyLabel(str(item.get("label") or os.path.basename(str(item.get("path", "")))), text_box)
+        name_label.setWordWrap(True)
+        detail = str(item.get("detail") or "")
+        detail_label = BodyLabel(detail, text_box)
+        detail_label.setWordWrap(True)
+        detail_label.setStyleSheet("color: #68707D;")
+        text_layout.addWidget(type_label)
+        text_layout.addWidget(name_label)
+        if detail:
+            text_layout.addWidget(detail_label)
+
+        item_layout.addWidget(thumb)
+        item_layout.addWidget(text_box, 1)
+        frame.mousePressEvent = lambda _event, i=index: self.select_image(i)
+        thumb.mousePressEvent = lambda _event, i=index: self.select_image(i)
+        text_box.mousePressEvent = lambda _event, i=index: self.select_image(i)
+
+        stretch_index = self.list_layout.count() - 1
+        last_item = self.list_layout.itemAt(stretch_index) if stretch_index >= 0 else None
+        if last_item and last_item.spacerItem():
+            self.list_layout.insertWidget(stretch_index, frame)
+        else:
+            self.list_layout.addWidget(frame)
+        self._list_items.append(frame)
+
+    def _populate_images(self):
+        self._populate_items()
 
     def clear(self):
         self._image_paths = []
+        self._preview_items = []
         self._current_index = 0
-        self._clear_grid()
+        self._fit_to_window = True
+        self._zoom = 1.0
+        self._current_pixmap = QPixmap()
+        self._clear_list()
         self.title_label.clear()
         self.path_label.clear()
+        self.limit_label.clear()
         self.main_image_label.clear()
 
-    def _clear_grid(self):
-        while self.grid_layout.count():
-            item = self.grid_layout.takeAt(0)
+    def _clear_list(self):
+        self._list_items = []
+        while self.list_layout.count():
+            item = self.list_layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if self._image_paths and self._column_count() != self._last_columns:
-            self._populate_images()
-        if self._image_paths:
-            self._show_current_image()
+        item = self.current_item()
+        if item and item.get("kind") == "image" and self._fit_to_window:
+            self._render_current_pixmap()
 
     def select_image(self, index: int):
-        if not self._image_paths:
+        if not self._preview_items:
             return
-        self._current_index = max(0, min(index, len(self._image_paths) - 1))
-        self._show_current_image()
+        self._current_index = max(0, min(index, len(self._preview_items) - 1))
+        self._fit_to_window = True
+        self._zoom = 1.0
+        self._show_current_item()
+        self.itemActivated.emit(self._current_index)
 
     def show_previous(self):
-        if not self._image_paths:
+        if not self._preview_items:
             return
-        self._current_index = (self._current_index - 1) % len(self._image_paths)
-        self._show_current_image()
+        self.select_image((self._current_index - 1) % len(self._preview_items))
 
     def show_next(self):
-        if not self._image_paths:
+        if not self._preview_items:
             return
-        self._current_index = (self._current_index + 1) % len(self._image_paths)
+        self.select_image((self._current_index + 1) % len(self._preview_items))
+
+    def fit_to_window(self):
+        if self._current_pixmap.isNull():
+            return
+        self._fit_to_window = True
+        self._render_current_pixmap()
+
+    def show_actual_size(self):
+        if self._current_pixmap.isNull():
+            return
+        self._fit_to_window = False
+        self._zoom = 1.0
+        self._render_current_pixmap()
+
+    def zoom_in(self):
+        self._set_zoom(self._displayed_zoom() * 1.25)
+
+    def zoom_out(self):
+        self._set_zoom(self._displayed_zoom() / 1.25)
+
+    def zoom_at_position(self, factor: float, viewport_pos: QPoint):
+        if self._current_pixmap.isNull() or factor <= 0:
+            return
+
+        label_pos = self.main_image_label.mapFrom(self.image_scroll.viewport(), viewport_pos)
+        old_width = max(1, self.main_image_label.width())
+        old_height = max(1, self.main_image_label.height())
+        rel_x = min(1.0, max(0.0, label_pos.x() / old_width))
+        rel_y = min(1.0, max(0.0, label_pos.y() / old_height))
+
+        self._set_zoom(self._displayed_zoom() * factor)
+
+        new_width = max(1, self.main_image_label.width())
+        new_height = max(1, self.main_image_label.height())
+        self.image_scroll.horizontalScrollBar().setValue(int(rel_x * new_width - viewport_pos.x()))
+        self.image_scroll.verticalScrollBar().setValue(int(rel_y * new_height - viewport_pos.y()))
+
+    def _set_zoom(self, zoom: float):
+        if self._current_pixmap.isNull():
+            return
+        self._fit_to_window = False
+        self._zoom = max(0.1, min(6.0, zoom))
+        self._render_current_pixmap()
+
+    def _displayed_zoom(self) -> float:
+        if self._current_pixmap.isNull():
+            return self._zoom
+        displayed_pixmap = self.main_image_label.pixmap()
+        if self._fit_to_window and displayed_pixmap is not None and not displayed_pixmap.isNull():
+            return displayed_pixmap.width() / max(1, self._current_pixmap.width())
+        return self._zoom
+
+    def _show_current_item(self):
+        item = self.current_item()
+        if not item:
+            self.main_image_label.setText("")
+            return
+        if item.get("kind") == "model":
+            self.path_label.setText(
+                tr(
+                    "preview.model_current_details",
+                    index=self._current_index + 1,
+                    total=len(self._preview_items),
+                    file=str(item.get("label") or os.path.basename(str(item.get("path", "")))),
+                )
+            )
+            self.show_model_placeholder()
+            self._update_list_styles()
+            return
         self._show_current_image()
 
     def _show_current_image(self):
-        if not self._image_paths:
+        item = self.current_item()
+        if not item or item.get("kind") != "image":
             self.main_image_label.setText("")
             return
-        path = self._image_paths[self._current_index]
-        pixmap = QPixmap(path)
-        self.path_label.setText(
-            f"{self._current_index + 1}/{len(self._image_paths)}  {path}"
-        )
-        if pixmap.isNull():
-            self.main_image_label.setText(os.path.basename(path))
+        path = str(item.get("path", ""))
+        filename = os.path.basename(path)
+        self._current_pixmap = QPixmap(path)
+        if self._current_pixmap.isNull():
+            self.path_label.setText(
+                tr(
+                    "preview.image_current_invalid",
+                    index=self._current_index + 1,
+                    total=len(self._preview_items),
+                    file=filename,
+                )
+            )
+            self.main_image_label.setPixmap(QPixmap())
+            self.main_image_label.setText(filename)
+            self.main_image_label.adjustSize()
+            self._update_list_styles()
             return
-        max_size = self.main_image_label.size()
-        self.main_image_label.setPixmap(
-            pixmap.scaled(
+
+        self.path_label.setText(
+            tr(
+                "preview.image_current_details",
+                index=self._current_index + 1,
+                total=len(self._preview_items),
+                width=self._current_pixmap.width(),
+                height=self._current_pixmap.height(),
+                file=filename,
+            )
+        )
+        self._render_current_pixmap()
+        self._update_list_styles()
+
+    def _render_current_pixmap(self):
+        if self._current_pixmap.isNull():
+            return
+        if self._fit_to_window:
+            max_size = self.image_scroll.viewport().size()
+            pixmap = self._current_pixmap.scaled(
                 max(1, max_size.width() - 24),
                 max(1, max_size.height() - 24),
                 Qt.KeepAspectRatio,
                 Qt.SmoothTransformation,
             )
-        )
+        else:
+            pixmap = self._current_pixmap.scaled(
+                max(1, int(self._current_pixmap.width() * self._zoom)),
+                max(1, int(self._current_pixmap.height() * self._zoom)),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+        self.main_image_label.setPixmap(pixmap)
+        self.main_image_label.resize(pixmap.size())
+
+    def _update_list_styles(self):
+        for index, item in enumerate(self._list_items):
+            if index == self._current_index:
+                item.setStyleSheet("""
+                    QFrame#imagePreviewListItem {
+                        border: 1px solid #00A6B3;
+                        border-radius: 8px;
+                        background: #EFFBFC;
+                    }
+                """)
+            else:
+                item.setStyleSheet("""
+                    QFrame#imagePreviewListItem {
+                        border: 1px solid transparent;
+                        border-radius: 8px;
+                        background: transparent;
+                    }
+                    QFrame#imagePreviewListItem:hover {
+                        border-color: #D0D7E2;
+                        background: #FFFFFF;
+                    }
+                """)
 
 
 class Live2DSettingsPanel(QFrame):
@@ -1290,6 +1872,8 @@ class PreviewPage(QFrame):
         self.source_edit = None
         self.source_file_btn = None
         self.source_folder_btn = None
+        self.image_limit_label = None
+        self.image_limit_spinbox = None
         self.title_label = None
         self.main_layout = None
         self.current_model_path = None
@@ -1311,6 +1895,10 @@ class PreviewPage(QFrame):
         self._image_preview_temp_dirs = []
         self._archive_preview_thread = None
         self._archive_preview_temp_dirs = []
+        self._folder_preview_thread = None
+        self._folder_preview_temp_dirs = []
+        self._preview_items = []
+        self._auto_selected_model_from_scan = False
         self._preview_export_thread = None
         self._preview_export_kind = None
         self._preview_export_source_dir = None
@@ -1330,6 +1918,7 @@ class PreviewPage(QFrame):
                 app.aboutToQuit.connect(self._cleanup_model_preview_temp_dirs)
                 app.aboutToQuit.connect(self._cleanup_image_preview_temp_dirs)
                 app.aboutToQuit.connect(self._cleanup_archive_preview_temp_dirs)
+                app.aboutToQuit.connect(self._cleanup_folder_preview_temp_dirs)
         except Exception:
             pass
 
@@ -1375,21 +1964,35 @@ class PreviewPage(QFrame):
         import_layout.addWidget(import_label)
         self.source_label = import_label
 
-        source_row = QHBoxLayout()
-        source_row.setSpacing(8)
         self.source_edit = PreviewPathLineEdit(import_card)
         self.source_edit.setReadOnly(True)
         self.source_edit.pathsDropped.connect(self.on_file_dropped)
+        self.source_edit.setMinimumHeight(34)
+        import_layout.addWidget(self.source_edit)
+
+        source_button_row = QHBoxLayout()
+        source_button_row.setSpacing(8)
         self.source_file_btn = PushButton("", import_card)
         self.source_file_btn.setIcon(FluentIcon.FOLDER)
         self.source_file_btn.clicked.connect(self.browse_preview_file)
         self.source_folder_btn = PushButton("", import_card)
         self.source_folder_btn.setIcon(FluentIcon.FOLDER_ADD)
         self.source_folder_btn.clicked.connect(self.browse_preview_folder)
-        source_row.addWidget(self.source_edit, 1)
-        source_row.addWidget(self.source_file_btn)
-        source_row.addWidget(self.source_folder_btn)
-        import_layout.addLayout(source_row)
+        source_button_row.addWidget(self.source_file_btn)
+        source_button_row.addWidget(self.source_folder_btn)
+        import_layout.addLayout(source_button_row)
+
+        image_limit_row = QHBoxLayout()
+        image_limit_row.setSpacing(8)
+        self.image_limit_label = BodyLabel("", import_card)
+        self.image_limit_spinbox = SpinBox(import_card)
+        self.image_limit_spinbox.setRange(1, 500)
+        self.image_limit_spinbox.setValue(int(self.settings_manager.get("preview.image_limit", 48) or 48))
+        self.image_limit_spinbox.valueChanged.connect(self.on_preview_image_limit_changed)
+        image_limit_row.addWidget(self.image_limit_label)
+        image_limit_row.addWidget(self.image_limit_spinbox)
+        image_limit_row.addStretch(1)
+        import_layout.addLayout(image_limit_row)
         left_layout.addWidget(import_card)
 
         # 当前模型信息
@@ -1532,6 +2135,7 @@ class PreviewPage(QFrame):
 
         self.image_preview_panel = ImagePreviewPanel(self.preview_dock_area)
         self.image_preview_panel.setVisible(False)
+        self.image_preview_panel.itemActivated.connect(self.on_preview_item_activated)
         self.preview_dock_layout.addWidget(self.image_preview_panel, 1)
         self.preview_stage_layout.addWidget(self.preview_dock_area, 1)
 
@@ -1574,6 +2178,8 @@ class PreviewPage(QFrame):
             self.source_file_btn.setText(tr("preview.browse_files"))
         if self.source_folder_btn:
             self.source_folder_btn.setText(tr("preview.browse_folder"))
+        if self.image_limit_label:
+            self.image_limit_label.setText(tr("preview.image_limit_label"))
         if self.preview_stage_title:
             self.preview_stage_title.setText(tr("preview.stage_title"))
         if self.preview_placeholder:
@@ -1591,6 +2197,8 @@ class PreviewPage(QFrame):
             self.play_motion_btn.setText(tr("preview.play_motion"))
         if self.motion_hint_label:
             self.motion_hint_label.setText(tr("preview.motion_hint"))
+        if self.image_preview_panel:
+            self.image_preview_panel.retranslate_ui()
 
         if hasattr(self, "drag_drop_area") and self.drag_drop_area:
             self.drag_drop_area.retranslate_ui()
@@ -1606,6 +2214,9 @@ class PreviewPage(QFrame):
             self.motion_combo.addItem(tr("preview.motion_none"))
             self.motion_combo.setEnabled(False)
             self.play_motion_btn.setEnabled(False)
+
+    def on_preview_image_limit_changed(self, value: int):
+        self.settings_manager.set("preview.image_limit", int(value))
 
     def browse_preview_file(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -1754,6 +2365,14 @@ class PreviewPage(QFrame):
             return False
 
     def _preview_dock_rect(self) -> dict | None:
+        if (
+            self.image_preview_panel is not None
+            and self.image_preview_panel.isVisible()
+            and self.image_preview_panel.is_model_item_selected()
+        ):
+            rect = self.image_preview_panel.preview_rect()
+            if rect:
+                return rect
         if self.preview_dock_area is None or not self.preview_dock_area.isVisible():
             return None
         try:
@@ -1979,6 +2598,15 @@ class PreviewPage(QFrame):
                 pass
         self._archive_preview_temp_dirs = []
 
+    def _cleanup_folder_preview_temp_dirs(self):
+        for temp_dir in list(self._folder_preview_temp_dirs):
+            try:
+                if temp_dir and os.path.isdir(temp_dir):
+                    shutil.rmtree(temp_dir)
+            except Exception:
+                pass
+        self._folder_preview_temp_dirs = []
+
     def on_file_dropped(self, file_path):
         """处理文件拖拽"""
         if self.source_edit:
@@ -2002,7 +2630,11 @@ class PreviewPage(QFrame):
             self.start_archive_preview_import(file_path)
             return
 
-        if _is_model_json(file_path) or os.path.isdir(file_path):
+        if os.path.isdir(file_path):
+            self.start_folder_preview_scan(file_path)
+            return
+
+        if _is_model_json(file_path):
             try:
                 resolve_live2d_package(file_path)
                 self.start_model_preview_import(file_path)
@@ -2017,7 +2649,7 @@ class PreviewPage(QFrame):
             self.start_model_preview_import(file_path)
             return
 
-        if _is_image_file(file_path) or os.path.isdir(file_path):
+        if _is_image_file(file_path):
             local_images = _collect_preview_images(file_path)
             if local_images:
                 self.load_image_preview(local_images, file_path, temporary=False)
@@ -2030,6 +2662,142 @@ class PreviewPage(QFrame):
         self.show_error(
             tr("preview.invalid_file_type_title"),
             tr("preview.invalid_file_type_content")
+        )
+
+    def start_folder_preview_scan(self, folder_path: str):
+        if self._folder_preview_thread is not None and self._folder_preview_thread.isRunning():
+            self._folder_preview_thread.requestInterruption()
+            self._folder_preview_thread.wait(300)
+        self.close_preview_window()
+        self._cleanup_temp_model_json()
+        self._cleanup_model_preview_temp_dirs()
+        self._cleanup_image_preview_temp_dirs()
+        self._cleanup_archive_preview_temp_dirs()
+        self._cleanup_folder_preview_temp_dirs()
+        self.current_model_path = None
+        self._preview_items = []
+        self._auto_selected_model_from_scan = False
+        self.preview_btn.setEnabled(False)
+        self._set_motion_debug_visible(False)
+        if self.image_preview_panel:
+            self.image_preview_panel.clear()
+            self.image_preview_panel.setVisible(True)
+        if self.preview_placeholder:
+            self.preview_placeholder.setVisible(False)
+        self.model_info_text_box.setMarkdown(
+            tr(
+                "preview.folder_scan_loading",
+                source=folder_path,
+                limit=self.current_preview_image_limit(),
+            )
+        )
+        self._folder_preview_thread = FolderPreviewScanThread(
+            folder_path,
+            self.settings_manager.get_temp_dir(),
+            self.current_preview_image_limit(),
+            self,
+        )
+        self._folder_preview_thread.itemFound.connect(self.on_folder_preview_item_found)
+        self._folder_preview_thread.scanFinished.connect(self.on_folder_preview_scan_finished)
+        self._folder_preview_thread.failed.connect(self.on_folder_preview_scan_failed)
+        self._folder_preview_thread.start()
+
+    def current_preview_image_limit(self) -> int:
+        if self.image_limit_spinbox:
+            return int(self.image_limit_spinbox.value())
+        return int(self.settings_manager.get("preview.image_limit", 48) or 48)
+
+    def on_folder_preview_item_found(self, item: dict):
+        self._preview_items.append(dict(item))
+        temp_dir = item.get("temp_dir")
+        if temp_dir and temp_dir not in self._folder_preview_temp_dirs:
+            self._folder_preview_temp_dirs.append(temp_dir)
+        if self.image_preview_panel:
+            self.image_preview_panel.append_item(item)
+            self.image_preview_panel.setVisible(True)
+
+        index = len(self._preview_items) - 1
+        if item.get("kind") == "model" and not self._auto_selected_model_from_scan:
+            self._auto_selected_model_from_scan = True
+            self.activate_preview_item(index)
+        elif item.get("kind") == "image" and not self._auto_selected_model_from_scan and len(self._preview_items) == 1:
+            self.activate_preview_item(index)
+
+    def on_folder_preview_scan_finished(self, count: int, limited: bool, source_path: str):
+        if self._folder_preview_thread is not None:
+            for temp_dir in self._folder_preview_thread.temp_dirs:
+                if temp_dir and temp_dir not in self._folder_preview_temp_dirs:
+                    self._folder_preview_temp_dirs.append(temp_dir)
+        self._folder_preview_thread = None
+        if count <= 0:
+            self._show_stage_placeholder(tr("preview.no_preview_items"))
+            self.model_info_text_box.setMarkdown(
+                tr("preview.folder_scan_empty", source=source_path)
+            )
+            return
+        note_key = "preview.folder_scan_limited" if limited else "preview.folder_scan_finished"
+        self.model_info_text_box.setMarkdown(
+            tr(
+                note_key,
+                source=source_path,
+                count=count,
+                limit=self.current_preview_image_limit(),
+            )
+        )
+
+    def on_folder_preview_scan_failed(self, error: str, source_path: str):
+        self._folder_preview_thread = None
+        self.show_error(
+            tr("preview.folder_scan_failed_title"),
+            tr("preview.folder_scan_failed_content", error=error),
+        )
+
+    def on_preview_item_activated(self, index: int):
+        self.activate_preview_item(index)
+
+    def activate_preview_item(self, index: int):
+        if index < 0 or index >= len(self._preview_items):
+            return
+        item = self._preview_items[index]
+        if self.image_preview_panel:
+            self.image_preview_panel.set_current_index(index, emit=False)
+            self.image_preview_panel.setVisible(True)
+        if self.preview_placeholder:
+            self.preview_placeholder.setVisible(False)
+        if item.get("kind") == "model":
+            self.activate_model_preview_item(item)
+        elif item.get("kind") == "image":
+            self.activate_image_preview_item(item)
+
+    def activate_model_preview_item(self, item: dict):
+        prepared = item.get("prepared_model_json")
+        if prepared and os.path.isfile(str(prepared)):
+            self.load_model_preview(str(prepared), str(item.get("source_path") or prepared))
+            return
+        source_path = str(item.get("source_path") or item.get("path") or "")
+        if source_path:
+            self.start_model_preview_import(source_path)
+
+    def activate_image_preview_item(self, item: dict):
+        self._terminate_preview_process()
+        self.current_model_path = None
+        self._set_motion_debug_visible(False)
+        self.preview_btn.setEnabled(False)
+        if self.preview_placeholder:
+            self.preview_placeholder.setVisible(False)
+        if self.image_preview_panel:
+            self.image_preview_panel.setVisible(True)
+        image_files = [
+            str(preview_item.get("path"))
+            for preview_item in self._preview_items
+            if preview_item.get("kind") == "image" and preview_item.get("path")
+        ]
+        source_dir = str(item.get("source_dir") or "")
+        self._set_preview_export_payload(
+            "textures",
+            source_dir=source_dir if source_dir and os.path.isdir(source_dir) else None,
+            files=image_files,
+            label=str(item.get("source_path") or item.get("path") or ""),
         )
 
     def start_archive_preview_import(self, archive_path: str):
@@ -2092,6 +2860,14 @@ class PreviewPage(QFrame):
         self._cleanup_model_preview_temp_dirs()
         self._cleanup_image_preview_temp_dirs()
         self._cleanup_archive_preview_temp_dirs()
+        preserve_items = any(
+            os.path.abspath(str(item.get("source_path") or item.get("path") or "")) == os.path.abspath(source_path)
+            for item in self._preview_items
+        )
+        if not preserve_items:
+            self._preview_items = []
+            if self.image_preview_panel:
+                self.image_preview_panel.clear()
         self._show_stage_placeholder(tr("preview.stage_loading"))
         self.current_model_path = None
         self._set_motion_debug_visible(False)
@@ -2126,15 +2902,29 @@ class PreviewPage(QFrame):
         self.current_model_path = os.path.abspath(model_json_path)
         self._temp_model_json_path = self.current_model_path
         self._cleanup_image_preview_temp_dirs()
-        if self.image_preview_panel:
-            self.image_preview_panel.setVisible(False)
 
         model_name = os.path.basename(self.current_model_path)
         model_dir = os.path.dirname(self.current_model_path)
+        if not self._preview_items:
+            self._preview_items = [{
+                "kind": "model",
+                "path": self.current_model_path,
+                "prepared_model_json": self.current_model_path,
+                "source_path": source_path or self.current_model_path,
+                "source_dir": model_dir,
+                "label": model_name,
+                "detail": model_dir,
+            }]
+            if self.image_preview_panel:
+                self.image_preview_panel.load_items(self._preview_items)
+        if self.image_preview_panel:
+            self.image_preview_panel.setVisible(True)
+            self.image_preview_panel.show_model_placeholder(tr("preview.stage_loading"))
+        if self.preview_placeholder:
+            self.preview_placeholder.setVisible(False)
         self.model_info_text_box.setMarkdown(
             tr("preview.model_info_loaded", file=model_name, directory=model_dir)
         )
-        self._show_stage_placeholder(tr("preview.stage_loading"))
         self._set_preview_export_payload(
             "live2d",
             source_dir=model_dir,
@@ -2163,8 +2953,19 @@ class PreviewPage(QFrame):
         self.current_model_path = None
         self._set_motion_debug_visible(False)
         self.preview_btn.setEnabled(False)
+        self._preview_items = [
+            {
+                "kind": "image",
+                "path": path,
+                "source_path": source_path,
+                "source_dir": source_path if os.path.isdir(source_path) else os.path.dirname(path),
+                "label": os.path.basename(path),
+                "detail": os.path.relpath(path, source_path) if os.path.isdir(source_path) else path,
+            }
+            for path in image_paths
+        ]
         if self.image_preview_panel:
-            self.image_preview_panel.load_images(image_paths)
+            self.image_preview_panel.load_items(self._preview_items)
         self._show_image_stage()
         export_label = self._pending_unity_preview_source_path or source_path
         self._set_preview_export_payload(
@@ -2278,7 +3079,11 @@ class PreviewPage(QFrame):
             if self._preview_dock_timer is not None:
                 self._preview_dock_timer.start()
             self._set_motion_debug_visible(True)
-            self._show_stage_placeholder(tr("preview.external_running"))
+            if self.preview_placeholder:
+                self.preview_placeholder.setVisible(False)
+            if self.image_preview_panel:
+                self.image_preview_panel.setVisible(True)
+                self.image_preview_panel.show_model_placeholder(tr("preview.external_running"))
             return True
         except Exception as exc:
             self._terminate_preview_process()

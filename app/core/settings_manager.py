@@ -54,6 +54,9 @@ class SettingsManager:
             "tools": {
                 "archive_extractor_path": "",
             },
+            "preview": {
+                "image_limit": 48,
+            },
             "window_geometry": {
                 "width": 1000,
                 "height": 700,
