@@ -119,7 +119,7 @@ Supported DLL discovery:
 3. packaged `tools/CubismCore/Live2DCubismCore.dll`
 4. development `app/tools/CubismCore/Live2DCubismCore.dll`
 
-The DLL is not bundled by release builds. See `docs/cubism-core-backend.md`.
+The DLL is not bundled by release builds. See `assets/docs/cubism-core-backend.md`.
 
 Remaining advanced options:
 

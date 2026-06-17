@@ -49,7 +49,7 @@ pixi install
 如果你需要使用GUI版本，使用如下的命令：
 
 ```
-pixi run dev
+pixi run start
 ```
 
 如果你需要使用命令行解包，可以使用以下命令:

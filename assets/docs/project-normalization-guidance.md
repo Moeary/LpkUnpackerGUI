@@ -22,7 +22,7 @@
 - `app/tools/*`：随包外部工具，目前包含 AssetStudioModCLI 和 CubismCore 开发占位。
 - `assets/live2d/*`：网页预览器静态资源与 vendor JS。
 - `scripts/*`：构建、发布、源码检查、Cubism drawable sidecar 导出等开发/维护脚本。
-- `docs/*`：已有构建、Cubism Core、PSD 重建管线等说明。
+- `assets/docs/*`：已有构建、Cubism Core、PSD 重建管线等说明。
 
 ## 目标边界
 
@@ -159,9 +159,9 @@ SourceInput -> ImportPlan -> Live2DPackage -> PreviewSession/PsdExport/EditSessi
 
 不建议把用户主流程依赖的功能只放在 `scripts` 中；如果 GUI 和 CLI 都要用，应下沉到 `core`。
 
-### `docs`
+### `assets/docs`
 
-`docs` 应承载产品边界、构建、第三方工具、技术限制、用户工作流说明：
+`assets/docs` 应承载产品边界、构建、第三方工具、技术限制、用户工作流说明：
 
 - 产品方向：本文。
 - 构建发布：`build-actions-guide.md`、`RELEASES.md`。
@@ -252,7 +252,7 @@ SourceInput -> ImportPlan -> Live2DPackage -> PreviewSession/PsdExport/EditSessi
 - 把 Steam 工坊扫描降级为解包页中的“扫描来源”入口。
 - 为 Web 预览增加模型挂载释放/过期机制。
 - 给解包、预览、PSD、魔改四个核心流程统一日志格式和错误提示。
-- 在 docs 中补充第三方工具和授权矩阵。
+- 在 `assets/docs` 中补充第三方工具和授权矩阵。
 
 ## 中期路线
 
@@ -282,7 +282,7 @@ SourceInput -> ImportPlan -> Live2DPackage -> PreviewSession/PsdExport/EditSessi
 - `EncryptionPage` 是占位功能，容易误导用户。
 - `core` 里同时存在业务、第三方工具封装、配置、Steam、PSD、Cubism 逻辑，缺少子域边界。
 - AssetStudio/Cubism Core 工具发现策略分散，授权和打包差异需要集中声明。
-- 构建脚本目前只明确包含 AssetStudioCLI，不包含 CubismCore；这是合理策略，但需要在 UI 设置和 docs 中保持一致。
+- 构建脚本目前只明确包含 AssetStudioCLI，不包含 CubismCore；这是合理策略，但需要在 UI 设置和 `assets/docs` 中保持一致。
 
 ## 打包和第三方工具策略
 

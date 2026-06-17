@@ -6,7 +6,7 @@ channels = ["conda-forge"]
 platforms = ["win-64"]
 
 [tasks]
-dev = "python -m app.main"
+start = "python -m app.main"
 cli = "python -m app.cli"
 build = "python scripts/build_nuitka.py"
 build-gcc = "python scripts/build_nuitka.py --compiler mingw"
