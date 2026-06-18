@@ -43,6 +43,7 @@ from app.core.live2dviewer_mod_project import (
     save_project,
 )
 from app.core.model import resolve_live2d_package
+from app.core.model.importer import import_texture_source_to_workspace
 from app.core.settings_manager import SettingsManager
 from app.gui.Live2DPreviewPanel import Live2DPreviewPanel
 from app.i18n import get_i18n, tr
@@ -107,6 +108,41 @@ class ModGenerateThread(QThread):
             self.projectError.emit(str(exc))
 
 
+class ModSkinSourceImportThread(QThread):
+    progressUpdated = Signal(str)
+    importReady = Signal(object)
+    importError = Signal(str)
+
+    def __init__(self, source_path: str, skin_name: str, workspace_dir: str, temp_root: str):
+        super().__init__()
+        self.source_path = source_path
+        self.skin_name = skin_name
+        self.workspace_dir = workspace_dir
+        self.temp_root = temp_root
+
+    def run(self):
+        try:
+            result = import_texture_source_to_workspace(
+                self.source_path,
+                self.workspace_dir,
+                temp_root=self.temp_root,
+                log=lambda message: self.progressUpdated.emit(str(message)),
+                image_suffixes=SUPPORTED_IMAGE_SUFFIXES,
+            )
+            self.importReady.emit(
+                {
+                    "source": str(result.source),
+                    "skin_name": self.skin_name,
+                    "workspace_dir": str(result.workspace_dir or ""),
+                    "model_json": str(result.model_json or ""),
+                    "texture_paths": [str(path) for path in result.texture_paths],
+                    "warnings": result.warnings,
+                }
+            )
+        except Exception as exc:
+            self.importError.emit(str(exc))
+
+
 class Live2DModPage(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -119,6 +155,7 @@ class Live2DModPage(QFrame):
         self.selected_source = ""
         self.project_worker: ModProjectImportThread | None = None
         self.generate_worker: ModGenerateThread | None = None
+        self.skin_import_worker: ModSkinSourceImportThread | None = None
         self._project_combo_refreshing = False
         self._hitarea_combo_refreshing = False
         self._skin_table_refreshing = False
@@ -338,11 +375,14 @@ class Live2DModPage(QFrame):
         self.texture_target_combo = ComboBox(self.texture_frame)
         self.add_texture_button = PushButton("", self.texture_frame)
         self.add_texture_button.clicked.connect(self.add_texture_replacement)
+        self.remove_texture_button = PushButton("", self.texture_frame)
+        self.remove_texture_button.clicked.connect(self.remove_selected_texture_replacement)
         self.texture_header_layout.addWidget(self.texture_title_label)
         self.texture_header_layout.addStretch(1)
         self.texture_header_layout.addWidget(self.texture_target_label)
         self.texture_header_layout.addWidget(self.texture_target_combo, 1)
         self.texture_header_layout.addWidget(self.add_texture_button)
+        self.texture_header_layout.addWidget(self.remove_texture_button)
         self.texture_layout.addLayout(self.texture_header_layout)
 
         self.texture_table = QTableWidget(self.texture_frame)
@@ -350,6 +390,7 @@ class Live2DModPage(QFrame):
         self.texture_table.verticalHeader().setVisible(False)
         self.texture_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.texture_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.texture_table.itemSelectionChanged.connect(self.update_texture_buttons)
         self.texture_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.texture_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.texture_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
@@ -412,6 +453,7 @@ class Live2DModPage(QFrame):
         self.texture_title_label.setText(tr("mod.texture.title"))
         self.texture_target_label.setText(tr("mod.texture.target"))
         self.add_texture_button.setText(tr("mod.texture.add"))
+        self.remove_texture_button.setText(tr("mod.texture.remove"))
         self.log_label.setText(tr("mod.log"))
         self.skin_table.setHorizontalHeaderLabels(
             [
@@ -451,20 +493,24 @@ class Live2DModPage(QFrame):
                 return
 
     def dropEvent(self, event: QDropEvent):
+        handled = False
         for url in event.mimeData().urls():
             path = url.toLocalFile()
             if not self._is_supported_drop_path(path):
                 continue
             if Path(path).is_file() and Path(path).name == PROJECT_FILE_NAME:
                 self.load_project_file(path)
-                event.acceptProposedAction()
-                return
+                handled = True
+                continue
             if self.current_project and self._is_image_path(path):
                 self.record_texture_replacement(path)
             elif self.current_project and self._is_supported_source_path(path):
                 self.record_skin_source(path)
             elif self._is_supported_source_path(path):
                 self.set_source(path)
+                self.create_project_from_current_source()
+            handled = True
+        if handled:
             event.acceptProposedAction()
             return
 
@@ -527,12 +573,13 @@ class Live2DModPage(QFrame):
         self.project_worker.progressUpdated.connect(self.append_log)
         self.project_worker.projectReady.connect(self.on_project_created)
         self.project_worker.projectError.connect(self.on_project_error)
-        self.project_worker.finished.connect(lambda: setattr(self, "project_worker", None))
+        self.project_worker.finished.connect(self.on_project_worker_finished)
         self.project_worker.start()
 
     def on_project_created(self, project: Live2DViewerModProject):
         self.set_busy(False)
         self.set_current_project(project)
+        self.load_preview_live2d()
         self.append_log(tr("mod.project.created", path=str(project.project_file)))
         InfoBar.success(
             title=tr("common.success"),
@@ -553,6 +600,12 @@ class Live2DModPage(QFrame):
             position=InfoBarPosition.TOP,
             duration=6000,
         )
+
+    def on_project_worker_finished(self):
+        self.project_worker = None
+        self.refresh_project_ui()
+        self.update_skin_buttons()
+        self.update_texture_buttons()
 
     def open_project_file(self):
         last_project = str(self.settings_manager.get("live2dviewer_mod.last_project_file", "") or "")
@@ -779,6 +832,7 @@ class Live2DModPage(QFrame):
         self.add_skin_file_button.setEnabled(has_project and self.project_worker is None)
         self.add_skin_folder_button.setEnabled(has_project and self.project_worker is None)
         self.add_texture_button.setEnabled(has_project and self.project_worker is None)
+        self.remove_texture_button.setEnabled(has_project and self.selected_texture_replacement_ref() is not None)
         self.add_empty_skin_button.setEnabled(has_project and self.project_worker is None)
         self.generate_button.setEnabled(has_project and self.project_worker is None)
         self.preview_images_button.setEnabled(has_project and self.project_worker is None)
@@ -789,12 +843,14 @@ class Live2DModPage(QFrame):
             self.hitarea_status_label.setText(tr("mod.hitarea.no_project"))
             self.refresh_preview_source_combo()
             self.refresh_preview_texture_combo()
+            self.update_texture_buttons()
             return
         self.project_status_label.setText(
             tr("mod.project.current", path=str(self.current_project.project_file))
         )
         self.refresh_preview_source_combo()
         self.refresh_preview_texture_combo()
+        self.update_texture_buttons()
 
     def refresh_hitarea_combo(self, *_args):
         if not hasattr(self, "hitarea_combo"):
@@ -908,19 +964,46 @@ class Live2DModPage(QFrame):
             return
         source = str(Path(path).resolve())
         skin_name = self.skin_name_edit.text().strip() or self.suggest_project_name(source)
+        workspace_dir = self.next_import_workspace_dir(source, skin_name)
+        self.set_busy(True)
+        self.append_log(tr("mod.skin.importing", path=source))
+        self.skin_import_worker = ModSkinSourceImportThread(
+            source,
+            skin_name,
+            str(workspace_dir),
+            self.settings_manager.get_temp_dir(),
+        )
+        self.skin_import_worker.progressUpdated.connect(self.append_log)
+        self.skin_import_worker.importReady.connect(self.on_skin_source_imported)
+        self.skin_import_worker.importError.connect(self.on_skin_source_import_error)
+        self.skin_import_worker.finished.connect(self.on_skin_import_worker_finished)
+        self.skin_import_worker.start()
+
+    def on_skin_source_imported(self, payload: dict[str, Any]):
+        self.set_busy(False)
+        if not self.current_project:
+            return
+        source = str(payload.get("source") or "")
+        skin_name = str(payload.get("skin_name") or self.suggest_project_name(source))
         skin = self.create_skin_entry(skin_name, source=source)
-        image_paths = self.image_paths_from_source(source)
-        if image_paths:
-            base_textures = self.base_texture_paths()
-            selected_target = self.selected_target_index()
-            if len(image_paths) == 1 and selected_target >= 0:
-                indexes = [selected_target]
-            else:
-                indexes = list(range(min(len(image_paths), len(base_textures))))
-            for target_index, image_path in zip(indexes, image_paths):
-                skin["texture_replacements"].append(
-                    self.texture_replacement_entry(str(image_path), target_index)
-                )
+        workspace_dir = str(payload.get("workspace_dir") or "")
+        model_json = str(payload.get("model_json") or "")
+        texture_paths = [Path(path) for path in payload.get("texture_paths") or [] if Path(path).is_file()]
+        if workspace_dir:
+            skin["import_workspace"] = self.relative_to_project(workspace_dir)
+        if model_json:
+            skin["import_model_json"] = self.relative_to_project(model_json)
+
+        base_textures = self.base_texture_paths()
+        selected_target = self.selected_target_index()
+        if len(texture_paths) == 1 and selected_target >= 0:
+            indexes = [selected_target]
+        else:
+            indexes = list(range(min(len(texture_paths), len(base_textures))))
+        for target_index, image_path in zip(indexes, texture_paths):
+            skin["texture_replacements"].append(
+                self.texture_replacement_entry(str(image_path), target_index)
+            )
 
         skins = list(self.current_project.data.get("skins") or [])
         skins.append(skin)
@@ -928,7 +1011,34 @@ class Live2DModPage(QFrame):
         self.persist_current_project()
         self.refresh_skin_table(select_skin_id=str(skin.get("id") or ""))
         self.refresh_texture_table()
-        self.append_log(tr("mod.skin.recorded", path=source))
+        self.refresh_preview_source_combo()
+        self.refresh_preview_texture_combo()
+        if texture_paths:
+            self.preview_panel.show_images(texture_paths, tr("mod.preview.images_title", count=len(texture_paths)))
+        self.append_log(
+            tr(
+                "mod.skin.imported",
+                path=source,
+                count=len(texture_paths),
+            )
+        )
+
+    def on_skin_source_import_error(self, error: str):
+        self.set_busy(False)
+        self.append_log(tr("mod.skin.import_failed", error=error))
+        InfoBar.error(
+            title=tr("common.error"),
+            content=error,
+            parent=self,
+            position=InfoBarPosition.TOP,
+            duration=6000,
+        )
+
+    def on_skin_import_worker_finished(self):
+        self.skin_import_worker = None
+        self.refresh_project_ui()
+        self.update_skin_buttons()
+        self.update_texture_buttons()
 
     def add_texture_replacement(self):
         if not self.current_project:
@@ -1038,12 +1148,13 @@ class Live2DModPage(QFrame):
         self.generate_worker.progressUpdated.connect(self.append_log)
         self.generate_worker.projectReady.connect(self.on_generate_finished)
         self.generate_worker.projectError.connect(self.on_generate_error)
-        self.generate_worker.finished.connect(lambda: setattr(self, "generate_worker", None))
+        self.generate_worker.finished.connect(self.on_generate_worker_finished)
         self.generate_worker.start()
 
     def on_generate_finished(self, project: Live2DViewerModProject):
         self.set_busy(False)
         self.set_current_project(project)
+        self.load_preview_live2d()
         self.append_log(tr("mod.generate.finished", path=str(project.project_dir / project.data.get("generated_output_dir", ""))))
         InfoBar.success(
             title=tr("common.success"),
@@ -1063,6 +1174,12 @@ class Live2DModPage(QFrame):
             position=InfoBarPosition.TOP,
             duration=6000,
         )
+
+    def on_generate_worker_finished(self):
+        self.generate_worker = None
+        self.refresh_project_ui()
+        self.update_skin_buttons()
+        self.update_texture_buttons()
 
     def image_paths_from_source(self, path: str, limit: int | None = None) -> list[Path]:
         source = Path(path)
@@ -1130,6 +1247,12 @@ class Live2DModPage(QFrame):
         if hasattr(self, "remove_skin_button"):
             self.remove_skin_button.setEnabled(has_project and has_skin and self.project_worker is None)
 
+    def update_texture_buttons(self):
+        has_project = self.current_project is not None
+        has_texture = self.selected_texture_replacement_ref() is not None
+        if hasattr(self, "remove_texture_button"):
+            self.remove_texture_button.setEnabled(has_project and has_texture and self.project_worker is None)
+
     def selected_skin_id(self) -> str:
         if not hasattr(self, "skin_table"):
             return ""
@@ -1183,10 +1306,14 @@ class Live2DModPage(QFrame):
         replacements = rows
         if not replacements:
             self._set_empty_table_row(self.texture_table, tr("mod.texture.empty"), 6)
+            self.update_texture_buttons()
             return
         self.texture_table.setRowCount(len(replacements))
         for row, item in enumerate(replacements):
-            self.texture_table.setItem(row, 0, QTableWidgetItem(str(item.get("skin_name") or "")))
+            skin_item = QTableWidgetItem(str(item.get("skin_name") or ""))
+            skin_item.setData(Qt.UserRole, str(item.get("skin_id") or ""))
+            skin_item.setData(Qt.UserRole + 1, int(item.get("replacement_index") or 0))
+            self.texture_table.setItem(row, 0, skin_item)
             self.texture_table.setItem(row, 1, QTableWidgetItem(str(item.get("target_texture") or "")))
             self.texture_table.setItem(row, 2, QTableWidgetItem(str(item.get("source") or "")))
             self.texture_table.setItem(row, 3, QTableWidgetItem(self.status_text(item.get("status"))))
@@ -1198,6 +1325,7 @@ class Live2DModPage(QFrame):
                 )
             )
             self.texture_table.setCellWidget(row, 5, preview_button)
+        self.update_texture_buttons()
 
     def flatten_texture_replacements(self) -> list[dict[str, Any]]:
         if not self.current_project:
@@ -1206,13 +1334,54 @@ class Live2DModPage(QFrame):
         for skin in self.current_project.data.get("skins") or []:
             if not isinstance(skin, dict):
                 continue
-            for replacement in skin.get("texture_replacements") or []:
+            for replacement_index, replacement in enumerate(skin.get("texture_replacements") or []):
                 if not isinstance(replacement, dict):
                     continue
                 row = dict(replacement)
+                row["skin_id"] = str(skin.get("id") or "")
                 row["skin_name"] = str(skin.get("name") or skin.get("id") or "")
+                row["replacement_index"] = replacement_index
                 rows.append(row)
         return rows
+
+    def selected_texture_replacement_ref(self) -> tuple[str, int] | None:
+        if not hasattr(self, "texture_table"):
+            return None
+        row = self.texture_table.currentRow()
+        if row < 0:
+            return None
+        item = self.texture_table.item(row, 0)
+        if not item:
+            return None
+        skin_id = str(item.data(Qt.UserRole) or "")
+        index = item.data(Qt.UserRole + 1)
+        if not skin_id:
+            return None
+        try:
+            return skin_id, int(index)
+        except Exception:
+            return None
+
+    def remove_selected_texture_replacement(self):
+        if not self.current_project:
+            return
+        ref = self.selected_texture_replacement_ref()
+        if ref is None:
+            return
+        skin_id, replacement_index = ref
+        for skin in self.current_project.data.get("skins") or []:
+            if not isinstance(skin, dict) or str(skin.get("id") or "") != skin_id:
+                continue
+            replacements = [item for item in skin.get("texture_replacements") or [] if isinstance(item, dict)]
+            if 0 <= replacement_index < len(replacements):
+                removed = replacements.pop(replacement_index)
+                skin["texture_replacements"] = replacements
+                self.persist_current_project()
+                self.refresh_skin_table(select_skin_id=skin_id)
+                self.refresh_texture_table()
+                self.refresh_preview_texture_combo()
+                self.append_log(tr("mod.texture.removed", path=str(removed.get("source") or "")))
+            break
 
     def refresh_preview_source_combo(self):
         if not hasattr(self, "preview_source_combo"):
@@ -1328,6 +1497,11 @@ class Live2DModPage(QFrame):
             if path.is_file():
                 return path
         source = str(skin.get("source") or "")
+        imported = str(skin.get("import_model_json") or "")
+        if imported:
+            path = self.resolve_project_path(imported)
+            if path.is_file():
+                return path
         if not source:
             return None
         try:
@@ -1427,6 +1601,20 @@ class Live2DModPage(QFrame):
         except Exception:
             return str(Path(path).resolve())
 
+    def next_import_workspace_dir(self, source: str, skin_name: str = "") -> Path:
+        if not self.current_project:
+            return Path(source).resolve().parent
+        source_path = Path(source)
+        stem = skin_name or source_path.stem or source_path.name or "skin_source"
+        base_name = sanitize_identifier(stem, "skin_source")
+        imports_root = self.current_project.project_dir / "workspace" / "imports"
+        candidate = imports_root / base_name
+        index = 1
+        while candidate.exists():
+            index += 1
+            candidate = imports_root / f"{base_name}_{index}"
+        return candidate
+
     def set_busy(self, busy: bool):
         for widget in (
             self.new_project_button,
@@ -1438,6 +1626,7 @@ class Live2DModPage(QFrame):
             self.add_skin_file_button,
             self.add_skin_folder_button,
             self.add_texture_button,
+            self.remove_texture_button,
             self.add_empty_skin_button,
             self.remove_skin_button,
             self.generate_button,
@@ -1449,6 +1638,7 @@ class Live2DModPage(QFrame):
         if not busy:
             self.refresh_project_ui()
             self.update_skin_buttons()
+            self.update_texture_buttons()
 
     def append_log(self, message: str):
         if message:

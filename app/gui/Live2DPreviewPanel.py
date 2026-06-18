@@ -126,6 +126,15 @@ class Live2DPreviewPanel(QFrame):
             pass
 
     def _apply_static_styles(self):
+        self.setStyleSheet(
+            f"""
+            QFrame#{self.objectName()} {{
+                border: 1px solid #dde2ea;
+                border-radius: 8px;
+                background: #ffffff;
+            }}
+            """
+        )
         self.live2d_host.setStyleSheet(
             """
             QFrame {
