@@ -127,7 +127,7 @@ class Live2DPreviewWindow(QWidget):
 
         if not self._embedded:
             self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setMouseTracking(True)
         if self._embedded:
             self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -175,7 +175,7 @@ class Live2DPreviewWindow(QWidget):
 
         # 创建Live2D显示区域并捕获异常
         try:
-            self.live2d_canvas = Live2DCanvas(self.model_path)
+            self.live2d_canvas = Live2DCanvas(self.model_path, embedded=self._embedded)
         except Exception as e:
             # 显示错误并关闭窗口
             self._show_error_infobar(

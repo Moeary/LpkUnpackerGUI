@@ -299,17 +299,19 @@ class ADPOpenGLCanvas(QOpenGLWidget):
 
 
 class Live2DCanvas(ADPOpenGLCanvas):
-    def __init__(self, model_path = None):
+    def __init__(self, model_path=None, embedded: bool = False):
         super().__init__()
         self.model_path = model_path
+        self._embedded = bool(embedded)
         self.model: Optional[live2d.LAppModel] = None
         # tool for controlling model opacity
         self.canvas: Optional[Canvas] = None
         self.setWindowTitle("Live2DCanvas")
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        if hasattr(Qt.WidgetAttribute, "WA_AlwaysStackOnTop"):
+        if not self._embedded:
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        if not self._embedded and hasattr(Qt.WidgetAttribute, "WA_AlwaysStackOnTop"):
             self.setAttribute(Qt.WidgetAttribute.WA_AlwaysStackOnTop, True)
-        if hasattr(Qt.WidgetAttribute, "WA_NoSystemBackground"):
+        if not self._embedded and hasattr(Qt.WidgetAttribute, "WA_NoSystemBackground"):
             self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
         self.setAutoFillBackground(False)
         self.radius_per_frame = math.pi * 0.5 / 120
@@ -558,14 +560,43 @@ class Live2DCanvas(ADPOpenGLCanvas):
         """Return cached motion list. Safe to call before GL init (may be empty)."""
         return list(self._motions or [])
 
-    def playMotion(self, group: str, index: int) -> bool:
+    def resetMotionState(self) -> None:
+        """Best-effort reset before playing another motion.
+
+        Some Live2D motions leave parameters, expressions, or poses in a modified
+        state. Resetting here makes debug playback predictable without reloading
+        the whole model.
+        """
+        if self.model is None:
+            return
+        for name in (
+            "StopAllMotions",
+            "ResetExpressions",
+            "ResetExpression",
+            "ResetParameters",
+            "ResetPose",
+        ):
+            fn = getattr(self.model, name, None)
+            if callable(fn):
+                try:
+                    fn()
+                except Exception:
+                    pass
+        try:
+            self.model.Update()
+        except Exception:
+            pass
+
+    def playMotion(self, group: str, index: int, reset_state: bool = True) -> bool:
         """Try to play a motion by group/index using best-effort API calls.
         Returns True if a call was attempted successfully.
         """
         if self.model is None:
             return False
+        if reset_state:
+            self.resetMotionState()
         try:
-            self.model.StartMotion(group, index, 1)
+            self.model.StartMotion(group, index, 3)
             return True
         except Exception:
             pass

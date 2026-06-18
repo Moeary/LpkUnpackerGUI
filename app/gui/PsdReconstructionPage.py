@@ -18,7 +18,6 @@ from PySide6.QtWidgets import (
 from qfluentwidgets import (
     BodyLabel,
     CaptionLabel,
-    CheckBox,
     ComboBox,
     EditableComboBox,
     InfoBar,
@@ -390,10 +389,6 @@ class PsdReconstructionPage(QFrame):
         self.preview_texture_layout.addWidget(self.preview_texture_combo, 1)
         self.preview_control_layout.addLayout(self.preview_texture_layout)
 
-        self.preview_live2d_check = CheckBox("", self.preview_control_frame)
-        self.preview_live2d_check.stateChanged.connect(lambda *_args: self.update_preview_controls())
-        self.preview_control_layout.addWidget(self.preview_live2d_check)
-
         self.preview_action_layout = QHBoxLayout()
         self.preview_action_layout.setSpacing(8)
         self.preview_image_button = PrimaryPushButton("", self.preview_control_frame)
@@ -402,9 +397,9 @@ class PsdReconstructionPage(QFrame):
         self.preview_live2d_button.clicked.connect(self.load_selected_preview_live2d)
         self.preview_close_button = PushButton("", self.preview_control_frame)
         self.preview_close_button.clicked.connect(self.close_preview_panel)
-        self.preview_action_layout.addWidget(self.preview_image_button)
-        self.preview_action_layout.addWidget(self.preview_live2d_button)
-        self.preview_action_layout.addWidget(self.preview_close_button)
+        self.preview_action_layout.addWidget(self.preview_image_button, 1)
+        self.preview_action_layout.addWidget(self.preview_live2d_button, 1)
+        self.preview_action_layout.addWidget(self.preview_close_button, 1)
         self.preview_control_layout.addLayout(self.preview_action_layout)
 
         self.preview_hint_label = CaptionLabel("", self.preview_control_frame)
@@ -523,11 +518,10 @@ class PsdReconstructionPage(QFrame):
         self.preview_control_title_label.setText(tr("psd.preview.controls"))
         self.preview_source_label.setText(tr("psd.preview.source"))
         self.preview_texture_label.setText(tr("psd.preview.texture"))
-        self.preview_live2d_check.setText(tr("psd.preview.enable_live2d"))
         self.preview_image_button.setText(tr("psd.preview.load_images"))
         self.preview_live2d_button.setText(tr("psd.preview.load_live2d"))
         self.preview_close_button.setText(tr("psd.preview.close"))
-        self.preview_hint_label.setText(tr("psd.preview.hint_images_first"))
+        self.preview_hint_label.setText(tr("psd.preview.hint_live2d_enabled"))
         self.motion_title_label.setText(tr("psd.preview.motion_title"))
         self.motion_label.setText(tr("psd.preview.motion"))
         self.motion_play_button.setText(tr("psd.preview.play_motion"))
@@ -1502,16 +1496,10 @@ class PsdReconstructionPage(QFrame):
         if not hasattr(self, "preview_live2d_button"):
             return
         has_project = self.current_project is not None
-        live2d_enabled = bool(self.preview_live2d_check.isChecked())
         self.preview_image_button.setEnabled(has_project)
-        self.preview_live2d_button.setEnabled(has_project and live2d_enabled)
-        self.preview_live2d_button.setVisible(live2d_enabled)
+        self.preview_live2d_button.setEnabled(has_project)
         self.motion_play_button.setEnabled(has_project and bool(self._motion_items))
-        self.preview_hint_label.setText(
-            tr("psd.preview.hint_live2d_enabled")
-            if live2d_enabled
-            else tr("psd.preview.hint_images_first")
-        )
+        self.preview_hint_label.setText(tr("psd.preview.hint_live2d_enabled"))
 
     @staticmethod
     def _combo_index_by_data(combo: ComboBox, value: str) -> int:
@@ -1580,8 +1568,6 @@ class PsdReconstructionPage(QFrame):
         self.preview_title_label.setText(tr("psd.preview.images_title", count=len(image_paths)))
 
     def load_selected_preview_live2d(self):
-        if not self.preview_live2d_check.isChecked():
-            return
         token = self.preview_source_token()
         if token.startswith("repack:"):
             self.start_project_preview("current", token.split(":", 1)[1])
@@ -1672,30 +1658,35 @@ class PsdReconstructionPage(QFrame):
             )
             return
 
-        self.set_preview_visible(True, stop_process=False)
-        self.close_project_preview(update_placeholder=False)
-        self.preview_mode = mode
-        self.preview_repack_id = repack_id
-        self.preview_placeholder_label.setVisible(False)
-        self.preview_image_panel.setVisible(False)
-        self.live2d_preview_host.setVisible(True)
-        self.preview_title_label.setText(tr("psd.preview.title"))
+        updates_were_enabled = self.updatesEnabled()
+        self.setUpdatesEnabled(False)
         try:
-            self.live2d_preview_window = Live2DPreviewWindow(
+            self.set_preview_visible(True, stop_process=False)
+            self.close_project_preview(update_placeholder=False)
+            self.preview_mode = mode
+            self.preview_repack_id = repack_id
+            self.preview_placeholder_label.setVisible(False)
+            self.preview_image_panel.setVisible(False)
+            self.live2d_preview_host.setVisible(False)
+            self.preview_title_label.setText(tr("psd.preview.title"))
+
+            preview_window = Live2DPreviewWindow(
                 str(preview_model_path),
                 parent=self.live2d_preview_host,
                 embedded=True,
             )
+            self.live2d_preview_window = preview_window
             self.refresh_motion_controls(preview_model_path)
-            self.live2d_preview_window.apply_settings(
+            preview_window.apply_settings(
                 {
                     "show_controls": False,
                     "selected_motion_on_click": True,
                 }
             )
             self.send_selected_motion_to_preview()
-            self.live2d_preview_host_layout.addWidget(self.live2d_preview_window, 1)
-            self.live2d_preview_window.show()
+            self.live2d_preview_host_layout.addWidget(preview_window, 1)
+            self.live2d_preview_host.setVisible(True)
+            preview_window.show()
             if self.current_project:
                 self.current_project = set_preview_state(self.current_project, mode, repack_id)
             if mode == "current":
@@ -1715,6 +1706,10 @@ class PsdReconstructionPage(QFrame):
                 position=InfoBarPosition.TOP,
                 duration=5000,
             )
+        finally:
+            self.setUpdatesEnabled(updates_were_enabled)
+            if updates_were_enabled:
+                self.update()
 
     def _send_preview_command(self, payload: dict) -> bool:
         window = self.live2d_preview_window
