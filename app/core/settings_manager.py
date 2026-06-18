@@ -62,6 +62,10 @@ class SettingsManager:
             "preview": {
                 "image_limit": 48,
             },
+            "psd": {
+                "last_project_file": "",
+                "project_files": [],
+            },
             "window_geometry": {
                 "width": 1000,
                 "height": 700,

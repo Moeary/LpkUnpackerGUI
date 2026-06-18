@@ -1,5 +1,5 @@
 import os
-from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QApplication, QLabel, QSizeGrip)
+from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QApplication, QLabel, QSizeGrip, QFrame, QSizePolicy)
 from PySide6.QtCore import Signal, QPoint, QRect, Qt, QEvent, QTimer, QUrl
 from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QCursor
 from qfluentwidgets import (PushButton, SubtitleLabel, BodyLabel)
@@ -82,9 +82,10 @@ class Live2DPreviewWindow(QWidget):
 
     closed = Signal()  # 窗口关闭信号
 
-    def __init__(self, model_path=None):
-        super().__init__()
+    def __init__(self, model_path=None, parent=None, embedded: bool = False):
+        super().__init__(parent)
         self.model_path = model_path
+        self._embedded = bool(embedded)
         self.i18n = get_i18n()
         self.live2d_canvas = None
         self.hit_area_overlay = None
@@ -93,6 +94,7 @@ class Live2DPreviewWindow(QWidget):
         self.dragging = False
         self.drag_position = QPoint()
         self._selected_motion = None
+        self._selected_motion_on_click = False
         self._motion_items = []
         self._dock_rect = None
         self._fit_to_dock = False
@@ -113,16 +115,25 @@ class Live2DPreviewWindow(QWidget):
         self.motion_label = None
         self.toggle_controls_btn = None
         self.close_btn = None
+        self.quick_motion_panel = None
+        self.quick_motion_title = None
+        self.quick_motion_combo = None
+        self.quick_motion_prev_btn = None
+        self.quick_motion_next_btn = None
+        self.quick_motion_play_btn = None
+        self.quick_motion_close_btn = None
+        self._quick_dragging = False
+        self._quick_drag_offset = QPoint()
 
-        # 设置无边框窗口
-        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
-        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
-        self.setWindowFlag(Qt.WindowType.Tool, True)
+        if not self._embedded:
+            self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setMouseTracking(True)
-        # 设置窗口大小和位置
-        self.resize(400, 300)
-        self.move_to_screen_center()
+        if self._embedded:
+            self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        else:
+            self.resize(400, 300)
+            self.move_to_screen_center()
 
         # 初始化UI
         self.setup_ui()
@@ -198,6 +209,7 @@ class Live2DPreviewWindow(QWidget):
         self.control_panel.setVisible(False)  # 默认隐藏
         layout.addWidget(self.control_panel)
         self._create_bubble_label()
+        self._create_quick_motion_panel()
 
     def create_control_panel(self):
         """创建控制面板"""
@@ -253,6 +265,133 @@ class Live2DPreviewWindow(QWidget):
         self.retranslate_ui()
         return panel
 
+    def _create_quick_motion_panel(self):
+        if not self.live2d_canvas:
+            return
+        panel = QFrame(self.live2d_canvas)
+        panel.setObjectName("live2dQuickMotionPanel")
+        panel.setFixedWidth(320)
+        panel.setStyleSheet("""
+            QFrame#live2dQuickMotionPanel {
+                background: rgba(32, 36, 43, 232);
+                border: 1px solid rgba(255, 255, 255, 80);
+                border-radius: 10px;
+            }
+            BodyLabel {
+                color: white;
+            }
+        """)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(10, 8, 10, 10)
+        layout.setSpacing(8)
+
+        title_row = QHBoxLayout()
+        title_row.setSpacing(6)
+        self.quick_motion_title = BodyLabel("", panel)
+        self.quick_motion_title.installEventFilter(self)
+        title_row.addWidget(self.quick_motion_title, 1)
+        self.quick_motion_close_btn = PushButton("", panel)
+        self.quick_motion_close_btn.setFixedWidth(42)
+        self.quick_motion_close_btn.clicked.connect(panel.hide)
+        title_row.addWidget(self.quick_motion_close_btn)
+        layout.addLayout(title_row)
+
+        self.quick_motion_combo = ComboBox(panel)
+        self.quick_motion_combo.currentIndexChanged.connect(self._on_quick_motion_changed)
+        layout.addWidget(self.quick_motion_combo)
+
+        button_row = QHBoxLayout()
+        button_row.setSpacing(6)
+        self.quick_motion_prev_btn = PushButton("", panel)
+        self.quick_motion_prev_btn.clicked.connect(lambda: self._step_quick_motion(-1))
+        self.quick_motion_play_btn = PushButton("", panel)
+        self.quick_motion_play_btn.clicked.connect(lambda: self._play_motion_item(self._selected_motion, None))
+        self.quick_motion_next_btn = PushButton("", panel)
+        self.quick_motion_next_btn.clicked.connect(lambda: self._step_quick_motion(1))
+        button_row.addWidget(self.quick_motion_prev_btn)
+        button_row.addWidget(self.quick_motion_play_btn, 1)
+        button_row.addWidget(self.quick_motion_next_btn)
+        layout.addLayout(button_row)
+
+        panel.installEventFilter(self)
+        panel.hide()
+        self.quick_motion_panel = panel
+        self._sync_quick_motion_combo()
+        self.retranslate_ui()
+
+    def _sync_quick_motion_combo(self):
+        combo = self.quick_motion_combo
+        if combo is None:
+            return
+        current_index = -1
+        if self._selected_motion:
+            for index, item in enumerate(self._motion_items):
+                if item is self._selected_motion:
+                    current_index = index
+                    break
+                if (
+                    str(item.get("group", "")) == str(self._selected_motion.get("group", ""))
+                    and int(item.get("index", -1)) == int(self._selected_motion.get("index", -2))
+                ):
+                    current_index = index
+                    break
+        combo.blockSignals(True)
+        combo.clear()
+        if not self._motion_items:
+            combo.addItem(tr("preview_window.no_motions"))
+            combo.setEnabled(False)
+        else:
+            combo.setEnabled(True)
+            for motion in self._motion_items:
+                combo.addItem(str(motion.get("display") or motion.get("group") or "motion"))
+            combo.setCurrentIndex(current_index if current_index >= 0 else 0)
+        combo.blockSignals(False)
+
+    def _on_quick_motion_changed(self, index: int):
+        self._select_motion_index(index, sync_main=True, sync_quick=False)
+
+    def _select_motion_index(self, index: int, sync_main: bool = True, sync_quick: bool = True):
+        if 0 <= index < len(self._motion_items):
+            self._selected_motion = self._motion_items[index]
+        else:
+            self._selected_motion = None
+            return
+        if sync_main and self.motion_combo:
+            self.motion_combo.blockSignals(True)
+            self.motion_combo.setCurrentIndex(index)
+            self.motion_combo.blockSignals(False)
+        if sync_quick and self.quick_motion_combo:
+            self.quick_motion_combo.blockSignals(True)
+            self.quick_motion_combo.setCurrentIndex(index)
+            self.quick_motion_combo.blockSignals(False)
+
+    def _step_quick_motion(self, delta: int):
+        if not self._motion_items:
+            return
+        index = 0
+        if self.quick_motion_combo:
+            index = self.quick_motion_combo.currentIndex()
+        index = (index + int(delta)) % len(self._motion_items)
+        self._select_motion_index(index)
+
+    def _show_quick_motion_panel(self, pos: QPoint):
+        if not self.quick_motion_panel or not self.live2d_canvas:
+            return
+        self._sync_quick_motion_combo()
+        panel = self.quick_motion_panel
+        panel.adjustSize()
+        target = QPoint(int(pos.x()) + 10, int(pos.y()) + 10)
+        panel.move(self._clamp_quick_panel_pos(target))
+        panel.show()
+        panel.raise_()
+
+    def _clamp_quick_panel_pos(self, pos: QPoint) -> QPoint:
+        if not self.quick_motion_panel or not self.live2d_canvas:
+            return pos
+        max_x = max(0, self.live2d_canvas.width() - self.quick_motion_panel.width())
+        max_y = max(0, self.live2d_canvas.height() - self.quick_motion_panel.height())
+        return QPoint(max(0, min(pos.x(), max_x)), max(0, min(pos.y(), max_y)))
+
     def _populate_motion_combo(self):
         """读取model*.json中的动作并填充到下拉框"""
         import json
@@ -287,6 +426,7 @@ class Live2DPreviewWindow(QWidget):
         if not self._motion_items:
             self.motion_combo.addItem(tr("preview_window.no_motions"))
             self.motion_combo.setEnabled(False)
+            self._sync_quick_motion_combo()
             return
         self.motion_combo.setEnabled(True)
         for motion in self._motion_items:
@@ -294,12 +434,10 @@ class Live2DPreviewWindow(QWidget):
         # 默认选中第一个
         self.motion_combo.setCurrentIndex(0)
         self._on_motion_changed(0)
+        self._sync_quick_motion_combo()
 
     def _on_motion_changed(self, i: int):
-        if 0 <= i < len(self._motion_items):
-            self._selected_motion = self._motion_items[i]
-        else:
-            self._selected_motion = None
+        self._select_motion_index(i, sync_main=False, sync_quick=True)
 
     def _load_hit_regions(self) -> list[dict]:
         import json
@@ -358,6 +496,27 @@ class Live2DPreviewWindow(QWidget):
         return {"id": hit_id or label, "name": label, "rect": rect, "words": words}
 
     def eventFilter(self, obj, event):
+        if obj in {self.quick_motion_panel, self.quick_motion_title} and self.quick_motion_panel:
+            try:
+                if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                    self._quick_dragging = True
+                    panel_pos = self.quick_motion_panel.mapFromGlobal(self._event_global_pos(event))
+                    self._quick_drag_offset = panel_pos
+                    return True
+                if event.type() == QEvent.Type.MouseMove and self._quick_dragging:
+                    canvas_pos = self.live2d_canvas.mapFromGlobal(self._event_global_pos(event))
+                    self.quick_motion_panel.move(self._clamp_quick_panel_pos(canvas_pos - self._quick_drag_offset))
+                    return True
+                if event.type() == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
+                    self._quick_dragging = False
+                    return True
+                if event.type() == QEvent.Type.Wheel:
+                    delta = -1 if event.angleDelta().y() > 0 else 1
+                    self._step_quick_motion(delta)
+                    return True
+            except Exception:
+                pass
+
         if obj is self.live2d_canvas:
             try:
                 pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
@@ -391,11 +550,14 @@ class Live2DPreviewWindow(QWidget):
                         if self.hit_area_overlay:
                             active_id = str(region.get("id") or region.get("name") or "") if region else None
                             self.hit_area_overlay.set_active_region(active_id)
+                        if self._selected_motion_on_click and self._selected_motion:
+                            self._play_motion_item(self._selected_motion, pos)
+                            return True
                         motion = self.live2d_canvas.playInteractiveMotion(pos.x() / w, pos.y() / h, words, name)
                         self._after_motion_triggered(motion, pos)
                         return True
-                    if event.button() == Qt.MouseButton.RightButton and self._selected_motion:
-                        self._play_motion_item(self._selected_motion, pos)
+                    if event.button() == Qt.MouseButton.RightButton:
+                        self._show_quick_motion_panel(pos)
                         return True
             except Exception:
                 pass
@@ -582,6 +744,24 @@ class Live2DPreviewWindow(QWidget):
                     break
         self._play_motion_item(motion, None)
 
+    def set_selected_motion(self, group: str, index: int):
+        target = None
+        target_row = -1
+        for row, item in enumerate(self._motion_items):
+            if str(item.get("group", "")) == str(group) and int(item.get("index", -1)) == int(index):
+                target = item
+                target_row = row
+                break
+        self._selected_motion = target
+        if target_row >= 0 and self.motion_combo:
+            self.motion_combo.blockSignals(True)
+            self.motion_combo.setCurrentIndex(target_row)
+            self.motion_combo.blockSignals(False)
+        if target_row >= 0 and self.quick_motion_combo:
+            self.quick_motion_combo.blockSignals(True)
+            self.quick_motion_combo.setCurrentIndex(target_row)
+            self.quick_motion_combo.blockSignals(False)
+
     def move_to_screen_center(self):
         """将窗口移动到屏幕中央"""
         screen = QApplication.primaryScreen()
@@ -605,6 +785,9 @@ class Live2DPreviewWindow(QWidget):
             should_show = bool(settings.get('show_controls'))
             if self.control_panel.isVisible() != should_show:
                 self.toggle_control_panel()
+
+        if 'selected_motion_on_click' in settings:
+            self._selected_motion_on_click = bool(settings.get('selected_motion_on_click'))
 
         # 应用窗口设置
         if 'window_size' in settings and not self._fit_to_dock:
@@ -740,6 +923,8 @@ class Live2DPreviewWindow(QWidget):
         self._sync_overlay_geometry()
         if self.bubble_label and self.bubble_label.isVisible():
             self._show_bubble(None)
+        if self.quick_motion_panel and self.quick_motion_panel.isVisible():
+            self.quick_motion_panel.move(self._clamp_quick_panel_pos(self.quick_motion_panel.pos()))
 
     def closeEvent(self, event):
         """窗口关闭事件"""
@@ -769,6 +954,18 @@ class Live2DPreviewWindow(QWidget):
                 self.hit_area_toggle_btn.setText(tr("preview_window.show_hit_areas"))
         if self.close_btn:
             self.close_btn.setText(tr("common.close"))
+        if self.quick_motion_title:
+            self.quick_motion_title.setText(tr("preview_window.quick_actions"))
+        if self.quick_motion_prev_btn:
+            self.quick_motion_prev_btn.setText(tr("preview_window.quick_prev"))
+        if self.quick_motion_next_btn:
+            self.quick_motion_next_btn.setText(tr("preview_window.quick_next"))
+        if self.quick_motion_play_btn:
+            self.quick_motion_play_btn.setText(tr("preview_window.quick_play"))
+        if self.quick_motion_close_btn:
+            self.quick_motion_close_btn.setText(tr("preview_window.quick_close"))
 
         if self.motion_combo and not self._motion_items and self.motion_combo.count() > 0:
             self.motion_combo.setItemText(0, tr("preview_window.no_motions"))
+        if self.quick_motion_combo and not self._motion_items and self.quick_motion_combo.count() > 0:
+            self.quick_motion_combo.setItemText(0, tr("preview_window.no_motions"))

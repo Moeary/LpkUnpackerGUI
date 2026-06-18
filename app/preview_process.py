@@ -121,6 +121,15 @@ def run_preview_process(argv: list[str] | None = None) -> int:
                 )
             except Exception:
                 logger.exception("Failed to play motion")
+            return
+        if command_type == "set_selected_motion" and window.live2d_canvas:
+            try:
+                window.set_selected_motion(
+                    str(command.get("group") or ""),
+                    int(command.get("index") or 0),
+                )
+            except Exception:
+                logger.exception("Failed to select motion")
 
     bridge.commandReceived.connect(handle_command)
     _start_command_reader(bridge)

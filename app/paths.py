@@ -22,6 +22,7 @@ OUTPUT_DIR_NAMES = {
     "spine": "spine",
     "unity": "unity",
     "psd": "psd",
+    "psd_projects": "psd_projects",
     "textures": "textures",
     "live2dviewer_mod": "live2dviewer_mod",
 }

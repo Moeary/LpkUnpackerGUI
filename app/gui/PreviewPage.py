@@ -931,23 +931,23 @@ class ImagePreviewPanel(QFrame):
         nav_layout.addWidget(self.path_label, 1)
         preview_layout.addLayout(nav_layout)
 
-        side_panel = QFrame(self)
-        side_panel.setObjectName("imagePreviewSidePanel")
-        side_panel.setMinimumWidth(210)
-        side_panel.setMaximumWidth(270)
-        side_panel.setStyleSheet("""
+        self.side_panel = QFrame(self)
+        self.side_panel.setObjectName("imagePreviewSidePanel")
+        self.side_panel.setMinimumWidth(210)
+        self.side_panel.setMaximumWidth(270)
+        self.side_panel.setStyleSheet("""
             QFrame#imagePreviewSidePanel {
                 border: 1px solid #E3E6EA;
                 border-radius: 8px;
                 background: #FAFBFD;
             }
         """)
-        side_layout = QVBoxLayout(side_panel)
+        side_layout = QVBoxLayout(self.side_panel)
         side_layout.setContentsMargins(10, 10, 10, 10)
         side_layout.setSpacing(8)
         self.limit_label.setWordWrap(True)
         self.limit_label.setStyleSheet("color: #68707D;")
-        list_scroll = QScrollArea(side_panel)
+        list_scroll = QScrollArea(self.side_panel)
         list_scroll.setWidgetResizable(True)
         list_scroll.setFrameShape(QFrame.NoFrame)
         list_scroll.setWidget(self.list_widget)
@@ -956,7 +956,7 @@ class ImagePreviewPanel(QFrame):
         side_layout.addWidget(list_scroll, 1)
 
         root_layout.addLayout(preview_layout, 1)
-        root_layout.addWidget(side_panel)
+        root_layout.addWidget(self.side_panel)
         self.setMinimumHeight(420)
         self.retranslate_ui()
 
@@ -1046,6 +1046,9 @@ class ImagePreviewPanel(QFrame):
     def is_model_item_selected(self) -> bool:
         item = self.current_item()
         return bool(item and item.get("kind") == "model")
+
+    def set_item_list_visible(self, visible: bool):
+        self.side_panel.setVisible(bool(visible))
 
     def set_current_index(self, index: int, emit: bool = False):
         if not self._preview_items:
@@ -1239,6 +1242,7 @@ class ImagePreviewPanel(QFrame):
             self.main_image_label.setText("")
             return
         if item.get("kind") == "model":
+            self.set_item_list_visible(False)
             self.path_label.setText(
                 tr(
                     "preview.model_current_details",
@@ -1250,6 +1254,7 @@ class ImagePreviewPanel(QFrame):
             self.show_model_placeholder()
             self._update_list_styles()
             return
+        self.set_item_list_visible(True)
         self._show_current_image()
 
     def _show_current_image(self):
