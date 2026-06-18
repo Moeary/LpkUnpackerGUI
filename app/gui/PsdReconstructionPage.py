@@ -337,9 +337,10 @@ class PsdReconstructionPage(QFrame):
         if Path(self.selected_source).suffix.lower() == ".psd":
             self.set_workflow("repack")
             self._sync_default_metadata()
+            self._sync_repack_output_dir()
         else:
             self.set_workflow("export")
-        if not self.output_manually_selected:
+        if self.workflow != "repack" and not self.output_manually_selected:
             self.last_output_dir = self.default_output_dir(self.selected_source)
             self.output_edit.setText(self.last_output_dir)
         self.append_log(tr("psd.selected_source", path=self.selected_source))
@@ -371,6 +372,7 @@ class PsdReconstructionPage(QFrame):
                     duration=3000,
                 )
                 return
+            output_dir = str(Path(source).resolve().parent)
             metadata_path = self.metadata_edit.text().strip() or None
             if metadata_path and not os.path.isfile(metadata_path):
                 InfoBar.warning(
@@ -466,7 +468,8 @@ class PsdReconstructionPage(QFrame):
         self.reconstruct_button.setEnabled(not busy)
         self.source_file_button.setEnabled(not busy)
         self.source_folder_button.setEnabled(not busy)
-        self.output_button.setEnabled(not busy)
+        self.output_button.setEnabled(not busy and self.workflow != "repack")
+        self.output_edit.setReadOnly(self.workflow == "repack")
         self.mode_combo.setEnabled(not busy)
         self.export_flow_button.setEnabled(not busy)
         self.repack_flow_button.setEnabled(not busy)
@@ -475,6 +478,8 @@ class PsdReconstructionPage(QFrame):
 
     def set_workflow(self, workflow: str):
         self.workflow = "repack" if workflow == "repack" else "export"
+        if self.workflow == "repack" and Path(self.selected_source).suffix.lower() == ".psd":
+            self._sync_repack_output_dir()
         self._update_workflow_ui()
 
     def on_mode_changed(self, *_args):
@@ -490,6 +495,8 @@ class PsdReconstructionPage(QFrame):
             tr("psd.placeholder_psd_source") if is_repack else tr("psd.placeholder_source")
         )
         self.reconstruct_button.setText(tr("psd.repack_button") if is_repack else tr("psd.export_button"))
+        self.output_button.setEnabled(not is_repack)
+        self.output_edit.setReadOnly(is_repack)
         self._style_workflow_button(self.export_flow_button, not is_repack)
         self._style_workflow_button(self.repack_flow_button, is_repack)
         self.update_mode_hint()
@@ -574,7 +581,18 @@ class PsdReconstructionPage(QFrame):
             self.selected_metadata = ""
             self.metadata_edit.clear()
 
+    def _sync_repack_output_dir(self):
+        if Path(self.selected_source).suffix.lower() != ".psd":
+            return
+        output_path = str(Path(self.selected_source).resolve().parent)
+        self.last_output_dir = output_path
+        self.output_edit.setText(output_path)
+
     def default_output_dir(self, source_path: str = "") -> str:
+        if source_path and Path(source_path).suffix.lower() == ".psd":
+            target = Path(source_path).resolve().parent
+            target.mkdir(parents=True, exist_ok=True)
+            return str(target)
         base_dir = Path(self.settings_manager.get_output_root()).resolve() / "psd"
         name = self.source_output_name(source_path)
         target = base_dir / name if name else base_dir
@@ -616,7 +634,13 @@ class PsdReconstructionPage(QFrame):
             return tr("psd.stage.repack_layer")
         if "writing metadata" in lower:
             return tr("psd.stage.write_metadata")
-        if "writing psd" in lower or "psd written" in lower:
+        if (
+            "writing psd" in lower
+            or "preparing psd" in lower
+            or "prepared psd layer" in lower
+            or "saving psd" in lower
+            or "psd written" in lower
+        ):
             return tr("psd.stage.write_psd")
         if "cubism core" in lower or "drawable" in lower:
             return tr("psd.stage.export_sidecar")

@@ -112,8 +112,8 @@ def reconstruct_live2d_psd(
     suffix = "mesh_pose" if mode == "mesh" else "editable_atlas"
     psd_path = output_path / f"{model_name}_{suffix}.psd"
     metadata_path = output_path / f"{model_name}_{suffix}.lpkpsd.json"
-    _emit(progress, 95, f"Writing PSD with {len(layers)} layer(s)")
-    _save_psd(psd_path, size, layers)
+    _emit(progress, 90, f"Preparing PSD with {len(layers)} layer(s)")
+    _save_psd(psd_path, size, layers, progress=progress)
     _emit(progress, 98, "Writing metadata")
     _write_json(
         metadata_path,
@@ -234,12 +234,14 @@ def _repack_mesh_psd_layers(
 ) -> ReconstructionResult:
     cv2 = _require_cv2()
     canvases, warnings = _load_mesh_repack_canvases(textures)
+    original_canvases = {index: canvas.copy() for index, canvas in canvases.items()}
     total = max(1, len(layers_metadata))
 
     for index, layer_info in enumerate(layers_metadata):
         texture_index = int(layer_info["texture_index"])
         canvas = canvases.get(texture_index)
-        if canvas is None:
+        original_canvas = original_canvases.get(texture_index)
+        if canvas is None or original_canvas is None:
             continue
 
         layer = psd_layers.get(str(layer_info["name"]))
@@ -269,13 +271,27 @@ def _repack_mesh_psd_layers(
         source = np.asarray(image.convert("RGBA"))
         local_vertices = vertices - np.asarray([left, top], dtype=np.float32)
         texture_points = _uv_to_texture_points(uvs, canvas)
+        original_layer = _render_repack_reference_layer(
+            cv2,
+            original_canvas,
+            source.shape,
+            local_vertices,
+            texture_points,
+            indices,
+            float(layer_info.get("opacity", 1.0)),
+        )
+        edit_mask = _changed_pixel_mask(cv2, source, original_layer)
+        if not np.any(edit_mask):
+            _emit(progress, 10 + int((index + 1) / total * 80), f"Packed {layer_info['name']}")
+            continue
 
         for tri in _iter_triangles(indices):
             if max(tri) >= len(local_vertices) or max(tri) >= len(texture_points):
                 continue
-            _replace_triangle(
+            _replace_triangle_masked(
                 cv2,
                 source,
+                edit_mask,
                 canvas,
                 local_vertices[list(tri)],
                 texture_points[list(tri)],
@@ -325,6 +341,54 @@ def _load_mesh_repack_canvases(
             image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
         canvases[int(texture["index"])] = np.asarray(image).copy()
     return canvases, warnings
+
+
+def _render_repack_reference_layer(
+    cv2,
+    texture: np.ndarray,
+    shape: tuple[int, int, int],
+    local_vertices: np.ndarray,
+    texture_points: np.ndarray,
+    indices: list[int],
+    opacity: float,
+) -> np.ndarray:
+    layer = np.zeros(shape, dtype=np.uint8)
+    for tri in _iter_triangles(indices):
+        if max(tri) >= len(local_vertices) or max(tri) >= len(texture_points):
+            continue
+        _warp_triangle(
+            cv2,
+            texture,
+            layer,
+            texture_points[list(tri)],
+            local_vertices[list(tri)],
+        )
+    if opacity < 1.0:
+        layer[:, :, 3] = np.clip(layer[:, :, 3].astype(np.float32) * opacity, 0, 255).astype(
+            np.uint8
+        )
+    return layer
+
+
+def _changed_pixel_mask(cv2, edited: np.ndarray, reference: np.ndarray) -> np.ndarray:
+    if edited.shape != reference.shape:
+        reference = cv2.resize(
+            reference,
+            (edited.shape[1], edited.shape[0]),
+            interpolation=cv2.INTER_LINEAR,
+        )
+
+    delta = np.abs(edited.astype(np.int16) - reference.astype(np.int16))
+    rgb_delta = np.max(delta[:, :, :3], axis=2)
+    alpha_delta = delta[:, :, 3]
+    alpha_present = (edited[:, :, 3] > 4) | (reference[:, :, 3] > 4)
+    changed = ((rgb_delta > 12) | (alpha_delta > 8)) & alpha_present
+    mask = (changed.astype(np.uint8) * 255)
+    if not np.any(mask):
+        return mask
+
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    return cv2.dilate(mask, kernel, iterations=2)
 
 
 def resolve_live2d_source(source: Path) -> Live2DSource:
@@ -785,9 +849,10 @@ def _warp_triangle(cv2, src: np.ndarray, dst: np.ndarray, src_tri: np.ndarray, d
     _alpha_blend(dst[dy0:dy1, dx0:dx1], warped, mask)
 
 
-def _replace_triangle(
+def _replace_triangle_masked(
     cv2,
     src: np.ndarray,
+    src_mask: np.ndarray,
     dst: np.ndarray,
     src_tri: np.ndarray,
     dst_tri: np.ndarray,
@@ -802,34 +867,55 @@ def _replace_triangle(
 
     sx0, sy0 = max(0, sx), max(0, sy)
     sx1, sy1 = min(src.shape[1], sx + sw), min(src.shape[0], sy + sh)
-    dx0, dy0 = max(0, dx), max(0, dy)
-    dx1, dy1 = min(dst.shape[1], dx + dw), min(dst.shape[0], dy + dh)
+    dx0, dy0 = max(0, dx - 1), max(0, dy - 1)
+    dx1, dy1 = min(dst.shape[1], dx + dw + 1), min(dst.shape[0], dy + dh + 1)
 
     if sx1 <= sx0 or sy1 <= sy0 or dx1 <= dx0 or dy1 <= dy0:
         return
 
     src_crop = src[sy0:sy1, sx0:sx1]
+    mask_crop = src_mask[sy0:sy1, sx0:sx1]
     src_shift = src_tri - np.asarray([sx0, sy0], dtype=np.float32)
     dst_shift = dst_tri - np.asarray([dx0, dy0], dtype=np.float32)
     matrix = cv2.getAffineTransform(src_shift.astype(np.float32), dst_shift.astype(np.float32))
 
+    target_size = (dx1 - dx0, dy1 - dy0)
     warped = cv2.warpAffine(
         src_crop,
         matrix,
-        (dx1 - dx0, dy1 - dy0),
+        target_size,
         flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+    warped_mask = cv2.warpAffine(
+        mask_crop,
+        matrix,
+        target_size,
+        flags=cv2.INTER_NEAREST,
         borderMode=cv2.BORDER_CONSTANT,
-        borderValue=(0, 0, 0, 0),
+        borderValue=0,
     )
 
-    mask = np.zeros((dy1 - dy0, dx1 - dx0), dtype=np.uint8)
-    cv2.fillConvexPoly(mask, dst_shift.astype(np.int32), 255, lineType=cv2.LINE_AA)
+    tri_mask = np.zeros((dy1 - dy0, dx1 - dx0), dtype=np.uint8)
+    expanded = _expand_triangle(dst_shift, amount=0.75)
+    cv2.fillConvexPoly(tri_mask, np.round(expanded).astype(np.int32), 255, lineType=cv2.LINE_8)
+    replace = (warped_mask > 0) & (tri_mask > 0)
+    if not np.any(replace):
+        return
+
     if warped.shape[2] == 4:
         warped = warped.copy()
-        warped[:, :, 3] = np.minimum(warped[:, :, 3], mask)
+        warped[:, :, 3] = np.where(replace, warped[:, :, 3], 0).astype(np.uint8)
     dst_roi = dst[dy0:dy1, dx0:dx1]
-    replace = mask > 0
     dst_roi[replace] = warped[replace]
+
+
+def _expand_triangle(points: np.ndarray, amount: float = 0.5) -> np.ndarray:
+    center = np.mean(points, axis=0)
+    vectors = points - center
+    lengths = np.linalg.norm(vectors, axis=1, keepdims=True)
+    safe_lengths = np.maximum(lengths, 1e-6)
+    return points + vectors / safe_lengths * float(amount)
 
 
 def _paint_triangles(
@@ -1021,14 +1107,17 @@ def _save_psd(
     path: Path,
     size: tuple[int, int],
     layers: list[PsdLayer],
+    progress: Optional[ProgressCallback] = None,
 ) -> None:
     from psd_tools import PSDImage
     from psd_tools.api.layers import PixelLayer
     from psd_tools.constants import Compression
 
     psd = PSDImage.new("RGBA", size)
-    compression = Compression.RLE
-    for layer in layers:
+    compression = Compression.RAW
+    total = max(1, len(layers))
+    step = max(1, total // 40)
+    for index, layer in enumerate(layers, start=1):
         psd.append(
             PixelLayer.frompil(
                 layer.image,
@@ -1039,6 +1128,9 @@ def _save_psd(
                 compression=compression,
             )
         )
+        if index == total or index % step == 0:
+            _emit(progress, 90 + int(index / total * 6), f"Prepared PSD layer {index}/{total}")
+    _emit(progress, 97, "Saving PSD file")
     psd.save(str(path))
 
 
