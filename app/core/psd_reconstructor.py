@@ -1,7 +1,6 @@
 import json
 import math
 import re
-import struct
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
@@ -114,7 +113,8 @@ def reconstruct_live2d_psd(
     psd_path = output_path / f"{model_name}_{suffix}.psd"
     metadata_path = output_path / f"{model_name}_{suffix}.lpkpsd.json"
     _emit(progress, 95, f"Writing PSD with {len(layers)} layer(s)")
-    _save_psd(psd_path, size, layers, raw_layers=(mode == "mesh"))
+    _save_psd(psd_path, size, layers)
+    _emit(progress, 98, "Writing metadata")
     _write_json(
         metadata_path,
         _build_export_metadata(source_info, textures, size, mode, layer_metadata),
@@ -147,25 +147,41 @@ def repack_atlas_png_from_psd(
     metadata = _read_json(metadata_file)
     if metadata.get("format") != METADATA_FORMAT:
         raise PsdReconstructionError(f"Unsupported PSD metadata file: {metadata_file}")
-    if metadata.get("mode") != "atlas-components":
+    mode = str(metadata.get("mode") or "")
+    if mode not in {"atlas-components", "mesh"}:
         raise PsdReconstructionError(
-            "Only editable atlas PSD metadata can be repacked into atlas PNG files."
+            "Only mesh or editable atlas PSD metadata can be repacked into atlas PNG files."
         )
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     textures = _metadata_textures(metadata)
-    layers_metadata = _metadata_layers(metadata)
+    layers_metadata = _metadata_layers(
+        metadata,
+        {"drawable-mesh"} if mode == "mesh" else {"atlas-component", "texture-atlas"},
+    )
 
+    _emit(progress, 5, f"Reading PSD: {psd_file}")
     psd = PSDImage.open(str(psd_file))
     psd_layers = _index_psd_layers(psd)
+    _emit(progress, 10, f"Loaded PSD: {psd_file}")
+
+    if mode == "mesh":
+        return _repack_mesh_psd_layers(
+            psd_layers,
+            textures,
+            layers_metadata,
+            output_path,
+            progress,
+            metadata_file,
+        )
+
     canvases = {
         texture["index"]: Image.new("RGBA", (texture["width"], texture["height"]), (0, 0, 0, 0))
         for texture in textures
     }
 
     warnings: list[str] = []
-    _emit(progress, 10, f"Loaded PSD: {psd_file}")
     total = max(1, len(layers_metadata))
 
     for index, layer_info in enumerate(layers_metadata):
@@ -190,6 +206,7 @@ def repack_atlas_png_from_psd(
         _emit(progress, 10 + int((index + 1) / total * 75), f"Packed {layer_info['name']}")
 
     outputs: list[Path] = []
+    _emit(progress, 95, "Writing atlas PNG")
     for texture in textures:
         canvas = canvases[texture["index"]]
         output_file = output_path / texture["name"]
@@ -205,6 +222,109 @@ def repack_atlas_png_from_psd(
         metadata_path=metadata_file,
         output_paths=outputs,
     )
+
+
+def _repack_mesh_psd_layers(
+    psd_layers: dict[str, Any],
+    textures: list[dict[str, Any]],
+    layers_metadata: list[dict[str, Any]],
+    output_path: Path,
+    progress: Optional[ProgressCallback],
+    metadata_file: Path,
+) -> ReconstructionResult:
+    cv2 = _require_cv2()
+    canvases, warnings = _load_mesh_repack_canvases(textures)
+    total = max(1, len(layers_metadata))
+
+    for index, layer_info in enumerate(layers_metadata):
+        texture_index = int(layer_info["texture_index"])
+        canvas = canvases.get(texture_index)
+        if canvas is None:
+            continue
+
+        layer = psd_layers.get(str(layer_info["name"]))
+        if layer is None:
+            warnings.append(f"Layer missing in PSD: {layer_info['name']}")
+            continue
+
+        image = layer.composite(force=True)
+        if image is None:
+            warnings.append(f"Layer has no pixel content: {layer_info['name']}")
+            continue
+
+        try:
+            vertices = np.asarray(layer_info["vertices"], dtype=np.float32)
+            uvs = np.asarray(layer_info["uvs"], dtype=np.float32)
+            indices = _as_int_list(layer_info["indices"])
+        except Exception:
+            warnings.append(f"Layer metadata is invalid: {layer_info['name']}")
+            continue
+
+        if len(vertices) != len(uvs) or not indices:
+            warnings.append(f"Layer metadata has mismatched mesh data: {layer_info['name']}")
+            continue
+
+        left = int(getattr(layer, "left", layer_info.get("left", 0)))
+        top = int(getattr(layer, "top", layer_info.get("top", 0)))
+        source = np.asarray(image.convert("RGBA"))
+        local_vertices = vertices - np.asarray([left, top], dtype=np.float32)
+        texture_points = _uv_to_texture_points(uvs, canvas)
+
+        for tri in _iter_triangles(indices):
+            if max(tri) >= len(local_vertices) or max(tri) >= len(texture_points):
+                continue
+            _replace_triangle(
+                cv2,
+                source,
+                canvas,
+                local_vertices[list(tri)],
+                texture_points[list(tri)],
+            )
+
+        _emit(progress, 10 + int((index + 1) / total * 80), f"Packed {layer_info['name']}")
+
+    outputs: list[Path] = []
+    _emit(progress, 95, "Writing atlas PNG")
+    for texture in textures:
+        canvas = canvases[texture["index"]]
+        output_file = output_path / texture["name"]
+        Image.fromarray(canvas, "RGBA").save(output_file)
+        outputs.append(output_file)
+
+    _emit(progress, 100, f"Atlas PNG written: {output_path}")
+    return ReconstructionResult(
+        psd_path=outputs[0] if outputs else output_path,
+        layer_count=len(layers_metadata),
+        mode="mesh-repack",
+        warnings=warnings,
+        metadata_path=metadata_file,
+        output_paths=outputs,
+    )
+
+
+def _load_mesh_repack_canvases(
+    textures: list[dict[str, Any]],
+) -> tuple[dict[int, np.ndarray], list[str]]:
+    canvases: dict[int, np.ndarray] = {}
+    warnings: list[str] = []
+    for texture in textures:
+        width = int(texture["width"])
+        height = int(texture["height"])
+        source_path = Path(str(texture.get("source_path") or ""))
+        if source_path.is_file():
+            image = Image.open(source_path).convert("RGBA")
+            if image.size != (width, height):
+                warnings.append(
+                    f"Texture size changed, resizing original atlas for repack: {source_path}"
+                )
+                image = image.resize((width, height), Image.Resampling.LANCZOS)
+        else:
+            warnings.append(
+                f"Original texture missing; unchanged hidden pixels cannot be preserved: {source_path}"
+            )
+            image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        canvases[int(texture["index"])] = np.asarray(image).copy()
+    return canvases, warnings
 
 
 def resolve_live2d_source(source: Path) -> Live2DSource:
@@ -665,6 +785,53 @@ def _warp_triangle(cv2, src: np.ndarray, dst: np.ndarray, src_tri: np.ndarray, d
     _alpha_blend(dst[dy0:dy1, dx0:dx1], warped, mask)
 
 
+def _replace_triangle(
+    cv2,
+    src: np.ndarray,
+    dst: np.ndarray,
+    src_tri: np.ndarray,
+    dst_tri: np.ndarray,
+) -> None:
+    src_rect = cv2.boundingRect(src_tri.astype(np.float32))
+    dst_rect = cv2.boundingRect(dst_tri.astype(np.float32))
+    sx, sy, sw, sh = src_rect
+    dx, dy, dw, dh = dst_rect
+
+    if sw <= 0 or sh <= 0 or dw <= 0 or dh <= 0:
+        return
+
+    sx0, sy0 = max(0, sx), max(0, sy)
+    sx1, sy1 = min(src.shape[1], sx + sw), min(src.shape[0], sy + sh)
+    dx0, dy0 = max(0, dx), max(0, dy)
+    dx1, dy1 = min(dst.shape[1], dx + dw), min(dst.shape[0], dy + dh)
+
+    if sx1 <= sx0 or sy1 <= sy0 or dx1 <= dx0 or dy1 <= dy0:
+        return
+
+    src_crop = src[sy0:sy1, sx0:sx1]
+    src_shift = src_tri - np.asarray([sx0, sy0], dtype=np.float32)
+    dst_shift = dst_tri - np.asarray([dx0, dy0], dtype=np.float32)
+    matrix = cv2.getAffineTransform(src_shift.astype(np.float32), dst_shift.astype(np.float32))
+
+    warped = cv2.warpAffine(
+        src_crop,
+        matrix,
+        (dx1 - dx0, dy1 - dy0),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0, 0),
+    )
+
+    mask = np.zeros((dy1 - dy0, dx1 - dx0), dtype=np.uint8)
+    cv2.fillConvexPoly(mask, dst_shift.astype(np.int32), 255, lineType=cv2.LINE_AA)
+    if warped.shape[2] == 4:
+        warped = warped.copy()
+        warped[:, :, 3] = np.minimum(warped[:, :, 3], mask)
+    dst_roi = dst[dy0:dy1, dx0:dx1]
+    replace = mask > 0
+    dst_roi[replace] = warped[replace]
+
+
 def _paint_triangles(
     cv2,
     texture: np.ndarray,
@@ -854,18 +1021,13 @@ def _save_psd(
     path: Path,
     size: tuple[int, int],
     layers: list[PsdLayer],
-    raw_layers: bool = False,
 ) -> None:
-    if raw_layers:
-        _save_fast_rgba_psd(path, size, layers)
-        return
-
     from psd_tools import PSDImage
     from psd_tools.api.layers import PixelLayer
     from psd_tools.constants import Compression
 
     psd = PSDImage.new("RGBA", size)
-    compression = Compression.RAW if raw_layers else Compression.RLE
+    compression = Compression.RLE
     for layer in layers:
         psd.append(
             PixelLayer.frompil(
@@ -878,169 +1040,6 @@ def _save_psd(
             )
         )
     psd.save(str(path))
-
-
-def _save_fast_rgba_psd(path: Path, size: tuple[int, int], layers: list[PsdLayer]) -> None:
-    width, height = size
-    if width <= 0 or height <= 0:
-        raise PsdReconstructionError(f"Invalid PSD canvas size: {size}")
-
-    visible_layers = [layer for layer in layers if layer.image.width and layer.image.height]
-    if len(visible_layers) > 32767:
-        raise PsdReconstructionError("PSD layer count exceeds the PSD format limit.")
-
-    record_specs = _build_psd_record_specs(visible_layers)
-    records = []
-    for spec in record_specs:
-        if spec["kind"] == "layer":
-            records.append(_pack_pixel_layer_record(spec["layer"]))
-        elif spec["kind"] == "group_start":
-            records.append(_pack_group_marker_record(str(spec["name"]), 1))
-        else:
-            records.append(_pack_group_marker_record("</Layer group>", 3))
-
-    layer_records = b"".join(records)
-    layer_pixels_length = sum(_record_channel_data_length(spec) for spec in record_specs)
-    layer_info_data_length = 2 + len(layer_records) + layer_pixels_length
-    layer_info_padding = layer_info_data_length % 2
-    layer_info_section_length = layer_info_data_length + layer_info_padding
-    layer_and_mask_length = 4 + layer_info_section_length + 4
-
-    with path.open("wb") as f:
-        f.write(b"8BPS")
-        f.write(struct.pack(">H", 1))
-        f.write(b"\0" * 6)
-        f.write(struct.pack(">HIIHH", 4, height, width, 8, 3))
-        f.write(struct.pack(">I", 0))
-        f.write(struct.pack(">I", 0))
-        f.write(struct.pack(">I", layer_and_mask_length))
-        f.write(struct.pack(">I", layer_info_section_length))
-        f.write(struct.pack(">h", len(record_specs)))
-        f.write(layer_records)
-
-        for spec in record_specs:
-            if spec["kind"] == "layer":
-                rgba = np.asarray(spec["layer"].image.convert("RGBA"))
-                for channel in (3, 0, 1, 2):
-                    f.write(struct.pack(">H", 0))
-                    f.write(np.ascontiguousarray(rgba[:, :, channel]).tobytes())
-            else:
-                for _ in range(4):
-                    f.write(struct.pack(">H", 0))
-
-        if layer_info_padding:
-            f.write(b"\0")
-        f.write(struct.pack(">I", 0))
-
-        flat = Image.new("RGBA", size, (0, 0, 0, 0))
-        for layer in visible_layers:
-            _alpha_composite_at(flat, layer.image.convert("RGBA"), layer.left, layer.top)
-        flat_rgba = np.asarray(flat)
-        f.write(struct.pack(">H", 0))
-        for channel in (0, 1, 2, 3):
-            f.write(np.ascontiguousarray(flat_rgba[:, :, channel]).tobytes())
-
-
-def _build_psd_record_specs(layers: list[PsdLayer]) -> list[dict[str, Any]]:
-    runs = []
-    current_group = None
-    current_layers = []
-    for layer in layers:
-        group = layer.group or "Ungrouped"
-        if current_group is None:
-            current_group = group
-        if group != current_group:
-            runs.append((current_group, current_layers))
-            current_group = group
-            current_layers = []
-        current_layers.append(layer)
-    if current_layers:
-        runs.append((current_group or "Ungrouped", current_layers))
-
-    specs: list[dict[str, Any]] = []
-    group_counts: dict[str, int] = {}
-    for group_name, group_layers in runs:
-        group_counts[group_name] = group_counts.get(group_name, 0) + 1
-        display_name = group_name
-        if group_counts[group_name] > 1:
-            display_name = f"{group_name} #{group_counts[group_name]}"
-        specs.append({"kind": "group_end", "name": "</Layer group>"})
-        specs.extend({"kind": "layer", "layer": layer} for layer in group_layers)
-        specs.append({"kind": "group_start", "name": display_name})
-    return specs
-
-
-def _pack_pixel_layer_record(layer: PsdLayer) -> bytes:
-    layer_width, layer_height = layer.image.size
-    top = int(layer.top)
-    left = int(layer.left)
-    bottom = top + layer_height
-    right = left + layer_width
-    channel_length = 2 + layer_width * layer_height
-    record = [
-        struct.pack(">iiii", top, left, bottom, right),
-        struct.pack(">H", 4),
-    ]
-    for channel_id in (-1, 0, 1, 2):
-        record.append(struct.pack(">hI", channel_id, channel_length))
-    record.extend([b"8BIM", b"norm", struct.pack(">BBBB", 255, 0, 8, 0)])
-    extra = _pack_layer_extra(layer.name)
-    record.extend([struct.pack(">I", len(extra)), extra])
-    return b"".join(record)
-
-
-def _pack_group_marker_record(name: str, section_kind: int) -> bytes:
-    record = [
-        struct.pack(">iiii", 0, 0, 0, 0),
-        struct.pack(">H", 4),
-    ]
-    for channel_id in (-1, 0, 1, 2):
-        record.append(struct.pack(">hI", channel_id, 2))
-    record.extend([b"8BIM", b"norm", struct.pack(">BBBB", 255, 0, 8, 0)])
-    extra = _pack_layer_extra(name, section_kind=section_kind)
-    record.extend([struct.pack(">I", len(extra)), extra])
-    return b"".join(record)
-
-
-def _record_channel_data_length(spec: dict[str, Any]) -> int:
-    if spec["kind"] != "layer":
-        return 8
-    width, height = spec["layer"].image.size
-    return (2 + width * height) * 4
-
-
-def _pack_layer_extra(name: str, section_kind: Optional[int] = None) -> bytes:
-    blocks = []
-    if section_kind is not None:
-        blocks.append(_pack_tagged_block(b"lsct", struct.pack(">I", section_kind)))
-        blocks.append(_pack_tagged_block(b"luni", _pack_unicode_name(name)))
-    return b"".join(
-        [
-            struct.pack(">I", 0),
-            struct.pack(">I", 0),
-            _pack_pascal_string(name),
-            b"".join(blocks),
-        ]
-    )
-
-
-def _pack_tagged_block(key: bytes, data: bytes) -> bytes:
-    if len(key) != 4:
-        raise ValueError("PSD tagged block keys must be 4 bytes")
-    padding = b"\0" if len(data) % 2 else b""
-    return b"8BIM" + key + struct.pack(">I", len(data)) + data + padding
-
-
-def _pack_unicode_name(name: str) -> bytes:
-    raw = name.encode("utf-16be", errors="replace")
-    return struct.pack(">I", len(raw) // 2) + raw
-
-
-def _pack_pascal_string(name: str) -> bytes:
-    raw = name.encode("macroman", errors="replace")[:255]
-    data = bytes([len(raw)]) + raw
-    padding = (-len(data)) % 4
-    return data + (b"\0" * padding)
 
 
 def _build_export_metadata(
@@ -1098,16 +1097,27 @@ def _metadata_textures(metadata: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(textures, list) or not textures:
         raise PsdReconstructionError("PSD metadata does not contain texture entries.")
 
+    source_root = None
+    source_model = metadata.get("source_model")
+    if isinstance(source_model, str) and source_model:
+        source_root = Path(source_model).resolve().parent
+
     normalized = []
     for item in textures:
         if not isinstance(item, dict):
             continue
+        relative_path = str(item.get("relative_path") or item.get("name") or "")
+        source_path = ""
+        if source_root and relative_path:
+            source_path = str((source_root / relative_path).resolve())
         normalized.append(
             {
                 "index": int(item["index"]),
                 "name": _safe_output_name(str(item["name"])),
                 "width": int(item["width"]),
                 "height": int(item["height"]),
+                "relative_path": relative_path,
+                "source_path": source_path,
             }
         )
     if not normalized:
@@ -1115,20 +1125,21 @@ def _metadata_textures(metadata: dict[str, Any]) -> list[dict[str, Any]]:
     return normalized
 
 
-def _metadata_layers(metadata: dict[str, Any]) -> list[dict[str, Any]]:
+def _metadata_layers(metadata: dict[str, Any], allowed_kinds: set[str] | None = None) -> list[dict[str, Any]]:
     layers = metadata.get("layers")
     if not isinstance(layers, list) or not layers:
         raise PsdReconstructionError("PSD metadata does not contain layer entries.")
 
+    allowed = allowed_kinds or {"atlas-component", "texture-atlas"}
     normalized = []
     for item in layers:
-        if not isinstance(item, dict) or item.get("kind") not in {"atlas-component", "texture-atlas"}:
+        if not isinstance(item, dict) or item.get("kind") not in allowed:
             continue
         if "name" not in item or "texture_index" not in item:
             continue
         normalized.append(item)
     if not normalized:
-        raise PsdReconstructionError("PSD metadata does not contain repackable atlas layers.")
+        raise PsdReconstructionError("PSD metadata does not contain repackable layers.")
     return normalized
 
 

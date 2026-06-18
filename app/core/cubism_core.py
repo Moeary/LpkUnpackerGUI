@@ -569,6 +569,15 @@ def resolve_cubism_core_dll(path: str | Path | None = None) -> Optional[Path]:
     if explicit:
         return explicit
 
+    try:
+        from app.core.settings_manager import SettingsManager
+
+        configured = _existing_file(SettingsManager().get_cubism_core_dll_path())
+        if configured:
+            return configured
+    except Exception:
+        pass
+
     env_file = _existing_file(os.environ.get("LPK_CUBISM_CORE_DLL"))
     if env_file:
         return env_file

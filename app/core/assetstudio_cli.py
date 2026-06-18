@@ -38,6 +38,14 @@ class AssetStudioCLI:
     def find_executable() -> Path:
         env_path = os.environ.get("LPK_ASSETSTUDIO_CLI")
         candidates = []
+        try:
+            from app.core.settings_manager import SettingsManager
+
+            configured_path = SettingsManager().get_assetstudio_cli_path()
+            if configured_path:
+                candidates.append(Path(configured_path))
+        except Exception:
+            pass
         if env_path:
             candidates.append(Path(env_path))
 

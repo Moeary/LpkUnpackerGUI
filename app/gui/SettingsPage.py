@@ -6,13 +6,15 @@ from qfluentwidgets import (
     BodyLabel,
     CaptionLabel,
     ComboBox,
-    FluentIcon,
     InfoBar,
     InfoBarPosition,
     LineEdit,
+    PrimaryPushButton,
     PushButton,
 )
 
+from app.core.assetstudio_cli import AssetStudioCLI, AssetStudioCLIError
+from app.core.cubism_core import resolve_cubism_core_dll
 from app.core.settings_manager import SettingsManager
 from app.i18n import get_i18n, normalize_language_code, tr
 
@@ -56,7 +58,20 @@ class SettingsPage(QFrame):
         self.archive_tool_edit = None
         self.archive_tool_button = None
         self.archive_tool_auto_button = None
+        self.assetstudio_tool_label = None
+        self.assetstudio_tool_desc = None
+        self.assetstudio_tool_status = None
+        self.assetstudio_tool_edit = None
+        self.assetstudio_tool_button = None
+        self.assetstudio_tool_auto_button = None
+        self.cubism_core_label = None
+        self.cubism_core_desc = None
+        self.cubism_core_status = None
+        self.cubism_core_edit = None
+        self.cubism_core_button = None
+        self.cubism_core_auto_button = None
         self.setting_file_note = None
+        self.save_button = None
 
         self.setup_ui()
         self.retranslate_ui()
@@ -155,7 +170,6 @@ class SettingsPage(QFrame):
         self.output_root_edit = LineEdit(runtime_card)
         self.output_root_edit.setReadOnly(True)
         self.output_root_button = PushButton("", runtime_card)
-        self.output_root_button.setIcon(FluentIcon.FOLDER)
         self.output_root_button.clicked.connect(self.browse_output_root)
 
         output_row.addLayout(output_text_layout, 1)
@@ -177,7 +191,6 @@ class SettingsPage(QFrame):
         self.archive_tool_edit = LineEdit(runtime_card)
         self.archive_tool_edit.editingFinished.connect(self.on_archive_tool_edit_finished)
         self.archive_tool_button = PushButton("", runtime_card)
-        self.archive_tool_button.setIcon(FluentIcon.FOLDER)
         self.archive_tool_button.clicked.connect(self.browse_archive_tool)
         self.archive_tool_auto_button = PushButton("", runtime_card)
         self.archive_tool_auto_button.clicked.connect(self.clear_archive_tool)
@@ -188,9 +201,70 @@ class SettingsPage(QFrame):
         archive_tool_row.addWidget(self.archive_tool_auto_button)
         runtime_layout.addLayout(archive_tool_row)
 
+        assetstudio_tool_row = QHBoxLayout()
+        assetstudio_tool_row.setSpacing(12)
+
+        assetstudio_tool_text_layout = QVBoxLayout()
+        assetstudio_tool_text_layout.setSpacing(4)
+        self.assetstudio_tool_label = BodyLabel("", runtime_card)
+        self.assetstudio_tool_desc = CaptionLabel("", runtime_card)
+        self.assetstudio_tool_desc.setWordWrap(True)
+        self.assetstudio_tool_status = CaptionLabel("", runtime_card)
+        self.assetstudio_tool_status.setWordWrap(True)
+        assetstudio_tool_text_layout.addWidget(self.assetstudio_tool_label)
+        assetstudio_tool_text_layout.addWidget(self.assetstudio_tool_desc)
+        assetstudio_tool_text_layout.addWidget(self.assetstudio_tool_status)
+
+        self.assetstudio_tool_edit = LineEdit(runtime_card)
+        self.assetstudio_tool_edit.editingFinished.connect(self.on_assetstudio_tool_edit_finished)
+        self.assetstudio_tool_button = PushButton("", runtime_card)
+        self.assetstudio_tool_button.clicked.connect(self.browse_assetstudio_tool)
+        self.assetstudio_tool_auto_button = PushButton("", runtime_card)
+        self.assetstudio_tool_auto_button.clicked.connect(self.clear_assetstudio_tool)
+
+        assetstudio_tool_row.addLayout(assetstudio_tool_text_layout, 1)
+        assetstudio_tool_row.addWidget(self.assetstudio_tool_edit, 2)
+        assetstudio_tool_row.addWidget(self.assetstudio_tool_button)
+        assetstudio_tool_row.addWidget(self.assetstudio_tool_auto_button)
+        runtime_layout.addLayout(assetstudio_tool_row)
+
+        cubism_core_row = QHBoxLayout()
+        cubism_core_row.setSpacing(12)
+
+        cubism_core_text_layout = QVBoxLayout()
+        cubism_core_text_layout.setSpacing(4)
+        self.cubism_core_label = BodyLabel("", runtime_card)
+        self.cubism_core_desc = CaptionLabel("", runtime_card)
+        self.cubism_core_desc.setWordWrap(True)
+        self.cubism_core_status = CaptionLabel("", runtime_card)
+        self.cubism_core_status.setWordWrap(True)
+        cubism_core_text_layout.addWidget(self.cubism_core_label)
+        cubism_core_text_layout.addWidget(self.cubism_core_desc)
+        cubism_core_text_layout.addWidget(self.cubism_core_status)
+
+        self.cubism_core_edit = LineEdit(runtime_card)
+        self.cubism_core_edit.editingFinished.connect(self.on_cubism_core_edit_finished)
+        self.cubism_core_button = PushButton("", runtime_card)
+        self.cubism_core_button.clicked.connect(self.browse_cubism_core)
+        self.cubism_core_auto_button = PushButton("", runtime_card)
+        self.cubism_core_auto_button.clicked.connect(self.clear_cubism_core)
+
+        cubism_core_row.addLayout(cubism_core_text_layout, 1)
+        cubism_core_row.addWidget(self.cubism_core_edit, 2)
+        cubism_core_row.addWidget(self.cubism_core_button)
+        cubism_core_row.addWidget(self.cubism_core_auto_button)
+        runtime_layout.addLayout(cubism_core_row)
+
         self.setting_file_note = CaptionLabel("", runtime_card)
         self.setting_file_note.setWordWrap(True)
         runtime_layout.addWidget(self.setting_file_note)
+
+        runtime_action_row = QHBoxLayout()
+        runtime_action_row.addStretch(1)
+        self.save_button = PrimaryPushButton("", runtime_card)
+        self.save_button.clicked.connect(self.save_runtime_settings)
+        runtime_action_row.addWidget(self.save_button)
+        runtime_layout.addLayout(runtime_action_row)
 
         main_layout.addWidget(runtime_card)
         main_layout.addStretch(1)
@@ -210,6 +284,11 @@ class SettingsPage(QFrame):
                 self.output_root_edit.setText(self.settings_manager.get_output_root())
             if self.archive_tool_edit:
                 self.archive_tool_edit.setText(self.settings_manager.get_archive_extractor_path())
+            if self.assetstudio_tool_edit:
+                self.assetstudio_tool_edit.setText(self.settings_manager.get_assetstudio_cli_path())
+            if self.cubism_core_edit:
+                self.cubism_core_edit.setText(self.settings_manager.get_cubism_core_dll_path())
+            self.refresh_tool_status_labels()
         finally:
             self._syncing_ui = False
 
@@ -261,9 +340,21 @@ class SettingsPage(QFrame):
             self.archive_tool_edit.setPlaceholderText(tr("settings.archive_tool_placeholder"))
             self.archive_tool_button.setText(tr("common.browse"))
             self.archive_tool_auto_button.setText(tr("settings.archive_tool_auto"))
+            self.assetstudio_tool_label.setText(tr("settings.assetstudio_tool_label"))
+            self.assetstudio_tool_desc.setText(tr("settings.assetstudio_tool_desc"))
+            self.assetstudio_tool_edit.setPlaceholderText(tr("settings.assetstudio_tool_placeholder"))
+            self.assetstudio_tool_button.setText(tr("common.browse"))
+            self.assetstudio_tool_auto_button.setText(tr("settings.tool_auto"))
+            self.cubism_core_label.setText(tr("settings.cubism_core_label"))
+            self.cubism_core_desc.setText(tr("settings.cubism_core_desc"))
+            self.cubism_core_edit.setPlaceholderText(tr("settings.cubism_core_placeholder"))
+            self.cubism_core_button.setText(tr("common.browse"))
+            self.cubism_core_auto_button.setText(tr("settings.tool_auto"))
+            self.refresh_tool_status_labels()
             self.setting_file_note.setText(
                 tr("settings.setting_file_note", path=self.settings_manager.settings_file)
             )
+            self.save_button.setText(tr("settings.save_button"))
         finally:
             self._syncing_ui = False
 
@@ -318,12 +409,37 @@ class SettingsPage(QFrame):
             return
         self.settings_manager.set_output_root(path)
         self.output_root_edit.setText(self.settings_manager.get_output_root())
+        self.load_current_settings()
         self.setting_file_note.setText(
             tr("settings.setting_file_note", path=self.settings_manager.settings_file)
         )
         InfoBar.success(
             title=tr("common.success"),
             content=tr("settings.output_root_saved"),
+            orient=Qt.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP,
+            duration=2500,
+            parent=self,
+        )
+
+    def save_runtime_settings(self):
+        output_root = self.output_root_edit.text().strip() if self.output_root_edit else ""
+        if output_root:
+            self.settings_manager.set_output_root(output_root)
+        self.settings_manager.set_archive_extractor_path(
+            self.archive_tool_edit.text() if self.archive_tool_edit else ""
+        )
+        self.settings_manager.set_assetstudio_cli_path(
+            self.assetstudio_tool_edit.text() if self.assetstudio_tool_edit else ""
+        )
+        self.settings_manager.set_cubism_core_dll_path(
+            self.cubism_core_edit.text() if self.cubism_core_edit else ""
+        )
+        self.load_current_settings()
+        InfoBar.success(
+            title=tr("common.success"),
+            content=tr("settings.saved"),
             orient=Qt.Horizontal,
             isClosable=True,
             position=InfoBarPosition.TOP,
@@ -363,6 +479,118 @@ class SettingsPage(QFrame):
             duration=2500,
             parent=self,
         )
+
+    def browse_assetstudio_tool(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            tr("settings.assetstudio_tool_select"),
+            self.assetstudio_tool_edit.text() or "",
+            tr("settings.assetstudio_tool_filter"),
+        )
+        if not path:
+            return
+        self.assetstudio_tool_edit.setText(path)
+        self.save_assetstudio_tool(path)
+
+    def clear_assetstudio_tool(self):
+        self.assetstudio_tool_edit.clear()
+        self.save_assetstudio_tool("")
+
+    def on_assetstudio_tool_edit_finished(self):
+        if self._syncing_ui:
+            return
+        self.save_assetstudio_tool(self.assetstudio_tool_edit.text())
+
+    def save_assetstudio_tool(self, path: str):
+        self.settings_manager.set_assetstudio_cli_path(path)
+        self.refresh_tool_status_labels()
+        InfoBar.success(
+            title=tr("common.success"),
+            content=tr("settings.assetstudio_tool_saved"),
+            orient=Qt.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP,
+            duration=2500,
+            parent=self,
+        )
+
+    def browse_cubism_core(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            tr("settings.cubism_core_select"),
+            self.cubism_core_edit.text() or "",
+            tr("settings.cubism_core_filter"),
+        )
+        if not path:
+            return
+        self.cubism_core_edit.setText(path)
+        self.save_cubism_core(path)
+
+    def clear_cubism_core(self):
+        self.cubism_core_edit.clear()
+        self.save_cubism_core("")
+
+    def on_cubism_core_edit_finished(self):
+        if self._syncing_ui:
+            return
+        self.save_cubism_core(self.cubism_core_edit.text())
+
+    def save_cubism_core(self, path: str):
+        self.settings_manager.set_cubism_core_dll_path(path)
+        self.refresh_tool_status_labels()
+        InfoBar.success(
+            title=tr("common.success"),
+            content=tr("settings.cubism_core_saved"),
+            orient=Qt.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP,
+            duration=2500,
+            parent=self,
+        )
+
+    def refresh_tool_status_labels(self):
+        if self.assetstudio_tool_status:
+            self.assetstudio_tool_status.setText(
+                self.tool_status_text(
+                    self.settings_manager.get_assetstudio_cli_path(),
+                    self.detect_assetstudio_path,
+                )
+            )
+        if self.cubism_core_status:
+            self.cubism_core_status.setText(
+                self.tool_status_text(
+                    self.settings_manager.get_cubism_core_dll_path(),
+                    self.detect_cubism_core_path,
+                )
+            )
+
+    def tool_status_text(self, configured_path: str, detector):
+        configured_path = str(configured_path or "").strip()
+        if configured_path:
+            if Path(configured_path).is_file():
+                return tr("settings.tool_status.configured", path=str(Path(configured_path).resolve()))
+            return tr("settings.tool_status.invalid", path=configured_path)
+        detected = detector()
+        if detected:
+            return tr("settings.tool_status.auto_found", path=str(detected))
+        return tr("settings.tool_status.not_found")
+
+    @staticmethod
+    def detect_assetstudio_path() -> str:
+        try:
+            return str(AssetStudioCLI.find_executable())
+        except AssetStudioCLIError:
+            return ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def detect_cubism_core_path() -> str:
+        try:
+            path = resolve_cubism_core_dll(None)
+            return str(path) if path else ""
+        except Exception:
+            return ""
 
     @staticmethod
     def _set_combo_by_value(combo: ComboBox, values: list, value: str):

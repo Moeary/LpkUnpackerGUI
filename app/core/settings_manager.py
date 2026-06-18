@@ -28,7 +28,10 @@ class SettingsManager:
             self.settings_file = str(RUNTIME_SETTINGS_FILE)
         settings_exists = os.path.exists(self.settings_file)
         self.settings = self.load_settings()
+        runtime_changed = self._normalize_runtime_paths()
         if not settings_exists:
+            self.save_settings()
+        elif runtime_changed:
             self.save_settings()
     
     def get_default_settings(self) -> Dict[str, Any]:
@@ -53,6 +56,8 @@ class SettingsManager:
             "language": "en_US",
             "tools": {
                 "archive_extractor_path": "",
+                "assetstudio_cli_path": "",
+                "cubism_core_dll_path": "",
             },
             "preview": {
                 "image_limit": 48,
@@ -187,6 +192,91 @@ class SettingsManager:
 
     def set_archive_extractor_path(self, path: str):
         self.set("tools.archive_extractor_path", str(path or "").strip())
+
+    def get_assetstudio_cli_path(self) -> str:
+        return str(self.get("tools.assetstudio_cli_path", "") or "").strip()
+
+    def set_assetstudio_cli_path(self, path: str):
+        self.set("tools.assetstudio_cli_path", str(path or "").strip())
+
+    def get_cubism_core_dll_path(self) -> str:
+        return str(self.get("tools.cubism_core_dll_path", "") or "").strip()
+
+    def set_cubism_core_dll_path(self, path: str):
+        self.set("tools.cubism_core_dll_path", str(path or "").strip())
+
+    def reset_runtime_to_project(self) -> None:
+        runtime = self.settings.setdefault("runtime", {})
+        runtime["dir"] = str(RUNTIME_DIR)
+        runtime["temp_dir"] = str(RUNTIME_TEMP_DIR)
+        runtime["output_root"] = str(RUNTIME_OUTPUT_DIR)
+        self.settings["output_paths"] = {
+            key: str(runtime_output_dir(key))
+            for key in OUTPUT_DIR_NAMES
+        }
+        self.settings["last_output_path"] = str(RUNTIME_OUTPUT_DIR)
+        self.save_settings()
+
+    def _normalize_runtime_paths(self) -> bool:
+        changed = False
+        runtime = self.settings.setdefault("runtime", {})
+
+        if runtime.get("dir") != str(RUNTIME_DIR):
+            runtime["dir"] = str(RUNTIME_DIR)
+            changed = True
+        if runtime.get("temp_dir") != str(RUNTIME_TEMP_DIR):
+            runtime["temp_dir"] = str(RUNTIME_TEMP_DIR)
+            changed = True
+
+        output_root = str(runtime.get("output_root") or RUNTIME_OUTPUT_DIR)
+        if self._is_stale_managed_runtime_path(output_root, ("runtime", "output")):
+            output_root = str(RUNTIME_OUTPUT_DIR)
+            runtime["output_root"] = output_root
+            changed = True
+        elif runtime.get("output_root") != output_root:
+            runtime["output_root"] = output_root
+            changed = True
+
+        output_paths = self.settings.setdefault("output_paths", {})
+        for key, dirname in OUTPUT_DIR_NAMES.items():
+            current = str(output_paths.get(key) or "")
+            expected = str(Path(output_root) / dirname)
+            if not current or self._is_stale_managed_runtime_path(
+                current,
+                ("runtime", "output", dirname),
+            ):
+                output_paths[key] = expected
+                changed = True
+
+        if str(self.settings.get("last_output_path") or "") and self._is_stale_managed_runtime_path(
+            str(self.settings.get("last_output_path")),
+            ("runtime", "output"),
+        ):
+            self.settings["last_output_path"] = output_root
+            changed = True
+
+        return changed
+
+    @staticmethod
+    def _is_stale_managed_runtime_path(path: str, suffix: tuple[str, ...]) -> bool:
+        if not path:
+            return True
+        try:
+            resolved = Path(path).resolve()
+        except Exception:
+            return True
+
+        current = {
+            ("runtime", "output"): RUNTIME_OUTPUT_DIR.resolve(),
+            ("runtime", "temp"): RUNTIME_TEMP_DIR.resolve(),
+        }.get(suffix)
+        if len(suffix) == 3 and suffix[:2] == ("runtime", "output"):
+            current = (RUNTIME_OUTPUT_DIR / suffix[2]).resolve()
+        if current and resolved == current:
+            return False
+
+        parts = tuple(part.lower() for part in resolved.parts[-len(suffix):])
+        return parts == tuple(part.lower() for part in suffix)
     
     def update_window_geometry(self, width: int, height: int, x: int, y: int):
         """Update window geometry"""

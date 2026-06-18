@@ -23,6 +23,7 @@ OUTPUT_DIR_NAMES = {
     "unity": "unity",
     "psd": "psd",
     "textures": "textures",
+    "live2dviewer_mod": "live2dviewer_mod",
 }
 
 
