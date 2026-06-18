@@ -332,6 +332,7 @@
   "psd.project.open": "開く",
   "psd.project.open_last": "前回を開く",
   "psd.project.save": "保存",
+  "psd.project.open_folder": "フォルダーを開く",
   "psd.project.no_project": "プロジェクト未読込。モデルソースを選択してから作成してください。",
   "psd.project.creating": "プロジェクトを作成中...",
   "psd.project.current": "現在のプロジェクト: {path}",

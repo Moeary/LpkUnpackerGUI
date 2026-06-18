@@ -52,6 +52,7 @@ from app.core.psd_project import (
     sanitize_project_name,
 )
 from app.core.model import prepare_model_json_for_preview, resolve_live2d_package
+from app.core.model.motions import load_live2d_motions
 from app.core.settings_manager import SettingsManager
 from app.gui.Live2DPreviewWindow import Live2DPreviewWindow
 from app.gui.PreviewPage import ImagePreviewPanel
@@ -252,8 +253,12 @@ class PsdReconstructionPage(QFrame):
         self.new_project_button.clicked.connect(self.create_project_from_current_source)
         self.save_project_button = PushButton("", self.project_frame)
         self.save_project_button.clicked.connect(self.save_current_project)
+        self.open_project_folder_button = PushButton("", self.project_frame)
+        self.open_project_folder_button.setEnabled(False)
+        self.open_project_folder_button.clicked.connect(self.open_current_project_folder)
         self.project_button_layout.addWidget(self.new_project_button)
         self.project_button_layout.addWidget(self.save_project_button)
+        self.project_button_layout.addWidget(self.open_project_folder_button)
         self.project_layout.addLayout(self.project_button_layout)
 
         self.project_status_label = CaptionLabel("", self.project_frame)
@@ -479,6 +484,7 @@ class PsdReconstructionPage(QFrame):
         for button in (
             self.new_project_button,
             self.save_project_button,
+            self.open_project_folder_button,
             self.preview_image_button,
             self.preview_live2d_button,
             self.preview_close_button,
@@ -499,6 +505,7 @@ class PsdReconstructionPage(QFrame):
         self.project_combo.setPlaceholderText(tr("psd.project.search_placeholder"))
         self.new_project_button.setText(tr("psd.project.new"))
         self.save_project_button.setText(tr("psd.project.save"))
+        self.open_project_folder_button.setText(tr("psd.project.open_folder"))
         self.project_status_label.setText(tr("psd.project.no_project"))
         self.source_label.setText(tr("psd.source"))
         self.source_edit.setPlaceholderText(tr("psd.placeholder_source"))
@@ -784,6 +791,7 @@ class PsdReconstructionPage(QFrame):
         self.source_folder_button.setEnabled(not busy)
         self.new_project_button.setEnabled(not busy)
         self.save_project_button.setEnabled(not busy)
+        self.open_project_folder_button.setEnabled(not busy and self.current_project is not None)
         self.project_combo.setEnabled(not busy)
         self.output_button.setEnabled(not busy and self.workflow != "repack")
         self.output_edit.setReadOnly(self.workflow == "repack")
@@ -1230,6 +1238,11 @@ class PsdReconstructionPage(QFrame):
         self.refresh_project_combo(select_project_file=str(project_file))
         self.append_log(tr("psd.project.saved", path=str(project_file)))
 
+    def open_current_project_folder(self):
+        if not self.current_project:
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.current_project.project_dir.resolve())))
+
     def on_project_created(self, project: Live2DPSDProject):
         self.set_busy(False)
         self.set_current_project(project)
@@ -1273,10 +1286,14 @@ class PsdReconstructionPage(QFrame):
 
     def refresh_project_ui(self, selected_id: str | None = None):
         if not self.current_project:
+            if hasattr(self, "open_project_folder_button"):
+                self.open_project_folder_button.setEnabled(False)
             self.project_status_label.setText(tr("psd.project.no_project"))
             self.refresh_preview_source_combo()
             self.refresh_motion_controls(None)
             return
+        if hasattr(self, "open_project_folder_button"):
+            self.open_project_folder_button.setEnabled(True)
         self.project_status_label.setText(
             tr("psd.project.current", path=str(self.current_project.project_file))
         )
@@ -1398,38 +1415,7 @@ class PsdReconstructionPage(QFrame):
 
     @staticmethod
     def _load_motions_from_model_json(model_json_path: str | Path | None) -> list[dict]:
-        if not model_json_path:
-            return []
-        path = Path(model_json_path)
-        if not path.is_file():
-            return []
-        try:
-            with path.open("r", encoding="utf-8-sig") as f:
-                data = json.load(f)
-        except Exception:
-            return []
-        refs = (data or {}).get("FileReferences") or {}
-        groups = refs.get("Motions") or {}
-        motions = []
-        for group, items in groups.items():
-            if not isinstance(items, list):
-                continue
-            for index, item in enumerate(items):
-                if not isinstance(item, dict):
-                    continue
-                rel = str(item.get("File") or "")
-                display = f"{group}[{index}]"
-                if rel:
-                    display = f"{display} - {Path(rel).name}"
-                motions.append(
-                    {
-                        "group": str(group),
-                        "index": int(index),
-                        "display": display,
-                        "rel": rel,
-                    }
-                )
-        return motions
+        return load_live2d_motions(model_json_path)
 
     def refresh_motion_controls(self, model_json_path: str | Path | None):
         if not hasattr(self, "motion_combo"):
@@ -1603,6 +1589,8 @@ class PsdReconstructionPage(QFrame):
         version_id = str(repack_entry.get("id") or version_id)
 
         self.set_preview_visible(True, stop_process=False)
+        self.clear_live2d_preview_widget()
+        self.live2d_preview_host.setVisible(False)
         self.preview_image_panel.setVisible(False)
         self.preview_placeholder_label.setVisible(True)
         self.preview_placeholder_label.setText(tr("psd.preview.preparing_current"))
@@ -1658,15 +1646,14 @@ class PsdReconstructionPage(QFrame):
             )
             return
 
-        updates_were_enabled = self.updatesEnabled()
-        self.setUpdatesEnabled(False)
         try:
             self.set_preview_visible(True, stop_process=False)
-            self.close_project_preview(update_placeholder=False)
+            self.clear_live2d_preview_widget()
             self.preview_mode = mode
             self.preview_repack_id = repack_id
-            self.preview_placeholder_label.setVisible(False)
             self.preview_image_panel.setVisible(False)
+            self.preview_placeholder_label.setVisible(True)
+            self.preview_placeholder_label.setText(tr("psd.preview.preparing_current"))
             self.live2d_preview_host.setVisible(False)
             self.preview_title_label.setText(tr("psd.preview.title"))
 
@@ -1685,6 +1672,7 @@ class PsdReconstructionPage(QFrame):
             )
             self.send_selected_motion_to_preview()
             self.live2d_preview_host_layout.addWidget(preview_window, 1)
+            self.preview_placeholder_label.setVisible(False)
             self.live2d_preview_host.setVisible(True)
             preview_window.show()
             if self.current_project:
@@ -1706,10 +1694,6 @@ class PsdReconstructionPage(QFrame):
                 position=InfoBarPosition.TOP,
                 duration=5000,
             )
-        finally:
-            self.setUpdatesEnabled(updates_were_enabled)
-            if updates_were_enabled:
-                self.update()
 
     def _send_preview_command(self, payload: dict) -> bool:
         window = self.live2d_preview_window
@@ -1730,6 +1714,18 @@ class PsdReconstructionPage(QFrame):
             return True
         except Exception:
             return False
+
+    def clear_live2d_preview_widget(self):
+        window = self.live2d_preview_window
+        self.live2d_preview_window = None
+        if window is None:
+            return
+        try:
+            self.live2d_preview_host_layout.removeWidget(window)
+            window.close()
+            window.deleteLater()
+        except Exception:
+            pass
 
     def _preview_dock_rect(self) -> dict | None:
         if self.preview_frame.isHidden():
@@ -1764,15 +1760,7 @@ class PsdReconstructionPage(QFrame):
         self._last_preview_dock_rect = None
         self.preview_mode = ""
         self.preview_repack_id = ""
-        window = self.live2d_preview_window
-        self.live2d_preview_window = None
-        if window is not None:
-            try:
-                self.live2d_preview_host_layout.removeWidget(window)
-                window.close()
-                window.deleteLater()
-            except Exception:
-                pass
+        self.clear_live2d_preview_widget()
         if hasattr(self, "live2d_preview_host"):
             self.live2d_preview_host.setVisible(False)
         if update_placeholder and hasattr(self, "preview_placeholder_label"):

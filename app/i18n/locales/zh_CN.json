@@ -332,6 +332,7 @@
   "psd.project.open": "加载工程",
   "psd.project.open_last": "加载上次",
   "psd.project.save": "保存工程",
+  "psd.project.open_folder": "打开目录",
   "psd.project.no_project": "未加载工程。可先选择模型来源，再新建工程。",
   "psd.project.creating": "正在创建工程...",
   "psd.project.current": "当前工程：{path}",

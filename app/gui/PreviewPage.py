@@ -26,6 +26,7 @@ from qfluentwidgets import (SubtitleLabel, BodyLabel, PushButton, Slider, CheckB
 
 from app.core.assetstudio_cli import AssetStudioCLI
 from app.core.model import is_model_json_path, resolve_live2d_package
+from app.core.model.motions import load_live2d_motions
 from app.core.preview import prepare_preview_import
 from app.core.settings_manager import SettingsManager
 from app.i18n import get_i18n, tr
@@ -2288,35 +2289,7 @@ class PreviewPage(QFrame):
 
     @staticmethod
     def _load_motions_from_model_json(model_json_path: str) -> list[dict]:
-        motions = []
-        if not model_json_path:
-            return motions
-        base_dir = os.path.dirname(model_json_path)
-        try:
-            with open(model_json_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            return motions
-        refs = (data or {}).get("FileReferences") or {}
-        motion_groups = refs.get("Motions") or {}
-        for group, items in motion_groups.items():
-            if not isinstance(items, list):
-                continue
-            for index, item in enumerate(items):
-                if not isinstance(item, dict):
-                    continue
-                rel = item.get("File") or ""
-                if not rel:
-                    continue
-                full_path = os.path.normpath(os.path.join(base_dir, rel))
-                motions.append({
-                    "group": str(group),
-                    "index": int(index),
-                    "file": full_path,
-                    "rel": rel,
-                    "display": f"{group}[{index}] - {os.path.basename(rel)}",
-                })
-        return motions
+        return load_live2d_motions(model_json_path)
 
     @staticmethod
     def _serialize_preview_settings(settings: dict) -> dict:

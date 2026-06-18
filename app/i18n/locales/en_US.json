@@ -332,6 +332,7 @@
   "psd.project.open": "Open Project",
   "psd.project.open_last": "Open Last",
   "psd.project.save": "Save Project",
+  "psd.project.open_folder": "Open Folder",
   "psd.project.no_project": "No project loaded. Select a model source, then create a project.",
   "psd.project.creating": "Creating project...",
   "psd.project.current": "Current project: {path}",

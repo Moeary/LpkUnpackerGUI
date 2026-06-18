@@ -10,6 +10,8 @@ from abc import abstractmethod
 import live2d.v3 as live2d
 from live2d.utils.canvas import Canvas
 
+from app.core.model.motions import load_live2d_motions
+
 live2d.init()
 
 def compile_shader(shader_src, shader_type):
@@ -519,42 +521,7 @@ class Live2DCanvas(ADPOpenGLCanvas):
         """Parse the Live2D model json (model*.json) to discover motion groups and files.
         Returns a list of items: { 'group': str, 'index': int, 'file': str, 'display': str }
         """
-        import os
-        import json
-        motions: List[Dict[str, Any]] = []
-        if not model_json_path:
-            return motions
-        base_dir = os.path.dirname(model_json_path)
-        try:
-            with open(model_json_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-        except Exception:
-            return motions
-        refs = (data or {}).get('FileReferences') or {}
-        motion_groups = refs.get('Motions') or {}
-        for group, items in motion_groups.items():
-            if not isinstance(items, list):
-                continue
-            for idx, it in enumerate(items):
-                if not isinstance(it, dict):
-                    continue
-                rel = it.get('File') or ''
-                if not rel:
-                    continue
-                full_path = os.path.normpath(os.path.join(base_dir, rel))
-                sound_rel = it.get('Sound') or ''
-                sound_path = os.path.normpath(os.path.join(base_dir, sound_rel)) if sound_rel else ''
-                display = f"{group}[{idx}] - {os.path.basename(rel)}"
-                motions.append({
-                    'group': str(group),
-                    'index': int(idx),
-                    'file': full_path,
-                    'rel': rel,
-                    'sound': sound_path,
-                    'sound_rel': sound_rel,
-                    'display': display,
-                })
-        return motions
+        return load_live2d_motions(model_json_path)
 
     def listMotions(self) -> List[Dict[str, Any]]:
         """Return cached motion list. Safe to call before GL init (may be empty)."""

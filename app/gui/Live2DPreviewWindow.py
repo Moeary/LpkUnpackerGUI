@@ -8,6 +8,7 @@ from qfluentwidgets import ComboBox
 from qfluentwidgets import InfoBar, InfoBarPosition
 from app.i18n import get_i18n, tr
 
+from app.core.model.motions import load_live2d_motions
 from app.gui.Live2DCanvas import Live2DCanvas
 
 try:
@@ -394,35 +395,9 @@ class Live2DPreviewWindow(QWidget):
 
     def _populate_motion_combo(self):
         """读取model*.json中的动作并填充到下拉框"""
-        import json
         self.motion_combo.clear()
-        self._motion_items = []
+        self._motion_items = load_live2d_motions(self.model_path)
         self._selected_motion = None
-        if not self.model_path or not os.path.exists(self.model_path):
-            return
-        base_dir = os.path.dirname(self.model_path)
-        try:
-            with open(self.model_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            refs = (data or {}).get('FileReferences') or {}
-            groups = refs.get('Motions') or {}
-            for g, items in groups.items():
-                if not isinstance(items, list):
-                    continue
-                for idx, it in enumerate(items):
-                    rel = (it or {}).get('File') or ''
-                    sound_rel = (it or {}).get('Sound') or ''
-                    display = f"{g}[{idx}] - {os.path.basename(rel) if rel else ''}"
-                    self._motion_items.append({
-                        "group": str(g),
-                        "index": int(idx),
-                        "display": display,
-                        "rel": rel,
-                        "sound": os.path.normpath(os.path.join(base_dir, sound_rel)) if sound_rel else "",
-                        "sound_rel": sound_rel,
-                    })
-        except Exception:
-            self._motion_items = []
         if not self._motion_items:
             self.motion_combo.addItem(tr("preview_window.no_motions"))
             self.motion_combo.setEnabled(False)
