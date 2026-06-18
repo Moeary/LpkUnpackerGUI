@@ -8,8 +8,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from app.core.model import Live2DPackage, Live2DPackageError, resolve_live2d_package
-from app.core.preview.session import prepare_preview_import
+from app.core.model import Live2DPackage, resolve_live2d_package
+from app.core.model.importer import prepare_live2d_source_import
 from app.core.settings_manager import SettingsManager
 
 
@@ -304,17 +304,7 @@ def _import_package(
     temp_root: str | Path | None,
     log: LogCallback | None,
 ) -> tuple[Live2DPackage, Path | None, list[str]]:
-    try:
-        return resolve_live2d_package(source_path), None, []
-    except Live2DPackageError:
-        pass
-
-    settings = SettingsManager()
-    result = prepare_preview_import(
-        source_path,
-        temp_root or settings.get_temp_dir(),
-        log=log,
-    )
+    result = prepare_live2d_source_import(source_path, temp_root=temp_root, log=log)
     return result.package, result.temp_dir, result.warnings
 
 

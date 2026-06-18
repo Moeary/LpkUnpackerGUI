@@ -66,6 +66,10 @@ class SettingsManager:
                 "last_project_file": "",
                 "project_files": [],
             },
+            "live2dviewer_mod": {
+                "last_project_file": "",
+                "project_files": [],
+            },
             "window_geometry": {
                 "width": 1000,
                 "height": 700,
