@@ -5,14 +5,17 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import Qt, QThread, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent
+from PySide6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QDialog,
     QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
+    QLabel,
+    QScrollArea,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -35,6 +38,7 @@ from qfluentwidgets import (
 from app.core.live2dviewer_mod_project import (
     Live2DViewerModProject,
     PROJECT_FILE_NAME,
+    build_temporary_texture_preview_model,
     create_project_from_base_source,
     generate_live2dviewer_mod,
     load_project,
@@ -44,8 +48,9 @@ from app.core.live2dviewer_mod_project import (
 )
 from app.core.model import resolve_live2d_package
 from app.core.model.importer import import_texture_source_to_workspace
+from app.core.preview.sources import IMAGE_PREVIEW_EXTENSIONS, UNITY_PREVIEW_EXTENSIONS
 from app.core.settings_manager import SettingsManager
-from app.gui.Live2DPreviewPanel import Live2DPreviewPanel
+from app.gui.UnifiedPreviewPanel import UnifiedPreviewPanel
 from app.i18n import get_i18n, tr
 
 
@@ -53,13 +58,11 @@ SUPPORTED_SOURCE_SUFFIXES = {
     ".lpk",
     ".wpk",
     ".json",
+    ".moc",
     ".moc3",
-    ".assets",
-    ".sharedassets",
-    ".bundle",
-    ".unity3d",
+    *(suffix for suffix in UNITY_PREVIEW_EXTENSIONS if suffix),
 }
-SUPPORTED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tga"}
+SUPPORTED_IMAGE_SUFFIXES = set(IMAGE_PREVIEW_EXTENSIONS)
 
 
 class ModProjectImportThread(QThread):
@@ -113,12 +116,20 @@ class ModSkinSourceImportThread(QThread):
     importReady = Signal(object)
     importError = Signal(str)
 
-    def __init__(self, source_path: str, skin_name: str, workspace_dir: str, temp_root: str):
+    def __init__(
+        self,
+        source_path: str,
+        skin_name: str,
+        workspace_dir: str,
+        temp_root: str,
+        source_kind: str = "skin",
+    ):
         super().__init__()
         self.source_path = source_path
         self.skin_name = skin_name
         self.workspace_dir = workspace_dir
         self.temp_root = temp_root
+        self.source_kind = source_kind
 
     def run(self):
         try:
@@ -137,10 +148,212 @@ class ModSkinSourceImportThread(QThread):
                     "model_json": str(result.model_json or ""),
                     "texture_paths": [str(path) for path in result.texture_paths],
                     "warnings": result.warnings,
+                    "source_kind": self.source_kind,
                 }
             )
         except Exception as exc:
             self.importError.emit(str(exc))
+
+
+class TextureMappingDialog(QDialog):
+    def __init__(
+        self,
+        skin_name: str,
+        base_textures: list[Path],
+        source_textures: list[Path],
+        suggestions: list[tuple[int, Path]] | None = None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("编辑贴图映射")
+        self.setMinimumSize(980, 640)
+        self.base_textures = [Path(path) for path in base_textures if Path(path).is_file()]
+        self.source_textures = [Path(path) for path in source_textures if Path(path).is_file()]
+        self.suggestions = [
+            (int(index), Path(path).resolve())
+            for index, path in suggestions or []
+            if Path(path).is_file()
+        ]
+        self.suggestion_map = {str(Path(path).resolve()): int(index) for index, path in suggestions or []}
+
+        self.main_layout = QVBoxLayout(self)
+        self.main_layout.setContentsMargins(16, 16, 16, 16)
+        self.main_layout.setSpacing(10)
+
+        name_layout = QHBoxLayout()
+        name_layout.setSpacing(8)
+        self.name_label = BodyLabel("皮肤名：", self)
+        self.skin_name_edit = LineEdit(self)
+        self.skin_name_edit.setText(skin_name)
+        self.skin_name_edit.setPlaceholderText("例如：泳装、替换皮肤 01")
+        name_layout.addWidget(self.name_label)
+        name_layout.addWidget(self.skin_name_edit, 1)
+        self.main_layout.addLayout(name_layout)
+
+        self.hint_label = CaptionLabel(
+            "左侧是导入来源的贴图，右侧选择它要替换主模型里的哪张原贴图；确认后才会写入工程。",
+            self,
+        )
+        self.hint_label.setWordWrap(True)
+        self.main_layout.addWidget(self.hint_label)
+
+        self.content_splitter = QSplitter(Qt.Horizontal, self)
+        self.content_splitter.setChildrenCollapsible(False)
+        self.main_layout.addWidget(self.content_splitter, 1)
+
+        self.mapping_table = QTableWidget(self.content_splitter)
+        self.mapping_table.setColumnCount(2)
+        self.mapping_table.setHorizontalHeaderLabels(["导入贴图", "替换目标"])
+        self.mapping_table.verticalHeader().setVisible(False)
+        self.mapping_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.mapping_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.mapping_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.mapping_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.mapping_table.itemSelectionChanged.connect(self.refresh_selected_preview)
+        self.content_splitter.addWidget(self.mapping_table)
+
+        self.preview_frame = QFrame(self.content_splitter)
+        self.preview_layout = QVBoxLayout(self.preview_frame)
+        self.preview_layout.setContentsMargins(0, 0, 0, 0)
+        self.preview_layout.setSpacing(8)
+        self.original_title = SubtitleLabel("主模型原贴图", self.preview_frame)
+        self.original_preview = QLabel(self.preview_frame)
+        self.source_title = SubtitleLabel("导入贴图", self.preview_frame)
+        self.source_preview = QLabel(self.preview_frame)
+        for label in (self.original_preview, self.source_preview):
+            label.setMinimumHeight(220)
+            label.setAlignment(Qt.AlignCenter)
+            label.setStyleSheet("QLabel { background: #f7f8fa; border: 1px solid #dce3eb; border-radius: 6px; }")
+        self.preview_layout.addWidget(self.original_title)
+        self.preview_layout.addWidget(self.original_preview, 1)
+        self.preview_layout.addWidget(self.source_title)
+        self.preview_layout.addWidget(self.source_preview, 1)
+        self.content_splitter.addWidget(self.preview_frame)
+        self.content_splitter.setSizes([560, 420])
+
+        self.status_label = CaptionLabel("", self)
+        self.status_label.setWordWrap(True)
+        self.main_layout.addWidget(self.status_label)
+
+        button_layout = QHBoxLayout()
+        button_layout.addStretch(1)
+        self.cancel_button = PushButton("取消", self)
+        self.cancel_button.clicked.connect(self.reject)
+        self.accept_button = PushButton("确认映射", self)
+        self.accept_button.clicked.connect(self.accept_if_valid)
+        button_layout.addWidget(self.cancel_button)
+        button_layout.addWidget(self.accept_button)
+        self.main_layout.addLayout(button_layout)
+
+        self.populate_table()
+
+    def populate_table(self):
+        self.mapping_table.setRowCount(len(self.source_textures))
+        for row, source_path in enumerate(self.source_textures):
+            item = QTableWidgetItem(source_path.name)
+            item.setData(Qt.UserRole, str(source_path.resolve()))
+            item.setToolTip(str(source_path))
+            self.mapping_table.setItem(row, 0, item)
+
+            combo = ComboBox(self.mapping_table)
+            combo.addItem("不映射", userData="-1")
+            for index, base_path in enumerate(self.base_textures):
+                combo.addItem(f"{index}: {base_path.name}", userData=str(index))
+            suggested = -1
+            if row < len(self.suggestions) and self.suggestions[row][1] == source_path.resolve():
+                suggested = self.suggestions[row][0]
+            if suggested < 0:
+                suggested = self.suggestion_map.get(str(source_path.resolve()), -1)
+            combo_index = 0
+            for index in range(combo.count()):
+                if str(combo.itemData(index) or "") == str(suggested):
+                    combo_index = index
+                    break
+            combo.setCurrentIndex(combo_index)
+            combo.currentIndexChanged.connect(self.refresh_selected_preview)
+            self.mapping_table.setCellWidget(row, 1, combo)
+        if self.source_textures:
+            self.mapping_table.selectRow(0)
+        self.refresh_selected_preview()
+
+    def skin_name(self) -> str:
+        return self.skin_name_edit.text().strip()
+
+    def mappings(self) -> list[tuple[int, Path]]:
+        result: list[tuple[int, Path]] = []
+        for row in range(self.mapping_table.rowCount()):
+            item = self.mapping_table.item(row, 0)
+            combo = self.mapping_table.cellWidget(row, 1)
+            if not item or not isinstance(combo, ComboBox):
+                continue
+            raw = str(combo.currentData() or "-1")
+            if not raw.isdigit():
+                continue
+            target_index = int(raw)
+            if target_index < 0:
+                continue
+            source_path = Path(str(item.data(Qt.UserRole) or ""))
+            if source_path.is_file():
+                result.append((target_index, source_path))
+        return result
+
+    def accept_if_valid(self):
+        if not self.skin_name():
+            self.status_label.setText("请先填写皮肤名。")
+            return
+        mappings = self.mappings()
+        if not mappings:
+            self.status_label.setText("至少需要选择一条贴图映射。")
+            return
+        targets = [index for index, _path in mappings]
+        if len(targets) != len(set(targets)):
+            self.status_label.setText("同一张主模型贴图只能被一张导入贴图替换。")
+            return
+        self.accept()
+
+    def refresh_selected_preview(self, *_args):
+        row = self.mapping_table.currentRow()
+        if row < 0 and self.mapping_table.rowCount():
+            row = 0
+        source_path = None
+        target_path = None
+        if row >= 0:
+            item = self.mapping_table.item(row, 0)
+            if item:
+                source_path = Path(str(item.data(Qt.UserRole) or ""))
+            combo = self.mapping_table.cellWidget(row, 1)
+            if isinstance(combo, ComboBox):
+                raw = str(combo.currentData() or "-1")
+                if raw.isdigit():
+                    index = int(raw)
+                    if 0 <= index < len(self.base_textures):
+                        target_path = self.base_textures[index]
+        self.set_preview_pixmap(self.source_preview, source_path, "未选择导入贴图")
+        self.set_preview_pixmap(self.original_preview, target_path, "未映射目标贴图")
+
+    @staticmethod
+    def set_preview_pixmap(label: QLabel, path: Path | None, empty_text: str):
+        if not path or not path.is_file():
+            label.setText(empty_text)
+            label.setPixmap(QPixmap())
+            return
+        pixmap = QPixmap(str(path))
+        if pixmap.isNull():
+            label.setText(path.name)
+            label.setPixmap(QPixmap())
+            return
+        label.setText("")
+        label.setPixmap(
+            pixmap.scaled(
+                label.size(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+        )
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.refresh_selected_preview()
 
 
 class Live2DModPage(QFrame):
@@ -153,6 +366,7 @@ class Live2DModPage(QFrame):
         self.settings_manager = SettingsManager()
         self.current_project: Live2DViewerModProject | None = None
         self.selected_source = ""
+        self.selected_aux_source = ""
         self.project_worker: ModProjectImportThread | None = None
         self.generate_worker: ModGenerateThread | None = None
         self.skin_import_worker: ModSkinSourceImportThread | None = None
@@ -192,27 +406,28 @@ class Live2DModPage(QFrame):
         self.content_splitter.setChildrenCollapsible(False)
         self.main_layout.addWidget(self.content_splitter, 1)
 
-        self.left_panel = QWidget(self.content_splitter)
-        self.left_panel.setMinimumWidth(340)
-        self.left_layout = QVBoxLayout(self.left_panel)
-        self.left_layout.setContentsMargins(0, 0, 6, 0)
-        self.left_layout.setSpacing(10)
-        self.content_splitter.addWidget(self.left_panel)
+        self.left_scroll = QScrollArea(self.content_splitter)
+        self.left_scroll.setWidgetResizable(True)
+        self.left_scroll.setFrameShape(QFrame.NoFrame)
+        self.left_scroll.setMinimumWidth(420)
+        self.content_splitter.addWidget(self.left_scroll)
 
-        self.center_panel = QWidget(self.content_splitter)
-        self.center_panel.setMinimumWidth(420)
-        self.center_layout = QVBoxLayout(self.center_panel)
-        self.center_layout.setContentsMargins(6, 0, 6, 0)
-        self.center_layout.setSpacing(10)
-        self.content_splitter.addWidget(self.center_panel)
+        self.left_panel = QWidget(self.left_scroll)
+        self.left_panel.setMinimumWidth(390)
+        self.left_layout = QVBoxLayout(self.left_panel)
+        self.left_layout.setContentsMargins(0, 0, 8, 0)
+        self.left_layout.setSpacing(10)
+        self.left_scroll.setWidget(self.left_panel)
 
         self.right_panel = QWidget(self.content_splitter)
-        self.right_panel.setMinimumWidth(360)
+        self.right_panel.setMinimumWidth(520)
         self.right_layout = QVBoxLayout(self.right_panel)
-        self.right_layout.setContentsMargins(6, 0, 0, 0)
+        self.right_layout.setContentsMargins(8, 0, 0, 0)
         self.right_layout.setSpacing(10)
         self.content_splitter.addWidget(self.right_panel)
-        self.content_splitter.setSizes([420, 760, 520])
+        self.content_splitter.setSizes([520, 980])
+        self.center_panel = self.right_panel
+        self.center_layout = self.right_layout
 
         self.project_frame, self.project_layout = self._create_card(self.left_panel)
         self.project_title_label = SubtitleLabel("", self.project_frame)
@@ -268,6 +483,29 @@ class Live2DModPage(QFrame):
         self.source_frame_layout.addWidget(self.source_hint_label)
         self.left_layout.addWidget(self.source_frame)
 
+        self.aux_source_frame, self.aux_source_layout = self._create_card(self.left_panel)
+        self.aux_source_title_label = SubtitleLabel("", self.aux_source_frame)
+        self.aux_source_layout.addWidget(self.aux_source_title_label)
+        self.aux_source_edit = LineEdit(self.aux_source_frame)
+        self.aux_source_edit.setReadOnly(True)
+        self.aux_source_layout.addWidget(self.aux_source_edit)
+        self.aux_source_buttons = QHBoxLayout()
+        self.aux_source_buttons.setSpacing(8)
+        self.aux_source_file_button = PushButton("", self.aux_source_frame)
+        self.aux_source_file_button.clicked.connect(self.browse_aux_source_file)
+        self.aux_source_folder_button = PushButton("", self.aux_source_frame)
+        self.aux_source_folder_button.clicked.connect(self.browse_aux_source_folder)
+        self.import_aux_source_button = PushButton("", self.aux_source_frame)
+        self.import_aux_source_button.clicked.connect(self.import_auxiliary_source_from_current)
+        self.aux_source_buttons.addWidget(self.aux_source_file_button, 1)
+        self.aux_source_buttons.addWidget(self.aux_source_folder_button, 1)
+        self.aux_source_buttons.addWidget(self.import_aux_source_button, 1)
+        self.aux_source_layout.addLayout(self.aux_source_buttons)
+        self.aux_source_hint_label = CaptionLabel("", self.aux_source_frame)
+        self.aux_source_hint_label.setWordWrap(True)
+        self.aux_source_layout.addWidget(self.aux_source_hint_label)
+        self.left_layout.addWidget(self.aux_source_frame)
+
         self.hitarea_frame, self.hitarea_layout = self._create_card(self.left_panel)
         self.hitarea_title_label = SubtitleLabel("", self.hitarea_frame)
         self.hitarea_layout.addWidget(self.hitarea_title_label)
@@ -281,8 +519,9 @@ class Live2DModPage(QFrame):
         self.hitarea_status_label.setWordWrap(True)
         self.hitarea_layout.addWidget(self.hitarea_status_label)
         self.left_layout.addWidget(self.hitarea_frame)
+        self.hitarea_frame.setVisible(False)
 
-        self.skin_config_frame, self.skin_config_layout = self._create_card(self.right_panel)
+        self.skin_config_frame, self.skin_config_layout = self._create_card(self.left_panel)
         self.skin_config_title_label = SubtitleLabel("", self.skin_config_frame)
         self.skin_config_layout.addWidget(self.skin_config_title_label)
         self.skin_name_edit = LineEdit(self.skin_config_frame)
@@ -291,17 +530,20 @@ class Live2DModPage(QFrame):
         self.skin_config_buttons.setSpacing(8)
         self.add_empty_skin_button = PushButton("", self.skin_config_frame)
         self.add_empty_skin_button.clicked.connect(self.add_empty_skin)
+        self.edit_skin_button = PushButton("编辑 Skin", self.skin_config_frame)
+        self.edit_skin_button.clicked.connect(self.edit_selected_skin_mapping)
         self.remove_skin_button = PushButton("", self.skin_config_frame)
         self.remove_skin_button.clicked.connect(self.remove_selected_skin)
         self.generate_button = PushButton("", self.skin_config_frame)
         self.generate_button.clicked.connect(self.start_generate_mod)
         self.skin_config_buttons.addWidget(self.add_empty_skin_button, 1)
+        self.skin_config_buttons.addWidget(self.edit_skin_button, 1)
         self.skin_config_buttons.addWidget(self.remove_skin_button, 1)
         self.skin_config_buttons.addWidget(self.generate_button, 1)
         self.skin_config_layout.addLayout(self.skin_config_buttons)
-        self.right_layout.addWidget(self.skin_config_frame)
+        self.left_layout.addWidget(self.skin_config_frame)
 
-        self.preview_control_frame, self.preview_control_layout = self._create_card(self.center_panel)
+        self.preview_control_frame, self.preview_control_layout = self._create_card(self.left_panel)
         self.preview_control_title_label = SubtitleLabel("", self.preview_control_frame)
         self.preview_control_layout.addWidget(self.preview_control_title_label)
 
@@ -332,14 +574,12 @@ class Live2DModPage(QFrame):
         self.preview_buttons.addWidget(self.preview_live2d_button, 1)
         self.preview_buttons.addWidget(self.preview_close_button, 1)
         self.preview_control_layout.addLayout(self.preview_buttons)
-        self.center_layout.addWidget(self.preview_control_frame)
+        self.left_layout.addWidget(self.preview_control_frame)
 
-        self.left_layout.addStretch(1)
+        self.preview_panel = UnifiedPreviewPanel(self.right_panel, "modPreviewPanel")
+        self.right_layout.addWidget(self.preview_panel, 1)
 
-        self.preview_panel = Live2DPreviewPanel(self.center_panel, "modPreviewPanel")
-        self.center_layout.addWidget(self.preview_panel, 1)
-
-        self.skin_frame, self.skin_layout = self._create_card(self.right_panel)
+        self.skin_frame, self.skin_layout = self._create_card(self.left_panel)
         self.skin_header_layout = QHBoxLayout()
         self.skin_header_layout.setSpacing(8)
         self.skin_title_label = SubtitleLabel("", self.skin_frame)
@@ -365,9 +605,9 @@ class Live2DModPage(QFrame):
         self.skin_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.skin_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         self.skin_layout.addWidget(self.skin_table, 1)
-        self.right_layout.addWidget(self.skin_frame, 1)
+        self.left_layout.addWidget(self.skin_frame)
 
-        self.texture_frame, self.texture_layout = self._create_card(self.right_panel)
+        self.texture_frame, self.texture_layout = self._create_card(self.left_panel)
         self.texture_header_layout = QHBoxLayout()
         self.texture_header_layout.setSpacing(8)
         self.texture_title_label = SubtitleLabel("", self.texture_frame)
@@ -375,6 +615,8 @@ class Live2DModPage(QFrame):
         self.texture_target_combo = ComboBox(self.texture_frame)
         self.add_texture_button = PushButton("", self.texture_frame)
         self.add_texture_button.clicked.connect(self.add_texture_replacement)
+        self.preview_temp_texture_button = PushButton("", self.texture_frame)
+        self.preview_temp_texture_button.clicked.connect(self.preview_selected_texture_live2d)
         self.remove_texture_button = PushButton("", self.texture_frame)
         self.remove_texture_button.clicked.connect(self.remove_selected_texture_replacement)
         self.texture_header_layout.addWidget(self.texture_title_label)
@@ -382,6 +624,7 @@ class Live2DModPage(QFrame):
         self.texture_header_layout.addWidget(self.texture_target_label)
         self.texture_header_layout.addWidget(self.texture_target_combo, 1)
         self.texture_header_layout.addWidget(self.add_texture_button)
+        self.texture_header_layout.addWidget(self.preview_temp_texture_button)
         self.texture_header_layout.addWidget(self.remove_texture_button)
         self.texture_layout.addLayout(self.texture_header_layout)
 
@@ -398,16 +641,17 @@ class Live2DModPage(QFrame):
         self.texture_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
         self.texture_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
         self.texture_layout.addWidget(self.texture_table, 1)
-        self.right_layout.addWidget(self.texture_frame, 1)
+        self.left_layout.addWidget(self.texture_frame)
 
-        self.log_frame, self.log_layout = self._create_card(self.right_panel)
+        self.log_frame, self.log_layout = self._create_card(self.left_panel)
         self.log_label = SubtitleLabel("", self.log_frame)
         self.log_layout.addWidget(self.log_label)
         self.log_text = TextEdit(self.log_frame)
         self.log_text.setReadOnly(True)
-        self.log_text.setMinimumHeight(160)
+        self.log_text.setMinimumHeight(130)
         self.log_layout.addWidget(self.log_text, 1)
-        self.right_layout.addWidget(self.log_frame, 1)
+        self.left_layout.addWidget(self.log_frame)
+        self.left_layout.addStretch(1)
 
         for button in self.findChildren(PushButton):
             button.setMinimumHeight(32)
@@ -433,11 +677,18 @@ class Live2DModPage(QFrame):
         self.source_file_button.setText(tr("mod.source.browse_file"))
         self.source_folder_button.setText(tr("mod.source.browse_folder"))
         self.source_hint_label.setText(tr("mod.source.hint"))
+        self.aux_source_title_label.setText(tr("mod.aux.title"))
+        self.aux_source_edit.setPlaceholderText(tr("mod.aux.placeholder"))
+        self.aux_source_file_button.setText(tr("mod.aux.browse_file"))
+        self.aux_source_folder_button.setText(tr("mod.aux.browse_folder"))
+        self.import_aux_source_button.setText(tr("mod.aux.import"))
+        self.aux_source_hint_label.setText(tr("mod.aux.hint"))
         self.hitarea_title_label.setText(tr("mod.hitarea.title"))
         self.hitarea_search_edit.setPlaceholderText(tr("mod.hitarea.search_placeholder"))
         self.skin_config_title_label.setText(tr("mod.skin.config_title"))
         self.skin_name_edit.setPlaceholderText(tr("mod.skin.name_placeholder"))
         self.add_empty_skin_button.setText(tr("mod.skin.add_empty"))
+        self.edit_skin_button.setText("编辑 Skin")
         self.remove_skin_button.setText(tr("mod.skin.remove"))
         self.generate_button.setText(tr("mod.generate.button"))
         self.preview_control_title_label.setText(tr("mod.preview.controls"))
@@ -453,6 +704,7 @@ class Live2DModPage(QFrame):
         self.texture_title_label.setText(tr("mod.texture.title"))
         self.texture_target_label.setText(tr("mod.texture.target"))
         self.add_texture_button.setText(tr("mod.texture.add"))
+        self.preview_temp_texture_button.setText(tr("mod.texture.preview_temp"))
         self.remove_texture_button.setText(tr("mod.texture.remove"))
         self.log_label.setText(tr("mod.log"))
         self.skin_table.setHorizontalHeaderLabels(
@@ -503,7 +755,7 @@ class Live2DModPage(QFrame):
                 handled = True
                 continue
             if self.current_project and self._is_image_path(path):
-                self.record_texture_replacement(path)
+                self.record_skin_source(path)
             elif self.current_project and self._is_supported_source_path(path):
                 self.record_skin_source(path)
             elif self._is_supported_source_path(path):
@@ -538,6 +790,57 @@ class Live2DModPage(QFrame):
         if not self.project_name_edit.text().strip():
             self.project_name_edit.setText(self.suggest_project_name(self.selected_source))
         self.append_log(tr("mod.source.selected", path=self.selected_source))
+
+    def browse_aux_source_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            tr("mod.dialog.select_aux_file"),
+            "",
+            tr("mod.dialog.filter_aux_files"),
+        )
+        if path:
+            self.set_aux_source(path)
+
+    def browse_aux_source_folder(self):
+        path = QFileDialog.getExistingDirectory(
+            self,
+            tr("mod.dialog.select_aux_folder"),
+        )
+        if path:
+            self.set_aux_source(path)
+
+    def set_aux_source(self, path: str):
+        self.selected_aux_source = os.path.abspath(path)
+        self.aux_source_edit.setText(self.selected_aux_source)
+        if not self.skin_name_edit.text().strip():
+            self.skin_name_edit.setText(self.suggest_project_name(self.selected_aux_source))
+        self.append_log(tr("mod.aux.selected", path=self.selected_aux_source))
+        self.refresh_project_ui()
+
+    def import_auxiliary_source_from_current(self):
+        if not self.current_project:
+            self._warn_no_project()
+            return
+        source = self.aux_source_edit.text().strip()
+        if not source:
+            InfoBar.warning(
+                title=tr("common.warning"),
+                content=tr("mod.warning.no_aux_source"),
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=3000,
+            )
+            return
+        if not self._is_supported_source_path(source) and not self._is_image_path(source):
+            InfoBar.warning(
+                title=tr("common.warning"),
+                content=tr("mod.warning.unsupported_source"),
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=3000,
+            )
+            return
+        self.record_skin_source(source, source_kind="auxiliary")
 
     def create_project_from_current_source(self):
         source = self.source_edit.text().strip()
@@ -659,6 +962,15 @@ class Live2DModPage(QFrame):
         source = project.data.get("base_source") or {}
         self.selected_source = str(source.get("path") or "")
         self.source_edit.setText(str(project.base_model_json))
+        auxiliary_sources = [
+            item for item in (project.data.get("auxiliary_sources") or []) if isinstance(item, dict)
+        ]
+        if auxiliary_sources:
+            self.selected_aux_source = str(auxiliary_sources[-1].get("source") or "")
+            self.aux_source_edit.setText(self.selected_aux_source)
+        else:
+            self.selected_aux_source = ""
+            self.aux_source_edit.clear()
         self.refresh_project_ui()
         self.refresh_project_combo(select_project_file=str(project.project_file))
         self.refresh_hitarea_combo()
@@ -680,8 +992,8 @@ class Live2DModPage(QFrame):
         data["project_name"] = sanitize_project_name(
             self.project_name_edit.text() or self.current_project.project_name
         )
-        selected_hit_area = str(self.hitarea_combo.currentData() or "")
-        data["selected_hit_area"] = selected_hit_area
+        # 原 model.json 的 HitAreas 容易和原动作冲突；等 ArtMesh 触发点选择做好前不写换肤入口。
+        data["selected_hit_area"] = ""
         self.sync_skin_names_from_table(data)
         project_file = save_project(self.current_project.project_dir, data)
         self.current_project = Live2DViewerModProject(self.current_project.project_dir, project_file, data)
@@ -829,11 +1141,20 @@ class Live2DModPage(QFrame):
         has_project = self.current_project is not None
         self.save_project_button.setEnabled(has_project and self.project_worker is None)
         self.open_project_folder_button.setEnabled(has_project and self.project_worker is None)
+        self.aux_source_file_button.setEnabled(has_project and self.project_worker is None)
+        self.aux_source_folder_button.setEnabled(has_project and self.project_worker is None)
+        self.import_aux_source_button.setEnabled(
+            has_project and self.project_worker is None and bool(self.aux_source_edit.text().strip())
+        )
         self.add_skin_file_button.setEnabled(has_project and self.project_worker is None)
         self.add_skin_folder_button.setEnabled(has_project and self.project_worker is None)
         self.add_texture_button.setEnabled(has_project and self.project_worker is None)
+        self.preview_temp_texture_button.setEnabled(
+            has_project and self.selected_texture_replacement_ref() is not None and self.project_worker is None
+        )
         self.remove_texture_button.setEnabled(has_project and self.selected_texture_replacement_ref() is not None)
         self.add_empty_skin_button.setEnabled(has_project and self.project_worker is None)
+        self.update_skin_buttons()
         self.generate_button.setEnabled(has_project and self.project_worker is None)
         self.preview_images_button.setEnabled(has_project and self.project_worker is None)
         self.preview_live2d_button.setEnabled(has_project and self.project_worker is None)
@@ -843,6 +1164,7 @@ class Live2DModPage(QFrame):
             self.hitarea_status_label.setText(tr("mod.hitarea.no_project"))
             self.refresh_preview_source_combo()
             self.refresh_preview_texture_combo()
+            self.update_skin_buttons()
             self.update_texture_buttons()
             return
         self.project_status_label.setText(
@@ -959,19 +1281,21 @@ class Live2DModPage(QFrame):
         if path:
             self.record_skin_source(path)
 
-    def record_skin_source(self, path: str):
+    def record_skin_source(self, path: str, source_kind: str = "skin"):
         if not self.current_project:
             return
         source = str(Path(path).resolve())
         skin_name = self.skin_name_edit.text().strip() or self.suggest_project_name(source)
         workspace_dir = self.next_import_workspace_dir(source, skin_name)
         self.set_busy(True)
-        self.append_log(tr("mod.skin.importing", path=source))
+        log_key = "mod.aux.importing" if source_kind == "auxiliary" else "mod.skin.importing"
+        self.append_log(tr(log_key, path=source))
         self.skin_import_worker = ModSkinSourceImportThread(
             source,
             skin_name,
             str(workspace_dir),
             self.settings_manager.get_temp_dir(),
+            source_kind=source_kind,
         )
         self.skin_import_worker.progressUpdated.connect(self.append_log)
         self.skin_import_worker.importReady.connect(self.on_skin_source_imported)
@@ -985,43 +1309,88 @@ class Live2DModPage(QFrame):
             return
         source = str(payload.get("source") or "")
         skin_name = str(payload.get("skin_name") or self.suggest_project_name(source))
-        skin = self.create_skin_entry(skin_name, source=source)
         workspace_dir = str(payload.get("workspace_dir") or "")
         model_json = str(payload.get("model_json") or "")
+        source_kind = str(payload.get("source_kind") or "skin")
         texture_paths = [Path(path) for path in payload.get("texture_paths") or [] if Path(path).is_file()]
+        for warning in payload.get("warnings") or []:
+            self.append_log(str(warning))
+        if not texture_paths:
+            if model_json and Path(model_json).is_file():
+                self.preview_panel.show_live2d(model_json, f"导入来源预览：{skin_name}", {"show_controls": True})
+            InfoBar.warning(
+                title=tr("common.warning"),
+                content="导入来源没有找到可用于替换的贴图。",
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=4000,
+            )
+            return
+
+        if model_json and Path(model_json).is_file():
+            self.preview_panel.show_live2d(model_json, f"导入来源预览：{skin_name}", {"show_controls": True})
+        else:
+            self.preview_panel.show_images(texture_paths, tr("mod.preview.images_title", count=len(texture_paths)))
+
+        base_textures = self.base_texture_paths()
+        if not base_textures:
+            InfoBar.warning(
+                title=tr("common.warning"),
+                content="主模型没有可映射的贴图，请先确认主模型来源是否正确。",
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=4000,
+            )
+            return
+
+        dialog = TextureMappingDialog(
+            skin_name,
+            base_textures,
+            texture_paths,
+            self.texture_target_matches(texture_paths),
+            self,
+        )
+        if dialog.exec() != QDialog.Accepted:
+            self.append_log(f"已取消贴图映射：{source}")
+            return
+
+        mappings = dialog.mappings()
+        skin = self.create_skin_entry(dialog.skin_name(), source=source)
         if workspace_dir:
             skin["import_workspace"] = self.relative_to_project(workspace_dir)
         if model_json:
             skin["import_model_json"] = self.relative_to_project(model_json)
-
-        base_textures = self.base_texture_paths()
-        selected_target = self.selected_target_index()
-        if len(texture_paths) == 1 and selected_target >= 0:
-            indexes = [selected_target]
-        else:
-            indexes = list(range(min(len(texture_paths), len(base_textures))))
-        for target_index, image_path in zip(indexes, texture_paths):
-            skin["texture_replacements"].append(
-                self.texture_replacement_entry(str(image_path), target_index)
-            )
+        self.apply_mappings_to_skin(skin, mappings, replace_existing=False)
 
         skins = list(self.current_project.data.get("skins") or [])
         skins.append(skin)
         self.current_project.data["skins"] = skins
+        if source_kind == "auxiliary":
+            auxiliary_sources = list(self.current_project.data.get("auxiliary_sources") or [])
+            auxiliary_sources.append(
+                {
+                    "name": dialog.skin_name(),
+                    "source": source,
+                    "import_workspace": self.relative_to_project(workspace_dir) if workspace_dir else "",
+                    "import_model_json": self.relative_to_project(model_json) if model_json else "",
+                    "texture_paths": [self.relative_to_project(path) for path in texture_paths],
+                    "texture_mappings": [
+                        {
+                            "target_index": target_index,
+                            "source": self.relative_to_project(path),
+                        }
+                        for target_index, path in mappings
+                    ],
+                }
+            )
+            self.current_project.data["auxiliary_sources"] = auxiliary_sources
         self.persist_current_project()
         self.refresh_skin_table(select_skin_id=str(skin.get("id") or ""))
         self.refresh_texture_table()
         self.refresh_preview_source_combo()
         self.refresh_preview_texture_combo()
-        if texture_paths:
-            self.preview_panel.show_images(texture_paths, tr("mod.preview.images_title", count=len(texture_paths)))
-        self.append_log(
-            tr(
-                "mod.skin.imported",
-                path=source,
-                count=len(texture_paths),
-            )
-        )
+        imported_key = "mod.aux.imported" if source_kind == "auxiliary" else "mod.skin.imported"
+        self.append_log(tr(imported_key, path=source, count=len(texture_paths)))
 
     def on_skin_source_import_error(self, error: str):
         self.set_busy(False)
@@ -1055,8 +1424,11 @@ class Live2DModPage(QFrame):
     def record_texture_replacement(self, path: str):
         if not self.current_project:
             return
-        target_index = self.selected_target_index()
-        if target_index < 0:
+        source = Path(path).resolve()
+        if not source.is_file():
+            return
+        base_textures = self.base_texture_paths()
+        if not base_textures:
             InfoBar.warning(
                 title=tr("common.warning"),
                 content=tr("mod.warning.no_texture_target"),
@@ -1065,23 +1437,82 @@ class Live2DModPage(QFrame):
                 duration=3000,
             )
             return
+
         skin = self.selected_skin()
+        created_skin = False
         if skin is None:
             name = self.skin_name_edit.text().strip() or tr(
                 "mod.skin.default_name",
                 index=len(self.current_project.data.get("skins") or []) + 1,
             )
             skin = self.create_skin_entry(name)
+            created_skin = True
+        dialog = TextureMappingDialog(
+            str(skin.get("name") or self.suggest_project_name(str(source))),
+            base_textures,
+            [source],
+            self.texture_target_matches([source]),
+            self,
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        skin["name"] = dialog.skin_name()
+        if created_skin:
+            skin["source"] = str(source)
             self.current_project.data.setdefault("skins", []).append(skin)
-        source = str(Path(path).resolve())
-        replacements = list(skin.get("texture_replacements") or [])
-        replacements.append(self.texture_replacement_entry(source, target_index))
-        skin["texture_replacements"] = replacements
+        self.apply_mappings_to_skin(skin, dialog.mappings(), replace_existing=True)
         skin["status"] = "source"
         self.persist_current_project()
         self.refresh_skin_table(select_skin_id=str(skin.get("id") or ""))
         self.refresh_texture_table()
-        self.append_log(tr("mod.texture.recorded", path=source))
+        self.refresh_preview_texture_combo()
+        self.append_log(tr("mod.texture.recorded", path=str(source)))
+
+    def edit_selected_skin_mapping(self):
+        if not self.current_project:
+            return
+        skin = self.selected_skin()
+        if not skin:
+            return
+        source_paths: list[Path] = []
+        suggestions: list[tuple[int, Path]] = []
+        for replacement in skin.get("texture_replacements") or []:
+            if not isinstance(replacement, dict):
+                continue
+            source_path = self._resolve_replacement_source_path(replacement)
+            if not source_path:
+                continue
+            source_paths.append(source_path)
+            target_index = self._replacement_target_index(replacement)
+            if target_index >= 0:
+                suggestions.append((target_index, source_path))
+        if not source_paths:
+            InfoBar.warning(
+                title=tr("common.warning"),
+                content="这个 Skin 还没有可编辑的贴图映射。",
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=3000,
+            )
+            return
+        dialog = TextureMappingDialog(
+            str(skin.get("name") or skin.get("id") or ""),
+            self.base_texture_paths(),
+            source_paths,
+            suggestions,
+            self,
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        skin["name"] = dialog.skin_name()
+        skin["texture_replacements"] = []
+        self.apply_mappings_to_skin(skin, dialog.mappings(), replace_existing=False)
+        skin["status"] = "source"
+        self.persist_current_project()
+        self.refresh_skin_table(select_skin_id=str(skin.get("id") or ""))
+        self.refresh_texture_table()
+        self.refresh_preview_texture_combo()
+        self.append_log(f"已更新 Skin 映射：{skin['name']}")
 
     def create_skin_entry(self, name: str, source: str = "") -> dict[str, Any]:
         skins = self.current_project.data.get("skins") if self.current_project else []
@@ -1114,6 +1545,24 @@ class Live2DModPage(QFrame):
             "note": "",
         }
 
+    def apply_mappings_to_skin(
+        self,
+        skin: dict[str, Any],
+        mappings: list[tuple[int, Path]],
+        replace_existing: bool,
+    ):
+        replacements = [item for item in skin.get("texture_replacements") or [] if isinstance(item, dict)]
+        if replace_existing:
+            target_indexes = {int(index) for index, _path in mappings}
+            replacements = [
+                item
+                for item in replacements
+                if self._replacement_target_index(item) not in target_indexes
+            ]
+        for target_index, source_path in mappings:
+            replacements.append(self.texture_replacement_entry(str(source_path.resolve()), target_index))
+        skin["texture_replacements"] = replacements
+
     def persist_current_project(self):
         if not self.current_project:
             return
@@ -1130,8 +1579,8 @@ class Live2DModPage(QFrame):
             self._warn_no_project()
             return
         self.sync_skin_names_from_table()
-        selected_hit_area = str(self.hitarea_combo.currentData() or "")
-        self.current_project.data["selected_hit_area"] = selected_hit_area
+        # 不再复用原始 HitAreas。下一步单独做 ArtMesh 触发点选择，避免抢占原动作。
+        self.current_project.data["selected_hit_area"] = ""
         if not self.current_project.data.get("skins"):
             InfoBar.warning(
                 title=tr("common.warning"),
@@ -1244,6 +1693,8 @@ class Live2DModPage(QFrame):
     def update_skin_buttons(self):
         has_project = self.current_project is not None
         has_skin = bool(self.selected_skin_id())
+        if hasattr(self, "edit_skin_button"):
+            self.edit_skin_button.setEnabled(has_project and has_skin and self.project_worker is None)
         if hasattr(self, "remove_skin_button"):
             self.remove_skin_button.setEnabled(has_project and has_skin and self.project_worker is None)
 
@@ -1252,6 +1703,8 @@ class Live2DModPage(QFrame):
         has_texture = self.selected_texture_replacement_ref() is not None
         if hasattr(self, "remove_texture_button"):
             self.remove_texture_button.setEnabled(has_project and has_texture and self.project_worker is None)
+        if hasattr(self, "preview_temp_texture_button"):
+            self.preview_temp_texture_button.setEnabled(has_project and has_texture and self.project_worker is None)
 
     def selected_skin_id(self) -> str:
         if not hasattr(self, "skin_table"):
@@ -1297,6 +1750,36 @@ class Live2DModPage(QFrame):
     def selected_target_index(self) -> int:
         raw = str(self.texture_target_combo.currentData() or "")
         return int(raw) if raw.isdigit() else -1
+
+    def texture_target_matches(self, texture_paths: list[Path]) -> list[tuple[int, Path]]:
+        base_textures = self.base_texture_paths()
+        if not texture_paths or not base_textures:
+            return []
+
+        selected_target = self.selected_target_index()
+        if len(texture_paths) == 1 and selected_target >= 0:
+            return [(selected_target, texture_paths[0])]
+
+        unused_indexes = list(range(len(base_textures)))
+        by_name = {path.name.lower(): index for index, path in enumerate(base_textures)}
+        result: list[tuple[int, Path]] = []
+        used = set()
+        for image_path in texture_paths:
+            index = by_name.get(image_path.name.lower())
+            if index is None or index in used:
+                continue
+            result.append((index, image_path))
+            used.add(index)
+            if index in unused_indexes:
+                unused_indexes.remove(index)
+
+        for image_path in texture_paths:
+            if any(path == image_path for _index, path in result):
+                continue
+            if not unused_indexes:
+                break
+            result.append((unused_indexes.pop(0), image_path))
+        return result
 
     def refresh_texture_table(self):
         if not hasattr(self, "texture_table"):
@@ -1361,6 +1844,99 @@ class Live2DModPage(QFrame):
             return skin_id, int(index)
         except Exception:
             return None
+
+    def selected_texture_replacement(self) -> dict[str, Any] | None:
+        if not self.current_project:
+            return None
+        ref = self.selected_texture_replacement_ref()
+        if ref is None:
+            return None
+        skin_id, replacement_index = ref
+        for skin in self.current_project.data.get("skins") or []:
+            if not isinstance(skin, dict) or str(skin.get("id") or "") != skin_id:
+                continue
+            replacements = [item for item in skin.get("texture_replacements") or [] if isinstance(item, dict)]
+            if 0 <= replacement_index < len(replacements):
+                replacement = dict(replacements[replacement_index])
+                replacement["skin_id"] = skin_id
+                replacement["skin_name"] = str(skin.get("name") or skin_id)
+                replacement["replacement_index"] = replacement_index
+                return replacement
+        return None
+
+    def preview_selected_texture_live2d(self):
+        if not self.current_project:
+            self._warn_no_project()
+            return
+        replacement = self.selected_texture_replacement()
+        if not replacement:
+            InfoBar.warning(
+                title=tr("common.warning"),
+                content=tr("mod.warning.no_texture_replacement"),
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=3000,
+            )
+            return
+        source_path = self._resolve_replacement_source_path(replacement)
+        if source_path is None:
+            InfoBar.warning(
+                title=tr("common.warning"),
+                content=tr("mod.preview.no_images"),
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=3000,
+            )
+            return
+        target_index = self._replacement_target_index(replacement)
+        try:
+            model_json = build_temporary_texture_preview_model(
+                self.current_project,
+                source_path,
+                target_index,
+                log=self.append_log,
+            )
+            self.preview_panel.show_live2d(
+                model_json,
+                tr("mod.preview.temp_live2d_title", name=source_path.name),
+                {"show_controls": True},
+            )
+            self.append_log(tr("mod.preview.temp_live2d_ready", path=str(model_json)))
+        except Exception as exc:
+            self.preview_panel.show_placeholder(tr("mod.preview.failed", error=str(exc)), tr("mod.preview.title"))
+            InfoBar.error(
+                title=tr("common.error"),
+                content=str(exc),
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=5000,
+            )
+
+    def _resolve_replacement_source_path(self, replacement: dict[str, Any]) -> Path | None:
+        for key in ("workspace_path", "source"):
+            raw = str(replacement.get(key) or "")
+            if not raw:
+                continue
+            candidate = Path(raw)
+            if not candidate.is_absolute():
+                candidate = self.resolve_project_path(candidate)
+            if candidate.is_file():
+                return candidate.resolve()
+        return None
+
+    def _replacement_target_index(self, replacement: dict[str, Any]) -> int:
+        raw = replacement.get("target_index")
+        if isinstance(raw, int):
+            return raw
+        if isinstance(raw, str) and raw.isdigit():
+            return int(raw)
+        target = str(replacement.get("target_texture") or "").replace("\\", "/")
+        target_name = Path(target).name.lower()
+        if target_name:
+            for index, texture_path in enumerate(self.base_texture_paths()):
+                if texture_path.name.lower() == target_name:
+                    return index
+        return -1
 
     def remove_selected_texture_replacement(self):
         if not self.current_project:
@@ -1623,11 +2199,16 @@ class Live2DModPage(QFrame):
             self.open_project_folder_button,
             self.source_file_button,
             self.source_folder_button,
+            self.aux_source_file_button,
+            self.aux_source_folder_button,
+            self.import_aux_source_button,
             self.add_skin_file_button,
             self.add_skin_folder_button,
             self.add_texture_button,
+            self.preview_temp_texture_button,
             self.remove_texture_button,
             self.add_empty_skin_button,
+            self.edit_skin_button,
             self.remove_skin_button,
             self.generate_button,
             self.preview_images_button,

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import shutil
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from app.core.extract import ExtractMode, ExtractSourceType, detect_source_type
+from app.core.extract.unity import extract_unity
 from app.core.model.live2d_package import Live2DPackage
 from app.core.model.resolver import Live2DPackageError, resolve_live2d_package
 from app.core.preview.session import prepare_preview_import
@@ -102,7 +105,20 @@ def import_texture_source_to_workspace(
                 texture_paths=copied_images,
             )
 
-    imported = prepare_live2d_source_import(source_path, temp_root=temp_root, log=log)
+    try:
+        imported = prepare_live2d_source_import(source_path, temp_root=temp_root, log=log)
+    except Live2DPackageError as exc:
+        texture_import = _try_import_unity_textures_to_workspace(
+            source_path,
+            workspace_path,
+            temp_root=temp_root,
+            log=log,
+            suffixes=suffixes,
+        )
+        if texture_import:
+            return texture_import
+        raise exc
+
     if workspace_path.exists():
         shutil.rmtree(workspace_path)
     shutil.copytree(
@@ -145,6 +161,57 @@ def _collect_images(source_path: Path, suffixes: set[str]) -> list[Path]:
         for item in sorted(source_path.rglob("*"), key=lambda p: str(p).lower())
         if item.is_file() and item.suffix.lower() in suffixes
     ]
+
+
+def _try_import_unity_textures_to_workspace(
+    source_path: Path,
+    workspace_path: Path,
+    temp_root: str | Path | None,
+    log: LogCallback | None,
+    suffixes: set[str],
+) -> ImportedTextureSource | None:
+    source_type = detect_source_type(source_path)
+    if source_type not in {ExtractSourceType.UNITY, ExtractSourceType.FOLDER}:
+        return None
+
+    settings = SettingsManager()
+    temp_root_path = Path(temp_root or settings.get_temp_dir()).resolve()
+    temp_root_path.mkdir(parents=True, exist_ok=True)
+    temp_dir = Path(tempfile.mkdtemp(prefix="mod_texture_import_", dir=temp_root_path))
+    try:
+        if log:
+            log(f"Live2D package import failed; trying Unity texture export: {source_path}")
+        result = extract_unity(
+            source_path,
+            temp_dir,
+            ExtractMode.TEXTURES,
+            log=_adapt_log_callback(log),
+        )
+        if not result.success:
+            if source_type == ExtractSourceType.FOLDER:
+                return None
+            raise Live2DPackageError(result.error or "Unity texture export failed")
+
+        exported_dir = result.output_dir if result.output_dir.exists() else temp_dir
+        exported_images = _collect_images(exported_dir, suffixes)
+        if not exported_images:
+            if source_type == ExtractSourceType.FOLDER:
+                return None
+            raise Live2DPackageError("Unity texture export did not produce image files")
+
+        if workspace_path.exists():
+            shutil.rmtree(workspace_path)
+        workspace_path.mkdir(parents=True, exist_ok=True)
+        copied_images = [_copy_unique_file(path, workspace_path / path.name) for path in exported_images]
+        return ImportedTextureSource(
+            source=source_path,
+            workspace_dir=workspace_path,
+            model_json=None,
+            texture_paths=copied_images,
+            warnings=["Imported textures from Unity source without a Live2D model."],
+        )
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def _copy_unique_file(source: Path, target: Path) -> Path:

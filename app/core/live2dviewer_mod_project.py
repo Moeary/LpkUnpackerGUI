@@ -17,6 +17,7 @@ PROJECT_FORMAT = "LpkUnpacker.Live2DViewerModProject"
 PROJECT_VERSION = 1
 PROJECT_FILE_NAME = "project.live2dviewer_mod.json"
 GENERATED_DIR = "generated/live2d"
+TEMP_PREVIEW_DIR = "preview/temporary"
 SKIN_MANIFEST_FILE = "skin_manifest.json"
 LogCallback = Callable[[str], None]
 
@@ -101,6 +102,7 @@ def build_project_data(
         "imported_workspace_paths": {
             "base": _relative_to_project(workspace_dir, project_dir),
         },
+        "auxiliary_sources": [],
         "skins": [],
         "texture_replacements": [],
         "selected_hit_area": "",
@@ -233,6 +235,38 @@ def generate_live2dviewer_mod(
     return Live2DViewerModProject(project_dir, project_file, data)
 
 
+def build_temporary_texture_preview_model(
+    project: Live2DViewerModProject,
+    source_texture: str | Path,
+    target_index: int,
+    log: LogCallback | None = None,
+) -> Path:
+    project_dir = project.project_dir.resolve()
+    source = Path(source_texture).resolve()
+    if not source.is_file():
+        raise Live2DViewerModProjectError(f"Texture source does not exist: {source}")
+
+    base_package = resolve_live2d_package(project.base_model_json)
+    preview_dir = project_dir / TEMP_PREVIEW_DIR
+    if preview_dir.exists():
+        shutil.rmtree(preview_dir)
+    _copy_workspace(base_package.root_dir, preview_dir)
+
+    preview_package = resolve_live2d_package(preview_dir)
+    model_json = preview_package.model_json
+    model_data = _read_json(model_json)
+    texture_refs = _texture_refs(model_data)
+    if target_index < 0 or target_index >= len(texture_refs):
+        raise Live2DViewerModProjectError(f"Invalid texture target index: {target_index}")
+
+    copied = _copy_skin_texture(source, preview_dir, "__temporary__", target_index, texture_refs[target_index])
+    texture_refs[target_index] = _relative_posix(copied, preview_dir)
+    _set_texture_refs(model_data, texture_refs)
+    _write_json(model_json, model_data)
+    _log(log, f"Temporary texture preview model: {model_json}")
+    return model_json
+
+
 def normalize_project_data(data: dict[str, Any], fallback_name: str) -> dict[str, Any]:
     payload = dict(data)
     payload["format"] = PROJECT_FORMAT
@@ -241,6 +275,7 @@ def normalize_project_data(data: dict[str, Any], fallback_name: str) -> dict[str
     payload.setdefault("base_source", {})
     payload.setdefault("base_model_json", "")
     payload.setdefault("imported_workspace_paths", {})
+    payload.setdefault("auxiliary_sources", [])
     payload.setdefault("skins", [])
     payload.setdefault("texture_replacements", [])
     payload.setdefault("selected_hit_area", "")
