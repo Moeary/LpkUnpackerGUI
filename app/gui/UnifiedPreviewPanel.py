@@ -106,7 +106,13 @@ class UnifiedPreviewPanel(QFrame):
             embedded=True,
         )
         self.live2d_preview_window = preview_window
-        preview_window.apply_settings(settings or {"show_controls": True})
+        merged_settings = {
+            "show_controls": False,
+            "selected_motion_on_click": True,
+        }
+        if settings:
+            merged_settings.update(settings)
+        preview_window.apply_settings(merged_settings)
         self.live2d_layout.addWidget(preview_window, 1)
         self.placeholder_label.setVisible(False)
         self.live2d_host.setVisible(True)

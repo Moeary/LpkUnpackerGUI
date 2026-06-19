@@ -433,6 +433,7 @@ class PsdReconstructionPage(QFrame):
         self.motion_hint_label.setWordWrap(True)
         self.motion_layout.addWidget(self.motion_hint_label)
         self.left_panel_layout.addWidget(self.motion_frame)
+        self.motion_frame.hide()
 
         self.left_panel_layout.addStretch(1)
 

@@ -917,6 +917,8 @@ class Live2DSettingsPanel(QFrame):
         layout.addLayout(opacity_layout)
 
         self.show_controls_check = CheckBox("", group)
+        self.show_controls_check.setChecked(False)
+        self.show_controls_check.hide()
         layout.addWidget(self.show_controls_check)
 
         # 尺寸变化时也应用
@@ -1207,7 +1209,7 @@ class Live2DSettingsPanel(QFrame):
         settings = {
             'window_size': (self.width_spinbox.value(), self.height_spinbox.value()),
             'opacity': self.opacity_slider.value() / 100.0,
-            'show_controls': self.show_controls_check.isChecked(),
+            'show_controls': bool(self.show_controls_check and self.show_controls_check.isVisible() and self.show_controls_check.isChecked()),
             'model_rotation': self.rotation_slider.value(),
             'transparent_bg': self.bg_transparent_check.isChecked(),
             'bg_color': self.selected_bg_color,
@@ -1930,7 +1932,7 @@ class PreviewPage(QFrame):
 
     def _set_motion_debug_visible(self, visible: bool):
         if self.motion_group:
-            self.motion_group.setVisible(bool(visible))
+            self.motion_group.setVisible(False)
 
     def play_selected_motion(self):
         if not self._motion_items or not self.motion_combo:

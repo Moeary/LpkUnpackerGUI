@@ -271,15 +271,44 @@ class Live2DPreviewWindow(QWidget):
             return
         panel = QFrame(self.live2d_canvas)
         panel.setObjectName("live2dQuickMotionPanel")
+        panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         panel.setFixedWidth(320)
         panel.setStyleSheet("""
             QFrame#live2dQuickMotionPanel {
-                background: rgba(32, 36, 43, 232);
-                border: 1px solid rgba(255, 255, 255, 80);
+                background: rgba(18, 20, 24, 252);
+                border: 1px solid rgba(255, 255, 255, 38);
                 border-radius: 10px;
             }
             BodyLabel {
                 color: white;
+            }
+            ComboBox {
+                background: rgba(248, 250, 252, 242);
+                color: #111827;
+                border: 1px solid rgba(255, 255, 255, 28);
+                border-radius: 8px;
+                padding: 6px 10px;
+                min-height: 34px;
+            }
+            ComboBox QListView {
+                background: #ffffff;
+                color: #111827;
+                border: 1px solid #cfd8e3;
+                outline: none;
+            }
+            PushButton {
+                background: rgba(255, 255, 255, 235);
+                color: #111827;
+                border: none;
+                border-radius: 8px;
+                min-height: 34px;
+                padding: 0 12px;
+            }
+            PushButton:hover {
+                background: rgba(255, 255, 255, 248);
+            }
+            PushButton:pressed {
+                background: rgba(228, 233, 240, 248);
             }
         """)
         layout = QVBoxLayout(panel)
@@ -910,7 +939,16 @@ class Live2DPreviewWindow(QWidget):
 
     def contextMenuEvent(self, event):
         """右键菜单事件"""
-        pass
+        if not self.live2d_canvas:
+            return super().contextMenuEvent(event)
+        try:
+            global_pos = event.globalPos() if hasattr(event, "globalPos") else event.globalPosition().toPoint()
+            canvas_pos = self.live2d_canvas.mapFromGlobal(global_pos)
+            self._show_quick_motion_panel(canvas_pos)
+            event.accept()
+            return
+        except Exception:
+            return super().contextMenuEvent(event)
 
     def retranslate_ui(self):
         if self.controls_title:

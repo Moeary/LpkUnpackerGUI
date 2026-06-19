@@ -481,6 +481,7 @@ class Live2DModPage(QFrame):
         self.source_hint_label = CaptionLabel("", self.source_frame)
         self.source_hint_label.setWordWrap(True)
         self.source_frame_layout.addWidget(self.source_hint_label)
+        self.source_hint_label.hide()
         self.left_layout.addWidget(self.source_frame)
 
         self.aux_source_frame, self.aux_source_layout = self._create_card(self.left_panel)
@@ -504,6 +505,7 @@ class Live2DModPage(QFrame):
         self.aux_source_hint_label = CaptionLabel("", self.aux_source_frame)
         self.aux_source_hint_label.setWordWrap(True)
         self.aux_source_layout.addWidget(self.aux_source_hint_label)
+        self.aux_source_hint_label.hide()
         self.left_layout.addWidget(self.aux_source_frame)
 
         self.hitarea_frame, self.hitarea_layout = self._create_card(self.left_panel)
@@ -530,7 +532,7 @@ class Live2DModPage(QFrame):
         self.skin_config_buttons.setSpacing(8)
         self.add_empty_skin_button = PushButton("", self.skin_config_frame)
         self.add_empty_skin_button.clicked.connect(self.add_empty_skin)
-        self.edit_skin_button = PushButton("编辑 Skin", self.skin_config_frame)
+        self.edit_skin_button = PushButton("", self.skin_config_frame)
         self.edit_skin_button.clicked.connect(self.edit_selected_skin_mapping)
         self.remove_skin_button = PushButton("", self.skin_config_frame)
         self.remove_skin_button.clicked.connect(self.remove_selected_skin)
@@ -565,9 +567,9 @@ class Live2DModPage(QFrame):
         self.preview_buttons = QHBoxLayout()
         self.preview_buttons.setSpacing(8)
         self.preview_images_button = PushButton("", self.preview_control_frame)
-        self.preview_images_button.clicked.connect(self.load_preview_images)
+        self.preview_images_button.clicked.connect(self.preview_original_model)
         self.preview_live2d_button = PushButton("", self.preview_control_frame)
-        self.preview_live2d_button.clicked.connect(self.load_preview_live2d)
+        self.preview_live2d_button.clicked.connect(self.preview_generated_model)
         self.preview_close_button = PushButton("", self.preview_control_frame)
         self.preview_close_button.clicked.connect(self.close_preview)
         self.preview_buttons.addWidget(self.preview_images_button, 1)
@@ -575,6 +577,12 @@ class Live2DModPage(QFrame):
         self.preview_buttons.addWidget(self.preview_close_button, 1)
         self.preview_control_layout.addLayout(self.preview_buttons)
         self.left_layout.addWidget(self.preview_control_frame)
+        self.preview_control_title_label.hide()
+        self.preview_source_label.hide()
+        self.preview_source_combo.hide()
+        self.preview_texture_label.hide()
+        self.preview_texture_combo.hide()
+        self.preview_hint_label = None
 
         self.preview_panel = UnifiedPreviewPanel(self.right_panel, "modPreviewPanel")
         self.right_layout.addWidget(self.preview_panel, 1)
@@ -596,16 +604,19 @@ class Live2DModPage(QFrame):
         self.skin_table = QTableWidget(self.skin_frame)
         self.skin_table.setColumnCount(4)
         self.skin_table.verticalHeader().setVisible(False)
-        self.skin_table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
+        self.skin_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.skin_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.skin_table.itemChanged.connect(self.on_skin_item_changed)
         self.skin_table.itemSelectionChanged.connect(self.update_skin_buttons)
-        self.skin_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.skin_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.skin_table.itemDoubleClicked.connect(lambda *_args: self.edit_selected_skin_mapping())
+        self.skin_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.skin_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.skin_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.skin_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         self.skin_layout.addWidget(self.skin_table, 1)
         self.left_layout.addWidget(self.skin_frame)
+        self.add_skin_file_button.hide()
+        self.add_skin_folder_button.hide()
 
         self.texture_frame, self.texture_layout = self._create_card(self.left_panel)
         self.texture_header_layout = QHBoxLayout()
@@ -642,13 +653,14 @@ class Live2DModPage(QFrame):
         self.texture_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
         self.texture_layout.addWidget(self.texture_table, 1)
         self.left_layout.addWidget(self.texture_frame)
+        self.texture_frame.hide()
 
         self.log_frame, self.log_layout = self._create_card(self.left_panel)
         self.log_label = SubtitleLabel("", self.log_frame)
         self.log_layout.addWidget(self.log_label)
         self.log_text = TextEdit(self.log_frame)
         self.log_text.setReadOnly(True)
-        self.log_text.setMinimumHeight(130)
+        self.log_text.setMinimumHeight(96)
         self.log_layout.addWidget(self.log_text, 1)
         self.left_layout.addWidget(self.log_frame)
         self.left_layout.addStretch(1)
@@ -688,14 +700,14 @@ class Live2DModPage(QFrame):
         self.skin_config_title_label.setText(tr("mod.skin.config_title"))
         self.skin_name_edit.setPlaceholderText(tr("mod.skin.name_placeholder"))
         self.add_empty_skin_button.setText(tr("mod.skin.add_empty"))
-        self.edit_skin_button.setText("编辑 Skin")
+        self.edit_skin_button.setText(tr("mod.skin.edit_mapping"))
         self.remove_skin_button.setText(tr("mod.skin.remove"))
         self.generate_button.setText(tr("mod.generate.button"))
         self.preview_control_title_label.setText(tr("mod.preview.controls"))
         self.preview_source_label.setText(tr("mod.preview.source"))
         self.preview_texture_label.setText(tr("mod.preview.texture"))
-        self.preview_images_button.setText(tr("mod.preview.load_images"))
-        self.preview_live2d_button.setText(tr("mod.preview.load_live2d"))
+        self.preview_images_button.setText(tr("mod.preview.show_original"))
+        self.preview_live2d_button.setText(tr("mod.preview.show_generated"))
         self.preview_close_button.setText(tr("mod.preview.close"))
         self.preview_panel.retranslate_ui()
         self.skin_title_label.setText(tr("mod.skin.title"))
@@ -882,7 +894,7 @@ class Live2DModPage(QFrame):
     def on_project_created(self, project: Live2DViewerModProject):
         self.set_busy(False)
         self.set_current_project(project)
-        self.load_preview_live2d()
+        self.preview_original_model()
         self.append_log(tr("mod.project.created", path=str(project.project_file)))
         InfoBar.success(
             title=tr("common.success"),
@@ -944,6 +956,8 @@ class Live2DModPage(QFrame):
         try:
             project = load_project(path)
             self.set_current_project(project)
+            if not silent:
+                self.preview_original_model()
             self.append_log(tr("mod.project.opened", path=str(project.project_file)))
         except Exception as exc:
             if not silent:
@@ -1157,7 +1171,9 @@ class Live2DModPage(QFrame):
         self.update_skin_buttons()
         self.generate_button.setEnabled(has_project and self.project_worker is None)
         self.preview_images_button.setEnabled(has_project and self.project_worker is None)
-        self.preview_live2d_button.setEnabled(has_project and self.project_worker is None)
+        self.preview_live2d_button.setEnabled(
+            has_project and self.project_worker is None and self.generated_model_json_path() is not None
+        )
         self.preview_close_button.setEnabled(has_project)
         if not has_project:
             self.project_status_label.setText(tr("mod.project.no_project"))
@@ -1317,7 +1333,7 @@ class Live2DModPage(QFrame):
             self.append_log(str(warning))
         if not texture_paths:
             if model_json and Path(model_json).is_file():
-                self.preview_panel.show_live2d(model_json, f"导入来源预览：{skin_name}", {"show_controls": True})
+                self._show_live2d_preview(model_json, f"导入来源预览：{skin_name}")
             InfoBar.warning(
                 title=tr("common.warning"),
                 content="导入来源没有找到可用于替换的贴图。",
@@ -1328,9 +1344,9 @@ class Live2DModPage(QFrame):
             return
 
         if model_json and Path(model_json).is_file():
-            self.preview_panel.show_live2d(model_json, f"导入来源预览：{skin_name}", {"show_controls": True})
+            self._show_live2d_preview(model_json, f"导入来源预览：{skin_name}")
         else:
-            self.preview_panel.show_images(texture_paths, tr("mod.preview.images_title", count=len(texture_paths)))
+            self._show_image_preview(texture_paths, tr("mod.preview.images_title", count=len(texture_paths)))
 
         base_textures = self.base_texture_paths()
         if not base_textures:
@@ -1469,9 +1485,12 @@ class Live2DModPage(QFrame):
         self.append_log(tr("mod.texture.recorded", path=str(source)))
 
     def edit_selected_skin_mapping(self):
+        self.edit_skin_mapping_by_id(self.selected_skin_id())
+
+    def edit_skin_mapping_by_id(self, skin_id: str):
         if not self.current_project:
             return
-        skin = self.selected_skin()
+        skin = self.skin_by_id(skin_id)
         if not skin:
             return
         source_paths: list[Path] = []
@@ -1603,7 +1622,7 @@ class Live2DModPage(QFrame):
     def on_generate_finished(self, project: Live2DViewerModProject):
         self.set_busy(False)
         self.set_current_project(project)
-        self.load_preview_live2d()
+        self.preview_generated_model()
         self.append_log(tr("mod.generate.finished", path=str(project.project_dir / project.data.get("generated_output_dir", ""))))
         InfoBar.success(
             title=tr("common.success"),
@@ -1661,18 +1680,19 @@ class Live2DModPage(QFrame):
             name_item = QTableWidgetItem(str(item.get("name") or ""))
             name_item.setData(Qt.UserRole, str(item.get("id") or ""))
             self.skin_table.setItem(row, 0, name_item)
-            source_item = QTableWidgetItem(str(item.get("source") or self.replacement_summary(item)))
+            source_item = QTableWidgetItem(self.replacement_summary(item))
             source_item.setFlags(source_item.flags() & ~Qt.ItemIsEditable)
+            source_item.setToolTip(self.replacement_tooltip(item))
             self.skin_table.setItem(row, 1, source_item)
             status_item = QTableWidgetItem(self.status_text(item.get("status")))
             status_item.setFlags(status_item.flags() & ~Qt.ItemIsEditable)
             self.skin_table.setItem(row, 2, status_item)
             skin_id = str(item.get("id") or "")
-            preview_button = PushButton(tr("mod.preview.preview_model"), self.skin_table)
-            preview_button.clicked.connect(lambda _checked=False, sid=skin_id: self.preview_skin_entry(sid))
-            self.skin_table.setCellWidget(row, 3, preview_button)
+            self.skin_table.setCellWidget(row, 3, self._create_skin_actions_widget(skin_id))
             if current_id and str(item.get("id") or "") == current_id:
                 self.skin_table.selectRow(row)
+        if self.skin_table.currentRow() < 0 and skins:
+            self.skin_table.selectRow(0)
         self._skin_table_refreshing = False
         self.update_skin_buttons()
 
@@ -1716,20 +1736,50 @@ class Live2DModPage(QFrame):
         return str(item.data(Qt.UserRole) or "") if item else ""
 
     def selected_skin(self) -> dict[str, Any] | None:
-        if not self.current_project:
-            return None
-        skin_id = self.selected_skin_id()
-        if not skin_id:
+        return self.skin_by_id(self.selected_skin_id())
+
+    def skin_by_id(self, skin_id: str) -> dict[str, Any] | None:
+        if not self.current_project or not skin_id:
             return None
         for skin in self.current_project.data.get("skins") or []:
-            if isinstance(skin, dict) and str(skin.get("id") or "") == skin_id:
+            if isinstance(skin, dict) and str(skin.get("id") or "") == str(skin_id):
                 return skin
         return None
 
     @staticmethod
     def replacement_summary(skin: dict[str, Any]) -> str:
         count = len([item for item in skin.get("texture_replacements") or [] if isinstance(item, dict)])
-        return f"{count} texture(s)"
+        return tr("mod.texture.summary_count", count=count)
+
+    @staticmethod
+    def replacement_tooltip(skin: dict[str, Any]) -> str:
+        names: list[str] = []
+        for item in skin.get("texture_replacements") or []:
+            if not isinstance(item, dict):
+                continue
+            source = str(item.get("source") or "")
+            if source:
+                names.append(Path(source).name)
+        return "\n".join(names[:8])
+
+    def _create_skin_actions_widget(self, skin_id: str) -> QWidget:
+        widget = QWidget(self.skin_table)
+        layout = QHBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        preview_button = PushButton(tr("mod.preview.preview_model"), widget)
+        preview_button.setMinimumWidth(88)
+        preview_button.setFixedHeight(28)
+        preview_button.clicked.connect(lambda _checked=False, sid=skin_id: self.preview_skin_entry(sid))
+        layout.addWidget(preview_button)
+
+        edit_button = PushButton(tr("mod.skin.edit_mapping"), widget)
+        edit_button.setMinimumWidth(88)
+        edit_button.setFixedHeight(28)
+        edit_button.clicked.connect(lambda _checked=False, sid=skin_id: self.edit_skin_mapping_by_id(sid))
+        layout.addWidget(edit_button)
+        return widget
 
     def refresh_texture_target_combo(self):
         if not hasattr(self, "texture_target_combo"):
@@ -1896,11 +1946,7 @@ class Live2DModPage(QFrame):
                 target_index,
                 log=self.append_log,
             )
-            self.preview_panel.show_live2d(
-                model_json,
-                tr("mod.preview.temp_live2d_title", name=source_path.name),
-                {"show_controls": True},
-            )
+            self._show_live2d_preview(model_json, tr("mod.preview.temp_live2d_title", name=source_path.name))
             self.append_log(tr("mod.preview.temp_live2d_ready", path=str(model_json)))
         except Exception as exc:
             self.preview_panel.show_placeholder(tr("mod.preview.failed", error=str(exc)), tr("mod.preview.title"))
@@ -2004,6 +2050,70 @@ class Live2DModPage(QFrame):
             return generated if generated and generated.is_file() else None
         return self.current_project.base_model_json
 
+    def _show_live2d_preview(self, model_json: str | Path, title: str):
+        self.preview_panel.show_live2d(
+            model_json,
+            title,
+            {
+                "show_controls": False,
+                "selected_motion_on_click": True,
+            },
+        )
+
+    def _show_image_preview(self, image_paths: list[str | Path], title: str):
+        self.preview_panel.show_images([str(path) for path in image_paths], title)
+
+    def preview_original_model(self):
+        if not self.current_project:
+            self._warn_no_project()
+            return
+        if not self.current_project.base_model_json.is_file():
+            InfoBar.warning(
+                title=tr("common.warning"),
+                content=tr("mod.preview.no_model"),
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=3000,
+            )
+            return
+        try:
+            self._show_live2d_preview(self.current_project.base_model_json, tr("mod.preview.original_running"))
+        except Exception as exc:
+            self.preview_panel.show_placeholder(tr("mod.preview.failed", error=str(exc)), tr("mod.preview.title"))
+            InfoBar.error(
+                title=tr("common.error"),
+                content=str(exc),
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=5000,
+            )
+
+    def preview_generated_model(self):
+        if not self.current_project:
+            self._warn_no_project()
+            return
+        model_json = self.generated_model_json_path()
+        if not model_json or not model_json.is_file():
+            InfoBar.warning(
+                title=tr("common.warning"),
+                content=tr("mod.preview.no_generated"),
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=3000,
+            )
+            return
+        try:
+            self._show_live2d_preview(model_json, tr("mod.preview.generated_running"))
+        except Exception as exc:
+            self.preview_panel.show_placeholder(tr("mod.preview.failed", error=str(exc)), tr("mod.preview.title"))
+            InfoBar.error(
+                title=tr("common.error"),
+                content=str(exc),
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=5000,
+            )
+
     def generated_model_json_path(self) -> Path | None:
         if not self.current_project:
             return None
@@ -2052,10 +2162,9 @@ class Live2DModPage(QFrame):
             )
             return
         try:
-            self.preview_panel.show_live2d(
+            self._show_live2d_preview(
                 model_path,
                 tr("mod.preview.skin_title", name=str(skin.get("name") or skin.get("id") or "")),
-                {"show_controls": True},
             )
         except Exception as exc:
             InfoBar.error(
@@ -2107,13 +2216,13 @@ class Live2DModPage(QFrame):
                 duration=3000,
             )
             return
-        self.preview_panel.show_images([path], tr("mod.preview.texture_title", name=path.name))
+        self._show_image_preview([path], tr("mod.preview.texture_title", name=path.name))
 
     def load_preview_images(self):
         if not self.current_project:
             self._warn_no_project()
             return
-        image_paths = self.selected_preview_image_paths()
+        image_paths = [str(path) for path in self.base_texture_paths()]
         if not image_paths:
             InfoBar.warning(
                 title=tr("common.warning"),
@@ -2123,30 +2232,13 @@ class Live2DModPage(QFrame):
                 duration=3000,
             )
             return
-        self.preview_panel.show_images(image_paths, tr("mod.preview.images_title", count=len(image_paths)))
+        self._show_image_preview(image_paths, tr("mod.preview.images_title", count=len(image_paths)))
 
     def load_preview_live2d(self):
-        model_json = self.preview_model_json_path()
-        if not model_json or not model_json.is_file():
-            InfoBar.warning(
-                title=tr("common.warning"),
-                content=tr("mod.preview.no_model"),
-                parent=self,
-                position=InfoBarPosition.TOP,
-                duration=3000,
-            )
+        if self.generated_model_json_path():
+            self.preview_generated_model()
             return
-        try:
-            self.preview_panel.show_live2d(model_json, tr("mod.preview.live2d_running"), {"show_controls": True})
-        except Exception as exc:
-            self.preview_panel.show_placeholder(tr("mod.preview.failed", error=str(exc)), tr("mod.preview.title"))
-            InfoBar.error(
-                title=tr("common.error"),
-                content=str(exc),
-                parent=self,
-                position=InfoBarPosition.TOP,
-                duration=5000,
-            )
+        self.preview_original_model()
 
     def close_preview(self):
         self.preview_panel.close_preview(tr("mod.preview.closed"))
@@ -2294,9 +2386,9 @@ class Live2DModPage(QFrame):
         self.drop_frame.setStyleSheet(
             """
             QFrame#modDropFrame {
-                border: 1px dashed #8a8a8a;
-                border-radius: 6px;
-                background: #fafafa;
+                border: 1px dashed #c8d3e1;
+                border-radius: 12px;
+                background: #fbfcfe;
             }
             """
         )
@@ -2304,8 +2396,8 @@ class Live2DModPage(QFrame):
             frame.setStyleSheet(
                 """
                 QFrame#modCard {
-                    border: 1px solid #dde2ea;
-                    border-radius: 8px;
+                    border: 1px solid #dde4ee;
+                    border-radius: 12px;
                     background: #ffffff;
                 }
                 """
