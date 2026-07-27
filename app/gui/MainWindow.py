@@ -171,6 +171,26 @@ class MainWindow(FluentWindow):
         )
         self.settingsPage = self._create_page(SettingsPage, "settingsPage")
 
+        unified_preview_requested = getattr(
+            self.psdReconstructionPage,
+            "unifiedPreviewRequested",
+            None,
+        )
+        if unified_preview_requested is not None and hasattr(unified_preview_requested, "connect"):
+            unified_preview_requested.connect(self.open_psd_preview)
+        pose_scheme_requested = getattr(self.previewPage, "poseSchemeRequested", None)
+        pose_scheme_handler = getattr(
+            self.psdReconstructionPage,
+            "create_pose_scheme_from_preview",
+            None,
+        )
+        if (
+            pose_scheme_requested is not None
+            and hasattr(pose_scheme_requested, "connect")
+            and callable(pose_scheme_handler)
+        ):
+            pose_scheme_requested.connect(self.save_psd_pose_scheme)
+
         language_changed = getattr(self.settingsPage, "languageChanged", None)
         theme_changed = getattr(self.settingsPage, "themeChanged", None)
         if language_changed is not None and hasattr(language_changed, "connect"):
@@ -344,3 +364,20 @@ class MainWindow(FluentWindow):
     def on_theme_changed(self, theme: str):
         self.settings_manager.set("theme", str(theme).lower())
         self.apply_theme()
+
+    def open_psd_preview(self, model_json_path: str, project_file: str):
+        self.switchTo(self.previewPage)
+        handler = getattr(self.previewPage, "open_psd_project_preview", None)
+        if callable(handler):
+            handler(model_json_path, project_file)
+
+    def save_psd_pose_scheme(self, payload: dict):
+        handler = getattr(
+            self.psdReconstructionPage,
+            "create_pose_scheme_from_preview",
+            None,
+        )
+        if not callable(handler):
+            return
+        self.switchTo(self.psdReconstructionPage)
+        handler(payload)

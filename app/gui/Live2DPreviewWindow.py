@@ -89,6 +89,7 @@ class Live2DPreviewWindow(QWidget):
         self._embedded = bool(embedded)
         self.i18n = get_i18n()
         self.live2d_canvas = None
+        self.live2d_container = None
         self.hit_area_overlay = None
         self.hit_area_toggle_btn = None
         self.control_panel = None
@@ -176,9 +177,9 @@ class Live2DPreviewWindow(QWidget):
             self.close()
             return
 
-        # Create the canvas even without a model. PreviewPage keeps this widget
-        # alive from application startup so the first real model does not force
-        # Qt to recreate the main window's OpenGL composition surface.
+        # QOpenGLWindow is embedded as a native child window. This keeps the
+        # surrounding FluentWindow on its normal raster/native Windows surface,
+        # so adding Live2D cannot recreate or replace the top-level HWND.
         try:
             self.live2d_canvas = Live2DCanvas(self.model_path, embedded=self._embedded)
         except Exception as e:
@@ -188,28 +189,24 @@ class Live2DPreviewWindow(QWidget):
             )
             self.close()
             return
-        # 设置Live2D widget样式
-        self.live2d_canvas.setStyleSheet("""
-            Live2DCanvas {
-                background: transparent;
-                border: 2px solid rgba(255, 255, 255, 0.3);
-                border-radius: 10px;
-            }
-            Live2DCanvas:hover {
-                border: 2px solid rgba(255, 255, 255, 0.5);
-            }
-        """)
+        self.live2d_container = QWidget.createWindowContainer(self.live2d_canvas, self)
+        self.live2d_container.setObjectName("live2dNativeContainer")
+        self.live2d_container.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        self.live2d_container.setStyleSheet(
+            "QWidget#live2dNativeContainer { background: transparent; border: none; }"
+        )
 
         # Keep left-click model interaction; context menus are disabled.
         self.live2d_canvas.setMouseTracking(True)
-        self.live2d_canvas.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         self.live2d_canvas.installEventFilter(self)
-        layout.addWidget(self.live2d_canvas)
-        self.hit_area_overlay = HitAreaOverlay(self.live2d_canvas)
-        self.hit_area_overlay.setGeometry(self.live2d_canvas.rect())
+        self.live2d_container.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+        layout.addWidget(self.live2d_container)
+        self.hit_area_overlay = HitAreaOverlay(self)
         self.hit_area_overlay.set_regions(self._load_hit_regions())
         self.hit_area_overlay.setVisible(False)
-        self.hit_area_overlay.raise_()
         # 创建控制面板（可隐藏）
         self.control_panel = self.create_control_panel()
         self.control_panel.setVisible(False)  # 默认隐藏
@@ -610,11 +607,10 @@ class Live2DPreviewWindow(QWidget):
         return self.hit_area_overlay.region_at(pos)
 
     def _sync_overlay_geometry(self):
-        if not self.hit_area_overlay or not self.live2d_canvas:
+        if not self.hit_area_overlay or not self.live2d_container:
             return
-        self.hit_area_overlay.setGeometry(self.live2d_canvas.rect())
+        self.hit_area_overlay.setGeometry(self.live2d_container.geometry())
         self.hit_area_overlay.setVisible(False)
-        self.hit_area_overlay.raise_()
 
     def _toggle_hit_area_overlay(self):
         self._show_hit_areas = False
@@ -998,6 +994,7 @@ class Live2DPreviewWindow(QWidget):
         if self.live2d_canvas and not self._released:
             self._released = True
             self.live2d_canvas.release()
+            self.live2d_canvas.close()
         self.closed.emit()
         super().closeEvent(event)
 

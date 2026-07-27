@@ -92,10 +92,14 @@ class CubismCoreModel:
     model_buffer: _AlignedBuffer
     model_pointer: ctypes.c_void_p
 
-    def drawable_snapshot(self) -> dict[str, Any]:
+    def drawable_snapshot(
+        self,
+        parameter_values: dict[str, float] | None = None,
+    ) -> dict[str, Any]:
         dll = self.core.dll
         model = self.model_pointer
 
+        applied_parameters = self.apply_parameters(parameter_values or {})
         dll.csmUpdateModel(model)
         drawable_count = dll.csmGetDrawableCount(model)
         if drawable_count < 0:
@@ -198,8 +202,35 @@ class CubismCoreModel:
             "canvas": canvas,
             "parts": parts,
             "offscreen_count": offscreen_count,
+            "parameters": applied_parameters,
             "drawables": drawables,
         }
+
+    def apply_parameters(self, parameter_values: dict[str, float]) -> dict[str, float]:
+        """Apply named Cubism parameters directly to the core model."""
+        dll = self.core.dll
+        model = self.model_pointer
+        count = int(dll.csmGetParameterCount(model))
+        ids = dll.csmGetParameterIds(model)
+        values = dll.csmGetParameterValues(model)
+        minimums = dll.csmGetParameterMinimumValues(model)
+        maximums = dll.csmGetParameterMaximumValues(model)
+        requested = {
+            str(key): float(value)
+            for key, value in dict(parameter_values or {}).items()
+        }
+        applied: dict[str, float] = {}
+        for index in range(max(0, count)):
+            parameter_id = ids[index].decode("utf-8", errors="replace")
+            value = float(values[index])
+            if parameter_id in requested:
+                value = max(
+                    float(minimums[index]),
+                    min(float(maximums[index]), requested[parameter_id]),
+                )
+                values[index] = value
+            applied[parameter_id] = value
+        return applied
 
     def _read_parts(self) -> list[dict[str, Any]]:
         dll = self.core.dll
@@ -422,6 +453,12 @@ class CubismCore:
 
         self.dll.csmGetParameterCount.argtypes = [c_void_p]
         self.dll.csmGetParameterCount.restype = c_int
+        self.dll.csmGetParameterIds.argtypes = [c_void_p]
+        self.dll.csmGetParameterIds.restype = ctypes.POINTER(ctypes.c_char_p)
+        self.dll.csmGetParameterMinimumValues.argtypes = [c_void_p]
+        self.dll.csmGetParameterMinimumValues.restype = ctypes.POINTER(c_float)
+        self.dll.csmGetParameterMaximumValues.argtypes = [c_void_p]
+        self.dll.csmGetParameterMaximumValues.restype = ctypes.POINTER(c_float)
         self.dll.csmGetParameterDefaultValues.argtypes = [c_void_p]
         self.dll.csmGetParameterDefaultValues.restype = ctypes.POINTER(c_float)
         self.dll.csmGetParameterValues.argtypes = [c_void_p]
@@ -498,6 +535,8 @@ def export_drawables_sidecar(
     output_dir: str | Path | None = None,
     dll_path: str | Path | None = None,
     progress: Optional[ProgressCallback] = None,
+    parameter_values: dict[str, float] | None = None,
+    pose_name: str | None = None,
 ) -> Path:
     source_info = resolve_live2d_source(Path(source))
     output_path = Path(output_dir) if output_dir else source_info.root_dir
@@ -508,7 +547,9 @@ def export_drawables_sidecar(
     _emit(progress, 20, f"Cubism Core {core.version_string}: {core.dll_path}")
 
     model = core.load_moc(source_info.moc3)
-    snapshot = model.drawable_snapshot()
+    snapshot = model.drawable_snapshot(parameter_values)
+    if pose_name:
+        snapshot["pose_name"] = str(pose_name)
     snapshot["source_model"] = str(source_info.model_json)
     snapshot["moc"] = str(source_info.moc3)
     snapshot["textures"] = [

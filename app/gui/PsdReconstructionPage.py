@@ -3,7 +3,7 @@ import os
 import re
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import Qt, QProcess, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -26,6 +26,7 @@ from qfluentwidgets import (
     PrimaryPushButton,
     ProgressBar,
     PushButton,
+    SpinBox,
     SubtitleLabel,
     TextEdit,
 )
@@ -39,17 +40,24 @@ from app.core.psd_project import (
     Live2DPSDProject,
     PROJECT_FILE_NAME,
     create_project_from_source,
+    create_pose_scheme,
     create_repack_dir,
+    compose_pose_versions,
+    find_composite_entry,
+    find_pose_scheme,
     find_repack_entry,
     load_project,
     prepare_repack_preview_workspace,
     record_psd_export,
+    record_pose_scheme_export,
     record_repack,
     resolve_project_path,
     save_project,
+    select_pose_scheme,
     select_repack,
     set_preview_state,
     sanitize_project_name,
+    set_pose_scheme_priority,
 )
 from app.core.model import prepare_model_json_for_preview, resolve_live2d_package
 from app.core.model.motions import load_live2d_motions
@@ -64,12 +72,24 @@ class PsdReconstructionThread(QThread):
     reconstructionFinished = Signal(object)
     reconstructionError = Signal(str)
 
-    def __init__(self, source_path: str, output_dir: str, mode: str, metadata_path: str | None = None):
+    def __init__(
+        self,
+        source_path: str,
+        output_dir: str,
+        mode: str,
+        metadata_path: str | None = None,
+        parameter_values: dict[str, float] | None = None,
+        pose_name: str | None = None,
+        output_name: str | None = None,
+    ):
         super().__init__()
         self.source_path = source_path
         self.output_dir = output_dir
         self.mode = mode
         self.metadata_path = metadata_path
+        self.parameter_values = parameter_values
+        self.pose_name = pose_name
+        self.output_name = output_name
 
     def run(self):
         try:
@@ -86,6 +106,9 @@ class PsdReconstructionThread(QThread):
                     self.output_dir,
                     progress=lambda value, message: self.progressUpdated.emit(value, message),
                     mode=self.mode,
+                    parameter_values=self.parameter_values,
+                    pose_name=self.pose_name,
+                    output_name=self.output_name,
                 )
             self.reconstructionFinished.emit(result)
         except Exception as exc:
@@ -137,6 +160,8 @@ class PsdPreviewPrepareThread(QThread):
 
 
 class PsdReconstructionPage(QFrame):
+    unifiedPreviewRequested = Signal(str, str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("psdReconstructionPage")
@@ -149,11 +174,13 @@ class PsdReconstructionPage(QFrame):
         self.workflow = "export"
         self.output_manually_selected = False
         self.last_output_dir = self.default_output_dir()
+        self.last_psd_path = ""
         self.worker: PsdReconstructionThread | None = None
         self.project_worker: PsdProjectImportThread | None = None
         self.preview_prepare_worker: PsdPreviewPrepareThread | None = None
         self.current_project: Live2DPSDProject | None = None
         self._project_combo_refreshing = False
+        self._pose_scheme_refreshing = False
         self._motion_items: list[dict] = []
         self.live2d_preview_window: Live2DPreviewWindow | None = None
         self.preview_mode = ""
@@ -163,6 +190,7 @@ class PsdReconstructionPage(QFrame):
         self.pending_repack_dir = ""
         self.pending_repack_source = ""
         self.pending_repack_metadata = ""
+        self.pending_pose_scheme_id = ""
         self._preview_dock_timer = QTimer(self)
         self._preview_dock_timer.setInterval(700)
         self._preview_dock_timer.timeout.connect(self._send_preview_dock_geometry)
@@ -264,6 +292,20 @@ class PsdReconstructionPage(QFrame):
         self.project_status_label = CaptionLabel("", self.project_frame)
         self.project_status_label.setWordWrap(True)
         self.project_layout.addWidget(self.project_status_label)
+
+        self.pose_scheme_row = QHBoxLayout()
+        self.pose_scheme_label = BodyLabel("", self.project_frame)
+        self.pose_scheme_combo = ComboBox(self.project_frame)
+        self.pose_scheme_combo.currentIndexChanged.connect(self.on_pose_scheme_changed)
+        self.pose_priority_spin = SpinBox(self.project_frame)
+        self.pose_priority_spin.setRange(-9999, 9999)
+        self.pose_priority_spin.editingFinished.connect(
+            lambda: self.on_pose_priority_changed(self.pose_priority_spin.value())
+        )
+        self.pose_scheme_row.addWidget(self.pose_scheme_label)
+        self.pose_scheme_row.addWidget(self.pose_scheme_combo, 1)
+        self.pose_scheme_row.addWidget(self.pose_priority_spin)
+        self.project_layout.addLayout(self.pose_scheme_row)
         self.left_panel_layout.addWidget(self.project_frame)
 
         self.workflow_layout = QHBoxLayout()
@@ -352,10 +394,14 @@ class PsdReconstructionPage(QFrame):
         self.open_output_button = PushButton("", self.left_panel)
         self.open_output_button.setEnabled(False)
         self.open_output_button.clicked.connect(self.open_output_folder)
+        self.open_photoshop_button = PushButton("", self.left_panel)
+        self.open_photoshop_button.setEnabled(False)
+        self.open_photoshop_button.clicked.connect(self.open_current_psd_in_photoshop)
         self.preview_toggle_button = PushButton("", self.left_panel)
         self.preview_toggle_button.clicked.connect(self.toggle_preview_panel)
         self.action_layout.addWidget(self.reconstruct_button)
         self.action_layout.addWidget(self.open_output_button)
+        self.action_layout.addWidget(self.open_photoshop_button)
         self.action_layout.addWidget(self.preview_toggle_button)
         self.action_layout.addStretch(1)
         self.left_panel_layout.addLayout(self.action_layout)
@@ -508,6 +554,7 @@ class PsdReconstructionPage(QFrame):
         self.save_project_button.setText(tr("psd.project.save"))
         self.open_project_folder_button.setText(tr("psd.project.open_folder"))
         self.project_status_label.setText(tr("psd.project.no_project"))
+        self.pose_scheme_label.setText(tr("psd.pose.scheme"))
         self.source_label.setText(tr("psd.source"))
         self.source_edit.setPlaceholderText(tr("psd.placeholder_source"))
         self.source_file_button.setText(tr("psd.browse_file"))
@@ -520,6 +567,7 @@ class PsdReconstructionPage(QFrame):
         self.output_button.setText(tr("common.browse"))
         self.reconstruct_button.setText(tr("psd.reconstruct_button"))
         self.open_output_button.setText(tr("psd.open_output_folder"))
+        self.open_photoshop_button.setText(tr("psd.pose.open_photoshop"))
         self.preview_toggle_button.setText(
             tr("psd.preview.hide") if not self.preview_frame.isHidden() else tr("psd.preview.show")
         )
@@ -658,6 +706,7 @@ class PsdReconstructionPage(QFrame):
         self.pending_repack_dir = ""
         self.pending_repack_source = ""
         self.pending_repack_metadata = ""
+        self.pending_pose_scheme_id = ""
         if self.workflow == "repack":
             if self.current_project and Path(source).suffix.lower() != ".psd":
                 latest_export = self.latest_project_export()
@@ -682,10 +731,13 @@ class PsdReconstructionPage(QFrame):
                 )
                 return
             if self.current_project:
-                version_id, version_dir = create_repack_dir(self.current_project)
+                scheme = self.pose_scheme_for_psd(source)
+                scheme_id = str(scheme.get("id") or "") if scheme else ""
+                version_id, version_dir = create_repack_dir(self.current_project, scheme_id)
                 output_dir = str(version_dir)
                 self.pending_repack_id = version_id
                 self.pending_repack_dir = output_dir
+                self.pending_pose_scheme_id = scheme_id
             else:
                 output_dir = str(Path(source).resolve().parent)
             metadata_path = metadata_path or self.metadata_edit.text().strip() or None
@@ -746,6 +798,11 @@ class PsdReconstructionPage(QFrame):
         self.progress_bar.setValue(100)
         self.stage_label.setText(tr("psd.stage.done"))
         self.open_output_button.setEnabled(True)
+        if result.mode in {"mesh", "atlas-components"} and Path(result.psd_path).is_file():
+            self.last_psd_path = str(Path(result.psd_path).resolve())
+        self.open_photoshop_button.setEnabled(
+            result.mode in {"mesh", "atlas-components"} and Path(result.psd_path).is_file()
+        )
 
         for warning in result.warnings:
             self.append_log(tr("psd.warning_prefix", message=warning))
@@ -794,6 +851,8 @@ class PsdReconstructionPage(QFrame):
         self.save_project_button.setEnabled(not busy)
         self.open_project_folder_button.setEnabled(not busy and self.current_project is not None)
         self.project_combo.setEnabled(not busy)
+        self.pose_scheme_combo.setEnabled(not busy)
+        self.pose_priority_spin.setEnabled(not busy and self.pose_scheme_combo.count() > 0)
         self.output_button.setEnabled(not busy and self.workflow != "repack")
         self.output_edit.setReadOnly(self.workflow == "repack")
         self.mode_combo.setEnabled(not busy)
@@ -1031,6 +1090,117 @@ class PsdReconstructionPage(QFrame):
     def open_output_folder(self):
         if os.path.isdir(self.last_output_dir):
             QDesktopServices.openUrl(QUrl.fromLocalFile(self.last_output_dir))
+
+    def open_current_psd_in_photoshop(self):
+        psd_path = Path(self.last_psd_path) if self.last_psd_path else None
+        if not psd_path or not psd_path.is_file():
+            scheme = find_pose_scheme(self.current_project) if self.current_project else None
+            value = str((scheme or {}).get("psd") or "")
+            psd_path = resolve_project_path(self.current_project, value) if value and self.current_project else None
+        photoshop = Path(self.settings_manager.get_photoshop_executable())
+        if not photoshop.is_file():
+            InfoBar.warning(
+                title=tr("common.warning"),
+                content=tr("psd.pose.photoshop_not_configured"),
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=4000,
+            )
+            return
+        if not psd_path or not psd_path.is_file():
+            return
+        QProcess.startDetached(str(photoshop), [str(psd_path)])
+
+    def pose_scheme_for_psd(self, psd_path: str | Path) -> dict | None:
+        if not self.current_project:
+            return None
+        target = Path(psd_path).resolve()
+        for scheme in self.current_project.data.get("pose_schemes", []):
+            value = str(scheme.get("psd") or "")
+            if value and resolve_project_path(self.current_project, value) == target:
+                return dict(scheme)
+        return None
+
+    def refresh_pose_scheme_controls(self):
+        if not hasattr(self, "pose_scheme_combo"):
+            return
+        selected = ""
+        if self.current_project:
+            selected = str(self.current_project.data.get("selected_pose_scheme") or "")
+        self._pose_scheme_refreshing = True
+        self.pose_scheme_combo.blockSignals(True)
+        self.pose_priority_spin.blockSignals(True)
+        self.pose_scheme_combo.clear()
+        schemes = self.current_project.data.get("pose_schemes", []) if self.current_project else []
+        for scheme in schemes:
+            self.pose_scheme_combo.addItem(
+                str(scheme.get("name") or scheme.get("id") or ""),
+                userData=str(scheme.get("id") or ""),
+            )
+        index = self._combo_index_by_data(self.pose_scheme_combo, selected)
+        self.pose_scheme_combo.setCurrentIndex(index if index >= 0 else (0 if schemes else -1))
+        current = find_pose_scheme(
+            self.current_project,
+            str(self.pose_scheme_combo.currentData() or ""),
+        ) if self.current_project and schemes else None
+        self.pose_priority_spin.setValue(int((current or {}).get("priority") or 0))
+        self.pose_scheme_combo.blockSignals(False)
+        self.pose_priority_spin.blockSignals(False)
+        self.pose_priority_spin.setEnabled(bool(schemes))
+        self.open_photoshop_button.setEnabled(
+            bool(current and resolve_project_path(self.current_project, current.get("psd", "")).is_file())
+        )
+        self._pose_scheme_refreshing = False
+
+    def on_pose_scheme_changed(self, *_args):
+        if self._pose_scheme_refreshing or not self.current_project:
+            return
+        scheme = find_pose_scheme(
+            self.current_project,
+            str(self.pose_scheme_combo.currentData() or ""),
+        )
+        if not scheme:
+            return
+        try:
+            self.current_project = select_pose_scheme(
+                self.current_project,
+                str(scheme.get("id") or ""),
+            )
+        except Exception as exc:
+            self.append_log(tr("psd.warning_prefix", message=str(exc)))
+            return
+        self._pose_scheme_refreshing = True
+        self.pose_priority_spin.setValue(int(scheme.get("priority") or 0))
+        self._pose_scheme_refreshing = False
+        self.last_psd_path = str(resolve_project_path(self.current_project, scheme.get("psd", "")))
+        self.open_photoshop_button.setEnabled(Path(self.last_psd_path).is_file())
+
+    def on_pose_priority_changed(self, value: int):
+        if self._pose_scheme_refreshing or not self.current_project:
+            return
+        scheme_id = str(self.pose_scheme_combo.currentData() or "")
+        if not scheme_id:
+            return
+        try:
+            self.current_project = set_pose_scheme_priority(
+                self.current_project,
+                scheme_id,
+                int(value),
+            )
+            if any(
+                scheme.get("versions")
+                for scheme in self.current_project.data.get("pose_schemes", [])
+            ):
+                self.current_project, composite = compose_pose_versions(
+                    self.current_project,
+                    log=self.append_log,
+                )
+                self.append_log(
+                    tr("psd.pose.composite_created", version=str(composite.get("id") or ""))
+                )
+                self.refresh_preview_source_combo()
+        except Exception as exc:
+            self.append_log(tr("psd.warning_prefix", message=str(exc)))
 
     def create_project_from_current_source(self):
         source = self.source_edit.text().strip()
@@ -1290,6 +1460,7 @@ class PsdReconstructionPage(QFrame):
             if hasattr(self, "open_project_folder_button"):
                 self.open_project_folder_button.setEnabled(False)
             self.project_status_label.setText(tr("psd.project.no_project"))
+            self.refresh_pose_scheme_controls()
             self.refresh_preview_source_combo()
             self.refresh_motion_controls(None)
             return
@@ -1298,6 +1469,7 @@ class PsdReconstructionPage(QFrame):
         self.project_status_label.setText(
             tr("psd.project.current", path=str(self.current_project.project_file))
         )
+        self.refresh_pose_scheme_controls()
         self.refresh_preview_source_combo(selected_id)
 
     def selected_repack_id(self) -> str:
@@ -1338,6 +1510,13 @@ class PsdReconstructionPage(QFrame):
                     self.preview_source_combo.addItem(
                         tr("psd.preview.repack_source", version=version_id),
                         userData=f"repack:{version_id}",
+                    )
+            for item in self.current_project.data.get("composite_history", []):
+                version_id = str(item.get("id") or "")
+                if version_id:
+                    self.preview_source_combo.addItem(
+                        tr("psd.preview.composite_source", version=version_id),
+                        userData=f"composite:{version_id}",
                     )
         index = self._combo_index_by_data(self.preview_source_combo, previous)
         if index < 0:
@@ -1395,6 +1574,15 @@ class PsdReconstructionPage(QFrame):
         try:
             if token.startswith("repack:"):
                 entry = find_repack_entry(self.current_project, token.split(":", 1)[1])
+                if not entry:
+                    return []
+                return [
+                    resolve_project_path(self.current_project, value)
+                    for value in (entry.get("output_paths") or [])
+                    if str(value or "").strip() and resolve_project_path(self.current_project, value).is_file()
+                ]
+            if token.startswith("composite:"):
+                entry = find_composite_entry(self.current_project, token.split(":", 1)[1])
                 if not entry:
                     return []
                 return [
@@ -1498,6 +1686,9 @@ class PsdReconstructionPage(QFrame):
     def latest_project_export(self) -> dict | None:
         if not self.current_project:
             return None
+        scheme = find_pose_scheme(self.current_project)
+        if scheme and scheme.get("psd"):
+            return scheme
         exports = self.current_project.data.get("psd_exports") or []
         return exports[-1] if exports else None
 
@@ -1505,7 +1696,16 @@ class PsdReconstructionPage(QFrame):
         if not self.current_project:
             return
         try:
-            if result.mode in {"mesh", "atlas-components"}:
+            if result.mode in {"mesh", "atlas-components"} and self.pending_pose_scheme_id:
+                self.current_project = record_pose_scheme_export(
+                    self.current_project,
+                    self.pending_pose_scheme_id,
+                    result.psd_path,
+                    result.metadata_path,
+                    result.mode,
+                    result.layer_count,
+                )
+            elif result.mode in {"mesh", "atlas-components"}:
                 self.current_project = record_psd_export(
                     self.current_project,
                     result.psd_path,
@@ -1521,11 +1721,70 @@ class PsdReconstructionPage(QFrame):
                     self.pending_repack_metadata or result.metadata_path,
                     self.pending_repack_dir,
                     result.output_paths,
+                    scheme_id=self.pending_pose_scheme_id,
                 )
+                if self.pending_pose_scheme_id:
+                    self.current_project, composite = compose_pose_versions(
+                        self.current_project,
+                        log=self.append_log,
+                    )
+                    self.append_log(
+                        tr("psd.pose.composite_created", version=str(composite.get("id") or ""))
+                    )
             self.refresh_project_ui(self.pending_repack_id or None)
             self.refresh_project_combo(select_project_file=str(self.current_project.project_file))
         except Exception as exc:
             self.append_log(tr("psd.warning_prefix", message=str(exc)))
+
+    def create_pose_scheme_from_preview(self, payload: dict):
+        """Accept pose snapshots only through the PSD page/MainWindow route."""
+        try:
+            project_file = str(payload.get("project_file") or "")
+            if not self.current_project or str(self.current_project.project_file) != str(Path(project_file).resolve()):
+                self.set_current_project(load_project(project_file))
+            name = str(payload.get("name") or "").strip()
+            priority = int(payload.get("priority") or 0)
+            parameters = {
+                str(key): float(value)
+                for key, value in dict(payload.get("parameters") or {}).items()
+            }
+            self.current_project, scheme, scheme_dir = create_pose_scheme(
+                self.current_project,
+                name,
+                priority,
+                parameters,
+            )
+            self.pending_pose_scheme_id = str(scheme["id"])
+            self.pending_repack_id = ""
+            self.pending_repack_dir = ""
+            self.last_output_dir = str(scheme_dir)
+            self.output_edit.setText(self.last_output_dir)
+            self.set_busy(True)
+            self.progress_bar.setValue(0)
+            self.stage_label.setText(tr("psd.stage.starting"))
+            self.log_text.clear()
+            self.append_log(tr("psd.pose.export_started", name=name))
+            self.worker = PsdReconstructionThread(
+                str(self.current_project.base_model_json),
+                str(scheme_dir),
+                "mesh",
+                parameter_values=parameters,
+                pose_name=name,
+                output_name=str(scheme["id"]),
+            )
+            self.worker.progressUpdated.connect(self.on_progress_updated)
+            self.worker.reconstructionFinished.connect(self.on_reconstruction_finished)
+            self.worker.reconstructionError.connect(self.on_reconstruction_error)
+            self.worker.start()
+        except Exception as exc:
+            self.set_busy(False)
+            InfoBar.error(
+                title=tr("common.error"),
+                content=str(exc),
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=6000,
+            )
 
     def load_selected_preview_images(self):
         if not self.current_project:
@@ -1556,7 +1815,7 @@ class PsdReconstructionPage(QFrame):
 
     def load_selected_preview_live2d(self):
         token = self.preview_source_token()
-        if token.startswith("repack:"):
+        if token.startswith(("repack:", "composite:")):
             self.start_project_preview("current", token.split(":", 1)[1])
         else:
             self.start_project_preview("original")
@@ -1573,11 +1832,18 @@ class PsdReconstructionPage(QFrame):
             return
 
         if mode == "original":
-            self._launch_preview_process(str(self.current_project.base_model_json), "original", "")
+            self.unifiedPreviewRequested.emit(
+                str(self.current_project.base_model_json),
+                str(self.current_project.project_file),
+            )
             return
 
         version_id = version_id or self.preview_source_repack_id() or self.selected_repack_id()
         repack_entry = find_repack_entry(self.current_project, version_id or None)
+        if version_id and (
+            not repack_entry or str(repack_entry.get("id") or "") != version_id
+        ):
+            repack_entry = find_composite_entry(self.current_project, version_id)
         if not repack_entry:
             InfoBar.warning(
                 title=tr("common.warning"),
@@ -1605,9 +1871,11 @@ class PsdReconstructionPage(QFrame):
         self.preview_prepare_worker.start()
 
     def on_preview_workspace_ready(self, model_json_path: str, version_id: str):
-        if self.preview_frame.isHidden():
-            return
-        self._launch_preview_process(model_json_path, "current", version_id)
+        if self.current_project:
+            self.unifiedPreviewRequested.emit(
+                model_json_path,
+                str(self.current_project.project_file),
+            )
 
     def on_preview_workspace_error(self, error: str):
         self.preview_placeholder_label.setText(tr("psd.preview.failed", error=error))

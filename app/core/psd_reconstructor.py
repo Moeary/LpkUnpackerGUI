@@ -61,6 +61,9 @@ def reconstruct_live2d_psd(
     output_dir: str | Path,
     progress: Optional[ProgressCallback] = None,
     mode: str = "mesh",
+    parameter_values: dict[str, float] | None = None,
+    pose_name: str | None = None,
+    output_name: str | None = None,
 ) -> ReconstructionResult:
     cv2 = _require_cv2()
     _require_psd_tools()
@@ -78,7 +81,7 @@ def reconstruct_live2d_psd(
 
     _emit(progress, 20, f"Loaded {len(textures)} texture atlas file(s)")
 
-    if mode == "mesh" and not source_info.mesh_data:
+    if mode == "mesh" and (parameter_values or not source_info.mesh_data):
         try:
             from app.core.cubism_core import CubismCoreError, export_drawables_sidecar
 
@@ -87,6 +90,8 @@ def reconstruct_live2d_psd(
                 source_info.model_json,
                 output_path,
                 progress=lambda value, message: _emit(progress, min(70, 22 + value // 3), message),
+                parameter_values=parameter_values,
+                pose_name=pose_name,
             )
             source_info.mesh_data = _read_json(sidecar_path)
             warnings.append(f"Drawable mesh metadata was exported with Cubism Core: {sidecar_path}")
@@ -108,7 +113,7 @@ def reconstruct_live2d_psd(
         )
         mode = "atlas-components"
 
-    model_name = _clean_model_name(source_info.model_json)
+    model_name = _safe_output_name(output_name or _clean_model_name(source_info.model_json))
     suffix = "mesh_pose" if mode == "mesh" else "editable_atlas"
     psd_path = output_path / f"{model_name}_{suffix}.psd"
     metadata_path = output_path / f"{model_name}_{suffix}.lpkpsd.json"
@@ -117,7 +122,15 @@ def reconstruct_live2d_psd(
     _emit(progress, 98, "Writing metadata")
     _write_json(
         metadata_path,
-        _build_export_metadata(source_info, textures, size, mode, layer_metadata),
+        _build_export_metadata(
+            source_info,
+            textures,
+            size,
+            mode,
+            layer_metadata,
+            pose_name=pose_name,
+            parameter_values=parameter_values,
+        ),
     )
 
     _emit(progress, 100, f"PSD written: {psd_path}")
@@ -1140,6 +1153,8 @@ def _build_export_metadata(
     canvas_size: tuple[int, int],
     mode: str,
     layers: list[dict[str, Any]],
+    pose_name: str | None = None,
+    parameter_values: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     texture_entries = []
     for index, (path, texture) in enumerate(zip(source.textures, textures)):
@@ -1158,7 +1173,7 @@ def _build_export_metadata(
             }
         )
 
-    return {
+    metadata = {
         "format": METADATA_FORMAT,
         "version": METADATA_VERSION,
         "mode": mode,
@@ -1167,6 +1182,15 @@ def _build_export_metadata(
         "textures": texture_entries,
         "layers": layers,
     }
+    if pose_name or parameter_values:
+        metadata["pose"] = {
+            "name": str(pose_name or ""),
+            "parameters": {
+                str(key): float(value)
+                for key, value in dict(parameter_values or {}).items()
+            },
+        }
+    return metadata
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:

@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QScrollArea,
     QSizePolicy,
+    QInputDialog,
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QCoreApplication, QThread, QPoint, QEvent
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QColor, QPixmap
@@ -1371,6 +1372,8 @@ class Live2DSettingsPanel(QFrame):
             pass
 
 class PreviewPage(QFrame):
+    poseSchemeRequested = Signal(dict)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.settings_panel = None
@@ -1396,6 +1399,7 @@ class PreviewPage(QFrame):
         self.freeze_motion_check = None
         self.loop_motion_check = None
         self.auto_play_motion_check = None
+        self.save_pose_scheme_btn = None
         self.left_sidebar_btn = None
         self.right_sidebar_btn = None
         self.preview_splitter = None
@@ -1442,6 +1446,8 @@ class PreviewPage(QFrame):
         self._pending_unity_preview_source_path = None
         self._parameter_sync_timer = None
         self._advanced_enabled_before_freeze = False
+        self._psd_project_context = None
+        self._pending_psd_project_context = None
 
         self.setupUI()
         self.retranslate_ui()
@@ -1707,6 +1713,11 @@ class PreviewPage(QFrame):
         motion_option_row.addWidget(self.auto_play_motion_check)
         motion_option_row.addStretch(1)
         motion_layout.addLayout(motion_option_row)
+        self.save_pose_scheme_btn = PushButton("", self.motion_group)
+        self.save_pose_scheme_btn.setIcon(FluentIcon.SAVE)
+        self.save_pose_scheme_btn.clicked.connect(self.request_pose_scheme_save)
+        self.save_pose_scheme_btn.setVisible(False)
+        motion_layout.addWidget(self.save_pose_scheme_btn)
         self.motion_hint_label = BodyLabel("", self.motion_group)
         self.motion_hint_label.setWordWrap(True)
         motion_layout.addWidget(self.motion_hint_label)
@@ -1783,6 +1794,8 @@ class PreviewPage(QFrame):
             self.loop_motion_check.setText(tr("preview.loop_motion"))
         if self.auto_play_motion_check:
             self.auto_play_motion_check.setText(tr("preview.auto_play_motion"))
+        if self.save_pose_scheme_btn:
+            self.save_pose_scheme_btn.setText(tr("preview.save_psd_pose_scheme"))
         if self.motion_hint_label:
             self.motion_hint_label.setText(tr("preview.trigger_motion_hint"))
         if self.image_preview_panel:
@@ -2592,6 +2605,10 @@ class PreviewPage(QFrame):
         )
 
     def load_model_preview(self, model_json_path: str, source_path: str | None = None):
+        self._psd_project_context = self._pending_psd_project_context
+        self._pending_psd_project_context = None
+        if self.save_pose_scheme_btn:
+            self.save_pose_scheme_btn.setVisible(bool(self._psd_project_context))
         self.current_model_path = os.path.abspath(model_json_path)
         self._temp_model_json_path = self.current_model_path
         self._cleanup_image_preview_temp_dirs()
@@ -2735,7 +2752,7 @@ class PreviewPage(QFrame):
         )
 
     def preview_current_model(self):
-        """Use QOpenGLWidget as a real child of the central preview stage."""
+        """Render Live2D in an isolated native QOpenGLWindow child."""
         if not self.current_model_path:
             self.show_error(
                 tr("preview.no_model_selected_title"),
@@ -2781,6 +2798,51 @@ class PreviewPage(QFrame):
                 tr("preview_window.error_model_load_failed", error_type=type(exc).__name__, error=exc),
             )
             return False
+
+    def open_psd_project_preview(self, model_json_path: str, project_file: str):
+        """Open a model with PSD provenance, enabling named pose export."""
+        self._pending_psd_project_context = {
+            "project_file": os.path.abspath(project_file),
+            "model_json": os.path.abspath(model_json_path),
+        }
+        self.load_model_preview(model_json_path, model_json_path)
+
+    def request_pose_scheme_save(self):
+        context = dict(self._psd_project_context or {})
+        if not context or not self.current_model_path or not self.live2d_preview:
+            return
+        if self.freeze_motion_check and not self.freeze_motion_check.isChecked():
+            self.freeze_motion_check.setChecked(True)
+        name, accepted = QInputDialog.getText(
+            self,
+            tr("preview.pose_scheme_dialog_title"),
+            tr("preview.pose_scheme_name_label"),
+        )
+        name = str(name or "").strip()
+        if not accepted or not name:
+            return
+        priority, accepted = QInputDialog.getInt(
+            self,
+            tr("preview.pose_scheme_dialog_title"),
+            tr("preview.pose_scheme_priority_label"),
+            100,
+            -9999,
+            9999,
+            1,
+        )
+        if not accepted:
+            return
+        parameters = {
+            str(item.get("id")): float(item.get("value", 0.0))
+            for item in self.live2d_preview.get_parameter_meta_list()
+            if item.get("id")
+        }
+        self.poseSchemeRequested.emit({
+            **context,
+            "name": name,
+            "priority": int(priority),
+            "parameters": parameters,
+        })
 
     def _refresh_parameter_controls(self, retries: int = 0):
         preview = self.live2d_preview

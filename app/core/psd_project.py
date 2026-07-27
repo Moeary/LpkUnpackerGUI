@@ -8,13 +8,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from PIL import Image, ImageChops
+
 from app.core.model import Live2DPackage, resolve_live2d_package
 from app.core.model.importer import prepare_live2d_source_import
 from app.core.settings_manager import SettingsManager
 
 
 PROJECT_FORMAT = "LpkUnpacker.Live2DPSDProject"
-PROJECT_VERSION = 1
+PROJECT_VERSION = 2
 PROJECT_FILE_NAME = "project.lpkpsd_project.json"
 LogCallback = Callable[[str], None]
 
@@ -101,8 +103,12 @@ def new_project_data(
             "base_model_json": _relative_to_project(base_package.model_json, project_dir),
         },
         "psd_exports": [],
+        "pose_schemes": [],
+        "selected_pose_scheme": "",
         "repack_history": [],
         "selected_repack": "",
+        "composite_history": [],
+        "selected_composite": "",
         "preview": {
             "current_dir": "preview/current",
             "mode": "original",
@@ -140,15 +146,19 @@ def save_project(project_dir: str | Path, data: dict[str, Any]) -> Path:
 def normalize_project_data(data: dict[str, Any], fallback_name: str) -> dict[str, Any]:
     payload = dict(data)
     payload["format"] = PROJECT_FORMAT
-    payload["version"] = int(payload.get("version") or PROJECT_VERSION)
+    payload["version"] = PROJECT_VERSION
     payload["project_name"] = sanitize_project_name(payload.get("project_name") or fallback_name)
     payload.setdefault("base_source", {})
     payload.setdefault("workspace", {})
     payload["workspace"].setdefault("live2d_dir", "live2d")
     payload["workspace"].setdefault("base_model_json", "")
     payload.setdefault("psd_exports", [])
+    payload.setdefault("pose_schemes", [])
+    payload.setdefault("selected_pose_scheme", "")
     payload.setdefault("repack_history", [])
     payload.setdefault("selected_repack", "")
+    payload.setdefault("composite_history", [])
+    payload.setdefault("selected_composite", "")
     payload.setdefault("preview", {})
     payload["preview"].setdefault("current_dir", "preview/current")
     payload["preview"].setdefault("mode", "original")
@@ -179,8 +189,133 @@ def record_psd_export(
     return Live2DPSDProject(project.project_dir, project.project_file, data)
 
 
-def create_repack_dir(project: Live2DPSDProject) -> tuple[str, Path]:
+def create_pose_scheme(
+    project: Live2DPSDProject,
+    name: str,
+    priority: int,
+    parameters: dict[str, float],
+) -> tuple[Live2DPSDProject, dict[str, Any], Path]:
+    """Create a named, PSD-page-owned pose workspace."""
+    display_name = str(name or "").strip()
+    if not display_name:
+        raise Live2DPSDProjectError("Pose scheme name cannot be empty.")
+    scheme_id = sanitize_project_name(display_name)
+    data = normalize_project_data(project.data, project.project_name)
+    if find_pose_scheme(project, scheme_id):
+        raise Live2DPSDProjectError(f"Pose scheme already exists: {display_name}")
+
+    scheme_dir = project.project_dir / "psd" / scheme_id
+    scheme_dir.mkdir(parents=True, exist_ok=False)
+    package = resolve_live2d_package(project.live2d_dir)
+    source_textures: list[str] = []
+    for index, source in enumerate(package.texture_paths):
+        suffix = source.suffix or ".png"
+        target = scheme_dir / f"texture_{index:02d}{suffix}"
+        shutil.copy2(source, target)
+        source_textures.append(_relative_to_project(target, project.project_dir))
+
+    entry = {
+        "id": scheme_id,
+        "name": display_name,
+        "priority": int(priority),
+        "directory": _relative_to_project(scheme_dir, project.project_dir),
+        "parameters": {
+            str(key): float(value)
+            for key, value in dict(parameters or {}).items()
+        },
+        "source_textures": source_textures,
+        "psd": "",
+        "metadata": "",
+        "mode": "mesh",
+        "layer_count": 0,
+        "versions": [],
+        "selected_version": "",
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    data.setdefault("pose_schemes", []).append(entry)
+    data["selected_pose_scheme"] = scheme_id
+    save_project(project.project_dir, data)
+    updated = Live2DPSDProject(project.project_dir, project.project_file, data)
+    return updated, entry, scheme_dir
+
+
+def record_pose_scheme_export(
+    project: Live2DPSDProject,
+    scheme_id: str,
+    psd_path: str | Path,
+    metadata_path: str | Path | None,
+    mode: str,
+    layer_count: int,
+) -> Live2DPSDProject:
+    data = normalize_project_data(project.data, project.project_name)
+    scheme = _mutable_pose_scheme(data, scheme_id)
+    if scheme is None:
+        raise Live2DPSDProjectError(f"Pose scheme does not exist: {scheme_id}")
+    scheme["psd"] = _relative_to_project(Path(psd_path), project.project_dir)
+    scheme["metadata"] = (
+        _relative_to_project(Path(metadata_path), project.project_dir)
+        if metadata_path
+        else ""
+    )
+    scheme["mode"] = str(mode)
+    scheme["layer_count"] = int(layer_count)
+    scheme["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    data["selected_pose_scheme"] = str(scheme_id)
+    save_project(project.project_dir, data)
+    return Live2DPSDProject(project.project_dir, project.project_file, data)
+
+
+def find_pose_scheme(
+    project: Live2DPSDProject,
+    scheme_id: str | None = None,
+) -> dict[str, Any] | None:
+    data = normalize_project_data(project.data, project.project_name)
+    explicit = scheme_id is not None
+    target = str(scheme_id or data.get("selected_pose_scheme") or "")
+    schemes = data.get("pose_schemes") or []
+    if target:
+        for entry in schemes:
+            if str(entry.get("id") or "") == target:
+                return dict(entry)
+        if explicit:
+            return None
+    return dict(schemes[-1]) if schemes else None
+
+
+def set_pose_scheme_priority(
+    project: Live2DPSDProject,
+    scheme_id: str,
+    priority: int,
+) -> Live2DPSDProject:
+    data = normalize_project_data(project.data, project.project_name)
+    scheme = _mutable_pose_scheme(data, scheme_id)
+    if scheme is None:
+        raise Live2DPSDProjectError(f"Pose scheme does not exist: {scheme_id}")
+    scheme["priority"] = int(priority)
+    scheme["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    save_project(project.project_dir, data)
+    return Live2DPSDProject(project.project_dir, project.project_file, data)
+
+
+def select_pose_scheme(
+    project: Live2DPSDProject,
+    scheme_id: str,
+) -> Live2DPSDProject:
+    if find_pose_scheme(project, scheme_id) is None:
+        raise Live2DPSDProjectError(f"Pose scheme does not exist: {scheme_id}")
+    data = normalize_project_data(project.data, project.project_name)
+    data["selected_pose_scheme"] = str(scheme_id)
+    save_project(project.project_dir, data)
+    return Live2DPSDProject(project.project_dir, project.project_file, data)
+
+
+def create_repack_dir(
+    project: Live2DPSDProject,
+    scheme_id: str | None = None,
+) -> tuple[str, Path]:
     repack_root = project.project_dir / "repacks"
+    if scheme_id:
+        repack_root = repack_root / sanitize_project_name(scheme_id)
     repack_root.mkdir(parents=True, exist_ok=True)
     version_id = timestamp_id()
     candidate = repack_root / version_id
@@ -199,6 +334,7 @@ def record_repack(
     metadata_path: str | Path | None,
     textures_dir: str | Path,
     output_paths: list[Path],
+    scheme_id: str = "",
 ) -> Live2DPSDProject:
     data = normalize_project_data(project.data, project.project_name)
     entry = {
@@ -210,12 +346,113 @@ def record_repack(
         "textures_dir": _relative_to_project(Path(textures_dir), project.project_dir),
         "output_paths": [_relative_to_project(Path(path), project.project_dir) for path in output_paths],
         "created_at": datetime.now().isoformat(timespec="seconds"),
+        "scheme_id": str(scheme_id or ""),
     }
     data.setdefault("repack_history", []).append(entry)
     data["selected_repack"] = version_id
+    if scheme_id:
+        scheme = _mutable_pose_scheme(data, scheme_id)
+        if scheme is None:
+            raise Live2DPSDProjectError(f"Pose scheme does not exist: {scheme_id}")
+        scheme.setdefault("versions", []).append(dict(entry))
+        scheme["selected_version"] = version_id
+        scheme["updated_at"] = entry["created_at"]
+        data["selected_pose_scheme"] = str(scheme_id)
     save_project(project.project_dir, data)
     _write_repack_manifest(Path(textures_dir), entry)
     return Live2DPSDProject(project.project_dir, project.project_file, data)
+
+
+def compose_pose_versions(
+    project: Live2DPSDProject,
+    log: LogCallback | None = None,
+) -> tuple[Live2DPSDProject, dict[str, Any]]:
+    """Compose all selected pose repacks; higher numeric priority wins overlaps."""
+    data = normalize_project_data(project.data, project.project_name)
+    schemes = [
+        dict(item)
+        for item in (data.get("pose_schemes") or [])
+        if item.get("versions")
+    ]
+    if not schemes:
+        raise Live2DPSDProjectError("No pose texture version is available to compose.")
+    schemes.sort(key=lambda item: (int(item.get("priority") or 0), str(item.get("id") or "")))
+
+    package = resolve_live2d_package(project.live2d_dir)
+    composite_id = timestamp_id()
+    root = project.project_dir / "composites" / composite_id
+    index = 1
+    while root.exists():
+        root = project.project_dir / "composites" / f"{composite_id}_{index}"
+        index += 1
+    textures_dir = root / "textures"
+    textures_dir.mkdir(parents=True, exist_ok=True)
+
+    selected_inputs: list[dict[str, Any]] = []
+    resolved_versions: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for scheme in schemes:
+        selected = str(scheme.get("selected_version") or "")
+        versions = list(scheme.get("versions") or [])
+        version = next(
+            (item for item in versions if str(item.get("id") or "") == selected),
+            versions[-1],
+        )
+        resolved_versions.append((scheme, version))
+        selected_inputs.append({
+            "scheme_id": str(scheme.get("id") or ""),
+            "name": str(scheme.get("name") or scheme.get("id") or ""),
+            "priority": int(scheme.get("priority") or 0),
+            "version_id": str(version.get("id") or ""),
+        })
+
+    output_paths: list[Path] = []
+    for texture_index, base_path in enumerate(package.texture_paths):
+        with Image.open(base_path) as source_image:
+            base = source_image.convert("RGBA")
+        composed = base.copy()
+        for scheme, version in resolved_versions:
+            values = version.get("output_paths") or []
+            if texture_index >= len(values):
+                continue
+            candidate = resolve_project_path(project, values[texture_index])
+            if not candidate.is_file():
+                continue
+            with Image.open(candidate) as changed_image:
+                changed = changed_image.convert("RGBA")
+            if changed.size != base.size:
+                raise Live2DPSDProjectError(
+                    f"Pose texture size mismatch: {candidate.name} {changed.size} != {base.size}"
+                )
+            diff = ImageChops.difference(changed, base)
+            channels = diff.split()
+            mask = channels[0]
+            for channel in channels[1:]:
+                mask = ImageChops.lighter(mask, channel)
+            composed = Image.composite(changed, composed, mask.point(lambda value: 255 if value else 0))
+            if log:
+                log(
+                    f"Applied pose {scheme.get('name') or scheme.get('id')} "
+                    f"(priority {int(scheme.get('priority') or 0)})"
+                )
+        target = textures_dir / base_path.name
+        composed.save(target, format="PNG")
+        output_paths.append(target)
+
+    entry = {
+        "id": root.name,
+        "inputs": selected_inputs,
+        "textures_dir": _relative_to_project(textures_dir, project.project_dir),
+        "output_paths": [
+            _relative_to_project(path, project.project_dir)
+            for path in output_paths
+        ],
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    data.setdefault("composite_history", []).append(entry)
+    data["selected_composite"] = entry["id"]
+    save_project(project.project_dir, data)
+    _write_repack_manifest(textures_dir, entry)
+    return Live2DPSDProject(project.project_dir, project.project_file, data), entry
 
 
 def select_repack(project: Live2DPSDProject, version_id: str) -> Live2DPSDProject:
@@ -252,12 +489,30 @@ def find_repack_entry(project: Live2DPSDProject, version_id: str | None = None) 
     return dict(history[-1]) if history else None
 
 
+def find_composite_entry(
+    project: Live2DPSDProject,
+    version_id: str | None = None,
+) -> dict[str, Any] | None:
+    data = normalize_project_data(project.data, project.project_name)
+    target_id = str(version_id or data.get("selected_composite") or "")
+    history = data.get("composite_history") or []
+    if target_id:
+        for entry in history:
+            if str(entry.get("id") or "") == target_id:
+                return dict(entry)
+    return dict(history[-1]) if history else None
+
+
 def prepare_repack_preview_workspace(
     project: Live2DPSDProject,
     version_id: str | None = None,
     log: LogCallback | None = None,
 ) -> Path:
     entry = find_repack_entry(project, version_id)
+    if version_id and (
+        not entry or str(entry.get("id") or "") != str(version_id)
+    ):
+        entry = find_composite_entry(project, version_id)
     if not entry:
         raise Live2DPSDProjectError("No repacked texture version is available for preview.")
 
@@ -286,6 +541,17 @@ def prepare_repack_preview_workspace(
 def resolve_project_path(project: Live2DPSDProject, value: str | Path) -> Path:
     path = Path(str(value))
     return path.resolve() if path.is_absolute() else (project.project_dir / path).resolve()
+
+
+def _mutable_pose_scheme(
+    data: dict[str, Any],
+    scheme_id: str,
+) -> dict[str, Any] | None:
+    target = str(scheme_id or "")
+    for entry in data.setdefault("pose_schemes", []):
+        if str(entry.get("id") or "") == target:
+            return entry
+    return None
 
 
 def timestamp_id() -> str:
@@ -343,7 +609,7 @@ def _copy_workspace(source_dir: Path, target_dir: Path) -> None:
 
 
 def _ensure_project_dirs(project_dir: Path) -> None:
-    for name in ("live2d", "psd", "repacks", "preview/current"):
+    for name in ("live2d", "psd", "repacks", "composites", "preview/current"):
         (project_dir / name).mkdir(parents=True, exist_ok=True)
 
 

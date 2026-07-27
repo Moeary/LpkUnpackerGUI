@@ -58,6 +58,7 @@ class SettingsManager:
                 "archive_extractor_path": "",
                 "assetstudio_cli_path": "",
                 "cubism_core_dll_path": "",
+                "photoshop_path": "",
             },
             "preview": {
                 "image_limit": 48,
@@ -212,6 +213,22 @@ class SettingsManager:
 
     def set_cubism_core_dll_path(self, path: str):
         self.set("tools.cubism_core_dll_path", str(path or "").strip())
+
+    def get_photoshop_path(self) -> str:
+        return str(self.get("tools.photoshop_path", "") or "").strip()
+
+    def set_photoshop_path(self, path: str):
+        self.set("tools.photoshop_path", str(path or "").strip())
+
+    def get_photoshop_executable(self) -> str:
+        configured = Path(self.get_photoshop_path()).expanduser()
+        if configured.is_file():
+            return str(configured.resolve())
+        if configured.is_dir():
+            candidate = configured / "Photoshop.exe"
+            if candidate.is_file():
+                return str(candidate.resolve())
+        return ""
 
     def reset_runtime_to_project(self) -> None:
         runtime = self.settings.setdefault("runtime", {})

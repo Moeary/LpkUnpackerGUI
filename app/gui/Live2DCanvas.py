@@ -2,7 +2,7 @@ import math
 import numpy as np
 from typing import Optional, List, Dict, Any
 
-from PySide6.QtOpenGLWidgets import QOpenGLWidget
+from PySide6.QtOpenGL import QOpenGLWindow
 from PySide6.QtCore import Qt
 import OpenGL.GL as GL
 from abc import abstractmethod
@@ -98,7 +98,7 @@ def create_canvas_framebuffer(width, height):
     return fbo, texture
 
 
-class ADPOpenGLCanvas(QOpenGLWidget):
+class ADPOpenGLCanvas(QOpenGLWindow):
 
     def __init__(self):
         super().__init__()
@@ -297,7 +297,17 @@ class ADPOpenGLCanvas(QOpenGLWidget):
         If transparent is True, the widget remains transparent.
         Otherwise, fill with the provided QColor.
         """
-        self.__use_background = not bool(transparent)
+        # A createWindowContainer() child is an opaque native window on
+        # Windows. Use the preview-stage color instead of exposing a black
+        # native surface when the UI requests "transparent".
+        embedded_transparent = bool(transparent) and bool(
+            getattr(self, "_embedded", False)
+        )
+        self.__use_background = not bool(transparent) or embedded_transparent
+        if embedded_transparent:
+            self.__bg_color = (0.98, 0.985, 0.992, 1.0)
+            self.update()
+            return
         if qcolor is not None:
             # QColor -> normalized RGBA
             r, g, b, a = qcolor.redF(), qcolor.greenF(), qcolor.blueF(), 1.0
@@ -329,13 +339,8 @@ class Live2DCanvas(ADPOpenGLCanvas):
         # tool for controlling model opacity
         self.canvas: Optional[Canvas] = None
         self.setWindowTitle("Live2DCanvas")
-        if not self._embedded:
-            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        if not self._embedded and hasattr(Qt.WidgetAttribute, "WA_AlwaysStackOnTop"):
-            self.setAttribute(Qt.WidgetAttribute.WA_AlwaysStackOnTop, True)
-        if not self._embedded and hasattr(Qt.WidgetAttribute, "WA_NoSystemBackground"):
-            self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
-        self.setAutoFillBackground(False)
+        if self._embedded:
+            self.setBackground(True, None)
         self.radius_per_frame = math.pi * 0.5 / 120
         self.total_radius = 0
         # Mouse follow control
@@ -439,7 +444,8 @@ class Live2DCanvas(ADPOpenGLCanvas):
 
     # --- Mouse tracking and follow implementation ---
     def setMouseTracking(self, enable: bool) -> None:  # type: ignore[override]
-        super().setMouseTracking(bool(enable))
+        # QWindow receives pointer move events directly; keep this flag for
+        # Live2D's optional gaze-follow behaviour.
         self._mouse_follow_enabled = bool(enable)
 
     def mouseMoveEvent(self, event):

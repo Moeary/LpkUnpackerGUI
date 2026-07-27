@@ -70,6 +70,12 @@ class SettingsPage(QFrame):
         self.cubism_core_edit = None
         self.cubism_core_button = None
         self.cubism_core_auto_button = None
+        self.photoshop_label = None
+        self.photoshop_desc = None
+        self.photoshop_status = None
+        self.photoshop_edit = None
+        self.photoshop_button = None
+        self.photoshop_clear_button = None
         self.setting_file_note = None
         self.save_button = None
 
@@ -255,6 +261,30 @@ class SettingsPage(QFrame):
         cubism_core_row.addWidget(self.cubism_core_auto_button)
         runtime_layout.addLayout(cubism_core_row)
 
+        photoshop_row = QHBoxLayout()
+        photoshop_row.setSpacing(12)
+        photoshop_text_layout = QVBoxLayout()
+        photoshop_text_layout.setSpacing(4)
+        self.photoshop_label = BodyLabel("", runtime_card)
+        self.photoshop_desc = CaptionLabel("", runtime_card)
+        self.photoshop_desc.setWordWrap(True)
+        self.photoshop_status = CaptionLabel("", runtime_card)
+        self.photoshop_status.setWordWrap(True)
+        photoshop_text_layout.addWidget(self.photoshop_label)
+        photoshop_text_layout.addWidget(self.photoshop_desc)
+        photoshop_text_layout.addWidget(self.photoshop_status)
+        self.photoshop_edit = LineEdit(runtime_card)
+        self.photoshop_edit.editingFinished.connect(self.on_photoshop_edit_finished)
+        self.photoshop_button = PushButton("", runtime_card)
+        self.photoshop_button.clicked.connect(self.browse_photoshop)
+        self.photoshop_clear_button = PushButton("", runtime_card)
+        self.photoshop_clear_button.clicked.connect(self.clear_photoshop)
+        photoshop_row.addLayout(photoshop_text_layout, 1)
+        photoshop_row.addWidget(self.photoshop_edit, 2)
+        photoshop_row.addWidget(self.photoshop_button)
+        photoshop_row.addWidget(self.photoshop_clear_button)
+        runtime_layout.addLayout(photoshop_row)
+
         self.setting_file_note = CaptionLabel("", runtime_card)
         self.setting_file_note.setWordWrap(True)
         runtime_layout.addWidget(self.setting_file_note)
@@ -288,6 +318,8 @@ class SettingsPage(QFrame):
                 self.assetstudio_tool_edit.setText(self.settings_manager.get_assetstudio_cli_path())
             if self.cubism_core_edit:
                 self.cubism_core_edit.setText(self.settings_manager.get_cubism_core_dll_path())
+            if self.photoshop_edit:
+                self.photoshop_edit.setText(self.settings_manager.get_photoshop_path())
             self.refresh_tool_status_labels()
         finally:
             self._syncing_ui = False
@@ -350,6 +382,11 @@ class SettingsPage(QFrame):
             self.cubism_core_edit.setPlaceholderText(tr("settings.cubism_core_placeholder"))
             self.cubism_core_button.setText(tr("common.browse"))
             self.cubism_core_auto_button.setText(tr("settings.tool_auto"))
+            self.photoshop_label.setText(tr("settings.photoshop_label"))
+            self.photoshop_desc.setText(tr("settings.photoshop_desc"))
+            self.photoshop_edit.setPlaceholderText(tr("settings.photoshop_placeholder"))
+            self.photoshop_button.setText(tr("common.browse"))
+            self.photoshop_clear_button.setText(tr("common.clear"))
             self.refresh_tool_status_labels()
             self.setting_file_note.setText(
                 tr("settings.setting_file_note", path=self.settings_manager.settings_file)
@@ -435,6 +472,9 @@ class SettingsPage(QFrame):
         )
         self.settings_manager.set_cubism_core_dll_path(
             self.cubism_core_edit.text() if self.cubism_core_edit else ""
+        )
+        self.settings_manager.set_photoshop_path(
+            self.photoshop_edit.text() if self.photoshop_edit else ""
         )
         self.load_current_settings()
         InfoBar.success(
@@ -548,6 +588,38 @@ class SettingsPage(QFrame):
             parent=self,
         )
 
+    def browse_photoshop(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            tr("settings.photoshop_select"),
+            self.photoshop_edit.text() or "",
+            tr("settings.photoshop_filter"),
+        )
+        if path:
+            self.photoshop_edit.setText(path)
+            self.save_photoshop(path)
+
+    def clear_photoshop(self):
+        self.photoshop_edit.clear()
+        self.save_photoshop("")
+
+    def on_photoshop_edit_finished(self):
+        if not self._syncing_ui:
+            self.save_photoshop(self.photoshop_edit.text())
+
+    def save_photoshop(self, path: str):
+        self.settings_manager.set_photoshop_path(path)
+        self.refresh_tool_status_labels()
+        InfoBar.success(
+            title=tr("common.success"),
+            content=tr("settings.photoshop_saved"),
+            orient=Qt.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP,
+            duration=2500,
+            parent=self,
+        )
+
     def refresh_tool_status_labels(self):
         if self.assetstudio_tool_status:
             self.assetstudio_tool_status.setText(
@@ -563,6 +635,19 @@ class SettingsPage(QFrame):
                     self.detect_cubism_core_path,
                 )
             )
+        if self.photoshop_status:
+            configured = self.settings_manager.get_photoshop_path()
+            executable = self.settings_manager.get_photoshop_executable()
+            if executable:
+                self.photoshop_status.setText(
+                    tr("settings.tool_status.configured", path=executable)
+                )
+            elif configured:
+                self.photoshop_status.setText(
+                    tr("settings.tool_status.invalid", path=configured)
+                )
+            else:
+                self.photoshop_status.setText(tr("settings.tool_status.not_found"))
 
     def tool_status_text(self, configured_path: str, detector):
         configured_path = str(configured_path or "").strip()
