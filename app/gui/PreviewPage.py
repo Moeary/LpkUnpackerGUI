@@ -42,6 +42,7 @@ from app.core.preview.sources import (
 )
 from app.core.settings_manager import SettingsManager
 from app.gui.ImagePreviewPanel import ImagePreviewPanel
+from app.gui.Live2DPreviewWindow import Live2DPreviewWindow
 from app.i18n import get_i18n, tr
 from app.paths import PROJECT_ROOT
 
@@ -753,9 +754,10 @@ class Live2DSettingsPanel(QFrame):
     settingsChanged = Signal(dict)
     requestRefreshParams = Signal()
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, mode: str = "display"):
         super().__init__(parent)
 
+        self.mode = mode if mode in {"display", "parameters"} else "display"
         self.preview_window = None
 
         self.width_spinbox = None
@@ -766,6 +768,12 @@ class Live2DSettingsPanel(QFrame):
 
         self.rotation_label = None
         self.rotation_slider = None
+        self.scale_text_label = None
+        self.scale_value_label = None
+        self.scale_slider = None
+        self.offset_text_label = None
+        self.position_x_label = None
+        self.position_y_label = None
         self.position_x_spinbox = None
         self.position_y_spinbox = None
         self.bg_transparent_check = None
@@ -819,28 +827,28 @@ class Live2DSettingsPanel(QFrame):
         scroll_layout.setContentsMargins(0, 0, 0, 0)
         scroll_layout.setSpacing(10)
 
-        # 窗口设置组
         window_group = self.create_window_settings_group()
-        scroll_layout.addWidget(window_group)
-
-        # 模型设置组
         model_group = self.create_model_settings_group()
-        scroll_layout.addWidget(model_group)
-
-        # 交互设置组
         interaction_group = self.create_interaction_settings_group()
-        scroll_layout.addWidget(interaction_group)
-
-        # 高级设置组（动态构建）
         advanced_group = self.create_advanced_settings_group()
         self.advanced_group = advanced_group
-        scroll_layout.addWidget(advanced_group)
+        if self.mode == "parameters":
+            window_group.hide()
+            model_group.hide()
+            interaction_group.hide()
+            scroll_layout.addWidget(advanced_group)
+        else:
+            advanced_group.hide()
+            scroll_layout.addWidget(window_group)
+            scroll_layout.addWidget(model_group)
+            scroll_layout.addWidget(interaction_group)
 
         # 添加弹性空间
         scroll_layout.addStretch()
 
         scroll.setWidget(scroll_widget)
         scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.enableTransparentBackground()
         layout.addWidget(scroll)
         self.retranslate_ui()
@@ -961,6 +969,48 @@ class Live2DSettingsPanel(QFrame):
 
         layout.addLayout(rotation_layout)
 
+        scale_layout = QHBoxLayout()
+        self.scale_text_label = BodyLabel("", group)
+        scale_layout.addWidget(self.scale_text_label)
+        self.scale_slider = Slider(Qt.Horizontal, group)
+        self.scale_slider.setRange(25, 300)
+        self.scale_slider.setValue(100)
+        self.scale_value_label = BodyLabel("100%", group)
+        self.scale_value_label.setMinimumWidth(48)
+        self.scale_slider.valueChanged.connect(
+            lambda value: self.scale_value_label.setText(f"{value}%")
+        )
+        self.scale_slider.valueChanged.connect(lambda _: self._emit_settings())
+        scale_layout.addWidget(self.scale_slider, 1)
+        scale_layout.addWidget(self.scale_value_label)
+        layout.addLayout(scale_layout)
+
+        offset_layout = QGridLayout()
+        offset_layout.setHorizontalSpacing(8)
+        offset_layout.setVerticalSpacing(6)
+        self.offset_text_label = BodyLabel("", group)
+        self.offset_text_label.setWordWrap(True)
+        offset_layout.addWidget(self.offset_text_label, 0, 0, 1, 4)
+        self.position_x_label = BodyLabel("X", group)
+        self.position_x_spinbox = SpinBox(group)
+        self.position_x_spinbox.setRange(-100, 100)
+        self.position_x_spinbox.setValue(0)
+        self.position_x_spinbox.setSuffix(" %")
+        self.position_x_spinbox.setFixedWidth(105)
+        self.position_x_spinbox.valueChanged.connect(lambda _: self._emit_settings())
+        self.position_y_label = BodyLabel("Y", group)
+        self.position_y_spinbox = SpinBox(group)
+        self.position_y_spinbox.setRange(-100, 100)
+        self.position_y_spinbox.setValue(0)
+        self.position_y_spinbox.setSuffix(" %")
+        self.position_y_spinbox.setFixedWidth(105)
+        self.position_y_spinbox.valueChanged.connect(lambda _: self._emit_settings())
+        offset_layout.addWidget(self.position_x_label, 1, 0)
+        offset_layout.addWidget(self.position_x_spinbox, 1, 1)
+        offset_layout.addWidget(self.position_y_label, 1, 2)
+        offset_layout.addWidget(self.position_y_spinbox, 1, 3)
+        layout.addLayout(offset_layout)
+
         # 背景设置
         bg_layout = QHBoxLayout()
         self.background_label = BodyLabel("", group)
@@ -1042,9 +1092,13 @@ class Live2DSettingsPanel(QFrame):
 
         # 容器用于放置动态参数滑条
         self.adv_params_container = QWidget(group)
-        self.adv_params_container_layout = QVBoxLayout(self.adv_params_container)
+        self.adv_params_container_layout = QGridLayout(self.adv_params_container)
         self.adv_params_container_layout.setContentsMargins(0, 0, 0, 0)
-        self.adv_params_container_layout.setSpacing(8)
+        self.adv_params_container_layout.setHorizontalSpacing(10)
+        self.adv_params_container_layout.setVerticalSpacing(8)
+        self.adv_params_container_layout.setColumnStretch(0, 1)
+        self.adv_params_container_layout.setColumnStretch(1, 0)
+        self.adv_params_container_layout.setColumnStretch(2, 0)
         layout.addWidget(self.adv_params_container)
 
         # Buttons row (adv params)
@@ -1078,6 +1132,10 @@ class Live2DSettingsPanel(QFrame):
             self.model_group_title.setText(tr("preview.model_display_settings"))
         if self.rotation_text_label:
             self.rotation_text_label.setText(tr("preview.model_rotation"))
+        if self.scale_text_label:
+            self.scale_text_label.setText(tr("preview.model_scale"))
+        if self.offset_text_label:
+            self.offset_text_label.setText(tr("preview.model_offset"))
         if self.background_label:
             self.background_label.setText(tr("preview.background"))
         if self.bg_transparent_check:
@@ -1148,8 +1206,10 @@ class Live2DSettingsPanel(QFrame):
         # 缩放决定函数
         def decide_scale(vmin, vmax):
             rng = max(vmax, vmin) - min(vmax, vmin)
-            if rng <= 2.0:
+            if rng <= 200.0:
                 return 100
+            if rng <= 2000.0:
+                return 10
             return 1
 
         # 构造控件，按id字母序排列以保持一致性
@@ -1171,11 +1231,14 @@ class Live2DSettingsPanel(QFrame):
             self.PARAM_SPECS.append(spec)
             self.param_specs_by_id[pid] = spec
 
-            row = QHBoxLayout()
             name_label = BodyLabel(f"{pid}:", self.adv_params_container)
-            row.addWidget(name_label)
+            name_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            name_label.setToolTip(pid)
+            name_label.setMinimumWidth(0)
+            name_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
 
             slider = Slider(Qt.Horizontal, self.adv_params_container)
+            slider.setFixedWidth(120)
             s_min = int(round(pmin * scale))
             s_max = int(round(pmax * scale))
             # Ensure s_min <= s_max
@@ -1189,7 +1252,8 @@ class Live2DSettingsPanel(QFrame):
             slider.setValue(int(round(init_val * scale)))
 
             val_label = BodyLabel(f"{init_val:.2f}" if scale != 1 else f"{int(round(init_val))}", self.adv_params_container)
-            val_label.setMinimumWidth(80)
+            val_label.setFixedWidth(58)
+            val_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
             def make_on_change(lbl, scale_factor):
                 return lambda v: lbl.setText(f"{v/scale_factor:.2f}") if scale_factor != 1 else lbl.setText(f"{v}")
@@ -1197,12 +1261,47 @@ class Live2DSettingsPanel(QFrame):
             slider.valueChanged.connect(make_on_change(val_label, scale))
             slider.valueChanged.connect(lambda _: self._emit_settings())
 
-            row.addWidget(slider)
-            row.addWidget(val_label)
-            row.addStretch()
-
-            self.adv_params_container_layout.addLayout(row)
+            row_index = len(self.advanced_param_sliders)
+            self.adv_params_container_layout.addWidget(
+                name_label,
+                row_index,
+                0,
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            )
+            self.adv_params_container_layout.addWidget(
+                slider,
+                row_index,
+                1,
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            )
+            self.adv_params_container_layout.addWidget(
+                val_label,
+                row_index,
+                2,
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            )
             self.advanced_param_sliders[pid] = (slider, val_label, scale)
+
+    def sync_advanced_param_values(self, meta_list: list):
+        """Mirror current model values without emitting override changes."""
+        current_values = {
+            str(item.get("id", "")): float(item.get("value", 0.0))
+            for item in meta_list
+            if item.get("id")
+        }
+        for pid, (slider, value_label, scale) in self.advanced_param_sliders.items():
+            if pid not in current_values or slider.isSliderDown():
+                continue
+            spec = self.param_specs_by_id.get(pid)
+            value = current_values[pid]
+            if spec:
+                value = max(spec["min"], min(spec["max"], value))
+            slider.blockSignals(True)
+            slider.setValue(int(round(value * scale)))
+            slider.blockSignals(False)
+            value_label.setText(
+                f"{value:.2f}" if scale != 1 else f"{int(round(value))}"
+            )
 
     def get_settings(self):
         """获取当前设置"""
@@ -1211,6 +1310,9 @@ class Live2DSettingsPanel(QFrame):
             'opacity': self.opacity_slider.value() / 100.0,
             'show_controls': bool(self.show_controls_check and self.show_controls_check.isVisible() and self.show_controls_check.isChecked()),
             'model_rotation': self.rotation_slider.value(),
+            'model_scale': self.scale_slider.value() / 100.0,
+            'model_offset_x': self.position_x_spinbox.value() / 100.0,
+            'model_offset_y': self.position_y_spinbox.value() / 100.0,
             'transparent_bg': self.bg_transparent_check.isChecked(),
             'bg_color': self.selected_bg_color,
             'mouse_tracking': self.mouse_tracking_check.isChecked(),
@@ -1234,6 +1336,13 @@ class Live2DSettingsPanel(QFrame):
         else:
             settings['advanced_params'] = {}
         return settings
+
+    def get_advanced_settings(self):
+        settings = self.get_settings()
+        return {
+            "advanced_enabled": settings.get("advanced_enabled", False),
+            "advanced_params": settings.get("advanced_params", {}),
+        }
 
     def open_color_dialog(self):
         """使用 qfluentwidgets 的 ColorDialog 选择背景颜色，并实时应用"""
@@ -1265,6 +1374,8 @@ class PreviewPage(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.settings_panel = None
+        self.advanced_panel = None
+        self.live2d_preview = None
         self.preview_btn = None
         self.close_all_btn = None
         self.model_info_text_box = None
@@ -1282,6 +1393,14 @@ class PreviewPage(QFrame):
         self.motion_combo = None
         self.play_motion_btn = None
         self.motion_hint_label = None
+        self.freeze_motion_check = None
+        self.loop_motion_check = None
+        self.auto_play_motion_check = None
+        self.left_sidebar_btn = None
+        self.right_sidebar_btn = None
+        self.preview_splitter = None
+        self.left_sidebar = None
+        self.right_sidebar = None
         self._motion_items = []
         self.drag_drop_area = None
         self.source_label = None
@@ -1321,6 +1440,8 @@ class PreviewPage(QFrame):
         self._preview_export_files = []
         self._preview_export_label = ""
         self._pending_unity_preview_source_path = None
+        self._parameter_sync_timer = None
+        self._advanced_enabled_before_freeze = False
 
         self.setupUI()
         self.retranslate_ui()
@@ -1330,6 +1451,7 @@ class PreviewPage(QFrame):
             app = QCoreApplication.instance()
             if app is not None:
                 app.aboutToQuit.connect(self._terminate_preview_process)
+                app.aboutToQuit.connect(self._destroy_embedded_live2d)
                 app.aboutToQuit.connect(self._cleanup_temp_model_json)
                 app.aboutToQuit.connect(self._cleanup_model_preview_temp_dirs)
                 app.aboutToQuit.connect(self._cleanup_image_preview_temp_dirs)
@@ -1343,12 +1465,23 @@ class PreviewPage(QFrame):
         self.main_layout.setContentsMargins(20, 18, 20, 20)
         self.main_layout.setSpacing(12)
 
-        # 标题
+        # 标题与侧栏开关始终位于三栏布局之外，侧栏隐藏后仍可恢复。
+        title_row = QHBoxLayout()
+        title_row.setSpacing(8)
         self.title_label = SubtitleLabel("", self)
-        self.main_layout.addWidget(self.title_label)
+        title_row.addWidget(self.title_label)
+        title_row.addStretch(1)
+        self.left_sidebar_btn = PushButton("", self)
+        self.left_sidebar_btn.clicked.connect(lambda: self._toggle_sidebar("left"))
+        title_row.addWidget(self.left_sidebar_btn)
+        self.right_sidebar_btn = PushButton("", self)
+        self.right_sidebar_btn.clicked.connect(lambda: self._toggle_sidebar("right"))
+        title_row.addWidget(self.right_sidebar_btn)
+        self.main_layout.addLayout(title_row)
 
         # 创建分割器
         splitter = QSplitter(Qt.Horizontal, self)
+        self.preview_splitter = splitter
         splitter.setChildrenCollapsible(False)
         splitter.setOpaqueResize(True)
         splitter.setHandleWidth(8)
@@ -1364,6 +1497,7 @@ class PreviewPage(QFrame):
 
         # 左侧：导入、设置和控制按钮
         left_widget = QWidget()
+        self.left_sidebar = left_widget
         left_widget.setMinimumWidth(320)
         left_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         left_layout = QVBoxLayout(left_widget)
@@ -1427,30 +1561,8 @@ class PreviewPage(QFrame):
 
         left_layout.addWidget(self.model_info_text_box)
 
-        self.motion_group = CardWidget(self)
-        self.motion_group.setVisible(False)
-        motion_layout = QVBoxLayout(self.motion_group)
-        motion_layout.setContentsMargins(12, 12, 12, 12)
-        motion_layout.setSpacing(8)
-        self.motion_group_title = SubtitleLabel("", self.motion_group)
-        motion_layout.addWidget(self.motion_group_title)
-        motion_row = QHBoxLayout()
-        motion_row.setSpacing(8)
-        self.motion_combo = ComboBox(self.motion_group)
-        self.motion_combo.setMinimumWidth(180)
-        self.play_motion_btn = PushButton("", self.motion_group)
-        self.play_motion_btn.setIcon(FluentIcon.PLAY)
-        self.play_motion_btn.clicked.connect(self.play_selected_motion)
-        motion_row.addWidget(self.motion_combo, 1)
-        motion_row.addWidget(self.play_motion_btn)
-        motion_layout.addLayout(motion_row)
-        self.motion_hint_label = BodyLabel("", self.motion_group)
-        self.motion_hint_label.setWordWrap(True)
-        motion_layout.addWidget(self.motion_hint_label)
-        left_layout.addWidget(self.motion_group)
-
-        # 设置面板
-        self.settings_panel = Live2DSettingsPanel(self)
+        # 左侧只保留导入、显示和交互设置。
+        self.settings_panel = Live2DSettingsPanel(self, mode="display")
         self.settings_panel.settingsChanged.connect(self.on_settings_changed)
         self.settings_panel.requestRefreshParams.connect(self.on_request_refresh_params)
         left_layout.addWidget(self.settings_panel, 1)
@@ -1473,7 +1585,7 @@ class PreviewPage(QFrame):
 
         left_layout.addLayout(button_layout)
 
-        # 右侧：大预览舞台
+        # 中间：统一的图片 / Live2D 预览舞台
         right_widget = QWidget()
         right_widget.setMinimumWidth(520)
         right_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -1553,16 +1665,66 @@ class PreviewPage(QFrame):
         self.image_preview_panel.setVisible(False)
         self.image_preview_panel.itemActivated.connect(self.on_preview_item_activated)
         self.preview_dock_layout.addWidget(self.image_preview_panel, 1)
+        self._ensure_embedded_live2d()
         self.preview_stage_layout.addWidget(self.preview_dock_area, 1)
 
         right_layout.addWidget(self.preview_stage, 1)
 
+        # 右侧：触发动作与高级参数编辑
+        action_widget = QWidget()
+        self.right_sidebar = action_widget
+        action_widget.setMinimumWidth(300)
+        action_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        action_layout = QVBoxLayout(action_widget)
+        action_layout.setContentsMargins(12, 10, 0, 0)
+        action_layout.setSpacing(10)
+
+        self.motion_group = CardWidget(action_widget)
+        motion_layout = QVBoxLayout(self.motion_group)
+        motion_layout.setContentsMargins(12, 12, 12, 12)
+        motion_layout.setSpacing(8)
+        self.motion_group_title = SubtitleLabel("", self.motion_group)
+        motion_layout.addWidget(self.motion_group_title)
+        self.motion_combo = ComboBox(self.motion_group)
+        self.motion_combo.currentIndexChanged.connect(self._on_motion_selection_changed)
+        motion_layout.addWidget(self.motion_combo)
+        motion_button_row = QHBoxLayout()
+        self.play_motion_btn = PushButton("", self.motion_group)
+        self.play_motion_btn.setIcon(FluentIcon.PLAY)
+        self.play_motion_btn.clicked.connect(self.play_selected_motion)
+        motion_button_row.addWidget(self.play_motion_btn, 1)
+        motion_layout.addLayout(motion_button_row)
+
+        motion_option_row = QHBoxLayout()
+        self.freeze_motion_check = CheckBox("", self.motion_group)
+        self.freeze_motion_check.toggled.connect(self.on_motion_freeze_changed)
+        motion_option_row.addWidget(self.freeze_motion_check)
+        self.loop_motion_check = CheckBox("", self.motion_group)
+        self.loop_motion_check.toggled.connect(self.on_motion_loop_changed)
+        motion_option_row.addWidget(self.loop_motion_check)
+        self.auto_play_motion_check = CheckBox("", self.motion_group)
+        self.auto_play_motion_check.setChecked(False)
+        motion_option_row.addWidget(self.auto_play_motion_check)
+        motion_option_row.addStretch(1)
+        motion_layout.addLayout(motion_option_row)
+        self.motion_hint_label = BodyLabel("", self.motion_group)
+        self.motion_hint_label.setWordWrap(True)
+        motion_layout.addWidget(self.motion_hint_label)
+        action_layout.addWidget(self.motion_group)
+
+        self.advanced_panel = Live2DSettingsPanel(action_widget, mode="parameters")
+        self.advanced_panel.settingsChanged.connect(self.on_advanced_settings_changed)
+        self.advanced_panel.requestRefreshParams.connect(self.on_request_refresh_params)
+        action_layout.addWidget(self.advanced_panel, 1)
+
         # 添加到分割器
         splitter.addWidget(left_widget)
         splitter.addWidget(right_widget)
+        splitter.addWidget(action_widget)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([380, 1040])  # 设置初始比例
+        splitter.setStretchFactor(2, 0)
+        splitter.setSizes([380, 760, 380])
 
         self.main_layout.addWidget(splitter, 1)
         self.main_layout.setStretch(0, 0)
@@ -1583,6 +1745,10 @@ class PreviewPage(QFrame):
         self._preview_dock_timer = QTimer(self)
         self._preview_dock_timer.setInterval(250)
         self._preview_dock_timer.timeout.connect(self._send_preview_dock_geometry)
+        self._parameter_sync_timer = QTimer(self)
+        self._parameter_sync_timer.setInterval(80)
+        self._parameter_sync_timer.timeout.connect(self._sync_live_parameter_controls)
+        self._set_motion_debug_visible(False)
 
     def retranslate_ui(self):
         self.title_label.setText(tr("preview.title"))
@@ -1608,11 +1774,17 @@ class PreviewPage(QFrame):
         if self.preview_stage_close_btn:
             self.preview_stage_close_btn.setToolTip(tr("preview.close_window"))
         if self.motion_group_title:
-            self.motion_group_title.setText(tr("preview.motion_debug"))
+            self.motion_group_title.setText(tr("preview.trigger_motion"))
         if self.play_motion_btn:
             self.play_motion_btn.setText(tr("preview.play_motion"))
+        if self.freeze_motion_check:
+            self.freeze_motion_check.setText(tr("preview.freeze_motion"))
+        if self.loop_motion_check:
+            self.loop_motion_check.setText(tr("preview.loop_motion"))
+        if self.auto_play_motion_check:
+            self.auto_play_motion_check.setText(tr("preview.auto_play_motion"))
         if self.motion_hint_label:
-            self.motion_hint_label.setText(tr("preview.motion_hint"))
+            self.motion_hint_label.setText(tr("preview.trigger_motion_hint"))
         if self.image_preview_panel:
             self.image_preview_panel.retranslate_ui()
 
@@ -1620,6 +1792,9 @@ class PreviewPage(QFrame):
             self.drag_drop_area.retranslate_ui()
         if hasattr(self, "settings_panel") and self.settings_panel:
             self.settings_panel.retranslate_ui()
+        if self.advanced_panel:
+            self.advanced_panel.retranslate_ui()
+        self._update_sidebar_button_text()
 
         if not self.current_model_path and not (
             self.image_preview_panel and self.image_preview_panel.isVisible()
@@ -1630,6 +1805,21 @@ class PreviewPage(QFrame):
             self.motion_combo.addItem(tr("preview.motion_none"))
             self.motion_combo.setEnabled(False)
             self.play_motion_btn.setEnabled(False)
+
+    def _toggle_sidebar(self, side: str):
+        widget = self.left_sidebar if side == "left" else self.right_sidebar
+        if widget is None:
+            return
+        widget.setVisible(not widget.isVisible())
+        self._update_sidebar_button_text()
+
+    def _update_sidebar_button_text(self):
+        if self.left_sidebar_btn and self.left_sidebar:
+            key = "preview.show_left_sidebar" if self.left_sidebar.isHidden() else "preview.hide_left_sidebar"
+            self.left_sidebar_btn.setText(tr(key))
+        if self.right_sidebar_btn and self.right_sidebar:
+            key = "preview.show_right_sidebar" if self.right_sidebar.isHidden() else "preview.hide_right_sidebar"
+            self.right_sidebar_btn.setText(tr(key))
 
     def on_preview_image_limit_changed(self, value: int):
         self.settings_manager.set("preview.image_limit", int(value))
@@ -1786,6 +1976,7 @@ class PreviewPage(QFrame):
             self._last_preview_dock_rect = rect
 
     def _terminate_preview_process(self):
+        self._close_embedded_live2d()
         process = self.preview_process
         self.preview_process = None
         if self._preview_process_poll_timer is not None:
@@ -1805,6 +1996,47 @@ class PreviewPage(QFrame):
         try:
             if process.poll() is None:
                 process.terminate()
+        except Exception:
+            pass
+
+    def _ensure_embedded_live2d(self):
+        if self.live2d_preview is not None:
+            return self.live2d_preview
+        if self.preview_dock_area is None or self.preview_dock_layout is None:
+            return None
+        preview = Live2DPreviewWindow(
+            None,
+            parent=self.preview_dock_area,
+            embedded=True,
+        )
+        if preview.live2d_canvas is None:
+            preview.deleteLater()
+            return None
+        self.live2d_preview = preview
+        self.preview_dock_layout.addWidget(preview, 1)
+        preview.hide()
+        return preview
+
+    def _close_embedded_live2d(self):
+        preview = self.live2d_preview
+        if preview is None:
+            return
+        try:
+            preview.unload_model()
+            preview.hide()
+        except Exception:
+            pass
+
+    def _destroy_embedded_live2d(self):
+        preview = self.live2d_preview
+        self.live2d_preview = None
+        if preview is None:
+            return
+        try:
+            if self.preview_dock_layout:
+                self.preview_dock_layout.removeWidget(preview)
+            preview.close()
+            preview.deleteLater()
         except Exception:
             pass
 
@@ -1828,6 +2060,8 @@ class PreviewPage(QFrame):
         self._set_motion_debug_visible(False)
 
     def _show_stage_placeholder(self, text: str | None = None):
+        if self.live2d_preview:
+            self.live2d_preview.setVisible(False)
         if self.image_preview_panel:
             self.image_preview_panel.setVisible(False)
         if self.preview_placeholder:
@@ -1835,6 +2069,8 @@ class PreviewPage(QFrame):
             self.preview_placeholder.setVisible(True)
 
     def _show_image_stage(self):
+        if self.live2d_preview:
+            self.live2d_preview.setVisible(False)
         if self.preview_placeholder:
             self.preview_placeholder.setVisible(False)
         if self.image_preview_panel:
@@ -1919,20 +2155,32 @@ class PreviewPage(QFrame):
         self._motion_items = list(motions or [])
         if not self.motion_combo or not self.play_motion_btn:
             return
+        self.motion_combo.blockSignals(True)
         self.motion_combo.clear()
         if not self._motion_items:
             self.motion_combo.addItem(tr("preview.motion_none"))
             self.motion_combo.setEnabled(False)
             self.play_motion_btn.setEnabled(False)
+            self.motion_combo.blockSignals(False)
             return
         for motion in self._motion_items:
             self.motion_combo.addItem(str(motion.get("display") or motion.get("group") or "motion"))
         self.motion_combo.setEnabled(True)
         self.play_motion_btn.setEnabled(True)
+        self.motion_combo.setCurrentIndex(0)
+        self.motion_combo.blockSignals(False)
+        self._on_motion_selection_changed(0)
 
     def _set_motion_debug_visible(self, visible: bool):
         if self.motion_group:
-            self.motion_group.setVisible(False)
+            self.motion_group.setEnabled(bool(visible))
+        if self.advanced_panel:
+            self.advanced_panel.setEnabled(bool(visible))
+        if self._parameter_sync_timer:
+            if visible:
+                self._parameter_sync_timer.start()
+            else:
+                self._parameter_sync_timer.stop()
 
     def play_selected_motion(self):
         if not self._motion_items or not self.motion_combo:
@@ -1941,11 +2189,68 @@ class PreviewPage(QFrame):
         if index < 0 or index >= len(self._motion_items):
             index = 0
         motion = self._motion_items[index]
-        self._send_preview_command({
-            "type": "play_motion",
-            "group": str(motion.get("group", "")),
-            "index": int(motion.get("index", 0)),
-        })
+        if self.freeze_motion_check:
+            self.freeze_motion_check.setChecked(False)
+        if self.live2d_preview:
+            self.live2d_preview.play_motion(
+                str(motion.get("group", "")),
+                int(motion.get("index", 0)),
+            )
+
+    def _on_motion_selection_changed(self, index: int):
+        if not self.live2d_preview or index < 0 or index >= len(self._motion_items):
+            return
+        motion = self._motion_items[index]
+        self.live2d_preview.set_selected_motion(
+            str(motion.get("group", "")),
+            int(motion.get("index", 0)),
+        )
+        if self.auto_play_motion_check and self.auto_play_motion_check.isChecked():
+            self.play_selected_motion()
+
+    def on_motion_freeze_changed(self, frozen: bool):
+        if not self.live2d_preview or not self.advanced_panel:
+            return
+        enable_check = self.advanced_panel.advanced_enable_check
+        if frozen:
+            self.live2d_preview.set_motion_frozen(True)
+            self._sync_live_parameter_controls(force=True)
+            self._advanced_enabled_before_freeze = bool(
+                enable_check and enable_check.isChecked()
+            )
+            if enable_check and not enable_check.isChecked():
+                enable_check.setChecked(True)
+            return
+        if (
+            enable_check
+            and enable_check.isChecked()
+            and not self._advanced_enabled_before_freeze
+        ):
+            enable_check.setChecked(False)
+        self._advanced_enabled_before_freeze = False
+        self.live2d_preview.set_motion_frozen(False)
+
+    def on_motion_loop_changed(self, enabled: bool):
+        if self.live2d_preview:
+            self.live2d_preview.set_motion_loop(bool(enabled))
+
+    def on_advanced_settings_changed(self, _settings: dict):
+        if self.live2d_preview and self.advanced_panel:
+            self.live2d_preview.apply_settings(self.advanced_panel.get_advanced_settings())
+
+    def _sync_live_parameter_controls(self, force: bool = False):
+        if (
+            self.live2d_preview is None
+            or self.advanced_panel is None
+            or (self.freeze_motion_check and self.freeze_motion_check.isChecked() and not force)
+        ):
+            return
+        meta = self.live2d_preview.get_parameter_meta_list()
+        if not meta:
+            return
+        if not self.advanced_panel.advanced_param_sliders:
+            self.advanced_panel.rebuild_advanced_params(meta)
+        self.advanced_panel.sync_advanced_param_values(meta)
 
     def _cleanup_temp_model_json(self):
         """删除上一次创建的临时美化 model json（若存在）。"""
@@ -2430,7 +2735,7 @@ class PreviewPage(QFrame):
         )
 
     def preview_current_model(self):
-        """在独立进程中预览当前模型，避免 Cubism/OpenGL 卡住主 GUI。"""
+        """Use QOpenGLWidget as a real child of the central preview stage."""
         if not self.current_model_path:
             self.show_error(
                 tr("preview.no_model_selected_title"),
@@ -2442,36 +2747,30 @@ class PreviewPage(QFrame):
             self._terminate_preview_process()
             motions = self._load_motions_from_model_json(self.current_model_path)
             self._populate_motion_controls(motions)
-
-            creationflags = 0
-            if os.name == "nt" and hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
-                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
-            self.preview_process = subprocess.Popen(
-                self._preview_command_args(),
-                cwd=str(PROJECT_ROOT),
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                creationflags=creationflags,
-            )
-            self._send_preview_dock_geometry()
-            self._send_preview_command({
-                "type": "settings",
-                "settings": self._serialize_preview_settings(self.settings_panel.get_settings()),
-            })
-            if self._preview_process_poll_timer is not None:
-                self._preview_process_poll_timer.start()
-            if self._preview_dock_timer is not None:
-                self._preview_dock_timer.start()
-            self._set_motion_debug_visible(True)
             if self.preview_placeholder:
                 self.preview_placeholder.setVisible(False)
             if self.image_preview_panel:
-                self.image_preview_panel.setVisible(True)
-                self.image_preview_panel.show_model_placeholder(tr("preview.external_running"))
+                self.image_preview_panel.setVisible(False)
+
+            preview = self._ensure_embedded_live2d()
+            if preview is None or preview.live2d_canvas is None:
+                raise RuntimeError("Live2D OpenGL canvas could not be created.")
+            preview.load_model(self.current_model_path)
+            settings = self.settings_panel.get_settings()
+            settings.update(self.advanced_panel.get_advanced_settings())
+            settings.update({
+                "fit_to_dock": True,
+                "selected_motion_on_click": True,
+                "motion_frozen": False,
+                "motion_loop": bool(self.loop_motion_check and self.loop_motion_check.isChecked()),
+            })
+            preview.apply_settings(settings)
+            preview.show()
+            if self.freeze_motion_check:
+                self.freeze_motion_check.setChecked(False)
+            self._set_motion_debug_visible(True)
+            self._on_motion_selection_changed(self.motion_combo.currentIndex())
+            QTimer.singleShot(120, lambda: self._refresh_parameter_controls(5))
             return True
         except Exception as exc:
             self._terminate_preview_process()
@@ -2483,13 +2782,25 @@ class PreviewPage(QFrame):
             )
             return False
 
+    def _refresh_parameter_controls(self, retries: int = 0):
+        preview = self.live2d_preview
+        if preview is None or self.advanced_panel is None:
+            return
+        meta = preview.get_parameter_meta_list()
+        if meta:
+            self.advanced_panel.rebuild_advanced_params(meta)
+            self.advanced_panel.sync_advanced_param_values(meta)
+            return
+        if retries > 0:
+            QTimer.singleShot(120, lambda: self._refresh_parameter_controls(retries - 1))
+
     def on_preview_window_closed(self, window):
         """预览窗口关闭处理"""
         if self.preview_process is not None and self.preview_process.poll() is not None:
             self.preview_process = None
 
     def close_preview_window(self):
-        """关闭独立预览进程"""
+        """Close the current image or embedded Live2D preview."""
         self._terminate_preview_process()
         self._populate_motion_controls([])
         self._set_motion_debug_visible(False)
@@ -2509,15 +2820,14 @@ class PreviewPage(QFrame):
         )
 
     def on_settings_changed(self, settings: dict):
-        """实时发送设置到独立预览进程"""
-        self._send_preview_command({
-            "type": "settings",
-            "settings": self._serialize_preview_settings(settings),
-        })
+        """Apply display settings directly to the embedded OpenGL widget."""
+        if self.live2d_preview:
+            self.live2d_preview.apply_settings(settings)
 
     def on_request_refresh_params(self):
-        """主进程不再加载 Cubism；这里只刷新 model3.json 内的动作列表。"""
+        """Refresh motions and parameter metadata from the embedded model."""
         if self.current_model_path:
             self._populate_motion_controls(self._load_motions_from_model_json(self.current_model_path))
+            self._refresh_parameter_controls(2)
         else:
             self._populate_motion_controls([])

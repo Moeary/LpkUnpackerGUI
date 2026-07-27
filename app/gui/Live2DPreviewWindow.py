@@ -96,6 +96,7 @@ class Live2DPreviewWindow(QWidget):
         self.drag_position = QPoint()
         self._selected_motion = None
         self._selected_motion_on_click = False
+        self._released = False
         self._motion_items = []
         self._dock_rect = None
         self._fit_to_dock = False
@@ -168,13 +169,16 @@ class Live2DPreviewWindow(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # 统一确定模型路径
-        if not self.model_path or not os.path.exists(self.model_path):
-            self._show_error_infobar(tr("preview_window.error_model_missing", path=self.model_path))
+        if self.model_path and not os.path.isfile(self.model_path):
+            self._show_error_infobar(
+                tr("preview_window.error_model_missing", path=self.model_path)
+            )
             self.close()
             return
 
-        # 创建Live2D显示区域并捕获异常
+        # Create the canvas even without a model. PreviewPage keeps this widget
+        # alive from application startup so the first real model does not force
+        # Qt to recreate the main window's OpenGL composition surface.
         try:
             self.live2d_canvas = Live2DCanvas(self.model_path, embedded=self._embedded)
         except Exception as e:
@@ -196,8 +200,9 @@ class Live2DPreviewWindow(QWidget):
             }
         """)
 
-        # 监听canvas右键
+        # Keep left-click model interaction; context menus are disabled.
         self.live2d_canvas.setMouseTracking(True)
+        self.live2d_canvas.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         self.live2d_canvas.installEventFilter(self)
         layout.addWidget(self.live2d_canvas)
         self.hit_area_overlay = HitAreaOverlay(self.live2d_canvas)
@@ -210,7 +215,35 @@ class Live2DPreviewWindow(QWidget):
         self.control_panel.setVisible(False)  # 默认隐藏
         layout.addWidget(self.control_panel)
         self._create_bubble_label()
-        self._create_quick_motion_panel()
+
+    def load_model(self, model_path: str):
+        model_path = os.path.abspath(str(model_path or ""))
+        if not os.path.isfile(model_path):
+            raise FileNotFoundError(
+                tr("preview_window.error_model_missing", path=model_path)
+            )
+        if self.live2d_canvas is None:
+            raise RuntimeError("Live2D canvas is unavailable.")
+        self.model_path = model_path
+        self._released = False
+        self.live2d_canvas.loadModel(model_path)
+        self._populate_motion_combo()
+        if self.hit_area_overlay:
+            self.hit_area_overlay.set_regions(self._load_hit_regions())
+            self.hit_area_overlay.set_active_region(None)
+        return True
+
+    def unload_model(self):
+        self.model_path = None
+        self._selected_motion = None
+        self._motion_items = []
+        if self.live2d_canvas:
+            self.live2d_canvas.unloadModel()
+        if self.motion_combo:
+            self._populate_motion_combo()
+        if self.hit_area_overlay:
+            self.hit_area_overlay.set_regions([])
+            self.hit_area_overlay.set_active_region(None)
 
     def create_control_panel(self):
         """创建控制面板"""
@@ -424,12 +457,18 @@ class Live2DPreviewWindow(QWidget):
 
     def _populate_motion_combo(self):
         """读取model*.json中的动作并填充到下拉框"""
+        self.motion_combo.blockSignals(True)
         self.motion_combo.clear()
-        self._motion_items = load_live2d_motions(self.model_path)
+        self._motion_items = (
+            load_live2d_motions(self.model_path)
+            if self.model_path and os.path.isfile(self.model_path)
+            else []
+        )
         self._selected_motion = None
         if not self._motion_items:
             self.motion_combo.addItem(tr("preview_window.no_motions"))
             self.motion_combo.setEnabled(False)
+            self.motion_combo.blockSignals(False)
             self._sync_quick_motion_combo()
             return
         self.motion_combo.setEnabled(True)
@@ -437,6 +476,7 @@ class Live2DPreviewWindow(QWidget):
             self.motion_combo.addItem(str(motion.get("display") or motion.get("group") or "motion"))
         # 默认选中第一个
         self.motion_combo.setCurrentIndex(0)
+        self.motion_combo.blockSignals(False)
         self._on_motion_changed(0)
         self._sync_quick_motion_combo()
 
@@ -559,9 +599,6 @@ class Live2DPreviewWindow(QWidget):
                             return True
                         motion = self.live2d_canvas.playInteractiveMotion(pos.x() / w, pos.y() / h, words, name)
                         self._after_motion_triggered(motion, pos)
-                        return True
-                    if event.button() == Qt.MouseButton.RightButton:
-                        self._show_quick_motion_panel(pos)
                         return True
             except Exception:
                 pass
@@ -818,6 +855,15 @@ class Live2DPreviewWindow(QWidget):
         if 'model_rotation' in settings and self.live2d_canvas:
             self.live2d_canvas.setRotationAngle(settings['model_rotation'])
 
+        if self.live2d_canvas and any(
+            key in settings for key in ('model_scale', 'model_offset_x', 'model_offset_y')
+        ):
+            self.live2d_canvas.setModelTransform(
+                float(settings.get('model_scale', 1.0)),
+                float(settings.get('model_offset_x', 0.0)),
+                float(settings.get('model_offset_y', 0.0)),
+            )
+
         # 背景透明/颜色
         if self.live2d_canvas and ('transparent_bg' in settings or 'bg_color' in settings):
             transparent = bool(settings.get('transparent_bg', True))
@@ -839,6 +885,24 @@ class Live2DPreviewWindow(QWidget):
             enabled = bool(settings.get('advanced_enabled', False))
             params = settings.get('advanced_params', {}) or {}
             self.live2d_canvas.setAdvancedParams(enabled, params)
+
+        if self.live2d_canvas and 'motion_frozen' in settings:
+            self.live2d_canvas.setMotionFrozen(bool(settings.get('motion_frozen')))
+        if self.live2d_canvas and 'motion_loop' in settings:
+            self.live2d_canvas.setMotionLoop(bool(settings.get('motion_loop')))
+
+    def get_parameter_meta_list(self) -> list[dict]:
+        if not self.live2d_canvas:
+            return []
+        return self.live2d_canvas.getParameterMetaList()
+
+    def set_motion_frozen(self, frozen: bool):
+        if self.live2d_canvas:
+            self.live2d_canvas.setMotionFrozen(bool(frozen))
+
+    def set_motion_loop(self, enabled: bool):
+        if self.live2d_canvas:
+            self.live2d_canvas.setMotionLoop(bool(enabled))
 
     def toggle_control_panel(self):
         """切换控制面板显示/隐藏"""
@@ -905,9 +969,8 @@ class Live2DPreviewWindow(QWidget):
             self.dragging = False
 
     def mouseDoubleClickEvent(self, event):
-        """双击事件 - 切换控制面板"""
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.toggle_control_panel()
+        """Double-click has no preview-specific action."""
+        event.accept()
 
     def keyPressEvent(self, event):
         """键盘事件处理"""
@@ -932,23 +995,15 @@ class Live2DPreviewWindow(QWidget):
 
     def closeEvent(self, event):
         """窗口关闭事件"""
-        if self.live2d_canvas:
+        if self.live2d_canvas and not self._released:
+            self._released = True
             self.live2d_canvas.release()
         self.closed.emit()
         super().closeEvent(event)
 
     def contextMenuEvent(self, event):
-        """右键菜单事件"""
-        if not self.live2d_canvas:
-            return super().contextMenuEvent(event)
-        try:
-            global_pos = event.globalPos() if hasattr(event, "globalPos") else event.globalPosition().toPoint()
-            canvas_pos = self.live2d_canvas.mapFromGlobal(global_pos)
-            self._show_quick_motion_panel(canvas_pos)
-            event.accept()
-            return
-        except Exception:
-            return super().contextMenuEvent(event)
+        """Right-click is intentionally unused inside the preview."""
+        event.accept()
 
     def retranslate_ui(self):
         if self.controls_title:

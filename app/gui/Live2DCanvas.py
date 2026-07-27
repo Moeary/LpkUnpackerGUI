@@ -104,6 +104,8 @@ class ADPOpenGLCanvas(QOpenGLWidget):
         super().__init__()
         self.__canvas_opacity = 1.0
         self.__rotation_angle = 0.0
+        self.__model_scale = 1.0
+        self.__model_offset = (0.0, 0.0)
         # Background control
         self.__use_background = False
         self.__bg_color = (0.0, 0.0, 0.0, 0.0)
@@ -121,6 +123,8 @@ class ADPOpenGLCanvas(QOpenGLWidget):
 
         out vec2 v_texCoord;
         uniform float rotation_angle;
+        uniform float model_scale;
+        uniform vec2 model_offset;
 
         void main() {
             gl_Position = vec4(a_position, 0.0, 1.0);
@@ -130,7 +134,8 @@ class ADPOpenGLCanvas(QOpenGLWidget):
                                        sin(angle), cos(angle));
 
             vec2 centeredTexCoord = a_texCoord - vec2(0.5, 0.5);
-            v_texCoord = rotationMatrix * centeredTexCoord + vec2(0.5, 0.5);
+            vec2 sourceCoord = (centeredTexCoord - model_offset) / max(model_scale, 0.01);
+            v_texCoord = rotationMatrix * sourceCoord + vec2(0.5, 0.5);
         }
         """
         frag_shader = """#version 330 core
@@ -141,7 +146,9 @@ class ADPOpenGLCanvas(QOpenGLWidget):
         uniform int use_bg; // 0 or 1
 
         void main() {
-            vec4 color = texture(canvas, v_texCoord);
+            bool outside = any(lessThan(v_texCoord, vec2(0.0))) ||
+                           any(greaterThan(v_texCoord, vec2(1.0)));
+            vec4 color = outside ? vec4(0.0) : texture(canvas, v_texCoord);
             color *= opacity;
             if (use_bg == 1) {
                 // Alpha composite over solid background
@@ -155,6 +162,8 @@ class ADPOpenGLCanvas(QOpenGLWidget):
         self._program = create_program(vertex_shader, frag_shader)
         self._opacity_loc = GL.glGetUniformLocation(self._program, "opacity")
         self._rotation_angle_loc = GL.glGetUniformLocation(self._program, "rotation_angle")
+        self._model_scale_loc = GL.glGetUniformLocation(self._program, "model_scale")
+        self._model_offset_loc = GL.glGetUniformLocation(self._program, "model_offset")
         self._bg_color_loc = GL.glGetUniformLocation(self._program, "bg_color")
         self._use_bg_loc = GL.glGetUniformLocation(self._program, "use_bg")
 
@@ -255,6 +264,8 @@ class ADPOpenGLCanvas(QOpenGLWidget):
 
         GL.glProgramUniform1f(self._program, self._opacity_loc, self.__canvas_opacity)
         GL.glProgramUniform1f(self._program, self._rotation_angle_loc, self.__rotation_angle)
+        GL.glProgramUniform1f(self._program, self._model_scale_loc, self.__model_scale)
+        GL.glProgramUniform2f(self._program, self._model_offset_loc, *self.__model_offset)
         GL.glProgramUniform4f(self._program, self._bg_color_loc, *self.__bg_color)
         GL.glProgramUniform1i(self._program, self._use_bg_loc, 1 if self.__use_background else 0)
 
@@ -270,6 +281,15 @@ class ADPOpenGLCanvas(QOpenGLWidget):
 
     def setRotationAngle(self, angle):
         self.__rotation_angle = float(angle)
+        self.update()
+
+    def setModelTransform(self, scale: float, offset_x: float, offset_y: float):
+        """Apply responsive model scale and offsets at the final composition pass."""
+        self.__model_scale = max(0.25, min(3.0, float(scale)))
+        self.__model_offset = (
+            max(-1.0, min(1.0, float(offset_x))),
+            max(-1.0, min(1.0, -float(offset_y))),
+        )
         self.update()
 
     def setBackground(self, transparent: bool, qcolor):
@@ -320,31 +340,91 @@ class Live2DCanvas(ADPOpenGLCanvas):
         self.total_radius = 0
         # Mouse follow control
         self._mouse_follow_enabled = False
+        self._auto_blink_enabled = True
+        self._auto_breath_enabled = True
         # Advanced parameter overrides
         self._advanced_enabled = False
         self._advanced_params = {}
+        self._motion_frozen = False
+        self._motion_loop_enabled = False
+        self._last_played_motion: tuple[str, int] | None = None
+        self._render_timer_id = None
+        self._gl_initialized = False
         # Cached motions metadata
         self._motions: List[Dict[str, Any]] = []
 
     def on_init(self):
         live2d.glInit()
-        self.model = live2d.LAppModel()
-        self.model.LoadModelJson(self.model_path)
         # must be created after opengl context is configured
         self.canvas = Canvas()
-        # Discover motions from model json
+        self._gl_initialized = True
+        if self.model_path:
+            self._load_model_with_current_context(self.model_path)
+        self._render_timer_id = self.startTimer(int(1000 / 60))
+
+    def _load_model_with_current_context(self, model_path: str):
+        model = live2d.LAppModel()
+        model.LoadModelJson(model_path)
+        if self._fbo_width > 0 and self._fbo_height > 0:
+            model.Resize(self._fbo_width, self._fbo_height)
+        self.model = model
+        self.model_path = model_path
         try:
-            self._motions = self._load_motions_from_model_json(self.model_path)
+            model.SetAutoBlinkEnable(self._auto_blink_enabled)
+            model.SetAutoBreathEnable(self._auto_breath_enabled)
+        except Exception:
+            pass
+        self._motion_frozen = False
+        self._last_played_motion = None
+        self._advanced_params = {}
+        try:
+            self._motions = self._load_motions_from_model_json(model_path)
         except Exception:
             self._motions = []
-        self.startTimer(int(1000 / 120))
+
+    def loadModel(self, model_path: str):
+        """Load a model into the already-created OpenGL widget."""
+        if not model_path:
+            raise ValueError("A Live2D model path is required.")
+        self.model_path = str(model_path)
+        if not self._gl_initialized or self.context() is None or not self.isValid():
+            self.update()
+            return
+        self.makeCurrent()
+        try:
+            self._load_model_with_current_context(self.model_path)
+        finally:
+            self.doneCurrent()
+        self.update()
+
+    def unloadModel(self):
+        """Drop the active model while retaining the warmed OpenGL context."""
+        context_current = False
+        try:
+            if self._gl_initialized and self.context() is not None and self.isValid():
+                self.makeCurrent()
+                context_current = True
+            self.model = None
+        finally:
+            if context_current:
+                self.doneCurrent()
+        self.model_path = None
+        self._motions = []
+        self._last_played_motion = None
+        self._motion_frozen = False
+        self._advanced_params = {}
+        self.update()
 
     def timerEvent(self, a0):
         self.update()
 
     def on_draw(self):
         live2d.clearBuffer()
-        self.model.Update()
+        if self.model is None:
+            return
+        if not self._motion_frozen:
+            self.model.Update()
+            self._restart_loop_motion_if_finished()
         # Apply advanced parameter overrides each frame if enabled
         if self._advanced_enabled:
             try:
@@ -354,7 +434,8 @@ class Live2DCanvas(ADPOpenGLCanvas):
         self.model.Draw()
 
     def on_resize(self, width: int, height: int):
-        self.model.Resize(width, height)
+        if self.model is not None:
+            self.model.Resize(width, height)
 
     # --- Mouse tracking and follow implementation ---
     def setMouseTracking(self, enable: bool) -> None:  # type: ignore[override]
@@ -423,31 +504,50 @@ class Live2DCanvas(ADPOpenGLCanvas):
         try_set("ParamEyeBallY", eye_y)
 
     def setAutoBlinkEnable(self, enabled: bool):
+        self._auto_blink_enabled = bool(enabled)
         try:
             if self.model:
-                self.model.SetAutoBlinkEnable(bool(enabled))
+                self.model.SetAutoBlinkEnable(self._auto_blink_enabled)
         except Exception:
             pass
 
     def setAutoBreathEnable(self, enabled: bool):
+        self._auto_breath_enabled = bool(enabled)
         try:
             if self.model:
-                self.model.SetAutoBreathEnable(bool(enabled))
+                self.model.SetAutoBreathEnable(self._auto_breath_enabled)
         except Exception:
             pass
 
     def release(self):
         """Release the current model and GL resources"""
-        if self.model is not None:
+        if self._render_timer_id is not None:
             try:
-                self.model = None
-            except Exception as e:
-                print(f"Error releasing model: {e}")
-        # Delete FBO/texture
+                self.killTimer(self._render_timer_id)
+            except Exception:
+                pass
+            self._render_timer_id = None
+
+        context_current = False
         try:
-            self._ADPOpenGLCanvas__delete_canvas_framebuffer()
+            if self.context() is not None and self.isValid():
+                self.makeCurrent()
+                context_current = True
         except Exception:
             pass
+        try:
+            self.model = None
+            self.canvas = None
+            self._ADPOpenGLCanvas__delete_canvas_framebuffer()
+            self._gl_initialized = False
+        except Exception as e:
+            print(f"Error releasing Live2D resources: {e}")
+        finally:
+            if context_current:
+                try:
+                    self.doneCurrent()
+                except Exception:
+                    pass
 
     def getParameterMetaList(self):
         """Return a list of parameter metadata from the loaded model.
@@ -501,6 +601,31 @@ class Live2DCanvas(ADPOpenGLCanvas):
                     except Exception:
                         continue
         self.update()
+
+    def setMotionFrozen(self, frozen: bool):
+        """Pause model updates while keeping rendering and parameter editing active."""
+        self._motion_frozen = bool(frozen)
+        self.update()
+
+    def isMotionFrozen(self) -> bool:
+        return self._motion_frozen
+
+    def setMotionLoop(self, enabled: bool):
+        self._motion_loop_enabled = bool(enabled)
+
+    def _restart_loop_motion_if_finished(self):
+        if not self._motion_loop_enabled or self._last_played_motion is None or self.model is None:
+            return
+        is_finished = getattr(self.model, "IsMotionFinished", None)
+        if not callable(is_finished):
+            return
+        try:
+            if not bool(is_finished()):
+                return
+            group, index = self._last_played_motion
+            self.model.StartMotion(group, index, 3)
+        except Exception:
+            pass
 
     def _apply_advanced_params(self):
         if self.model is None or not self._advanced_params:
@@ -560,10 +685,13 @@ class Live2DCanvas(ADPOpenGLCanvas):
         """
         if self.model is None:
             return False
+        if self._motion_frozen:
+            return False
         if reset_state:
             self.resetMotionState()
         try:
             self.model.StartMotion(group, index, 3)
+            self._last_played_motion = (str(group), int(index))
             return True
         except Exception:
             pass
