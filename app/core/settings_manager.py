@@ -68,6 +68,15 @@ class SettingsManager:
             "psd": {
                 "last_project_file": "",
                 "project_files": [],
+                "resource_limits": {
+                    "max_cpu_threads": 2,
+                    "max_memory_mb": 8192,
+                    "max_texture_pixels": 64 * 1024 * 1024,
+                    "max_canvas_pixels": 48 * 1024 * 1024,
+                    "max_total_layer_pixels": 192 * 1024 * 1024,
+                    "max_layer_count": 512,
+                    "mesh_max_dimension": 2048,
+                },
             },
             "live2dviewer_mod": {
                 "last_project_file": "",

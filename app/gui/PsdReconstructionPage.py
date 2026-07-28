@@ -7,10 +7,13 @@ from PySide6.QtCore import Qt, QProcess, QThread, QTimer, QUrl, Signal, QStringL
 from PySide6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
     QInputDialog,
+    QListWidget,
+    QListWidgetItem,
     QCompleter,
     QSizePolicy,
     QSplitter,
@@ -39,6 +42,7 @@ from app.core.psd_reconstructor import (
     ReconstructionResult,
     reconstruct_live2d_psd,
     repack_atlas_png_from_psd,
+    repack_multiple_psds,
 )
 from app.core.psd_project import (
     Live2DPSDProject,
@@ -47,7 +51,7 @@ from app.core.psd_project import (
     create_pose_scheme,
     create_parameter_preset,
     create_repack_dir,
-    compose_pose_versions,
+    create_multi_repack_dir,
     find_composite_entry,
     find_pose_scheme,
     find_parameter_preset,
@@ -57,6 +61,7 @@ from app.core.psd_project import (
     record_psd_export,
     record_pose_scheme_export,
     record_repack,
+    record_multi_repack,
     resolve_project_path,
     save_project,
     select_pose_scheme,
@@ -64,7 +69,6 @@ from app.core.psd_project import (
     select_repack,
     set_preview_state,
     sanitize_project_name,
-    set_pose_scheme_priority,
 )
 from app.core.model import prepare_model_json_for_preview, resolve_live2d_package
 from app.core.model.motions import load_live2d_motions
@@ -88,6 +92,8 @@ class PsdReconstructionThread(QThread):
         parameter_values: dict[str, float] | None = None,
         pose_name: str | None = None,
         output_name: str | None = None,
+        resource_limits: dict[str, int] | None = None,
+        multi_psd_paths: list[str] | None = None,
     ):
         super().__init__()
         self.source_path = source_path
@@ -97,15 +103,25 @@ class PsdReconstructionThread(QThread):
         self.parameter_values = parameter_values
         self.pose_name = pose_name
         self.output_name = output_name
+        self.resource_limits = dict(resource_limits or {})
+        self.multi_psd_paths = list(multi_psd_paths or [])
 
     def run(self):
         try:
-            if self.mode == "repack-atlas":
+            if self.mode == "multi-repack":
+                result = repack_multiple_psds(
+                    self.multi_psd_paths,
+                    self.output_dir,
+                    progress=lambda value, message: self.progressUpdated.emit(value, message),
+                    resource_limits=self.resource_limits,
+                )
+            elif self.mode == "repack-atlas":
                 result = repack_atlas_png_from_psd(
                     self.source_path,
                     self.output_dir,
                     metadata_path=self.metadata_path or None,
                     progress=lambda value, message: self.progressUpdated.emit(value, message),
+                    resource_limits=self.resource_limits,
                 )
             else:
                 result = reconstruct_live2d_psd(
@@ -116,10 +132,104 @@ class PsdReconstructionThread(QThread):
                     parameter_values=self.parameter_values,
                     pose_name=self.pose_name,
                     output_name=self.output_name,
+                    resource_limits=self.resource_limits,
                 )
             self.reconstructionFinished.emit(result)
         except Exception as exc:
             self.reconstructionError.emit(str(exc))
+
+
+class PsdMultiRepackDialog(QDialog):
+    """Collect a PSD stack ordered from highest to lowest priority."""
+
+    def __init__(self, parent: QWidget, initial_psd: str = ""):
+        super().__init__(parent)
+        self.setMinimumWidth(640)
+        self.setWindowTitle(tr("psd.multi.title"))
+        layout = QVBoxLayout(self)
+        hint = CaptionLabel(tr("psd.multi.hint"), self)
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self.psd_list = QListWidget(self)
+        self.psd_list.setMinimumHeight(210)
+        layout.addWidget(self.psd_list)
+
+        controls = QHBoxLayout()
+        self.add_button = PushButton(tr("psd.multi.add"), self)
+        self.remove_button = PushButton(tr("psd.multi.remove"), self)
+        self.up_button = PushButton(tr("psd.multi.move_up"), self)
+        self.down_button = PushButton(tr("psd.multi.move_down"), self)
+        self.add_button.clicked.connect(self.add_psds)
+        self.remove_button.clicked.connect(self.remove_current)
+        self.up_button.clicked.connect(lambda: self.move_current(-1))
+        self.down_button.clicked.connect(lambda: self.move_current(1))
+        for button in (self.add_button, self.remove_button, self.up_button, self.down_button):
+            controls.addWidget(button)
+        controls.addStretch(1)
+        layout.addLayout(controls)
+
+        name_layout = QHBoxLayout()
+        name_layout.addWidget(BodyLabel(tr("psd.multi.texture_name"), self))
+        self.texture_name_edit = LineEdit(self)
+        self.texture_name_edit.setPlaceholderText(tr("psd.repack.texture_name_placeholder"))
+        name_layout.addWidget(self.texture_name_edit, 1)
+        layout.addLayout(name_layout)
+
+        actions = QHBoxLayout()
+        self.cancel_button = PushButton(tr("common.cancel"), self)
+        self.confirm_button = PrimaryPushButton(tr("psd.multi.confirm"), self)
+        self.cancel_button.clicked.connect(self.reject)
+        self.confirm_button.clicked.connect(self.accept_if_valid)
+        actions.addStretch(1)
+        actions.addWidget(self.cancel_button)
+        actions.addWidget(self.confirm_button)
+        layout.addLayout(actions)
+        if initial_psd and Path(initial_psd).is_file():
+            self.add_path(initial_psd)
+
+    def add_path(self, path: str):
+        resolved = str(Path(path).resolve())
+        if any(self.psd_list.item(i).data(Qt.ItemDataRole.UserRole) == resolved for i in range(self.psd_list.count())):
+            return
+        item = QListWidgetItem(Path(resolved).name)
+        item.setToolTip(resolved)
+        item.setData(Qt.ItemDataRole.UserRole, resolved)
+        self.psd_list.addItem(item)
+        self.psd_list.setCurrentItem(item)
+
+    def add_psds(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, tr("psd.multi.add"), "", "PSD (*.psd)")
+        for path in paths:
+            self.add_path(path)
+
+    def remove_current(self):
+        row = self.psd_list.currentRow()
+        if row >= 0:
+            self.psd_list.takeItem(row)
+
+    def move_current(self, offset: int):
+        row = self.psd_list.currentRow()
+        target = row + offset
+        if row < 0 or not 0 <= target < self.psd_list.count():
+            return
+        item = self.psd_list.takeItem(row)
+        self.psd_list.insertItem(target, item)
+        self.psd_list.setCurrentRow(target)
+
+    def ordered_paths(self) -> list[str]:
+        return [str(self.psd_list.item(i).data(Qt.ItemDataRole.UserRole)) for i in range(self.psd_list.count())]
+
+    def accept_if_valid(self):
+        if len(self.ordered_paths()) < 2 or not self.texture_name_edit.text().strip():
+            InfoBar.warning(
+                title=tr("common.warning"),
+                content=tr("psd.multi.validation"),
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=3500,
+            )
+            return
+        self.accept()
 
 
 class PsdProjectImportThread(QThread):
@@ -203,6 +313,7 @@ class PsdReconstructionPage(QFrame):
         self.pending_repack_source = ""
         self.pending_repack_metadata = ""
         self.pending_repack_name = ""
+        self.pending_multi_psd_paths: list[str] = []
         self.pending_pose_scheme_id = ""
         self._preview_dock_timer = QTimer(self)
         self._preview_dock_timer.setInterval(700)
@@ -439,6 +550,35 @@ class PsdReconstructionPage(QFrame):
         self.mode_hint_label.setWordWrap(True)
         self.mode_container_layout.addLayout(self.mode_layout)
         self.mode_container_layout.addWidget(self.mode_hint_label)
+
+        self.mesh_canvas_frame = QFrame(self.mode_frame)
+        self.mesh_canvas_layout = QHBoxLayout(self.mesh_canvas_frame)
+        self.mesh_canvas_layout.setContentsMargins(0, 0, 0, 0)
+        self.mesh_canvas_label = BodyLabel("", self.mesh_canvas_frame)
+        self.mesh_canvas_preset_combo = ComboBox(self.mesh_canvas_frame)
+        self.mesh_canvas_preset_combo.addItem("2048 px", userData=2048)
+        self.mesh_canvas_preset_combo.addItem("4096 px", userData=4096)
+        self.mesh_canvas_preset_combo.addItem("", userData="custom")
+        self.mesh_canvas_preset_combo.currentIndexChanged.connect(
+            self.on_mesh_canvas_preset_changed
+        )
+        self.mesh_canvas_spin = SpinBox(self.mesh_canvas_frame)
+        self.mesh_canvas_spin.setRange(0, 16384)
+        self.mesh_canvas_spin.setSingleStep(256)
+        self.mesh_canvas_spin.setSuffix(" px")
+        self.mesh_canvas_spin.setValue(
+            int(self.settings_manager.get("psd.resource_limits.mesh_max_dimension", 2048))
+        )
+        self.mesh_canvas_spin.editingFinished.connect(self.on_mesh_canvas_limit_changed)
+        self._sync_mesh_canvas_preset()
+        self.mesh_canvas_hint_label = CaptionLabel("", self.mesh_canvas_frame)
+        self.mesh_canvas_hint_label.setWordWrap(True)
+        self.mesh_canvas_layout.addWidget(self.mesh_canvas_label)
+        self.mesh_canvas_layout.addWidget(self.mesh_canvas_preset_combo)
+        self.mesh_canvas_layout.addWidget(self.mesh_canvas_spin)
+        self.mesh_canvas_layout.addStretch(1)
+        self.mode_container_layout.addWidget(self.mesh_canvas_frame)
+        self.mode_container_layout.addWidget(self.mesh_canvas_hint_label)
         self.export_card_layout.addWidget(self.mode_frame)
 
         self.output_layout = QHBoxLayout()
@@ -483,9 +623,12 @@ class PsdReconstructionPage(QFrame):
         )
         self.repack_psd_button = PushButton("", self.repack_card)
         self.repack_psd_button.clicked.connect(self.browse_repack_psd_file)
+        self.repack_photoshop_button = PushButton("", self.repack_card)
+        self.repack_photoshop_button.clicked.connect(self.open_current_psd_in_photoshop)
         self.repack_psd_layout.addWidget(self.pose_scheme_label)
         self.repack_psd_layout.addWidget(self.pose_scheme_combo, 1)
         self.repack_psd_layout.addWidget(self.repack_psd_button)
+        self.repack_psd_layout.addWidget(self.repack_photoshop_button)
         self.repack_card_layout.addLayout(self.repack_psd_layout)
 
         self.metadata_frame = QFrame(self.repack_card)
@@ -503,6 +646,7 @@ class PsdReconstructionPage(QFrame):
         self.metadata_layout.addWidget(self.metadata_button)
         self.metadata_layout.addWidget(self.metadata_default_button)
         self.repack_card_layout.addWidget(self.metadata_frame)
+        self.metadata_frame.setVisible(False)
 
         self.texture_name_layout = QHBoxLayout()
         self.texture_name_label = BodyLabel("", self.repack_card)
@@ -511,18 +655,8 @@ class PsdReconstructionPage(QFrame):
         self.texture_name_layout.addWidget(self.texture_name_label)
         self.texture_name_layout.addWidget(self.texture_name_edit, 1)
         self.repack_card_layout.addLayout(self.texture_name_layout)
-
-        self.pose_priority_layout = QHBoxLayout()
-        self.pose_priority_label = BodyLabel("", self.repack_card)
-        self.pose_priority_spin = SpinBox(self.repack_card)
-        self.pose_priority_spin.setRange(-9999, 9999)
-        self.pose_priority_spin.editingFinished.connect(
-            lambda: self.on_pose_priority_changed(self.pose_priority_spin.value())
-        )
-        self.pose_priority_layout.addWidget(self.pose_priority_label)
-        self.pose_priority_layout.addWidget(self.pose_priority_spin)
-        self.pose_priority_layout.addStretch(1)
-        self.repack_card_layout.addLayout(self.pose_priority_layout)
+        self.texture_name_label.setVisible(False)
+        self.texture_name_edit.setVisible(False)
 
         self.repack_output_layout = QHBoxLayout()
         self.repack_output_label = BodyLabel("", self.repack_card)
@@ -542,11 +676,13 @@ class PsdReconstructionPage(QFrame):
         self.open_photoshop_button = PushButton("", self.left_panel)
         self.open_photoshop_button.setEnabled(False)
         self.open_photoshop_button.clicked.connect(self.open_current_psd_in_photoshop)
+        self.multi_repack_button = PushButton("", self.left_panel)
+        self.multi_repack_button.clicked.connect(self.start_multi_repack)
         self.preview_toggle_button = PushButton("", self.left_panel)
         self.preview_toggle_button.clicked.connect(self.toggle_preview_panel)
         self.action_layout.addWidget(self.reconstruct_button)
+        self.action_layout.addWidget(self.multi_repack_button)
         self.action_layout.addWidget(self.open_output_button)
-        self.action_layout.addWidget(self.open_photoshop_button)
         self.action_layout.addWidget(self.preview_toggle_button)
         self.action_layout.addStretch(1)
         self.left_panel_layout.addLayout(self.action_layout)
@@ -706,11 +842,11 @@ class PsdReconstructionPage(QFrame):
         self.export_name_edit.setPlaceholderText(tr("psd.export.name_placeholder"))
         self.export_preset_hint.setText(tr("psd.export.preset_hint"))
         self.repack_psd_button.setText(tr("psd.repack.browse_psd"))
+        self.repack_photoshop_button.setText(tr("psd.pose.open_photoshop"))
         self.texture_name_label.setText(tr("psd.repack.texture_name"))
         self.texture_name_edit.setPlaceholderText(
             tr("psd.repack.texture_name_placeholder")
         )
-        self.pose_priority_label.setText(tr("psd.repack.priority"))
         self.repack_output_label.setText(tr("psd.repack.output"))
         self.source_label.setText(tr("psd.source"))
         self.source_edit.setPlaceholderText(tr("psd.placeholder_source"))
@@ -719,10 +855,15 @@ class PsdReconstructionPage(QFrame):
         self.mode_label.setText(tr("psd.mode"))
         self.mode_combo.setItemText(0, tr("psd.mode.mesh_pose"))
         self.mode_combo.setItemText(1, tr("psd.mode.editable_atlas"))
+        self.mesh_canvas_label.setText(tr("psd.mesh_canvas.max_dimension"))
+        self.mesh_canvas_preset_combo.setItemText(2, tr("psd.mesh_canvas.custom"))
+        self.mesh_canvas_spin.setSpecialValueText(tr("psd.mesh_canvas.original"))
+        self.mesh_canvas_hint_label.setText(tr("psd.mesh_canvas.hint"))
         self.output_label.setText(tr("psd.output_directory"))
         self.output_edit.setPlaceholderText(tr("psd.placeholder_output"))
         self.output_button.setText(tr("common.browse"))
         self.reconstruct_button.setText(tr("psd.reconstruct_button"))
+        self.multi_repack_button.setText(tr("psd.multi.button"))
         self.open_output_button.setText(tr("psd.open_output_folder"))
         self.open_photoshop_button.setText(tr("psd.pose.open_photoshop"))
         self.preview_toggle_button.setText(
@@ -746,10 +887,6 @@ class PsdReconstructionPage(QFrame):
         self.workflow_label.setText(tr("psd.workflow"))
         self.export_flow_button.setText(tr("psd.workflow.export"))
         self.repack_flow_button.setText(tr("psd.workflow.repack"))
-        self.metadata_label.setText(tr("psd.metadata_file"))
-        self.metadata_edit.setPlaceholderText(tr("psd.placeholder_metadata"))
-        self.metadata_button.setText(tr("psd.browse_metadata"))
-        self.metadata_default_button.setText(tr("psd.use_default_metadata"))
         self.stage_label.setText(tr("psd.stage.idle"))
         self._update_workflow_ui()
         self.refresh_project_ui()
@@ -1013,6 +1150,7 @@ class PsdReconstructionPage(QFrame):
         self.pending_repack_source = ""
         self.pending_repack_metadata = ""
         self.pending_repack_name = ""
+        self.pending_multi_psd_paths = []
         self.pending_pose_scheme_id = ""
 
         metadata_path = None
@@ -1032,16 +1170,7 @@ class PsdReconstructionPage(QFrame):
                 )
                 return
 
-            texture_name = self.texture_name_edit.text().strip()
-            if not texture_name:
-                texture_name = self._prompt_non_empty_name(
-                    "psd.repack.name_dialog_title",
-                    "psd.repack.name_dialog_prompt",
-                    Path(source).stem,
-                )
-                if not texture_name:
-                    return
-                self.texture_name_edit.setText(texture_name)
+            texture_name = Path(source).stem
 
             scheme = self.selected_pose_scheme()
             scheme_id = str((scheme or {}).get("id") or "")
@@ -1057,16 +1186,6 @@ class PsdReconstructionPage(QFrame):
                 self.pending_pose_scheme_id = scheme_id
             else:
                 output_dir = str(Path(source).resolve().parent / sanitize_project_name(texture_name))
-            metadata_path = self.metadata_edit.text().strip() or None
-            if metadata_path and not os.path.isfile(metadata_path):
-                InfoBar.warning(
-                    title=tr("common.warning"),
-                    content=tr("psd.warning_metadata_missing", path=metadata_path),
-                    parent=self,
-                    position=InfoBarPosition.TOP,
-                    duration=3000,
-                )
-                return
             mode = "repack-atlas"
             mode_text = tr("psd.workflow.repack")
             self.pending_repack_source = source
@@ -1154,9 +1273,7 @@ class PsdReconstructionPage(QFrame):
         self.stage_label.setText(tr("psd.stage.starting"))
         self.log_text.clear()
         self.append_log(tr("psd.started", mode=mode_text))
-        if mode == "repack-atlas" and metadata_path:
-            self.append_log(tr("psd.metadata_log", path=metadata_path))
-        elif mode == "repack-atlas":
+        if mode == "repack-atlas":
             self.append_log(tr("psd.metadata_default_log"))
 
         self.worker = PsdReconstructionThread(
@@ -1167,6 +1284,44 @@ class PsdReconstructionPage(QFrame):
             parameter_values=parameter_values,
             pose_name=pose_name,
             output_name=output_name,
+            resource_limits=self.settings_manager.get("psd.resource_limits", {}),
+        )
+        self.worker.progressUpdated.connect(self.on_progress_updated)
+        self.worker.reconstructionFinished.connect(self.on_reconstruction_finished)
+        self.worker.reconstructionError.connect(self.on_reconstruction_error)
+        self.worker.start()
+
+    def start_multi_repack(self):
+        initial_psd = self.selected_repack_psd_path()
+        dialog = PsdMultiRepackDialog(self, initial_psd)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        psd_paths = dialog.ordered_paths()
+        texture_name = dialog.texture_name_edit.text().strip()
+        if not self.current_project:
+            output_dir = Path(psd_paths[0]).resolve().parent / "multi" / sanitize_project_name(texture_name)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            version_id = ""
+        else:
+            version_id, output_dir = create_multi_repack_dir(self.current_project, texture_name)
+
+        self.pending_repack_id = version_id
+        self.pending_repack_dir = str(output_dir)
+        self.pending_repack_name = texture_name
+        self.pending_multi_psd_paths = psd_paths
+        self.last_output_dir = str(output_dir.resolve())
+        self.repack_output_edit.setText(self.last_output_dir)
+        self.set_busy(True)
+        self.progress_bar.setValue(0)
+        self.stage_label.setText(tr("psd.stage.starting"))
+        self.log_text.clear()
+        self.append_log(tr("psd.started", mode=tr("psd.multi.button")))
+        self.worker = PsdReconstructionThread(
+            psd_paths[0],
+            self.last_output_dir,
+            "multi-repack",
+            resource_limits=self.settings_manager.get("psd.resource_limits", {}),
+            multi_psd_paths=psd_paths,
         )
         self.worker.progressUpdated.connect(self.on_progress_updated)
         self.worker.reconstructionFinished.connect(self.on_reconstruction_finished)
@@ -1191,6 +1346,7 @@ class PsdReconstructionPage(QFrame):
         self.open_photoshop_button.setEnabled(
             result.mode in {"mesh", "atlas-components"} and Path(result.psd_path).is_file()
         )
+        self.repack_photoshop_button.setEnabled(bool(self.selected_repack_psd_path()))
 
         for warning in result.warnings:
             self.append_log(tr("psd.warning_prefix", message=warning))
@@ -1238,22 +1394,21 @@ class PsdReconstructionPage(QFrame):
         self.source_folder_button.setEnabled(not busy)
         self.export_name_edit.setEnabled(not busy)
         self.repack_psd_button.setEnabled(not busy)
+        self.repack_photoshop_button.setEnabled(not busy and bool(self.selected_repack_psd_path()))
+        self.multi_repack_button.setEnabled(not busy)
         self.texture_name_edit.setEnabled(not busy)
         self.new_project_button.setEnabled(not busy)
         self.save_project_button.setEnabled(not busy)
         self.open_project_folder_button.setEnabled(not busy and self.current_project is not None)
         self.project_combo.setEnabled(not busy)
         self.pose_scheme_combo.setEnabled(not busy)
-        self.pose_priority_spin.setEnabled(
-            not busy and self.selected_pose_scheme() is not None
-        )
         self.output_button.setEnabled(not busy and self.workflow != "repack")
         self.output_edit.setReadOnly(self.workflow == "repack")
         self.mode_combo.setEnabled(not busy)
+        self.mesh_canvas_spin.setEnabled(not busy)
+        self.mesh_canvas_preset_combo.setEnabled(not busy)
         self.export_flow_button.setEnabled(not busy)
         self.repack_flow_button.setEnabled(not busy)
-        self.metadata_button.setEnabled(not busy)
-        self.metadata_default_button.setEnabled(not busy)
         self.preview_image_button.setEnabled(not busy and self.current_project is not None)
         self.motion_play_button.setEnabled(not busy and bool(self._motion_items))
         self.update_preview_controls()
@@ -1270,11 +1425,44 @@ class PsdReconstructionPage(QFrame):
         self.update_mode_hint()
         self.mark_project_dirty()
 
+    def on_mesh_canvas_limit_changed(self):
+        self.settings_manager.set(
+            "psd.resource_limits.mesh_max_dimension",
+            int(self.mesh_canvas_spin.value()),
+        )
+        self.update_mode_hint()
+        self._sync_mesh_canvas_preset()
+        self.mark_project_dirty()
+
+    def on_mesh_canvas_preset_changed(self):
+        value = self.mesh_canvas_preset_combo.currentData()
+        if value == "custom":
+            return
+        self.mesh_canvas_spin.setValue(int(value))
+        self.on_mesh_canvas_limit_changed()
+
+    def _sync_mesh_canvas_preset(self):
+        value = int(self.mesh_canvas_spin.value())
+        index = next(
+            (
+                index
+                for index in range(self.mesh_canvas_preset_combo.count())
+                if self.mesh_canvas_preset_combo.itemData(index) == value
+            ),
+            self.mesh_canvas_preset_combo.count() - 1,
+        )
+        self.mesh_canvas_preset_combo.blockSignals(True)
+        self.mesh_canvas_preset_combo.setCurrentIndex(index)
+        self.mesh_canvas_preset_combo.blockSignals(False)
+
     def _update_workflow_ui(self):
         is_repack = self.workflow == "repack"
         self.export_card.setVisible(not is_repack)
         self.repack_card.setVisible(is_repack)
-        self.reconstruct_button.setText(tr("psd.repack_button") if is_repack else tr("psd.export_button"))
+        self.reconstruct_button.setText(
+            tr("psd.repack.single_button") if is_repack else tr("psd.export_button")
+        )
+        self.multi_repack_button.setVisible(is_repack)
         self._style_workflow_button(self.export_flow_button, not is_repack)
         self._style_workflow_button(self.repack_flow_button, is_repack)
         self.update_mode_hint()
@@ -1398,6 +1586,10 @@ class PsdReconstructionPage(QFrame):
 
     def update_mode_hint(self):
         mode = self.mode_combo.currentData() or "mesh"
+        is_mesh_export = self.workflow == "export" and mode == "mesh"
+        if hasattr(self, "mesh_canvas_frame"):
+            self.mesh_canvas_frame.setVisible(is_mesh_export)
+            self.mesh_canvas_hint_label.setVisible(is_mesh_export)
         if self.workflow == "repack":
             self.mode_hint_label.setText("")
         elif mode == "atlas-components":
@@ -1550,7 +1742,6 @@ class PsdReconstructionPage(QFrame):
             selected = str(self.current_project.data.get("selected_pose_scheme") or "")
         self._pose_scheme_refreshing = True
         self.pose_scheme_combo.blockSignals(True)
-        self.pose_priority_spin.blockSignals(True)
         self.pose_scheme_combo.clear()
         schemes = self.current_project.data.get("pose_schemes", []) if self.current_project else []
         completion_labels: list[str] = []
@@ -1583,14 +1774,11 @@ class PsdReconstructionPage(QFrame):
         self.pose_scheme_combo.setCurrentIndex(
             index if index >= 0 else (0 if self.pose_scheme_combo.count() else -1)
         )
-        current = self.selected_pose_scheme()
-        self.pose_priority_spin.setValue(int((current or {}).get("priority") or 0))
         self.pose_scheme_combo.blockSignals(False)
-        self.pose_priority_spin.blockSignals(False)
-        self.pose_priority_spin.setEnabled(bool(current))
         self.open_photoshop_button.setEnabled(
             bool(self.selected_repack_psd_path())
         )
+        self.repack_photoshop_button.setEnabled(bool(self.selected_repack_psd_path()))
         self._pose_scheme_refreshing = False
         self._sync_default_metadata()
         self._sync_repack_output_dir()
@@ -1600,10 +1788,10 @@ class PsdReconstructionPage(QFrame):
             return
         scheme = self.selected_pose_scheme()
         if not scheme:
-            self.pose_priority_spin.setEnabled(False)
             path = self.selected_repack_psd_path()
             self.last_psd_path = path
             self.open_photoshop_button.setEnabled(bool(path))
+            self.repack_photoshop_button.setEnabled(bool(path))
             self._sync_default_metadata()
             self._sync_repack_output_dir()
             return
@@ -1615,41 +1803,11 @@ class PsdReconstructionPage(QFrame):
         except Exception as exc:
             self.append_log(tr("psd.warning_prefix", message=str(exc)))
             return
-        self._pose_scheme_refreshing = True
-        self.pose_priority_spin.setValue(int(scheme.get("priority") or 0))
-        self.pose_priority_spin.setEnabled(True)
-        self._pose_scheme_refreshing = False
         self.last_psd_path = str(resolve_project_path(self.current_project, scheme.get("psd", "")))
         self.open_photoshop_button.setEnabled(Path(self.last_psd_path).is_file())
+        self.repack_photoshop_button.setEnabled(Path(self.last_psd_path).is_file())
         self._sync_default_metadata()
         self._sync_repack_output_dir()
-
-    def on_pose_priority_changed(self, value: int):
-        if self._pose_scheme_refreshing or not self.current_project:
-            return
-        scheme_id = str(self.pose_scheme_combo.currentData() or "")
-        if not scheme_id:
-            return
-        try:
-            self.current_project = set_pose_scheme_priority(
-                self.current_project,
-                scheme_id,
-                int(value),
-            )
-            if any(
-                scheme.get("versions")
-                for scheme in self.current_project.data.get("pose_schemes", [])
-            ):
-                self.current_project, composite = compose_pose_versions(
-                    self.current_project,
-                    log=self.append_log,
-                )
-                self.append_log(
-                    tr("psd.pose.composite_created", version=str(composite.get("id") or ""))
-                )
-                self.refresh_preview_source_combo()
-        except Exception as exc:
-            self.append_log(tr("psd.warning_prefix", message=str(exc)))
 
     def create_project_from_current_source(self):
         source = self.source_edit.text().strip()
@@ -2232,6 +2390,15 @@ class PsdReconstructionPage(QFrame):
                     result.mode,
                     result.layer_count,
                 )
+            elif result.mode == "multi-repack" and self.pending_repack_id:
+                self.current_project = record_multi_repack(
+                    self.current_project,
+                    self.pending_repack_id,
+                    self.pending_multi_psd_paths,
+                    self.pending_repack_dir,
+                    result.output_paths,
+                    self.pending_repack_name,
+                )
             elif result.mode in {"mesh-repack", "atlas-repack"} and self.pending_repack_id:
                 self.current_project = record_repack(
                     self.current_project,
@@ -2243,14 +2410,6 @@ class PsdReconstructionPage(QFrame):
                     scheme_id=self.pending_pose_scheme_id,
                     display_name=self.pending_repack_name,
                 )
-                if self.pending_pose_scheme_id:
-                    self.current_project, composite = compose_pose_versions(
-                        self.current_project,
-                        log=self.append_log,
-                    )
-                    self.append_log(
-                        tr("psd.pose.composite_created", version=str(composite.get("id") or ""))
-                    )
             self.refresh_project_ui(self.pending_repack_id or None)
             self.refresh_project_combo(select_project_file=str(self.current_project.project_file))
             self._project_dirty = False

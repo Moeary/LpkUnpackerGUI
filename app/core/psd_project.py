@@ -508,6 +508,36 @@ def create_repack_dir(
     return version_id, candidate
 
 
+def create_multi_repack_dir(
+    project: Live2DPSDProject,
+    texture_name: str,
+) -> tuple[str, Path]:
+    """Create the dedicated output folder for a manually ordered PSD stack."""
+    data = normalize_project_data(project.data, project.project_name)
+    version_id = timestamp_id()
+    existing_ids = {
+        str(entry.get("id") or "")
+        for entry in (data.get("repack_history") or [])
+        if isinstance(entry, dict)
+    }
+    suffix = 1
+    base_id = version_id
+    while version_id in existing_ids:
+        version_id = f"{base_id}_{suffix}"
+        suffix += 1
+
+    root = project.project_dir / "tex" / "multi"
+    root.mkdir(parents=True, exist_ok=True)
+    folder_name = sanitize_project_name(texture_name or version_id)
+    candidate = root / folder_name
+    index = 1
+    while candidate.exists():
+        candidate = root / f"{folder_name}_{index}"
+        index += 1
+    candidate.mkdir(parents=True, exist_ok=True)
+    return version_id, candidate
+
+
 def record_repack(
     project: Live2DPSDProject,
     version_id: str,
@@ -541,6 +571,36 @@ def record_repack(
         scheme["selected_version"] = version_id
         scheme["updated_at"] = entry["created_at"]
         data["selected_pose_scheme"] = str(scheme_id)
+    save_project(project.project_dir, data)
+    _write_repack_manifest(Path(textures_dir), entry)
+    return Live2DPSDProject(project.project_dir, project.project_file, data)
+
+
+def record_multi_repack(
+    project: Live2DPSDProject,
+    version_id: str,
+    source_psds: list[str | Path],
+    textures_dir: str | Path,
+    output_paths: list[Path],
+    display_name: str,
+) -> Live2DPSDProject:
+    """Record a multi-PSD output without involving pose-priority composition."""
+    data = normalize_project_data(project.data, project.project_name)
+    entry = {
+        "id": version_id,
+        "name": str(display_name or Path(textures_dir).name or version_id),
+        "mode": "multi",
+        "source_psds": [
+            _relative_to_project(Path(path), project.project_dir)
+            for path in source_psds
+        ],
+        "textures_dir": _relative_to_project(Path(textures_dir), project.project_dir),
+        "output_paths": [_relative_to_project(Path(path), project.project_dir) for path in output_paths],
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "scheme_id": "",
+    }
+    data.setdefault("repack_history", []).append(entry)
+    data["selected_repack"] = version_id
     save_project(project.project_dir, data)
     _write_repack_manifest(Path(textures_dir), entry)
     return Live2DPSDProject(project.project_dir, project.project_file, data)

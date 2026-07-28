@@ -3,7 +3,7 @@ import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 import numpy as np
 from PIL import Image
@@ -20,6 +20,47 @@ class PsdReconstructionError(RuntimeError):
 
 class MissingDependencyError(PsdReconstructionError):
     pass
+
+
+@dataclass(frozen=True)
+class PsdResourceLimits:
+    """Conservative per-job limits used before allocating image buffers.
+
+    PSD export can retain the source textures, rendered layers and psd-tools
+    channel data at the same time.  These limits intentionally leave a large
+    margin for the rest of the desktop instead of trying to consume all RAM.
+    """
+
+    max_cpu_threads: int = 2
+    max_memory_mb: int = 8192
+    max_texture_pixels: int = 64 * 1024 * 1024
+    max_canvas_pixels: int = 48 * 1024 * 1024
+    max_total_layer_pixels: int = 192 * 1024 * 1024
+    max_layer_count: int = 512
+    mesh_max_dimension: int = 2048
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, Any] | None = None) -> "PsdResourceLimits":
+        values = values or {}
+        defaults = cls()
+
+        def read(name: str, default: int, minimum: int) -> int:
+            try:
+                return max(minimum, int(values.get(name, default)))
+            except (TypeError, ValueError):
+                return default
+
+        return cls(
+            max_cpu_threads=read("max_cpu_threads", defaults.max_cpu_threads, 1),
+            max_memory_mb=read("max_memory_mb", defaults.max_memory_mb, 512),
+            max_texture_pixels=read("max_texture_pixels", defaults.max_texture_pixels, 1),
+            max_canvas_pixels=read("max_canvas_pixels", defaults.max_canvas_pixels, 1),
+            max_total_layer_pixels=read(
+                "max_total_layer_pixels", defaults.max_total_layer_pixels, 1
+            ),
+            max_layer_count=read("max_layer_count", defaults.max_layer_count, 1),
+            mesh_max_dimension=read("mesh_max_dimension", defaults.mesh_max_dimension, 0),
+        )
 
 
 @dataclass
@@ -39,6 +80,10 @@ class ReconstructionResult:
     warnings: list[str]
     metadata_path: Optional[Path] = None
     output_paths: list[Path] = field(default_factory=list)
+    # Maps the source texture index to the latest written PNG.  Multi-PSD
+    # repack uses this as the next PSD's baseline, so untouched pixels survive
+    # every pass instead of being recreated from a transparent canvas.
+    texture_outputs: dict[int, Path] = field(default_factory=dict)
 
     @property
     def primary_path(self) -> Path:
@@ -56,6 +101,190 @@ class PsdLayer:
     group: Optional[str] = None
 
 
+def _resolve_resource_limits(
+    resource_limits: PsdResourceLimits | Mapping[str, Any] | None,
+) -> PsdResourceLimits:
+    if isinstance(resource_limits, PsdResourceLimits):
+        return resource_limits
+    return PsdResourceLimits.from_mapping(resource_limits)
+
+
+def _configure_opencv(cv2, limits: PsdResourceLimits) -> None:
+    """Keep OpenCV from taking every logical CPU during a PSD job."""
+    try:
+        cv2.setNumThreads(limits.max_cpu_threads)
+    except Exception:
+        # Thread limiting is a safety improvement, not a requirement for export.
+        pass
+
+
+def _scaled_mesh_canvas(
+    source_size: tuple[int, int], limits: PsdResourceLimits
+) -> tuple[tuple[int, int], float]:
+    """Scale a display-space mesh PSD while preserving its aspect ratio."""
+    width, height = (int(source_size[0]), int(source_size[1]))
+    _pixel_count(width, height, "Mesh canvas")
+    maximum = int(limits.mesh_max_dimension)
+    if maximum <= 0 or max(width, height) <= maximum:
+        return (width, height), 1.0
+    scale = maximum / float(max(width, height))
+    return (max(1, int(round(width * scale))), max(1, int(round(height * scale)))), scale
+
+
+def _metadata_coordinate_scale(layer_info: Mapping[str, Any]) -> float:
+    try:
+        scale = float(layer_info.get("coordinate_scale", 1.0))
+    except (TypeError, ValueError):
+        return 1.0
+    return scale if math.isfinite(scale) and scale > 0 else 1.0
+
+
+def _pixel_count(width: int, height: int, label: str) -> int:
+    if width <= 0 or height <= 0:
+        raise PsdReconstructionError(f"{label} has an invalid size: {width}x{height}.")
+    return width * height
+
+
+def _format_mib(byte_count: int) -> str:
+    return f"{byte_count / (1024 * 1024):.0f} MiB"
+
+
+def _validate_canvas_size(
+    size: tuple[int, int], limits: PsdResourceLimits, operation: str
+) -> int:
+    width, height = (int(size[0]), int(size[1]))
+    pixels = _pixel_count(width, height, f"{operation} canvas")
+    if pixels > limits.max_canvas_pixels:
+        raise PsdReconstructionError(
+            f"{operation} blocked by the safety limit: canvas {width}x{height} "
+            f"({pixels:,} pixels) exceeds the configured maximum "
+            f"({limits.max_canvas_pixels:,} pixels)."
+        )
+    return pixels
+
+
+def _validate_texture_paths(
+    paths: list[Path], limits: PsdResourceLimits, operation: str
+) -> int:
+    total_pixels = 0
+    for path in paths:
+        try:
+            with Image.open(path) as image:
+                pixels = _pixel_count(int(image.width), int(image.height), f"Texture {path.name}")
+        except PsdReconstructionError:
+            raise
+        except Exception as exc:
+            raise PsdReconstructionError(f"Failed to inspect texture {path}: {exc}") from exc
+        total_pixels += pixels
+        if total_pixels > limits.max_texture_pixels:
+            raise PsdReconstructionError(
+                f"{operation} blocked by the safety limit: texture atlases total "
+                f"{total_pixels:,} pixels, exceeding {limits.max_texture_pixels:,} pixels."
+            )
+    return total_pixels
+
+
+def _validate_metadata_textures(
+    textures: list[dict[str, Any]], limits: PsdResourceLimits, operation: str
+) -> int:
+    total_pixels = 0
+    for texture in textures:
+        width = int(texture["width"])
+        height = int(texture["height"])
+        _validate_canvas_size((width, height), limits, operation)
+        total_pixels += _pixel_count(width, height, f"Texture {texture.get('name', '?')}")
+        if total_pixels > limits.max_texture_pixels:
+            raise PsdReconstructionError(
+                f"{operation} blocked by the safety limit: target atlases total "
+                f"{total_pixels:,} pixels, exceeding {limits.max_texture_pixels:,} pixels."
+            )
+    return total_pixels
+
+
+def _layers_pixel_count(layers: Iterable[PsdLayer]) -> int:
+    return sum(_pixel_count(layer.image.width, layer.image.height, f"Layer {layer.name}") for layer in layers)
+
+
+def _metadata_layers_pixel_count(layers: Iterable[dict[str, Any]]) -> int:
+    total_pixels = 0
+    for layer in layers:
+        bbox = layer.get("bbox")
+        if not isinstance(bbox, list | tuple) or len(bbox) < 4:
+            raise PsdReconstructionError(f"Layer metadata is missing a valid bounding box: {layer.get('name', '?')}")
+        total_pixels += _pixel_count(int(bbox[2]), int(bbox[3]), f"Layer {layer.get('name', '?')}")
+    return total_pixels
+
+
+def _validate_layer_budget(
+    layer_count: int,
+    total_layer_pixels: int,
+    texture_pixels: int,
+    limits: PsdResourceLimits,
+    operation: str,
+) -> None:
+    if layer_count > limits.max_layer_count:
+        raise PsdReconstructionError(
+            f"{operation} blocked by the safety limit: {layer_count:,} layers exceed the configured "
+            f"maximum of {limits.max_layer_count:,}."
+        )
+    if total_layer_pixels > limits.max_total_layer_pixels:
+        raise PsdReconstructionError(
+            f"{operation} blocked by the safety limit: layers contain {total_layer_pixels:,} pixels, "
+            f"exceeding {limits.max_total_layer_pixels:,} pixels."
+        )
+
+    # Export keeps source RGBA textures and several copies of each layer while
+    # psd-tools builds channel data.  The multiplier is deliberately cautious.
+    estimated_bytes = texture_pixels * 4 * 2 + total_layer_pixels * 4 * 5
+    limit_bytes = limits.max_memory_mb * 1024 * 1024
+    if estimated_bytes > limit_bytes:
+        raise PsdReconstructionError(
+            f"{operation} blocked by the safety limit: estimated peak memory "
+            f"{_format_mib(estimated_bytes)} exceeds the configured budget "
+            f"{limits.max_memory_mb:,} MiB."
+        )
+
+
+def _validate_metadata_layer_budget(
+    layers: list[dict[str, Any]],
+    texture_pixels: int,
+    limits: PsdResourceLimits,
+    operation: str,
+) -> None:
+    _validate_layer_budget(
+        len(layers), _metadata_layers_pixel_count(layers), texture_pixels, limits, operation
+    )
+
+
+def _validate_psd_layers(
+    psd_layers: Mapping[str, Any],
+    texture_pixels: int,
+    limits: PsdResourceLimits,
+    operation: str,
+) -> None:
+    if len(psd_layers) > limits.max_layer_count:
+        raise PsdReconstructionError(
+            f"{operation} blocked by the safety limit: PSD contains {len(psd_layers):,} indexed layers, "
+            f"exceeding {limits.max_layer_count:,}."
+        )
+    total_pixels = 0
+    for name, layer in psd_layers.items():
+        width = int(getattr(layer, "width", 0) or 0)
+        height = int(getattr(layer, "height", 0) or 0)
+        if width <= 0 or height <= 0:
+            continue
+        pixels = _pixel_count(width, height, f"PSD layer {name}")
+        if pixels > limits.max_total_layer_pixels:
+            raise PsdReconstructionError(
+                f"{operation} blocked by the safety limit: PSD layer {name} contains "
+                f"{pixels:,} pixels, exceeding the total layer budget."
+            )
+        total_pixels += pixels
+    _validate_layer_budget(
+        len(psd_layers), total_pixels, texture_pixels, limits, operation
+    )
+
+
 def reconstruct_live2d_psd(
     source: str | Path,
     output_dir: str | Path,
@@ -64,8 +293,11 @@ def reconstruct_live2d_psd(
     parameter_values: dict[str, float] | None = None,
     pose_name: str | None = None,
     output_name: str | None = None,
+    resource_limits: PsdResourceLimits | Mapping[str, Any] | None = None,
 ) -> ReconstructionResult:
+    limits = _resolve_resource_limits(resource_limits)
     cv2 = _require_cv2()
+    _configure_opencv(cv2, limits)
     _require_psd_tools()
 
     source_info = resolve_live2d_source(Path(source))
@@ -75,6 +307,7 @@ def reconstruct_live2d_psd(
     warnings: list[str] = []
     _emit(progress, 5, "Live2D source resolved")
 
+    texture_pixels = _validate_texture_paths(source_info.textures, limits, "PSD export")
     textures = [_load_rgba_texture(cv2, path) for path in source_info.textures]
     if not textures:
         raise PsdReconstructionError("No texture atlas PNG files were found.")
@@ -100,7 +333,7 @@ def reconstruct_live2d_psd(
 
     if mode == "mesh" and source_info.mesh_data:
         layers, size, layer_metadata = _render_mesh_layers(
-            cv2, source_info.mesh_data, textures, progress
+            cv2, source_info.mesh_data, textures, progress, limits, texture_pixels
         )
         mode = "mesh"
     else:
@@ -109,7 +342,7 @@ def reconstruct_live2d_psd(
                 "No drawable mesh metadata was found. Exported editable atlas layers instead."
             )
         layers, size, layer_metadata = _build_texture_component_layers(
-            cv2, source_info.textures, textures, progress
+            cv2, source_info.textures, textures, progress, limits, texture_pixels
         )
         mode = "atlas-components"
 
@@ -118,7 +351,15 @@ def reconstruct_live2d_psd(
     psd_path = output_path / f"{model_name}_{suffix}.psd"
     metadata_path = output_path / f"{model_name}_{suffix}.lpkpsd.json"
     _emit(progress, 90, f"Preparing PSD with {len(layers)} layer(s)")
-    _save_psd(psd_path, size, layers, progress=progress)
+    _validate_canvas_size(size, limits, "PSD export")
+    _validate_layer_budget(
+        len(layers),
+        _layers_pixel_count(layers),
+        texture_pixels,
+        limits,
+        "PSD export",
+    )
+    _save_psd(psd_path, size, layers, progress=progress, resource_limits=limits)
     _emit(progress, 98, "Writing metadata")
     _write_json(
         metadata_path,
@@ -148,7 +389,10 @@ def repack_atlas_png_from_psd(
     output_dir: str | Path,
     metadata_path: str | Path | None = None,
     progress: Optional[ProgressCallback] = None,
+    resource_limits: PsdResourceLimits | Mapping[str, Any] | None = None,
+    input_texture_paths: Mapping[int, str | Path] | None = None,
 ) -> ReconstructionResult:
+    limits = _resolve_resource_limits(resource_limits)
     _require_psd_tools()
     from psd_tools import PSDImage
 
@@ -173,10 +417,14 @@ def repack_atlas_png_from_psd(
         metadata,
         {"drawable-mesh"} if mode == "mesh" else {"atlas-component", "texture-atlas"},
     )
+    texture_pixels = _validate_metadata_textures(textures, limits, "PSD repack")
+    _validate_metadata_layer_budget(layers_metadata, texture_pixels, limits, "PSD repack")
 
     _emit(progress, 5, f"Reading PSD: {psd_file}")
     psd = PSDImage.open(str(psd_file))
+    _validate_canvas_size((int(psd.width), int(psd.height)), limits, "PSD repack")
     psd_layers = _index_psd_layers(psd)
+    _validate_psd_layers(psd_layers, texture_pixels, limits, "PSD repack")
     _emit(progress, 10, f"Loaded PSD: {psd_file}")
 
     if mode == "mesh":
@@ -187,14 +435,12 @@ def repack_atlas_png_from_psd(
             output_path,
             progress,
             metadata_file,
+            limits,
+            texture_pixels,
+            input_texture_paths,
         )
 
-    canvases = {
-        texture["index"]: Image.new("RGBA", (texture["width"], texture["height"]), (0, 0, 0, 0))
-        for texture in textures
-    }
-
-    warnings: list[str] = []
+    canvases, warnings = _load_atlas_repack_canvases(textures, input_texture_paths)
     total = max(1, len(layers_metadata))
 
     for index, layer_info in enumerate(layers_metadata):
@@ -234,6 +480,7 @@ def repack_atlas_png_from_psd(
         warnings=warnings,
         metadata_path=metadata_file,
         output_paths=outputs,
+        texture_outputs={int(texture["index"]): output for texture, output in zip(textures, outputs)},
     )
 
 
@@ -244,9 +491,20 @@ def _repack_mesh_psd_layers(
     output_path: Path,
     progress: Optional[ProgressCallback],
     metadata_file: Path,
+    limits: PsdResourceLimits,
+    texture_pixels: int,
+    input_texture_paths: Mapping[int, str | Path] | None = None,
 ) -> ReconstructionResult:
     cv2 = _require_cv2()
-    canvases, warnings = _load_mesh_repack_canvases(textures)
+    _configure_opencv(cv2, limits)
+    _validate_layer_budget(
+        len(layers_metadata),
+        _metadata_layers_pixel_count(layers_metadata),
+        texture_pixels,
+        limits,
+        "PSD mesh repack",
+    )
+    canvases, warnings = _load_mesh_repack_canvases(textures, input_texture_paths)
     original_canvases = {index: canvas.copy() for index, canvas in canvases.items()}
     total = max(1, len(layers_metadata))
 
@@ -268,7 +526,8 @@ def _repack_mesh_psd_layers(
             continue
 
         try:
-            vertices = np.asarray(layer_info["vertices"], dtype=np.float32)
+            coordinate_scale = _metadata_coordinate_scale(layer_info)
+            vertices = np.asarray(layer_info["vertices"], dtype=np.float32) * coordinate_scale
             uvs = np.asarray(layer_info["uvs"], dtype=np.float32)
             indices = _as_int_list(layer_info["indices"])
         except Exception:
@@ -328,20 +587,23 @@ def _repack_mesh_psd_layers(
         warnings=warnings,
         metadata_path=metadata_file,
         output_paths=outputs,
+        texture_outputs={int(texture["index"]): output for texture, output in zip(textures, outputs)},
     )
 
 
 def _load_mesh_repack_canvases(
     textures: list[dict[str, Any]],
+    input_texture_paths: Mapping[int, str | Path] | None = None,
 ) -> tuple[dict[int, np.ndarray], list[str]]:
     canvases: dict[int, np.ndarray] = {}
     warnings: list[str] = []
     for texture in textures:
         width = int(texture["width"])
         height = int(texture["height"])
-        source_path = Path(str(texture.get("source_path") or ""))
+        source_path = _resolve_repack_texture_path(texture, input_texture_paths)
         if source_path.is_file():
-            image = Image.open(source_path).convert("RGBA")
+            with Image.open(source_path) as source_image:
+                image = source_image.convert("RGBA")
             if image.size != (width, height):
                 warnings.append(
                     f"Texture size changed, resizing original atlas for repack: {source_path}"
@@ -354,6 +616,99 @@ def _load_mesh_repack_canvases(
             image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
         canvases[int(texture["index"])] = np.asarray(image).copy()
     return canvases, warnings
+
+
+def _load_atlas_repack_canvases(
+    textures: list[dict[str, Any]],
+    input_texture_paths: Mapping[int, str | Path] | None = None,
+) -> tuple[dict[int, Image.Image], list[str]]:
+    """Load the original atlas as the base for component PSD repack too.
+
+    Component exports do not necessarily cover every pixel in an atlas.  A
+    transparent new canvas made an untouched region look like an edit on the
+    next pass, which is especially dangerous for alpha-heavy hair textures.
+    """
+    canvases: dict[int, Image.Image] = {}
+    warnings: list[str] = []
+    for texture in textures:
+        width = int(texture["width"])
+        height = int(texture["height"])
+        source_path = _resolve_repack_texture_path(texture, input_texture_paths)
+        if source_path.is_file():
+            with Image.open(source_path) as source_image:
+                image = source_image.convert("RGBA")
+            if image.size != (width, height):
+                warnings.append(
+                    f"Texture size changed, resizing original atlas for repack: {source_path}"
+                )
+                image = image.resize((width, height), Image.Resampling.LANCZOS)
+        else:
+            warnings.append(
+                f"Original texture missing; unchanged hidden pixels cannot be preserved: {source_path}"
+            )
+            image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        canvases[int(texture["index"])] = image
+    return canvases, warnings
+
+
+def _resolve_repack_texture_path(
+    texture: Mapping[str, Any],
+    input_texture_paths: Mapping[int, str | Path] | None,
+) -> Path:
+    texture_index = int(texture["index"])
+    candidate = (input_texture_paths or {}).get(texture_index)
+    return Path(str(candidate or texture.get("source_path") or ""))
+
+
+def repack_multiple_psds(
+    psd_paths: Iterable[str | Path],
+    output_dir: str | Path,
+    progress: Optional[ProgressCallback] = None,
+    resource_limits: PsdResourceLimits | Mapping[str, Any] | None = None,
+) -> ReconstructionResult:
+    """Repack PSDs from low to high priority into one atlas set.
+
+    The user-facing list is ordered high to low, so it is processed in reverse:
+    later (higher priority) PSDs receive the preceding output as their base.
+    """
+    ordered_paths = [Path(path).resolve() for path in psd_paths]
+    if len(ordered_paths) < 2:
+        raise PsdReconstructionError("Multi-PSD repack requires at least two PSD files.")
+
+    latest: ReconstructionResult | None = None
+    texture_paths: dict[int, Path] | None = None
+    total = len(ordered_paths)
+    warnings: list[str] = []
+    for step, psd_file in enumerate(reversed(ordered_paths)):
+        start = int(step / total * 95)
+        span = max(1, int(95 / total))
+        result = repack_atlas_png_from_psd(
+            psd_file,
+            output_dir,
+            progress=lambda value, message, start=start, span=span, step=step: _emit(
+                progress,
+                min(95, start + int(value / 100 * span)),
+                f"[{step + 1}/{total}] {message}",
+            ),
+            resource_limits=resource_limits,
+            input_texture_paths=texture_paths,
+        )
+        warnings.extend(result.warnings)
+        texture_paths = result.texture_outputs
+        latest = result
+
+    if latest is None:
+        raise PsdReconstructionError("No PSD was available for multi-PSD repack.")
+    _emit(progress, 100, f"Atlas PNG written: {Path(output_dir)}")
+    return ReconstructionResult(
+        psd_path=latest.psd_path,
+        layer_count=sum(1 for _ in ordered_paths),
+        mode="multi-repack",
+        warnings=warnings,
+        metadata_path=latest.metadata_path,
+        output_paths=latest.output_paths,
+        texture_outputs=latest.texture_outputs,
+    )
 
 
 def _render_repack_reference_layer(
@@ -393,15 +748,20 @@ def _changed_pixel_mask(cv2, edited: np.ndarray, reference: np.ndarray) -> np.nd
 
     delta = np.abs(edited.astype(np.int16) - reference.astype(np.int16))
     rgb_delta = np.max(delta[:, :, :3], axis=2)
-    alpha_delta = delta[:, :, 3]
-    alpha_present = (edited[:, :, 3] > 4) | (reference[:, :, 3] > 4)
-    changed = ((rgb_delta > 12) | (alpha_delta > 8)) & alpha_present
+    # Mesh exports apply Live2D drawable masks.  Those masks make parts of an
+    # otherwise opaque reconstructed reference transparent, even when the
+    # artist did not touch the PSD.  Treating alpha-only differences as edits
+    # therefore erased hair and other masked drawables on writeback.  Only a
+    # visible RGB change in pixels that are visible in both images is safe to
+    # project back onto the original atlas.
+    mutually_visible = (edited[:, :, 3] > 8) & (reference[:, :, 3] > 8)
+    changed = (rgb_delta > 12) & mutually_visible
     mask = (changed.astype(np.uint8) * 255)
     if not np.any(mask):
         return mask
 
     kernel = np.ones((3, 3), dtype=np.uint8)
-    return cv2.dilate(mask, kernel, iterations=2)
+    return cv2.dilate(mask, kernel, iterations=1)
 
 
 def resolve_live2d_source(source: Path) -> Live2DSource:
@@ -508,6 +868,8 @@ def _render_mesh_layers(
     mesh_data: dict[str, Any],
     textures: list[np.ndarray],
     progress: Optional[ProgressCallback],
+    limits: PsdResourceLimits,
+    texture_pixels: int,
 ) -> tuple[list[PsdLayer], tuple[int, int], list[dict[str, Any]]]:
     drawables = mesh_data.get("drawables")
     if not isinstance(drawables, list) or not drawables:
@@ -524,8 +886,38 @@ def _render_mesh_layers(
     if not drawable_infos:
         raise PsdReconstructionError("No usable drawable mesh entries were found.")
 
-    size, offset = _resolve_canvas(mesh_data, drawable_infos)
+    source_size, offset = _resolve_canvas(mesh_data, drawable_infos)
+    size, coordinate_scale = _scaled_mesh_canvas(source_size, limits)
     canvas_w, canvas_h = size
+    _validate_canvas_size(size, limits, "PSD export")
+
+    # Validate all potential output bounds before creating any drawable-sized
+    # RGBA buffer.  A malformed sidecar can otherwise request a huge canvas.
+    planned_layer_count = 0
+    planned_layer_pixels = 0
+    for drawable in drawable_infos:
+        texture_index = int(drawable.get("texture_index", 0))
+        if (
+            not drawable.get("visible", True)
+            or float(drawable.get("opacity", 1.0)) <= 0.001
+            or texture_index < 0
+            or texture_index >= len(textures)
+        ):
+            continue
+        vertices = (np.asarray(drawable["vertices"], dtype=np.float32) + offset) * coordinate_scale
+        bounds = _vertex_bounds(vertices, canvas_w, canvas_h)
+        if bounds is None:
+            continue
+        planned_layer_count += 1
+        planned_layer_pixels += bounds[2] * bounds[3]
+    _validate_layer_budget(
+        planned_layer_count,
+        planned_layer_pixels,
+        texture_pixels,
+        limits,
+        "PSD export",
+    )
+
     drawable_by_index = {int(item["source_index"]): item for item in drawable_infos}
     ordered = sorted(
         drawable_infos,
@@ -548,7 +940,7 @@ def _render_mesh_layers(
             continue
 
         texture = textures[texture_index]
-        vertices = np.asarray(drawable["vertices"], dtype=np.float32) + offset
+        vertices = (np.asarray(drawable["vertices"], dtype=np.float32) + offset) * coordinate_scale
         uvs = _uv_to_texture_points(np.asarray(drawable["uvs"], dtype=np.float32), texture)
         if not _uv_source_has_alpha(texture, uvs):
             continue
@@ -575,6 +967,7 @@ def _render_mesh_layers(
             textures,
             offset,
             np.asarray([layer_left, layer_top], dtype=np.float32),
+            coordinate_scale,
         )
 
         bbox = _alpha_bbox(layer)
@@ -607,6 +1000,7 @@ def _render_mesh_layers(
                 "opacity": drawable.get("opacity", 1.0),
                 "render_order": drawable.get("render_order", 0),
                 "draw_order": drawable.get("draw_order", 0),
+                "coordinate_scale": coordinate_scale,
             }
         )
         _emit(progress, 20 + int((index + 1) / total * 70), f"Rendered {drawable['id']}")
@@ -621,9 +1015,16 @@ def _build_texture_component_layers(
     paths: list[Path],
     textures: list[np.ndarray],
     progress: Optional[ProgressCallback] = None,
+    limits: PsdResourceLimits | None = None,
+    texture_pixels: int | None = None,
 ) -> tuple[list[PsdLayer], tuple[int, int], list[dict[str, Any]]]:
+    limits = limits or PsdResourceLimits()
+    texture_pixels = texture_pixels if texture_pixels is not None else sum(
+        texture.shape[0] * texture.shape[1] for texture in textures
+    )
     width = max(texture.shape[1] for texture in textures)
     height = max(texture.shape[0] for texture in textures)
+    _validate_canvas_size((width, height), limits, "PSD export")
     layers: list[PsdLayer] = []
     layer_metadata: list[dict[str, Any]] = []
 
@@ -643,6 +1044,14 @@ def _build_texture_component_layers(
             pieces.append((0, 0, texture.shape[1], texture.shape[0], int(np.count_nonzero(alpha)), 0))
 
         pieces.sort(key=lambda item: (item[0], item[1], -item[4]))
+        planned_pixels = sum(piece[2] * piece[3] for piece in pieces)
+        _validate_layer_budget(
+            len(layers) + len(pieces),
+            _layers_pixel_count(layers) + planned_pixels,
+            texture_pixels,
+            limits,
+            "PSD export",
+        )
         for piece_index, (y, x, w, h, area, label_index) in enumerate(pieces, start=1):
             crop = texture[y : y + h, x : x + w].copy()
             if label_index:
@@ -665,7 +1074,9 @@ def _build_texture_component_layers(
             )
 
     if not layers:
-        layers, size, layer_metadata = _build_texture_atlas_layers(paths, textures)
+        layers, size, layer_metadata = _build_texture_atlas_layers(
+            paths, textures, limits, texture_pixels
+        )
         return layers, size, layer_metadata
 
     _emit(progress, 85, f"Split texture atlases into {len(layers)} editable layer(s)")
@@ -675,9 +1086,23 @@ def _build_texture_component_layers(
 def _build_texture_atlas_layers(
     paths: list[Path],
     textures: list[np.ndarray],
+    limits: PsdResourceLimits | None = None,
+    texture_pixels: int | None = None,
 ) -> tuple[list[PsdLayer], tuple[int, int], list[dict[str, Any]]]:
+    limits = limits or PsdResourceLimits()
+    texture_pixels = texture_pixels if texture_pixels is not None else sum(
+        texture.shape[0] * texture.shape[1] for texture in textures
+    )
     width = max(texture.shape[1] for texture in textures)
     height = max(texture.shape[0] for texture in textures)
+    _validate_canvas_size((width, height), limits, "PSD export")
+    _validate_layer_budget(
+        len(textures),
+        len(textures) * width * height,
+        texture_pixels,
+        limits,
+        "PSD export",
+    )
     layers: list[PsdLayer] = []
     layer_metadata: list[dict[str, Any]] = []
 
@@ -857,8 +1282,18 @@ def _warp_triangle(cv2, src: np.ndarray, dst: np.ndarray, src_tri: np.ndarray, d
         borderValue=(0, 0, 0, 0),
     )
 
+    # Adjacent Cubism triangles often meet on fractional coordinates.  A
+    # one-pixel overlap with a hard mask avoids transparent/black hairline
+    # seams created by anti-aliased masks and zero-alpha border interpolation.
+    center = np.mean(dst_shift, axis=0)
+    expanded = center + (dst_shift - center) * 1.01
     mask = np.zeros((dy1 - dy0, dx1 - dx0), dtype=np.uint8)
-    cv2.fillConvexPoly(mask, dst_shift.astype(np.int32), 255, lineType=cv2.LINE_AA)
+    cv2.fillConvexPoly(
+        mask,
+        np.rint(expanded).astype(np.int32),
+        255,
+        lineType=cv2.LINE_8,
+    )
     _alpha_blend(dst[dy0:dy1, dx0:dx1], warped, mask)
 
 
@@ -953,6 +1388,7 @@ def _apply_drawable_masks(
     textures: list[np.ndarray],
     offset: np.ndarray,
     origin: np.ndarray,
+    coordinate_scale: float = 1.0,
 ) -> None:
     mask_indices = drawable.get("masks") or []
     if not mask_indices:
@@ -968,7 +1404,9 @@ def _apply_drawable_masks(
             continue
 
         texture = textures[texture_index]
-        vertices = np.asarray(mask_drawable["vertices"], dtype=np.float32) + offset
+        vertices = (
+            np.asarray(mask_drawable["vertices"], dtype=np.float32) + offset
+        ) * coordinate_scale
         uvs = _uv_to_texture_points(np.asarray(mask_drawable["uvs"], dtype=np.float32), texture)
         if not _uv_source_has_alpha(texture, uvs):
             continue
@@ -1121,11 +1559,17 @@ def _save_psd(
     size: tuple[int, int],
     layers: list[PsdLayer],
     progress: Optional[ProgressCallback] = None,
+    resource_limits: PsdResourceLimits | None = None,
 ) -> None:
     from psd_tools import PSDImage
     from psd_tools.api.layers import PixelLayer
     from psd_tools.constants import Compression
 
+    limits = resource_limits or PsdResourceLimits()
+    _validate_canvas_size(size, limits, "PSD export")
+    _validate_layer_budget(
+        len(layers), _layers_pixel_count(layers), 0, limits, "PSD export"
+    )
     psd = PSDImage.new("RGBA", size)
     compression = Compression.RAW
     total = max(1, len(layers))
