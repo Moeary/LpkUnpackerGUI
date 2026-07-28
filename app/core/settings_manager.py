@@ -59,9 +59,11 @@ class SettingsManager:
                 "assetstudio_cli_path": "",
                 "cubism_core_dll_path": "",
                 "photoshop_path": "",
+                "image_viewer_path": "",
             },
             "preview": {
                 "image_limit": 48,
+                "texture_viewer": "internal",
             },
             "psd": {
                 "last_project_file": "",
@@ -229,6 +231,27 @@ class SettingsManager:
             if candidate.is_file():
                 return str(candidate.resolve())
         return ""
+
+    def get_texture_viewer_mode(self) -> str:
+        mode = str(self.get("preview.texture_viewer", "internal") or "internal")
+        return mode if mode in {"internal", "system", "custom"} else "internal"
+
+    def set_texture_viewer_mode(self, mode: str):
+        normalized = str(mode or "internal")
+        self.set(
+            "preview.texture_viewer",
+            normalized if normalized in {"internal", "system", "custom"} else "internal",
+        )
+
+    def get_image_viewer_path(self) -> str:
+        return str(self.get("tools.image_viewer_path", "") or "").strip()
+
+    def set_image_viewer_path(self, path: str):
+        self.set("tools.image_viewer_path", str(path or "").strip())
+
+    def get_image_viewer_executable(self) -> str:
+        configured = Path(self.get_image_viewer_path()).expanduser()
+        return str(configured.resolve()) if configured.is_file() else ""
 
     def reset_runtime_to_project(self) -> None:
         runtime = self.settings.setdefault("runtime", {})

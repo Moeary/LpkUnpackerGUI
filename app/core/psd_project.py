@@ -16,7 +16,7 @@ from app.core.settings_manager import SettingsManager
 
 
 PROJECT_FORMAT = "LpkUnpacker.Live2DPSDProject"
-PROJECT_VERSION = 2
+PROJECT_VERSION = 4
 PROJECT_FILE_NAME = "project.lpkpsd_project.json"
 LogCallback = Callable[[str], None]
 
@@ -103,6 +103,8 @@ def new_project_data(
             "base_model_json": _relative_to_project(base_package.model_json, project_dir),
         },
         "psd_exports": [],
+        "parameter_presets": [_default_parameter_preset()],
+        "selected_parameter_preset": "default",
         "pose_schemes": [],
         "selected_pose_scheme": "",
         "repack_history": [],
@@ -113,6 +115,7 @@ def new_project_data(
             "current_dir": "preview/current",
             "mode": "original",
         },
+        "ui_state": {},
         "warnings": warnings or [],
     }
 
@@ -153,6 +156,8 @@ def normalize_project_data(data: dict[str, Any], fallback_name: str) -> dict[str
     payload["workspace"].setdefault("live2d_dir", "live2d")
     payload["workspace"].setdefault("base_model_json", "")
     payload.setdefault("psd_exports", [])
+    payload.setdefault("parameter_presets", [])
+    payload.setdefault("selected_parameter_preset", "default")
     payload.setdefault("pose_schemes", [])
     payload.setdefault("selected_pose_scheme", "")
     payload.setdefault("repack_history", [])
@@ -162,8 +167,147 @@ def normalize_project_data(data: dict[str, Any], fallback_name: str) -> dict[str
     payload.setdefault("preview", {})
     payload["preview"].setdefault("current_dir", "preview/current")
     payload["preview"].setdefault("mode", "original")
+    payload.setdefault("ui_state", {})
     payload.setdefault("warnings", [])
+    for scheme in payload.get("pose_schemes") or []:
+        if not isinstance(scheme, dict):
+            continue
+        scheme.setdefault(
+            "pose_source",
+            "preview" if scheme.get("parameters") else "initial",
+        )
+        scheme.setdefault(
+            "exported_parameters",
+            dict(scheme.get("parameters") or {}),
+        )
+        for version in scheme.get("versions") or []:
+            if isinstance(version, dict):
+                version.setdefault("name", str(version.get("id") or "texture"))
+        preset_id = str(
+            scheme.get("parameter_preset_id") or scheme.get("id") or ""
+        )
+        scheme.setdefault("parameter_preset_id", preset_id)
+        if preset_id and not any(
+            str(item.get("id") or "") == preset_id
+            for item in payload["parameter_presets"]
+            if isinstance(item, dict)
+        ):
+            payload["parameter_presets"].append(
+                {
+                    "id": preset_id,
+                    "name": str(scheme.get("name") or preset_id),
+                    "parameters": dict(
+                        scheme.get("exported_parameters")
+                        or scheme.get("parameters")
+                        or {}
+                    ),
+                    "source": str(scheme.get("pose_source") or "preview"),
+                    "is_default": False,
+                    "created_at": str(
+                        scheme.get("created_at")
+                        or datetime.now().isoformat(timespec="seconds")
+                    ),
+                }
+            )
+    if not any(
+        isinstance(item, dict) and str(item.get("id") or "") == "default"
+        for item in payload["parameter_presets"]
+    ):
+        payload["parameter_presets"].insert(0, _default_parameter_preset())
+    for preset in payload["parameter_presets"]:
+        if not isinstance(preset, dict):
+            continue
+        if str(preset.get("id") or "") == "default":
+            preset["is_default"] = True
+            preset["source"] = "initial"
+            preset["parameters"] = {}
+        preset.setdefault("parameters", {})
+        preset.setdefault("source", "initial" if preset.get("is_default") else "preview")
+        preset.setdefault("is_default", str(preset.get("id") or "") == "default")
+    available_presets = {
+        str(item.get("id") or "")
+        for item in payload["parameter_presets"]
+        if isinstance(item, dict)
+    }
+    if str(payload.get("selected_parameter_preset") or "") not in available_presets:
+        payload["selected_parameter_preset"] = "default"
     return payload
+
+
+def _default_parameter_preset() -> dict[str, Any]:
+    return {
+        "id": "default",
+        "name": "Default",
+        "parameters": {},
+        "source": "initial",
+        "is_default": True,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def find_parameter_preset(
+    project: Live2DPSDProject,
+    preset_id: str | None = None,
+) -> dict[str, Any] | None:
+    data = normalize_project_data(project.data, project.project_name)
+    target = str(
+        preset_id
+        if preset_id is not None
+        else data.get("selected_parameter_preset") or "default"
+    )
+    for preset in data.get("parameter_presets") or []:
+        if isinstance(preset, dict) and str(preset.get("id") or "") == target:
+            return dict(preset)
+    return None
+
+
+def create_parameter_preset(
+    project: Live2DPSDProject,
+    name: str,
+    parameters: dict[str, float],
+) -> tuple[Live2DPSDProject, dict[str, Any]]:
+    display_name = str(name or "").strip()
+    if not display_name:
+        raise Live2DPSDProjectError("Parameter preset name cannot be empty.")
+    preset_id = sanitize_project_name(display_name)
+    if preset_id.lower() == "default":
+        raise Live2DPSDProjectError("The default parameter preset is reserved.")
+    data = normalize_project_data(project.data, project.project_name)
+    if any(
+        str(item.get("id") or "").casefold() == preset_id.casefold()
+        for item in data.get("parameter_presets") or []
+        if isinstance(item, dict)
+    ):
+        raise Live2DPSDProjectError(f"Parameter preset already exists: {display_name}")
+    preset = {
+        "id": preset_id,
+        "name": display_name,
+        "parameters": {
+            str(key): float(value)
+            for key, value in dict(parameters or {}).items()
+        },
+        "source": "preview",
+        "is_default": False,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    data.setdefault("parameter_presets", []).append(preset)
+    data["selected_parameter_preset"] = preset_id
+    save_project(project.project_dir, data)
+    return Live2DPSDProject(project.project_dir, project.project_file, data), preset
+
+
+def select_parameter_preset(
+    project: Live2DPSDProject,
+    preset_id: str,
+) -> Live2DPSDProject:
+    if find_parameter_preset(project, preset_id) is None:
+        raise Live2DPSDProjectError(
+            f"Parameter preset does not exist: {preset_id}"
+        )
+    data = normalize_project_data(project.data, project.project_name)
+    data["selected_parameter_preset"] = str(preset_id)
+    save_project(project.project_dir, data)
+    return Live2DPSDProject(project.project_dir, project.project_file, data)
 
 
 def record_psd_export(
@@ -194,15 +338,35 @@ def create_pose_scheme(
     name: str,
     priority: int,
     parameters: dict[str, float],
+    pose_source: str = "preview",
+    parameter_preset_id: str = "",
 ) -> tuple[Live2DPSDProject, dict[str, Any], Path]:
     """Create a named, PSD-page-owned pose workspace."""
     display_name = str(name or "").strip()
     if not display_name:
         raise Live2DPSDProjectError("Pose scheme name cannot be empty.")
-    scheme_id = sanitize_project_name(display_name)
+    scheme_id = sanitize_project_name(parameter_preset_id or display_name)
     data = normalize_project_data(project.data, project.project_name)
-    if find_pose_scheme(project, scheme_id):
-        raise Live2DPSDProjectError(f"Pose scheme already exists: {display_name}")
+    existing = find_pose_scheme(project, scheme_id)
+    if existing:
+        scheme_dir = project.project_dir / str(
+            existing.get("directory") or f"psd/{scheme_id}"
+        )
+        existing_parameters = dict(
+            existing.get("exported_parameters")
+            or existing.get("parameters")
+            or {}
+        )
+        requested_parameters = {
+            str(key): float(value)
+            for key, value in dict(parameters or {}).items()
+        }
+        if existing_parameters != requested_parameters:
+            raise Live2DPSDProjectError(
+                f"PSD name is already bound to different parameters: {display_name}"
+            )
+        scheme_dir.mkdir(parents=True, exist_ok=True)
+        return project, existing, scheme_dir
 
     scheme_dir = project.project_dir / "psd" / scheme_id
     scheme_dir.mkdir(parents=True, exist_ok=False)
@@ -223,6 +387,12 @@ def create_pose_scheme(
             str(key): float(value)
             for key, value in dict(parameters or {}).items()
         },
+        "exported_parameters": {
+            str(key): float(value)
+            for key, value in dict(parameters or {}).items()
+        },
+        "pose_source": "initial" if pose_source == "initial" else "preview",
+        "parameter_preset_id": str(parameter_preset_id or scheme_id),
         "source_textures": source_textures,
         "psd": "",
         "metadata": "",
@@ -312,19 +482,30 @@ def select_pose_scheme(
 def create_repack_dir(
     project: Live2DPSDProject,
     scheme_id: str | None = None,
+    texture_name: str | None = None,
 ) -> tuple[str, Path]:
-    repack_root = project.project_dir / "repacks"
-    if scheme_id:
-        repack_root = repack_root / sanitize_project_name(scheme_id)
+    repack_root = project.project_dir / "tex"
+    repack_root = repack_root / sanitize_project_name(scheme_id or "unassigned")
     repack_root.mkdir(parents=True, exist_ok=True)
     version_id = timestamp_id()
-    candidate = repack_root / version_id
+    existing_ids = {
+        str(entry.get("id") or "")
+        for entry in (project.data.get("repack_history") or [])
+        if isinstance(entry, dict)
+    }
+    version_index = 1
+    base_version_id = version_id
+    while version_id in existing_ids:
+        version_id = f"{base_version_id}_{version_index}"
+        version_index += 1
+    folder_name = sanitize_project_name(texture_name or version_id)
+    candidate = repack_root / folder_name
     index = 1
     while candidate.exists():
-        candidate = repack_root / f"{version_id}_{index}"
+        candidate = repack_root / f"{folder_name}_{index}"
         index += 1
     candidate.mkdir(parents=True, exist_ok=True)
-    return candidate.name, candidate
+    return version_id, candidate
 
 
 def record_repack(
@@ -335,10 +516,12 @@ def record_repack(
     textures_dir: str | Path,
     output_paths: list[Path],
     scheme_id: str = "",
+    display_name: str = "",
 ) -> Live2DPSDProject:
     data = normalize_project_data(project.data, project.project_name)
     entry = {
         "id": version_id,
+        "name": str(display_name or Path(textures_dir).name or version_id),
         "source_psd": _relative_to_project(Path(source_psd), project.project_dir),
         "metadata": _relative_to_project(Path(metadata_path), project.project_dir)
         if metadata_path
@@ -424,11 +607,36 @@ def compose_pose_versions(
                     f"Pose texture size mismatch: {candidate.name} {changed.size} != {base.size}"
                 )
             diff = ImageChops.difference(changed, base)
+            if diff.getbbox() is None:
+                if log:
+                    log(
+                        f"Skipped unchanged pose {scheme.get('name') or scheme.get('id')} "
+                        f"for {base_path.name}"
+                    )
+                continue
             channels = diff.split()
             mask = channels[0]
             for channel in channels[1:]:
                 mask = ImageChops.lighter(mask, channel)
-            composed = Image.composite(changed, composed, mask.point(lambda value: 255 if value else 0))
+            effective = ImageChops.difference(changed, composed)
+            if effective.getbbox() is None:
+                if log:
+                    log(
+                        f"Skipped duplicate pose pixels from "
+                        f"{scheme.get('name') or scheme.get('id')}"
+                    )
+                continue
+            effective_channels = effective.split()
+            effective_mask = effective_channels[0]
+            for channel in effective_channels[1:]:
+                effective_mask = ImageChops.lighter(effective_mask, channel)
+            changed_mask = ImageChops.multiply(
+                mask.point(lambda value: 255 if value else 0),
+                effective_mask.point(lambda value: 255 if value else 0),
+            )
+            if changed_mask.getbbox() is None:
+                continue
+            composed = Image.composite(changed, composed, changed_mask)
             if log:
                 log(
                     f"Applied pose {scheme.get('name') or scheme.get('id')} "
@@ -604,12 +812,12 @@ def _copy_workspace(source_dir: Path, target_dir: Path) -> None:
     shutil.copytree(
         source_dir,
         target_dir,
-        ignore=shutil.ignore_patterns("*.pretty.json", "__pycache__"),
+        ignore=shutil.ignore_patterns("*.pretty.json", "*.preview.json", "__pycache__"),
     )
 
 
 def _ensure_project_dirs(project_dir: Path) -> None:
-    for name in ("live2d", "psd", "repacks", "composites", "preview/current"):
+    for name in ("live2d", "psd", "tex", "repacks", "composites", "preview/current"):
         (project_dir / name).mkdir(parents=True, exist_ok=True)
 
 

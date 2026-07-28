@@ -18,15 +18,25 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QInputDialog,
+    QCompleter,
 )
-from PySide6.QtCore import Qt, Signal, QTimer, QCoreApplication, QThread, QPoint, QEvent
+from PySide6.QtCore import (
+    Qt,
+    Signal,
+    QTimer,
+    QCoreApplication,
+    QThread,
+    QPoint,
+    QEvent,
+    QStringListModel,
+)
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QColor, QPixmap
 from qfluentwidgets import (SubtitleLabel, BodyLabel, PushButton, Slider, CheckBox, SpinBox, InfoBar, InfoBarPosition,
                            CardWidget, SingleDirectionScrollArea, TextBrowser, ColorDialog, FluentIcon, IconWidget,
-                           ComboBox, LineEdit)
+                           ComboBox, EditableComboBox, LineEdit)
 
 from app.core.assetstudio_cli import AssetStudioCLI
-from app.core.model import resolve_live2d_package
+from app.core.model import prepare_model_json_for_preview, resolve_live2d_package
 from app.core.model.motions import load_live2d_motions
 from app.core.preview import prepare_preview_import
 from app.core.preview.sources import (
@@ -1691,7 +1701,15 @@ class PreviewPage(QFrame):
         motion_layout.setSpacing(8)
         self.motion_group_title = SubtitleLabel("", self.motion_group)
         motion_layout.addWidget(self.motion_group_title)
-        self.motion_combo = ComboBox(self.motion_group)
+        self.motion_combo = EditableComboBox(self.motion_group)
+        self.motion_combo.setClearButtonEnabled(True)
+        self._motion_completer_model = QStringListModel(self.motion_combo)
+        self._motion_completer = QCompleter(self._motion_completer_model, self.motion_combo)
+        self._motion_completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self._motion_completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self._motion_completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        self._motion_completer.setMaxVisibleItems(14)
+        self.motion_combo.setCompleter(self._motion_completer)
         self.motion_combo.currentIndexChanged.connect(self._on_motion_selection_changed)
         motion_layout.addWidget(self.motion_combo)
         motion_button_row = QHBoxLayout()
@@ -1702,9 +1720,6 @@ class PreviewPage(QFrame):
         motion_layout.addLayout(motion_button_row)
 
         motion_option_row = QHBoxLayout()
-        self.freeze_motion_check = CheckBox("", self.motion_group)
-        self.freeze_motion_check.toggled.connect(self.on_motion_freeze_changed)
-        motion_option_row.addWidget(self.freeze_motion_check)
         self.loop_motion_check = CheckBox("", self.motion_group)
         self.loop_motion_check.toggled.connect(self.on_motion_loop_changed)
         motion_option_row.addWidget(self.loop_motion_check)
@@ -1726,6 +1741,9 @@ class PreviewPage(QFrame):
         self.advanced_panel = Live2DSettingsPanel(action_widget, mode="parameters")
         self.advanced_panel.settingsChanged.connect(self.on_advanced_settings_changed)
         self.advanced_panel.requestRefreshParams.connect(self.on_request_refresh_params)
+        # Freezing the current pose and applying parameter overrides are one
+        # editing mode. Keep a single switch in the parameter card.
+        self.freeze_motion_check = self.advanced_panel.advanced_enable_check
         action_layout.addWidget(self.advanced_panel, 1)
 
         # 添加到分割器
@@ -1786,10 +1804,10 @@ class PreviewPage(QFrame):
             self.preview_stage_close_btn.setToolTip(tr("preview.close_window"))
         if self.motion_group_title:
             self.motion_group_title.setText(tr("preview.trigger_motion"))
+        if self.motion_combo:
+            self.motion_combo.setPlaceholderText(tr("preview.motion_search_placeholder"))
         if self.play_motion_btn:
             self.play_motion_btn.setText(tr("preview.play_motion"))
-        if self.freeze_motion_check:
-            self.freeze_motion_check.setText(tr("preview.freeze_motion"))
         if self.loop_motion_check:
             self.loop_motion_check.setText(tr("preview.loop_motion"))
         if self.auto_play_motion_check:
@@ -2165,6 +2183,7 @@ class PreviewPage(QFrame):
         )
 
     def _populate_motion_controls(self, motions: list[dict]):
+        previous = str(self.motion_combo.currentData() or "") if self.motion_combo else ""
         self._motion_items = list(motions or [])
         if not self.motion_combo or not self.play_motion_btn:
             return
@@ -2172,17 +2191,26 @@ class PreviewPage(QFrame):
         self.motion_combo.clear()
         if not self._motion_items:
             self.motion_combo.addItem(tr("preview.motion_none"))
+            if hasattr(self, "_motion_completer_model"):
+                self._motion_completer_model.setStringList([])
             self.motion_combo.setEnabled(False)
             self.play_motion_btn.setEnabled(False)
             self.motion_combo.blockSignals(False)
             return
+        labels = []
         for motion in self._motion_items:
-            self.motion_combo.addItem(str(motion.get("display") or motion.get("group") or "motion"))
+            label = str(motion.get("display") or motion.get("group") or "motion")
+            key = f"{motion.get('group', '')}::{int(motion.get('index', 0))}"
+            labels.append(label)
+            self.motion_combo.addItem(label, userData=key)
+        if hasattr(self, "_motion_completer_model"):
+            self._motion_completer_model.setStringList(labels)
         self.motion_combo.setEnabled(True)
         self.play_motion_btn.setEnabled(True)
-        self.motion_combo.setCurrentIndex(0)
+        selected_index = self.motion_combo.findData(previous) if previous else -1
+        self.motion_combo.setCurrentIndex(selected_index if selected_index >= 0 else 0)
         self.motion_combo.blockSignals(False)
-        self._on_motion_selection_changed(0)
+        self._on_motion_selection_changed(self.motion_combo.currentIndex())
 
     def _set_motion_debug_visible(self, visible: bool):
         if self.motion_group:
@@ -2200,7 +2228,20 @@ class PreviewPage(QFrame):
             return
         index = self.motion_combo.currentIndex()
         if index < 0 or index >= len(self._motion_items):
-            index = 0
+            query = self.motion_combo.currentText().strip().lower()
+            index = next(
+                (
+                    item_index
+                    for item_index, item in enumerate(self._motion_items)
+                    if query
+                    and query
+                    in str(item.get("display") or item.get("group") or "").lower()
+                ),
+                -1,
+            )
+            if index < 0:
+                return
+            self.motion_combo.setCurrentIndex(index)
         motion = self._motion_items[index]
         if self.freeze_motion_check:
             self.freeze_motion_check.setChecked(False)
@@ -2222,34 +2263,23 @@ class PreviewPage(QFrame):
             self.play_selected_motion()
 
     def on_motion_freeze_changed(self, frozen: bool):
-        if not self.live2d_preview or not self.advanced_panel:
+        if not self.live2d_preview:
             return
-        enable_check = self.advanced_panel.advanced_enable_check
+        self.live2d_preview.set_motion_frozen(bool(frozen))
         if frozen:
-            self.live2d_preview.set_motion_frozen(True)
             self._sync_live_parameter_controls(force=True)
-            self._advanced_enabled_before_freeze = bool(
-                enable_check and enable_check.isChecked()
-            )
-            if enable_check and not enable_check.isChecked():
-                enable_check.setChecked(True)
-            return
-        if (
-            enable_check
-            and enable_check.isChecked()
-            and not self._advanced_enabled_before_freeze
-        ):
-            enable_check.setChecked(False)
-        self._advanced_enabled_before_freeze = False
-        self.live2d_preview.set_motion_frozen(False)
 
     def on_motion_loop_changed(self, enabled: bool):
         if self.live2d_preview:
             self.live2d_preview.set_motion_loop(bool(enabled))
 
-    def on_advanced_settings_changed(self, _settings: dict):
+    def on_advanced_settings_changed(self, settings: dict):
         if self.live2d_preview and self.advanced_panel:
-            self.live2d_preview.apply_settings(self.advanced_panel.get_advanced_settings())
+            editing_pose = bool(settings.get("advanced_enabled", False))
+            self.on_motion_freeze_changed(editing_pose)
+            self.live2d_preview.apply_settings(
+                self.advanced_panel.get_advanced_settings()
+            )
 
     def _sync_live_parameter_controls(self, force: bool = False):
         if (
@@ -2801,11 +2831,19 @@ class PreviewPage(QFrame):
 
     def open_psd_project_preview(self, model_json_path: str, project_file: str):
         """Open a model with PSD provenance, enabling named pose export."""
+        try:
+            preview_model_json = prepare_model_json_for_preview(model_json_path)
+        except Exception as exc:
+            self.show_error(
+                tr("common.error"),
+                tr("preview_window.error_model_load_failed", error_type=type(exc).__name__, error=exc),
+            )
+            return
         self._pending_psd_project_context = {
             "project_file": os.path.abspath(project_file),
             "model_json": os.path.abspath(model_json_path),
         }
-        self.load_model_preview(model_json_path, model_json_path)
+        self.load_model_preview(str(preview_model_json), model_json_path)
 
     def request_pose_scheme_save(self):
         context = dict(self._psd_project_context or {})
@@ -2821,26 +2859,20 @@ class PreviewPage(QFrame):
         name = str(name or "").strip()
         if not accepted or not name:
             return
-        priority, accepted = QInputDialog.getInt(
-            self,
-            tr("preview.pose_scheme_dialog_title"),
-            tr("preview.pose_scheme_priority_label"),
-            100,
-            -9999,
-            9999,
-            1,
-        )
-        if not accepted:
-            return
         parameters = {
             str(item.get("id")): float(item.get("value", 0.0))
             for item in self.live2d_preview.get_parameter_meta_list()
             if item.get("id")
         }
+        if not parameters:
+            self.show_error(
+                tr("common.warning"),
+                tr("preview.parameter_preset_empty"),
+            )
+            return
         self.poseSchemeRequested.emit({
             **context,
             "name": name,
-            "priority": int(priority),
             "parameters": parameters,
         })
 

@@ -1,4 +1,5 @@
 import math
+import math
 import numpy as np
 from typing import Optional, List, Dict, Any
 
@@ -13,6 +14,20 @@ from live2d.utils.canvas import Canvas
 from app.core.model.motions import load_live2d_motions
 
 live2d.init()
+
+
+def _gl_object_id(value) -> int:
+    """Normalize PyOpenGL scalar/array handles to a plain GLuint-compatible int."""
+    if value is None:
+        return 0
+    try:
+        array = np.asarray(value).reshape(-1)
+        if array.size:
+            return int(array[0])
+    except Exception:
+        pass
+    return int(value)
+
 
 def compile_shader(shader_src, shader_type):
     shader = GL.glCreateShader(shader_type)
@@ -44,9 +59,9 @@ def create_program(vs, fs):
 def create_vao(v_pos, uv_coord):
     """创建 VAO/VBO"""
 
-    vao = GL.glGenVertexArrays(1)
-    vbo = GL.glGenBuffers(1)
-    uvbo = GL.glGenBuffers(1)
+    vao = _gl_object_id(GL.glGenVertexArrays(1))
+    vbo = _gl_object_id(GL.glGenBuffers(1))
+    uvbo = _gl_object_id(GL.glGenBuffers(1))
 
     GL.glBindVertexArray(vao)
 
@@ -78,12 +93,12 @@ def create_vao(v_pos, uv_coord):
 
 
 def create_canvas_framebuffer(width, height):
-    old_fbo = GL.glGetIntegerv(GL.GL_FRAMEBUFFER_BINDING)
-    fbo = GL.glGenFramebuffers(1)
+    old_fbo = _gl_object_id(GL.glGetIntegerv(GL.GL_FRAMEBUFFER_BINDING))
+    fbo = _gl_object_id(GL.glGenFramebuffers(1))
 
     GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, fbo)
 
-    texture = GL.glGenTextures(1)
+    texture = _gl_object_id(GL.glGenTextures(1))
     GL.glBindTexture(GL.GL_TEXTURE_2D, texture)
     GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGBA,
                     width, height,
@@ -115,6 +130,7 @@ class ADPOpenGLCanvas(QOpenGLWindow):
         self._canvas_texture = None
         self._fbo_width = 0
         self._fbo_height = 0
+        self._source_aspect_ratio = 1.0
 
     def __create_program(self):
         vertex_shader = """#version 330 core
@@ -125,6 +141,7 @@ class ADPOpenGLCanvas(QOpenGLWindow):
         uniform float rotation_angle;
         uniform float model_scale;
         uniform vec2 model_offset;
+        uniform vec2 stage_to_canvas_scale;
 
         void main() {
             gl_Position = vec4(a_position, 0.0, 1.0);
@@ -133,7 +150,11 @@ class ADPOpenGLCanvas(QOpenGLWindow):
             mat2 rotationMatrix = mat2(cos(angle), -sin(angle),
                                        sin(angle), cos(angle));
 
-            vec2 centeredTexCoord = a_texCoord - vec2(0.5, 0.5);
+            // Preserve the model's intrinsic canvas aspect ratio. The
+            // offscreen buffer follows that ratio and the final pass uses
+            // contain-style sampling, so no model edge is cropped.
+            vec2 centeredTexCoord =
+                (a_texCoord - vec2(0.5, 0.5)) * stage_to_canvas_scale;
             vec2 sourceCoord = (centeredTexCoord - model_offset) / max(model_scale, 0.01);
             v_texCoord = rotationMatrix * sourceCoord + vec2(0.5, 0.5);
         }
@@ -164,6 +185,9 @@ class ADPOpenGLCanvas(QOpenGLWindow):
         self._rotation_angle_loc = GL.glGetUniformLocation(self._program, "rotation_angle")
         self._model_scale_loc = GL.glGetUniformLocation(self._program, "model_scale")
         self._model_offset_loc = GL.glGetUniformLocation(self._program, "model_offset")
+        self._stage_to_canvas_scale_loc = GL.glGetUniformLocation(
+            self._program, "stage_to_canvas_scale"
+        )
         self._bg_color_loc = GL.glGetUniformLocation(self._program, "bg_color")
         self._use_bg_loc = GL.glGetUniformLocation(self._program, "use_bg")
 
@@ -202,24 +226,59 @@ class ADPOpenGLCanvas(QOpenGLWindow):
                 pass
             self._canvas_framebuffer = None
 
-    def __create_canvas_framebuffer(self):
+    def _desired_canvas_size(self, width: int | None = None, height: int | None = None):
+        logical_width = max(1, int(self.width() if width is None else width))
+        logical_height = max(1, int(self.height() if height is None else height))
+        # Match the longest host edge while retaining the model canvas aspect.
+        # This gives Live2D enough projection space for panoramic and portrait
+        # models instead of forcing them through a short-edge square.
+        longest = max(
+            1,
+            int(math.ceil(max(logical_width, logical_height) * self._dpr)),
+        )
+        aspect = max(0.01, float(self._source_aspect_ratio))
+        if aspect >= 1.0:
+            return longest, max(1, int(round(longest / aspect)))
+        return max(1, int(round(longest * aspect))), longest
+
+    def setSourceAspectRatio(self, aspect_ratio: float):
+        aspect = max(0.05, min(20.0, float(aspect_ratio or 1.0)))
+        if math.isclose(aspect, self._source_aspect_ratio, rel_tol=1e-4):
+            return
+        self._source_aspect_ratio = aspect
+        if self.context() is not None and self.isValid():
+            self.__create_canvas_framebuffer()
+
+    def __create_canvas_framebuffer(self, force: bool = False):
         # Determine device-pixel size for FBO
         self._dpr = float(self.devicePixelRatioF()) if hasattr(self, 'devicePixelRatioF') else float(self.devicePixelRatio())
-        fb_w = max(1, int(math.ceil(self.width() * self._dpr)))
-        fb_h = max(1, int(math.ceil(self.height() * self._dpr)))
+        fb_w, fb_h = self._desired_canvas_size()
         # Recreate only if size changed
-        if self._canvas_framebuffer and (fb_w == self._fbo_width and fb_h == self._fbo_height):
+        if (
+            not force
+            and self._canvas_framebuffer
+            and fb_w == self._fbo_width
+            and fb_h == self._fbo_height
+        ):
             return
-        # Delete old
-        self.__delete_canvas_framebuffer()
+        if force:
+            # initializeGL() may run for a freshly-created context. Object IDs
+            # from the previous context must not be reused or deleted there.
+            self._canvas_framebuffer = None
+            self._canvas_texture = None
+        else:
+            self.__delete_canvas_framebuffer()
         # Create new
         self._canvas_framebuffer, self._canvas_texture = create_canvas_framebuffer(fb_w, fb_h)
         self._fbo_width, self._fbo_height = fb_w, fb_h
 
     def __draw_on_canvas(self):
+        framebuffer = _gl_object_id(self._canvas_framebuffer)
+        if framebuffer <= 0:
+            return
         # Draw model into offscreen FBO at device-pixel resolution
-        old_fbo = GL.glGetIntegerv(GL.GL_FRAMEBUFFER_BINDING)
-        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self._canvas_framebuffer)
+        old_fbo = _gl_object_id(GL.glGetIntegerv(GL.GL_FRAMEBUFFER_BINDING))
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, framebuffer)
         # Ensure viewport matches FBO size
         GL.glViewport(0, 0, int(self._fbo_width), int(self._fbo_height))
         # Keep FBO transparent so compositing in second pass works
@@ -231,7 +290,7 @@ class ADPOpenGLCanvas(QOpenGLWindow):
     def initializeGL(self):
         self.__create_program()
         self.__create_vao()
-        self.__create_canvas_framebuffer()
+        self.__create_canvas_framebuffer(force=True)
         self.on_init()
         # Ensure model has correct initial size in pixels
         self.on_resize(self._fbo_width, self._fbo_height)
@@ -240,12 +299,19 @@ class ADPOpenGLCanvas(QOpenGLWindow):
         # Recreate FBO when widget size or DPR changes
         old_dpr = self._dpr
         self._dpr = float(self.devicePixelRatioF()) if hasattr(self, 'devicePixelRatioF') else float(self.devicePixelRatio())
-        if (int(math.ceil(w * self._dpr)) != self._fbo_width) or (int(math.ceil(h * self._dpr)) != self._fbo_height) or (self._dpr != old_dpr):
+        desired_w, desired_h = self._desired_canvas_size(w, h)
+        if (
+            desired_w != self._fbo_width
+            or desired_h != self._fbo_height
+            or self._dpr != old_dpr
+        ):
             self.__create_canvas_framebuffer()
         # Notify subclass with pixel sizes
         self.on_resize(self._fbo_width, self._fbo_height)
 
     def paintGL(self):
+        if not self._canvas_framebuffer or not self._canvas_texture:
+            return
         # First render to offscreen canvas
         self.__draw_on_canvas()
         # Then draw the canvas texture to the widget's default framebuffer
@@ -266,11 +332,22 @@ class ADPOpenGLCanvas(QOpenGLWindow):
         GL.glProgramUniform1f(self._program, self._rotation_angle_loc, self.__rotation_angle)
         GL.glProgramUniform1f(self._program, self._model_scale_loc, self.__model_scale)
         GL.glProgramUniform2f(self._program, self._model_offset_loc, *self.__model_offset)
+        viewport_aspect = float(vp_w) / float(vp_h)
+        canvas_aspect = float(self._fbo_width) / float(max(1, self._fbo_height))
+        if viewport_aspect >= canvas_aspect:
+            stage_to_canvas = (viewport_aspect / canvas_aspect, 1.0)
+        else:
+            stage_to_canvas = (1.0, canvas_aspect / viewport_aspect)
+        GL.glProgramUniform2f(
+            self._program,
+            self._stage_to_canvas_scale_loc,
+            *stage_to_canvas,
+        )
         GL.glProgramUniform4f(self._program, self._bg_color_loc, *self.__bg_color)
         GL.glProgramUniform1i(self._program, self._use_bg_loc, 1 if self.__use_background else 0)
 
         GL.glActiveTexture(GL.GL_TEXTURE0)
-        GL.glBindTexture(GL.GL_TEXTURE_2D, self._canvas_texture)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, _gl_object_id(self._canvas_texture))
         GL.glDrawArrays(GL.GL_TRIANGLES, 0, 6)
 
         GL.glBindVertexArray(0)
@@ -338,7 +415,10 @@ class Live2DCanvas(ADPOpenGLCanvas):
         self.model: Optional[live2d.LAppModel] = None
         # tool for controlling model opacity
         self.canvas: Optional[Canvas] = None
-        self.setWindowTitle("Live2DCanvas")
+        if hasattr(self, "setTitle"):
+            self.setTitle("Live2DCanvas")
+        elif hasattr(self, "setWindowTitle"):
+            self.setWindowTitle("Live2DCanvas")
         if self._embedded:
             self.setBackground(True, None)
         self.radius_per_frame = math.pi * 0.5 / 120
@@ -370,6 +450,21 @@ class Live2DCanvas(ADPOpenGLCanvas):
     def _load_model_with_current_context(self, model_path: str):
         model = live2d.LAppModel()
         model.LoadModelJson(model_path)
+        try:
+            canvas_size = model.GetCanvasSizePixel()
+            canvas_width = float(canvas_size[0])
+            canvas_height = float(canvas_size[1])
+            if canvas_width > 0 and canvas_height > 0:
+                self.setSourceAspectRatio(canvas_width / canvas_height)
+        except Exception:
+            try:
+                canvas_size = model.GetCanvasSize()
+                canvas_width = float(canvas_size[0])
+                canvas_height = float(canvas_size[1])
+                if canvas_width > 0 and canvas_height > 0:
+                    self.setSourceAspectRatio(canvas_width / canvas_height)
+            except Exception:
+                pass
         if self._fbo_width > 0 and self._fbo_height > 0:
             model.Resize(self._fbo_width, self._fbo_height)
         self.model = model

@@ -54,22 +54,19 @@ def prepare_model_json_for_preview(path: str | Path) -> Path:
     data = _read_json(model_json)
     _fix_model_motions(data, package.root_dir)
 
-    stem = model_json.stem
+    # A number of game-exported model settings are accepted by Python's JSON
+    # decoder but rejected by Cubism Native.  Write one normalized, disposable
+    # companion file for the preview backend instead of altering the source.
+    # Reusing this path also prevents a new ``.prettyN.json`` file from being
+    # created every time a user returns to the preview page.
     suffix = model_json.suffix or ".json"
-    pretty_path = model_json.with_name(f"{stem}.pretty{suffix}")
-    if pretty_path.exists():
-        index = 1
-        while True:
-            candidate = model_json.with_name(f"{stem}.pretty{index}{suffix}")
-            if not candidate.exists():
-                pretty_path = candidate
-                break
-            index += 1
-
-    with open(pretty_path, "w", encoding="utf-8") as f:
+    preview_path = model_json.with_name(f"{model_json.stem}.preview{suffix}")
+    temporary_path = preview_path.with_suffix(f"{preview_path.suffix}.tmp")
+    with open(temporary_path, "w", encoding="utf-8", newline="\n") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
         f.write("\n")
-    return pretty_path
+    temporary_path.replace(preview_path)
+    return preview_path
 
 
 def _package_from_model_json(model_json: Path) -> Live2DPackage:
@@ -124,9 +121,11 @@ def _fix_model_motions(model_json: dict, base_dir: Path) -> None:
     if not isinstance(motions, dict):
         return
 
-    for items in motions.values():
+    playable_groups: dict[str, list[dict]] = {}
+    for group, items in motions.items():
         if not isinstance(items, list):
             continue
+        playable_items: list[dict] = []
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -142,7 +141,17 @@ def _fix_model_motions(model_json: dict, base_dir: Path) -> None:
                     save_root=str(motion_path.parent),
                 )
             except Exception:
-                continue
+                pass
+            playable_items.append(item)
+        if playable_items:
+            playable_groups[str(group)] = playable_items
+
+    # Live2DViewer-style model settings sometimes use action entries without a
+    # motion file (for example, text/menu commands).  pylive2d maps those to
+    # ``NullValue`` and then asks Cubism to parse it as a motion.  They cannot
+    # be played in the native renderer, so omit them only from the generated
+    # preview copy; the source model remains untouched.
+    refs["Motions"] = playable_groups
 
 
 def _model_sort_key(path: Path) -> tuple[int, int, str]:

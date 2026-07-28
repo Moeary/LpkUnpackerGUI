@@ -1,5 +1,6 @@
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QFileDialog, QFrame, QVBoxLayout, QHBoxLayout
+from pathlib import Path
 from qfluentwidgets import (
     CardWidget,
     SubtitleLabel,
@@ -34,6 +35,7 @@ class SettingsPage(QFrame):
 
         self._language_codes = ["en_US", "zh_CN", "ja_JP"]
         self._theme_values = ["auto", "light", "dark"]
+        self._texture_viewer_values = ["internal", "system", "custom"]
         self._syncing_ui = False
 
         self.title_label = None
@@ -76,6 +78,12 @@ class SettingsPage(QFrame):
         self.photoshop_edit = None
         self.photoshop_button = None
         self.photoshop_clear_button = None
+        self.texture_viewer_label = None
+        self.texture_viewer_desc = None
+        self.texture_viewer_combo = None
+        self.image_viewer_edit = None
+        self.image_viewer_button = None
+        self.image_viewer_clear_button = None
         self.setting_file_note = None
         self.save_button = None
 
@@ -285,6 +293,29 @@ class SettingsPage(QFrame):
         photoshop_row.addWidget(self.photoshop_clear_button)
         runtime_layout.addLayout(photoshop_row)
 
+        texture_viewer_row = QHBoxLayout()
+        texture_viewer_row.setSpacing(12)
+        texture_viewer_text_layout = QVBoxLayout()
+        texture_viewer_text_layout.setSpacing(4)
+        self.texture_viewer_label = BodyLabel("", runtime_card)
+        self.texture_viewer_desc = CaptionLabel("", runtime_card)
+        self.texture_viewer_desc.setWordWrap(True)
+        texture_viewer_text_layout.addWidget(self.texture_viewer_label)
+        texture_viewer_text_layout.addWidget(self.texture_viewer_desc)
+        self.texture_viewer_combo = ComboBox(runtime_card)
+        self.texture_viewer_combo.setMinimumWidth(150)
+        self.image_viewer_edit = LineEdit(runtime_card)
+        self.image_viewer_button = PushButton("", runtime_card)
+        self.image_viewer_button.clicked.connect(self.browse_image_viewer)
+        self.image_viewer_clear_button = PushButton("", runtime_card)
+        self.image_viewer_clear_button.clicked.connect(self.clear_image_viewer)
+        texture_viewer_row.addLayout(texture_viewer_text_layout, 1)
+        texture_viewer_row.addWidget(self.texture_viewer_combo)
+        texture_viewer_row.addWidget(self.image_viewer_edit, 2)
+        texture_viewer_row.addWidget(self.image_viewer_button)
+        texture_viewer_row.addWidget(self.image_viewer_clear_button)
+        runtime_layout.addLayout(texture_viewer_row)
+
         self.setting_file_note = CaptionLabel("", runtime_card)
         self.setting_file_note.setWordWrap(True)
         runtime_layout.addWidget(self.setting_file_note)
@@ -320,6 +351,16 @@ class SettingsPage(QFrame):
                 self.cubism_core_edit.setText(self.settings_manager.get_cubism_core_dll_path())
             if self.photoshop_edit:
                 self.photoshop_edit.setText(self.settings_manager.get_photoshop_path())
+            if self.texture_viewer_combo:
+                self._set_combo_by_value(
+                    self.texture_viewer_combo,
+                    self._texture_viewer_values,
+                    self.settings_manager.get_texture_viewer_mode(),
+                )
+            if self.image_viewer_edit:
+                self.image_viewer_edit.setText(
+                    self.settings_manager.get_image_viewer_path()
+                )
             self.refresh_tool_status_labels()
         finally:
             self._syncing_ui = False
@@ -387,6 +428,27 @@ class SettingsPage(QFrame):
             self.photoshop_edit.setPlaceholderText(tr("settings.photoshop_placeholder"))
             self.photoshop_button.setText(tr("common.browse"))
             self.photoshop_clear_button.setText(tr("common.clear"))
+            self.texture_viewer_label.setText(tr("settings.texture_viewer_label"))
+            self.texture_viewer_desc.setText(tr("settings.texture_viewer_desc"))
+            current_texture_viewer = self._current_combo_value(
+                self.texture_viewer_combo,
+                self._texture_viewer_values,
+            )
+            self.texture_viewer_combo.clear()
+            for mode in self._texture_viewer_values:
+                self.texture_viewer_combo.addItem(
+                    tr(f"settings.texture_viewer.{mode}")
+                )
+            self._set_combo_by_value(
+                self.texture_viewer_combo,
+                self._texture_viewer_values,
+                current_texture_viewer,
+            )
+            self.image_viewer_edit.setPlaceholderText(
+                tr("settings.image_viewer_placeholder")
+            )
+            self.image_viewer_button.setText(tr("common.browse"))
+            self.image_viewer_clear_button.setText(tr("common.clear"))
             self.refresh_tool_status_labels()
             self.setting_file_note.setText(
                 tr("settings.setting_file_note", path=self.settings_manager.settings_file)
@@ -475,6 +537,15 @@ class SettingsPage(QFrame):
         )
         self.settings_manager.set_photoshop_path(
             self.photoshop_edit.text() if self.photoshop_edit else ""
+        )
+        self.settings_manager.set_texture_viewer_mode(
+            self._current_combo_value(
+                self.texture_viewer_combo,
+                self._texture_viewer_values,
+            )
+        )
+        self.settings_manager.set_image_viewer_path(
+            self.image_viewer_edit.text() if self.image_viewer_edit else ""
         )
         self.load_current_settings()
         InfoBar.success(
@@ -598,6 +669,20 @@ class SettingsPage(QFrame):
         if path:
             self.photoshop_edit.setText(path)
             self.save_photoshop(path)
+
+    def browse_image_viewer(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            tr("settings.image_viewer_select"),
+            self.image_viewer_edit.text() or "",
+            tr("settings.image_viewer_filter"),
+        )
+        if path:
+            self.image_viewer_edit.setText(path)
+
+    def clear_image_viewer(self):
+        self.image_viewer_edit.clear()
+        self.settings_manager.set_image_viewer_path("")
 
     def clear_photoshop(self):
         self.photoshop_edit.clear()
