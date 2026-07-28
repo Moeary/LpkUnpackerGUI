@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import json
 import math
 import re
@@ -221,6 +223,7 @@ def _validate_layer_budget(
     texture_pixels: int,
     limits: PsdResourceLimits,
     operation: str,
+    extra_memory_bytes: int = 0,
 ) -> None:
     if layer_count > limits.max_layer_count:
         raise PsdReconstructionError(
@@ -235,7 +238,11 @@ def _validate_layer_budget(
 
     # Export keeps source RGBA textures and several copies of each layer while
     # psd-tools builds channel data.  The multiplier is deliberately cautious.
-    estimated_bytes = texture_pixels * 4 * 2 + total_layer_pixels * 4 * 5
+    estimated_bytes = (
+        texture_pixels * 4 * 2
+        + total_layer_pixels * 4 * 5
+        + max(0, int(extra_memory_bytes))
+    )
     limit_bytes = limits.max_memory_mb * 1024 * 1024
     if estimated_bytes > limit_bytes:
         raise PsdReconstructionError(
@@ -361,6 +368,7 @@ def reconstruct_live2d_psd(
     )
     _save_psd(psd_path, size, layers, progress=progress, resource_limits=limits)
     _emit(progress, 98, "Writing metadata")
+    _refresh_pixel_references_from_psd(psd_path, layer_metadata)
     _write_json(
         metadata_path,
         _build_export_metadata(
@@ -541,6 +549,13 @@ def _repack_mesh_psd_layers(
         left = int(getattr(layer, "left", layer_info.get("left", 0)))
         top = int(getattr(layer, "top", layer_info.get("top", 0)))
         source = np.asarray(image.convert("RGBA"))
+        changed_tiles = _pixel_reference_changed_mask(
+            source,
+            layer_info.get("pixel_reference"),
+        )
+        if changed_tiles is not None and not np.any(changed_tiles):
+            _emit(progress, 10 + int((index + 1) / total * 80), f"Packed {layer_info['name']}")
+            continue
         local_vertices = vertices - np.asarray([left, top], dtype=np.float32)
         texture_points = _uv_to_texture_points(uvs, canvas)
         original_layer = _render_repack_reference_layer(
@@ -553,6 +568,8 @@ def _repack_mesh_psd_layers(
             float(layer_info.get("opacity", 1.0)),
         )
         edit_mask = _changed_pixel_mask(cv2, source, original_layer)
+        if changed_tiles is not None:
+            edit_mask = np.where(changed_tiles, edit_mask, 0).astype(np.uint8)
         if not np.any(edit_mask):
             _emit(progress, 10 + int((index + 1) / total * 80), f"Packed {layer_info['name']}")
             continue
@@ -721,16 +738,7 @@ def _render_repack_reference_layer(
     opacity: float,
 ) -> np.ndarray:
     layer = np.zeros(shape, dtype=np.uint8)
-    for tri in _iter_triangles(indices):
-        if max(tri) >= len(local_vertices) or max(tri) >= len(texture_points):
-            continue
-        _warp_triangle(
-            cv2,
-            texture,
-            layer,
-            texture_points[list(tri)],
-            local_vertices[list(tri)],
-        )
+    _paint_triangles(cv2, texture, layer, texture_points, local_vertices, indices)
     if opacity < 1.0:
         layer[:, :, 3] = np.clip(layer[:, :, 3].astype(np.float32) * opacity, 0, 255).astype(
             np.uint8
@@ -762,6 +770,94 @@ def _changed_pixel_mask(cv2, edited: np.ndarray, reference: np.ndarray) -> np.nd
 
     kernel = np.ones((3, 3), dtype=np.uint8)
     return cv2.dilate(mask, kernel, iterations=1)
+
+
+def _build_pixel_reference(image: Image.Image, tile_size: int = 32) -> dict[str, Any]:
+    rgba = np.ascontiguousarray(np.asarray(image.convert("RGBA"), dtype=np.uint8))
+    height, width = rgba.shape[:2]
+    tile_size = max(8, int(tile_size))
+    hashes = bytearray()
+    for top in range(0, height, tile_size):
+        for left in range(0, width, tile_size):
+            tile = np.ascontiguousarray(
+                rgba[top : top + tile_size, left : left + tile_size]
+            )
+            hashes.extend(hashlib.blake2b(tile.tobytes(), digest_size=8).digest())
+    return {
+        "version": 1,
+        "width": width,
+        "height": height,
+        "tile_size": tile_size,
+        "digest": base64.b64encode(
+            hashlib.blake2b(rgba.tobytes(), digest_size=16).digest()
+        ).decode("ascii"),
+        "tile_hashes": base64.b64encode(bytes(hashes)).decode("ascii"),
+    }
+
+
+def _refresh_pixel_references_from_psd(
+    psd_path: Path,
+    layers_metadata: list[dict[str, Any]],
+) -> None:
+    from psd_tools import PSDImage
+
+    indexed = _index_psd_layers(PSDImage.open(psd_path))
+    for layer_info in layers_metadata:
+        layer = indexed.get(str(layer_info.get("name", "")))
+        if layer is None:
+            continue
+        image = layer.composite(force=True)
+        if image is not None:
+            layer_info["pixel_reference"] = _build_pixel_reference(image)
+
+
+def _pixel_reference_changed_mask(
+    rgba: np.ndarray,
+    reference: Any,
+) -> np.ndarray | None:
+    if not isinstance(reference, Mapping):
+        return None
+    image = np.ascontiguousarray(np.asarray(rgba, dtype=np.uint8))
+    height, width = image.shape[:2]
+    if (
+        int(reference.get("width", -1)) != width
+        or int(reference.get("height", -1)) != height
+    ):
+        return None
+    try:
+        expected_digest = base64.b64decode(str(reference.get("digest", "")), validate=True)
+        actual_digest = hashlib.blake2b(image.tobytes(), digest_size=16).digest()
+        if actual_digest == expected_digest:
+            return np.zeros((height, width), dtype=bool)
+
+        tile_size = max(8, int(reference.get("tile_size", 32)))
+        expected = base64.b64decode(
+            str(reference.get("tile_hashes", "")),
+            validate=True,
+        )
+    except (TypeError, ValueError):
+        return None
+
+    tiles_x = math.ceil(width / tile_size)
+    tiles_y = math.ceil(height / tile_size)
+    if len(expected) != tiles_x * tiles_y * 8:
+        return None
+
+    changed = np.zeros((height, width), dtype=bool)
+    offset = 0
+    for top in range(0, height, tile_size):
+        for left in range(0, width, tile_size):
+            tile = np.ascontiguousarray(
+                image[top : top + tile_size, left : left + tile_size]
+            )
+            digest = hashlib.blake2b(tile.tobytes(), digest_size=8).digest()
+            if digest != expected[offset : offset + 8]:
+                changed[
+                    top : top + tile_size,
+                    left : left + tile_size,
+                ] = True
+            offset += 8
+    return changed
 
 
 def resolve_live2d_source(source: Path) -> Live2DSource:
@@ -916,6 +1012,11 @@ def _render_mesh_layers(
         texture_pixels,
         limits,
         "PSD export",
+        extra_memory_bytes=(
+            source_size[0] * source_size[1] * 8
+            if coordinate_scale < 1.0
+            else 0
+        ),
     )
 
     drawable_by_index = {int(item["source_index"]): item for item in drawable_infos}
@@ -926,6 +1027,11 @@ def _render_mesh_layers(
 
     layers: list[PsdLayer] = []
     layer_metadata: list[dict[str, Any]] = []
+    clean_source_composite = (
+        Image.new("RGBA", source_size, (0, 0, 0, 0))
+        if coordinate_scale < 1.0
+        else None
+    )
     total = max(1, len(ordered))
     for index, drawable in enumerate(ordered):
         if not drawable.get("visible", True):
@@ -940,18 +1046,29 @@ def _render_mesh_layers(
             continue
 
         texture = textures[texture_index]
-        vertices = (np.asarray(drawable["vertices"], dtype=np.float32) + offset) * coordinate_scale
+        # Rasterize in the original Cubism coordinate space, matching the
+        # pre-limit exporter that produced clean layers.  Scaling every mesh
+        # vertex before rasterization moves shared triangle edges onto slightly
+        # different subpixels and exposes their anti-aliased boundaries.
+        source_vertices = np.asarray(drawable["vertices"], dtype=np.float32) + offset
+        vertices = source_vertices * coordinate_scale
         uvs = _uv_to_texture_points(np.asarray(drawable["uvs"], dtype=np.float32), texture)
         if not _uv_source_has_alpha(texture, uvs):
             continue
 
         indices = drawable["indices"]
-        bounds = _vertex_bounds(vertices, canvas_w, canvas_h)
-        if bounds is None:
+        source_bounds = _vertex_bounds(source_vertices, source_size[0], source_size[1])
+        if source_bounds is None:
             continue
-        layer_left, layer_top, layer_width, layer_height = bounds
+        layer_left, layer_top, layer_width, layer_height = source_bounds
+        layer_pixels = layer_width * layer_height
+        if layer_pixels * 20 > limits.max_memory_mb * 1024 * 1024:
+            raise PsdReconstructionError(
+                f"PSD export blocked by the safety limit: drawable {drawable['id']} "
+                f"needs too much temporary raster memory."
+            )
         layer = np.zeros((layer_height, layer_width, 4), dtype=np.uint8)
-        local_vertices = vertices - np.asarray([layer_left, layer_top], dtype=np.float32)
+        local_vertices = source_vertices - np.asarray([layer_left, layer_top], dtype=np.float32)
 
         _paint_triangles(cv2, texture, layer, uvs, local_vertices, indices)
 
@@ -967,21 +1084,39 @@ def _render_mesh_layers(
             textures,
             offset,
             np.asarray([layer_left, layer_top], dtype=np.float32),
-            coordinate_scale,
+            1.0,
         )
 
         bbox = _alpha_bbox(layer)
         if bbox is None:
             continue
         crop_left, crop_top, width, height = bbox
-        left = layer_left + crop_left
-        top = layer_top + crop_top
+        source_left = layer_left + crop_left
+        source_top = layer_top + crop_top
+        source_right = source_left + width
+        source_bottom = source_top + height
+        left = int(math.floor(source_left * coordinate_scale))
+        top = int(math.floor(source_top * coordinate_scale))
+        right = int(math.ceil(source_right * coordinate_scale))
+        bottom = int(math.ceil(source_bottom * coordinate_scale))
+        output_width = max(1, right - left)
+        output_height = max(1, bottom - top)
 
         layer_name = _safe_layer_name(drawable["id"])
         group_name = _drawable_group_name(drawable)
-        image = Image.fromarray(
+        source_image = Image.fromarray(
             layer[crop_top : crop_top + height, crop_left : crop_left + width],
             "RGBA",
+        )
+        if clean_source_composite is not None:
+            clean_source_composite.alpha_composite(
+                source_image,
+                dest=(source_left, source_top),
+            )
+        image = (
+            _resize_rgba_premultiplied(source_image, (output_width, output_height))
+            if coordinate_scale != 1.0
+            else source_image
         )
         layers.append(PsdLayer(layer_name, image, left, top, group_name))
         layer_metadata.append(
@@ -993,7 +1128,7 @@ def _render_mesh_layers(
                 "texture_index": texture_index,
                 "left": left,
                 "top": top,
-                "bbox": [left, top, width, height],
+                "bbox": [left, top, output_width, output_height],
                 "vertices": drawable["vertices"],
                 "uvs": drawable["uvs"],
                 "indices": drawable["indices"],
@@ -1007,6 +1142,17 @@ def _render_mesh_layers(
 
     if not layers:
         raise PsdReconstructionError("No drawable layers were rendered.")
+    if clean_source_composite is not None:
+        clean_target = _resize_rgba_premultiplied(clean_source_composite, size)
+        seam_underlay, seam_overlay = _build_seam_protection_layers(
+            clean_target,
+            size,
+            layers,
+        )
+        if seam_underlay is not None:
+            layers.insert(0, seam_underlay)
+        if seam_overlay is not None:
+            layers.append(seam_overlay)
     return layers, size, layer_metadata
 
 
@@ -1260,10 +1406,13 @@ def _warp_triangle(cv2, src: np.ndarray, dst: np.ndarray, src_tri: np.ndarray, d
     if sw <= 0 or sh <= 0 or dw <= 0 or dh <= 0:
         return
 
-    sx0, sy0 = max(0, sx), max(0, sy)
-    sx1, sy1 = min(src.shape[1], sx + sw), min(src.shape[0], sy + sh)
-    dx0, dy0 = max(0, dx), max(0, dy)
-    dx1, dy1 = min(dst.shape[1], dx + dw), min(dst.shape[0], dy + dh)
+    # Keep interpolation taps outside the triangle's own bounding box.  Without
+    # this padding, pixels along a shared mesh edge sample the transparent
+    # border of the temporary crop rather than the neighbouring atlas texels.
+    sx0, sy0 = max(0, sx - 2), max(0, sy - 2)
+    sx1, sy1 = min(src.shape[1], sx + sw + 2), min(src.shape[0], sy + sh + 2)
+    dx0, dy0 = max(0, dx - 1), max(0, dy - 1)
+    dx1, dy1 = min(dst.shape[1], dx + dw + 1), min(dst.shape[0], dy + dh + 1)
 
     if sx1 <= sx0 or sy1 <= sy0 or dx1 <= dx0 or dy1 <= dy0:
         return
@@ -1282,15 +1431,16 @@ def _warp_triangle(cv2, src: np.ndarray, dst: np.ndarray, src_tri: np.ndarray, d
         borderValue=(0, 0, 0, 0),
     )
 
-    # Adjacent Cubism triangles often meet on fractional coordinates.  A
-    # one-pixel overlap with a hard mask avoids transparent/black hairline
-    # seams created by anti-aliased masks and zero-alpha border interpolation.
-    center = np.mean(dst_shift, axis=0)
-    expanded = center + (dst_shift - center) * 1.01
+    # Internal triangle edges are not visible object edges.  Anti-aliasing each
+    # triangle separately blends two half-covered pixels and leaves a bright or
+    # transparent seam.  A hard, unexpanded mask assigns every shared-edge
+    # pixel to at least one triangle.  The completed high-resolution drawable
+    # is downsampled as one image later, which provides anti-aliasing only at
+    # the actual ArtMesh silhouette.
     mask = np.zeros((dy1 - dy0, dx1 - dx0), dtype=np.uint8)
     cv2.fillConvexPoly(
         mask,
-        np.rint(expanded).astype(np.int32),
+        np.rint(dst_shift).astype(np.int32),
         255,
         lineType=cv2.LINE_8,
     )
@@ -1374,10 +1524,83 @@ def _paint_triangles(
     vertices: np.ndarray,
     indices: list[int],
 ) -> None:
+    """Rasterize one ArtMesh with a single UV map.
+
+    Sampling each triangle into a transparent temporary crop makes interpolation
+    read that crop border at shared edges.  Compositing anti-aliased triangle
+    masks then turns two half-covered edges into a visible seam.  Building one
+    destination-to-texture map avoids both effects: every covered pixel is
+    sampled once from the complete atlas.  The completed high-resolution
+    drawable is resized as one image later, so only its outer silhouette is
+    anti-aliased.
+    """
+    height, width = layer.shape[:2]
+    map_x = np.full((height, width), -1.0, dtype=np.float32)
+    map_y = np.full((height, width), -1.0, dtype=np.float32)
+    coverage = np.zeros((height, width), dtype=bool)
+    fallback_triangles: list[tuple[np.ndarray, np.ndarray]] = []
+
     for tri in _iter_triangles(indices):
         if max(tri) >= len(vertices) or max(tri) >= len(uvs):
             continue
-        _warp_triangle(cv2, texture, layer, uvs[list(tri)], vertices[list(tri)])
+        dst_tri = np.asarray(vertices[list(tri)], dtype=np.float32)
+        src_tri = np.asarray(uvs[list(tri)], dtype=np.float32)
+        if not np.all(np.isfinite(dst_tri)) or not np.all(np.isfinite(src_tri)):
+            continue
+        edge_a = dst_tri[1] - dst_tri[0]
+        edge_b = dst_tri[2] - dst_tri[0]
+        determinant = float(edge_a[0] * edge_b[1] - edge_a[1] * edge_b[0])
+        if abs(determinant) < 1e-5:
+            fallback_triangles.append((src_tri, dst_tri))
+            continue
+
+        x0 = max(0, int(math.floor(float(np.min(dst_tri[:, 0])))))
+        y0 = max(0, int(math.floor(float(np.min(dst_tri[:, 1])))))
+        x1 = min(width, int(math.ceil(float(np.max(dst_tri[:, 0])))) + 1)
+        y1 = min(height, int(math.ceil(float(np.max(dst_tri[:, 1])))) + 1)
+        if x1 <= x0 or y1 <= y0:
+            continue
+
+        shifted = dst_tri - np.asarray([x0, y0], dtype=np.float32)
+        hard_mask = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+        points = np.rint(shifted).astype(np.int32)
+        cv2.fillConvexPoly(hard_mask, points, 255, lineType=cv2.LINE_8)
+        selected = hard_mask > 0
+        if not np.any(selected):
+            continue
+
+        inverse = cv2.getAffineTransform(dst_tri, src_tri)
+        rows, columns = np.ogrid[y0:y1, x0:x1]
+        source_x = (
+            inverse[0, 0] * columns
+            + inverse[0, 1] * rows
+            + inverse[0, 2]
+        ).astype(np.float32)
+        source_y = (
+            inverse[1, 0] * columns
+            + inverse[1, 1] * rows
+            + inverse[1, 2]
+        ).astype(np.float32)
+
+        roi_x = map_x[y0:y1, x0:x1]
+        roi_y = map_y[y0:y1, x0:x1]
+        roi_coverage = coverage[y0:y1, x0:x1]
+        roi_x[selected] = source_x[selected]
+        roi_y[selected] = source_y[selected]
+        roi_coverage[selected] = True
+
+    if np.any(coverage):
+        sampled = cv2.remap(
+            texture,
+            map_x,
+            map_y,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0, 0),
+        )
+        layer[coverage] = sampled[coverage]
+    for src_tri, dst_tri in fallback_triangles:
+        _warp_triangle(cv2, texture, layer, src_tri, dst_tri)
 
 
 def _apply_drawable_masks(
@@ -1460,6 +1683,133 @@ def _alpha_blend(dst_roi: np.ndarray, src_rgba: np.ndarray, mask: np.ndarray) ->
 
     dst_roi[:, :, :3] = np.clip(out_rgb, 0, 255).astype(np.uint8)
     dst_roi[:, :, 3:4] = np.clip(out_alpha * 255.0, 0, 255).astype(np.uint8)
+
+
+def _resize_rgba_premultiplied(image: Image.Image, size: tuple[int, int]) -> Image.Image:
+    """Resize RGBA without pulling transparent black into visible edge pixels."""
+    if image.size == size:
+        return image
+    rgba = np.asarray(image.convert("RGBA"), dtype=np.float32)
+    alpha = rgba[:, :, 3:4] / 255.0
+    premultiplied = np.concatenate((rgba[:, :, :3] * alpha, rgba[:, :, 3:4]), axis=2)
+    resized = np.asarray(
+        Image.fromarray(np.clip(premultiplied, 0, 255).astype(np.uint8), "RGBA").resize(
+            size,
+            Image.Resampling.LANCZOS,
+        ),
+        dtype=np.float32,
+    )
+    out_alpha = resized[:, :, 3:4]
+    rgb = np.divide(
+        resized[:, :, :3] * 255.0,
+        np.maximum(out_alpha, 1.0),
+        out=np.zeros_like(resized[:, :, :3]),
+        where=out_alpha > 0,
+    )
+    output = np.concatenate((np.clip(rgb, 0, 255), np.clip(out_alpha, 0, 255)), axis=2)
+    return Image.fromarray(output.astype(np.uint8), "RGBA")
+
+
+def _build_seam_protection_layers(
+    clean_composite: Image.Image,
+    size: tuple[int, int],
+    layers: list[PsdLayer],
+) -> tuple[PsdLayer | None, PsdLayer | None]:
+    """Build small non-repack layers that restore composite-after-resize output."""
+    resized_stack = Image.new("RGBA", size, (0, 0, 0, 0))
+    for layer in layers:
+        resized_stack.alpha_composite(
+            layer.image,
+            dest=(int(layer.left), int(layer.top)),
+        )
+
+    target = np.asarray(clean_composite.convert("RGBA"), dtype=np.float32) / 255.0
+    front = np.asarray(resized_stack, dtype=np.float32) / 255.0
+    target_alpha = target[:, :, 3:4]
+    front_alpha = front[:, :, 3:4]
+    remaining = 1.0 - front_alpha
+
+    under_alpha = np.divide(
+        target_alpha - front_alpha,
+        np.maximum(remaining, 1e-6),
+        out=np.zeros_like(target_alpha),
+        where=remaining > 1e-6,
+    )
+    under_alpha = np.clip(under_alpha, 0.0, 1.0)
+
+    target_premultiplied = target[:, :, :3] * target_alpha
+    front_premultiplied = front[:, :, :3] * front_alpha
+    under_premultiplied = np.divide(
+        target_premultiplied - front_premultiplied,
+        np.maximum(remaining, 1e-6),
+        out=np.zeros_like(target_premultiplied),
+        where=remaining > 1e-6,
+    )
+    under_rgb = np.divide(
+        under_premultiplied,
+        np.maximum(under_alpha, 1e-6),
+        out=np.zeros_like(under_premultiplied),
+        where=under_alpha > 1e-6,
+    )
+
+    under_correction = np.concatenate(
+        (np.clip(under_rgb, 0.0, 1.0), under_alpha),
+        axis=2,
+    )
+    under_correction[under_alpha[:, :, 0] < (1.0 / 255.0)] = 0.0
+    underlay = _crop_protection_layer(
+        under_correction,
+        "__Seam protection underlay - do not edit__",
+    )
+
+    # Where both composites are already opaque, an underlay cannot alter RGB.
+    # Find the least-opaque source-over colour that transforms the separately
+    # resized stack back to the clean composite.  This keeps the correction as
+    # transparent as possible instead of covering editable artwork wholesale.
+    front_rgb = front[:, :, :3]
+    target_rgb = target[:, :, :3]
+    delta = target_rgb - front_rgb
+    brighter = np.divide(
+        np.maximum(delta, 0.0),
+        np.maximum(1.0 - front_rgb, 1e-6),
+    )
+    darker = np.divide(
+        np.maximum(-delta, 0.0),
+        np.maximum(front_rgb, 1e-6),
+    )
+    overlay_alpha = np.max(np.maximum(brighter, darker), axis=2, keepdims=True)
+    opaque = (target_alpha > 0.995) & (front_alpha > 0.995)
+    visible_delta = np.max(np.abs(delta), axis=2, keepdims=True) > (2.0 / 255.0)
+    overlay_alpha = np.where(opaque & visible_delta, overlay_alpha, 0.0)
+    overlay_alpha = np.clip(overlay_alpha, 0.0, 1.0)
+    overlay_rgb = np.divide(
+        target_rgb - front_rgb * (1.0 - overlay_alpha),
+        np.maximum(overlay_alpha, 1e-6),
+        out=np.zeros_like(target_rgb),
+        where=overlay_alpha > 1e-6,
+    )
+    overlay_correction = np.concatenate(
+        (np.clip(overlay_rgb, 0.0, 1.0), overlay_alpha),
+        axis=2,
+    )
+    overlay = _crop_protection_layer(
+        overlay_correction,
+        "__Seam protection overlay - hide for edge edits__",
+    )
+    return underlay, overlay
+
+
+def _crop_protection_layer(
+    correction: np.ndarray,
+    name: str,
+) -> PsdLayer | None:
+    rgba = np.clip(correction * 255.0, 0, 255).astype(np.uint8)
+    bbox = _alpha_bbox(rgba)
+    if bbox is None:
+        return None
+    left, top, width, height = bbox
+    image = Image.fromarray(rgba[top : top + height, left : left + width], "RGBA")
+    return PsdLayer(name, image, left, top)
 
 
 def _vertex_bounds(

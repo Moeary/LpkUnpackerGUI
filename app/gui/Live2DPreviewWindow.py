@@ -900,6 +900,11 @@ class Live2DPreviewWindow(QWidget):
         if self.live2d_canvas:
             self.live2d_canvas.setMotionLoop(bool(enabled))
 
+    def set_motion_time(self, motion: dict | None, seconds: float) -> dict[str, float]:
+        if not self.live2d_canvas:
+            return {}
+        return self.live2d_canvas.setMotionTime(motion, float(seconds))
+
     def toggle_control_panel(self):
         """切换控制面板显示/隐藏"""
         if self.control_panel.isVisible():

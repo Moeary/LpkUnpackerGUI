@@ -140,30 +140,42 @@ class PsdReconstructionThread(QThread):
 
 
 class PsdMultiRepackDialog(QDialog):
-    """Collect a PSD stack ordered from highest to lowest priority."""
+    """Choose project PSDs and order only the stack being written back."""
 
-    def __init__(self, parent: QWidget, initial_psd: str = ""):
+    def __init__(
+        self,
+        parent: QWidget,
+        project_psds: list[tuple[str, str]],
+        initial_psd: str = "",
+    ):
         super().__init__(parent)
-        self.setMinimumWidth(640)
+        self.setMinimumWidth(560)
         self.setWindowTitle(tr("psd.multi.title"))
         layout = QVBoxLayout(self)
         hint = CaptionLabel(tr("psd.multi.hint"), self)
         hint.setWordWrap(True)
         layout.addWidget(hint)
+        source_row = QHBoxLayout()
+        self.project_psd_combo = ComboBox(self)
+        for label, path in project_psds:
+            self.project_psd_combo.addItem(label, userData=path)
+        self.add_button = PushButton(tr("psd.multi.add"), self)
+        self.add_button.clicked.connect(self.add_selected_project_psd)
+        source_row.addWidget(self.project_psd_combo, 1)
+        source_row.addWidget(self.add_button)
+        layout.addLayout(source_row)
         self.psd_list = QListWidget(self)
-        self.psd_list.setMinimumHeight(210)
+        self.psd_list.setMinimumHeight(150)
         layout.addWidget(self.psd_list)
 
         controls = QHBoxLayout()
-        self.add_button = PushButton(tr("psd.multi.add"), self)
         self.remove_button = PushButton(tr("psd.multi.remove"), self)
         self.up_button = PushButton(tr("psd.multi.move_up"), self)
         self.down_button = PushButton(tr("psd.multi.move_down"), self)
-        self.add_button.clicked.connect(self.add_psds)
         self.remove_button.clicked.connect(self.remove_current)
         self.up_button.clicked.connect(lambda: self.move_current(-1))
         self.down_button.clicked.connect(lambda: self.move_current(1))
-        for button in (self.add_button, self.remove_button, self.up_button, self.down_button):
+        for button in (self.remove_button, self.up_button, self.down_button):
             controls.addWidget(button)
         controls.addStretch(1)
         layout.addLayout(controls)
@@ -187,6 +199,11 @@ class PsdMultiRepackDialog(QDialog):
         if initial_psd and Path(initial_psd).is_file():
             self.add_path(initial_psd)
 
+    def add_selected_project_psd(self):
+        path = str(self.project_psd_combo.currentData() or "")
+        if path:
+            self.add_path(path)
+
     def add_path(self, path: str):
         resolved = str(Path(path).resolve())
         if any(self.psd_list.item(i).data(Qt.ItemDataRole.UserRole) == resolved for i in range(self.psd_list.count())):
@@ -196,11 +213,6 @@ class PsdMultiRepackDialog(QDialog):
         item.setData(Qt.ItemDataRole.UserRole, resolved)
         self.psd_list.addItem(item)
         self.psd_list.setCurrentItem(item)
-
-    def add_psds(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, tr("psd.multi.add"), "", "PSD (*.psd)")
-        for path in paths:
-            self.add_path(path)
 
     def remove_current(self):
         row = self.psd_list.currentRow()
@@ -220,7 +232,8 @@ class PsdMultiRepackDialog(QDialog):
         return [str(self.psd_list.item(i).data(Qt.ItemDataRole.UserRole)) for i in range(self.psd_list.count())]
 
     def accept_if_valid(self):
-        if len(self.ordered_paths()) < 2 or not self.texture_name_edit.text().strip():
+        count = len(self.ordered_paths())
+        if count < 1 or (count > 1 and not self.texture_name_edit.text().strip()):
             InfoBar.warning(
                 title=tr("common.warning"),
                 content=tr("psd.multi.validation"),
@@ -622,12 +635,11 @@ class PsdReconstructionPage(QFrame):
             self.on_pose_scheme_changed
         )
         self.repack_psd_button = PushButton("", self.repack_card)
-        self.repack_psd_button.clicked.connect(self.browse_repack_psd_file)
+        self.repack_psd_button.clicked.connect(self.open_project_psd_folder)
         self.repack_photoshop_button = PushButton("", self.repack_card)
         self.repack_photoshop_button.clicked.connect(self.open_current_psd_in_photoshop)
         self.repack_psd_layout.addWidget(self.pose_scheme_label)
         self.repack_psd_layout.addWidget(self.pose_scheme_combo, 1)
-        self.repack_psd_layout.addWidget(self.repack_psd_button)
         self.repack_psd_layout.addWidget(self.repack_photoshop_button)
         self.repack_card_layout.addLayout(self.repack_psd_layout)
 
@@ -676,12 +688,17 @@ class PsdReconstructionPage(QFrame):
         self.open_photoshop_button = PushButton("", self.left_panel)
         self.open_photoshop_button.setEnabled(False)
         self.open_photoshop_button.clicked.connect(self.open_current_psd_in_photoshop)
+        # Kept for compatibility with older signal paths, but it is no longer
+        # part of the layout.  Leaving a parented visible widget here caused
+        # the stray button at the page's top-left corner.
+        self.open_photoshop_button.setVisible(False)
         self.multi_repack_button = PushButton("", self.left_panel)
         self.multi_repack_button.clicked.connect(self.start_multi_repack)
+        self.multi_repack_button.setVisible(False)
         self.preview_toggle_button = PushButton("", self.left_panel)
         self.preview_toggle_button.clicked.connect(self.toggle_preview_panel)
         self.action_layout.addWidget(self.reconstruct_button)
-        self.action_layout.addWidget(self.multi_repack_button)
+        self.action_layout.addWidget(self.repack_psd_button)
         self.action_layout.addWidget(self.open_output_button)
         self.action_layout.addWidget(self.preview_toggle_button)
         self.action_layout.addStretch(1)
@@ -841,7 +858,7 @@ class PsdReconstructionPage(QFrame):
         self.export_name_label.setText(tr("psd.export.name"))
         self.export_name_edit.setPlaceholderText(tr("psd.export.name_placeholder"))
         self.export_preset_hint.setText(tr("psd.export.preset_hint"))
-        self.repack_psd_button.setText(tr("psd.repack.browse_psd"))
+        self.repack_psd_button.setText(tr("psd.repack.open_psd_directory"))
         self.repack_photoshop_button.setText(tr("psd.pose.open_photoshop"))
         self.texture_name_label.setText(tr("psd.repack.texture_name"))
         self.texture_name_edit.setPlaceholderText(
@@ -863,7 +880,6 @@ class PsdReconstructionPage(QFrame):
         self.output_edit.setPlaceholderText(tr("psd.placeholder_output"))
         self.output_button.setText(tr("common.browse"))
         self.reconstruct_button.setText(tr("psd.reconstruct_button"))
-        self.multi_repack_button.setText(tr("psd.multi.button"))
         self.open_output_button.setText(tr("psd.open_output_folder"))
         self.open_photoshop_button.setText(tr("psd.pose.open_photoshop"))
         self.preview_toggle_button.setText(
@@ -997,6 +1013,27 @@ class PsdReconstructionPage(QFrame):
             self._sync_repack_output_dir()
             self.mark_project_dirty()
             self.append_log(tr("psd.selected_source", path=os.path.abspath(path)))
+
+    def project_psd_choices(self) -> list[tuple[str, str]]:
+        if not self.current_project:
+            return []
+        choices: list[tuple[str, str]] = []
+        for scheme in self.current_project.data.get("pose_schemes", []):
+            if not isinstance(scheme, dict) or not scheme.get("psd"):
+                continue
+            path = resolve_project_path(self.current_project, scheme["psd"])
+            if not path.is_file():
+                continue
+            name = str(scheme.get("name") or scheme.get("id") or path.stem)
+            choices.append((f"{name} — {path.name}", str(path)))
+        return choices
+
+    def open_project_psd_folder(self):
+        if not self.current_project:
+            return
+        folder = self.current_project.project_dir / "psd"
+        folder.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder.resolve())))
 
     def _set_manual_repack_psd(self, path: str):
         self.manual_repack_psd = os.path.abspath(path)
@@ -1144,7 +1181,7 @@ class PsdReconstructionPage(QFrame):
             )
         )
 
-    def start_reconstruction(self):
+    def start_reconstruction(self, direct_psd_path: str = ""):
         self.pending_repack_id = ""
         self.pending_repack_dir = ""
         self.pending_repack_source = ""
@@ -1158,8 +1195,12 @@ class PsdReconstructionPage(QFrame):
         pose_name = None
         output_name = None
 
+        if self.workflow == "repack" and not direct_psd_path:
+            self.start_multi_repack()
+            return
+
         if self.workflow == "repack":
-            source = self.selected_repack_psd_path()
+            source = direct_psd_path or self.selected_repack_psd_path()
             if not source:
                 InfoBar.warning(
                     title=tr("common.warning"),
@@ -1172,7 +1213,7 @@ class PsdReconstructionPage(QFrame):
 
             texture_name = Path(source).stem
 
-            scheme = self.selected_pose_scheme()
+            scheme = self.pose_scheme_for_psd(source) or self.selected_pose_scheme()
             scheme_id = str((scheme or {}).get("id") or "")
             if self.current_project:
                 version_id, version_dir = create_repack_dir(
@@ -1293,10 +1334,23 @@ class PsdReconstructionPage(QFrame):
 
     def start_multi_repack(self):
         initial_psd = self.selected_repack_psd_path()
-        dialog = PsdMultiRepackDialog(self, initial_psd)
+        project_psds = self.project_psd_choices()
+        if not project_psds:
+            InfoBar.warning(
+                title=tr("common.warning"),
+                content=tr("psd.multi.no_project_psd"),
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=3500,
+            )
+            return
+        dialog = PsdMultiRepackDialog(self, project_psds, initial_psd)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         psd_paths = dialog.ordered_paths()
+        if len(psd_paths) == 1:
+            self.start_reconstruction(psd_paths[0])
+            return
         texture_name = dialog.texture_name_edit.text().strip()
         if not self.current_project:
             output_dir = Path(psd_paths[0]).resolve().parent / "multi" / sanitize_project_name(texture_name)
@@ -1395,7 +1449,6 @@ class PsdReconstructionPage(QFrame):
         self.export_name_edit.setEnabled(not busy)
         self.repack_psd_button.setEnabled(not busy)
         self.repack_photoshop_button.setEnabled(not busy and bool(self.selected_repack_psd_path()))
-        self.multi_repack_button.setEnabled(not busy)
         self.texture_name_edit.setEnabled(not busy)
         self.new_project_button.setEnabled(not busy)
         self.save_project_button.setEnabled(not busy)
@@ -1462,7 +1515,7 @@ class PsdReconstructionPage(QFrame):
         self.reconstruct_button.setText(
             tr("psd.repack.single_button") if is_repack else tr("psd.export_button")
         )
-        self.multi_repack_button.setVisible(is_repack)
+        self.multi_repack_button.setVisible(False)
         self._style_workflow_button(self.export_flow_button, not is_repack)
         self._style_workflow_button(self.repack_flow_button, is_repack)
         self.update_mode_hint()

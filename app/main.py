@@ -18,6 +18,9 @@ def run_application():
 
     # 创建QApplication实例
     app = QApplication(sys.argv)
+    app.setApplicationName("Live2D_MOD_Helper")
+    app.setApplicationDisplayName("Live2D_MOD_Helper")
+    app.setOrganizationName("Live2D_MOD_Helper")
 
     # 在创建窗口前初始化语言
     settings_manager = SettingsManager()

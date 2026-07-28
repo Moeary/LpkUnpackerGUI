@@ -217,8 +217,27 @@ class MainWindow(FluentWindow):
             return page
 
     def initWindow(self):
-        self.resize(1000, 700)
+        geometry = dict(self.settings_manager.get("window_geometry", {}) or {})
+        self.setGeometry(
+            int(geometry.get("x", 100)),
+            int(geometry.get("y", 100)),
+            max(800, int(geometry.get("width", 1000))),
+            max(600, int(geometry.get("height", 700))),
+        )
         self.setWindowTitle(tr("main.window_title"))
+
+    def closeEvent(self, event):
+        rect = self.geometry()
+        self.settings_manager.set(
+            "window_geometry",
+            {
+                "width": rect.width(),
+                "height": rect.height(),
+                "x": rect.x(),
+                "y": rect.y(),
+            },
+        )
+        super().closeEvent(event)
 
     def initNavigation(self):
         try:

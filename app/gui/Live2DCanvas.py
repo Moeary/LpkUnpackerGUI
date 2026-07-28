@@ -11,7 +11,7 @@ from abc import abstractmethod
 import live2d.v3 as live2d
 from live2d.utils.canvas import Canvas
 
-from app.core.model.motions import load_live2d_motions
+from app.core.model.motions import evaluate_motion_parameters, load_live2d_motions
 
 live2d.init()
 
@@ -713,6 +713,22 @@ class Live2DCanvas(ADPOpenGLCanvas):
 
     def setMotionLoop(self, enabled: bool):
         self._motion_loop_enabled = bool(enabled)
+
+    def setMotionTime(self, motion: Dict[str, Any] | None, seconds: float) -> dict[str, float]:
+        """Apply motion Parameter curves for deterministic frozen-pose scrubbing."""
+        if self.model is None or not motion:
+            return {}
+        values = evaluate_motion_parameters(str(motion.get("file") or ""), seconds)
+        setter = getattr(self.model, "SetParameterValue", None)
+        if not callable(setter):
+            return {}
+        for parameter_id, value in values.items():
+            try:
+                setter(parameter_id, float(value))
+            except Exception:
+                continue
+        self.update()
+        return values
 
     def _restart_loop_motion_if_finished(self):
         if not self._motion_loop_enabled or self._last_played_motion is None or self.model is None:

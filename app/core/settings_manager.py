@@ -64,6 +64,23 @@ class SettingsManager:
             "preview": {
                 "image_limit": 48,
                 "texture_viewer": "internal",
+                "ui_state": {
+                    "opacity": 100,
+                    "rotation": 0,
+                    "scale": 100,
+                    "offset_x": 0,
+                    "offset_y": 0,
+                    "transparent_bg": True,
+                    "mouse_tracking": True,
+                    "auto_blink": True,
+                    "auto_breath": True,
+                    "motion_loop": False,
+                    "motion_auto_play": False,
+                    "freeze_pose": False,
+                    "left_sidebar_visible": True,
+                    "right_sidebar_visible": True,
+                    "selected_motion": "",
+                },
             },
             "psd": {
                 "last_project_file": "",

@@ -31,7 +31,7 @@ from PySide6.QtCore import (
     QStringListModel,
 )
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QColor, QPixmap
-from qfluentwidgets import (SubtitleLabel, BodyLabel, PushButton, Slider, CheckBox, SpinBox, InfoBar, InfoBarPosition,
+from qfluentwidgets import (SubtitleLabel, BodyLabel, CaptionLabel, PushButton, Slider, CheckBox, SpinBox, InfoBar, InfoBarPosition,
                            CardWidget, SingleDirectionScrollArea, TextBrowser, ColorDialog, FluentIcon, IconWidget,
                            ComboBox, EditableComboBox, LineEdit)
 
@@ -1314,6 +1314,15 @@ class Live2DSettingsPanel(QFrame):
                 f"{value:.2f}" if scale != 1 else f"{int(round(value))}"
             )
 
+    def set_advanced_param_values(self, values: dict[str, float]):
+        """Update visible parameter controls from a frozen motion timeline."""
+        for parameter_id, value in values.items():
+            item = self.advanced_param_sliders.get(parameter_id)
+            if item is None:
+                continue
+            slider, _label, scale = item
+            slider.setValue(int(round(float(value) * scale)))
+
     def get_settings(self):
         """获取当前设置"""
         settings = {
@@ -1410,6 +1419,16 @@ class PreviewPage(QFrame):
         self.loop_motion_check = None
         self.auto_play_motion_check = None
         self.save_pose_scheme_btn = None
+        self.pose_controls_card = None
+        self.pose_controls_title = None
+        self.refresh_pose_params_btn = None
+        self.reset_pose_params_btn = None
+        self.motion_timeline_frame = None
+        self.motion_timeline = None
+        self.motion_time_spin = None
+        self.motion_time_label = None
+        self._timeline_sync = False
+        self._freeze_syncing = False
         self.left_sidebar_btn = None
         self.right_sidebar_btn = None
         self.preview_splitter = None
@@ -1725,6 +1744,7 @@ class PreviewPage(QFrame):
         motion_option_row.addWidget(self.loop_motion_check)
         self.auto_play_motion_check = CheckBox("", self.motion_group)
         self.auto_play_motion_check.setChecked(False)
+        self.auto_play_motion_check.toggled.connect(self._save_preview_ui_state)
         motion_option_row.addWidget(self.auto_play_motion_check)
         motion_option_row.addStretch(1)
         motion_layout.addLayout(motion_option_row)
@@ -1732,7 +1752,6 @@ class PreviewPage(QFrame):
         self.save_pose_scheme_btn.setIcon(FluentIcon.SAVE)
         self.save_pose_scheme_btn.clicked.connect(self.request_pose_scheme_save)
         self.save_pose_scheme_btn.setVisible(False)
-        motion_layout.addWidget(self.save_pose_scheme_btn)
         self.motion_hint_label = BodyLabel("", self.motion_group)
         self.motion_hint_label.setWordWrap(True)
         motion_layout.addWidget(self.motion_hint_label)
@@ -1741,9 +1760,52 @@ class PreviewPage(QFrame):
         self.advanced_panel = Live2DSettingsPanel(action_widget, mode="parameters")
         self.advanced_panel.settingsChanged.connect(self.on_advanced_settings_changed)
         self.advanced_panel.requestRefreshParams.connect(self.on_request_refresh_params)
-        # Freezing the current pose and applying parameter overrides are one
-        # editing mode. Keep a single switch in the parameter card.
-        self.freeze_motion_check = self.advanced_panel.advanced_enable_check
+        # Keep pose actions above the scrollable parameter list: when a model
+        # has many parameters, freeze/save/reset controls must stay reachable.
+        self.advanced_panel.advanced_group_title.setVisible(False)
+        self.advanced_panel.advanced_enable_check.setVisible(False)
+        self.pose_controls_card = CardWidget(action_widget)
+        pose_layout = QVBoxLayout(self.pose_controls_card)
+        pose_layout.setContentsMargins(12, 12, 12, 12)
+        pose_layout.setSpacing(8)
+        self.pose_controls_title = SubtitleLabel("", self.pose_controls_card)
+        pose_layout.addWidget(self.pose_controls_title)
+        self.freeze_motion_check = CheckBox("", self.pose_controls_card)
+        self.freeze_motion_check.toggled.connect(self._on_pose_freeze_toggled)
+        pose_layout.addWidget(self.freeze_motion_check)
+        pose_action_row = QHBoxLayout()
+        self.refresh_pose_params_btn = PushButton("", self.pose_controls_card)
+        self.refresh_pose_params_btn.clicked.connect(self.on_request_refresh_params)
+        self.reset_pose_params_btn = PushButton("", self.pose_controls_card)
+        self.reset_pose_params_btn.clicked.connect(self.advanced_panel.reset_advanced_params)
+        pose_action_row.addWidget(self.refresh_pose_params_btn)
+        pose_action_row.addWidget(self.reset_pose_params_btn)
+        pose_action_row.addStretch(1)
+        pose_layout.addLayout(pose_action_row)
+
+        self.motion_timeline_frame = QFrame(self.pose_controls_card)
+        timeline_layout = QVBoxLayout(self.motion_timeline_frame)
+        timeline_layout.setContentsMargins(0, 0, 0, 0)
+        timeline_layout.setSpacing(5)
+        self.motion_timeline = Slider(Qt.Horizontal, self.motion_timeline_frame)
+        self.motion_timeline.setRange(0, 1000)
+        self.motion_timeline.valueChanged.connect(self._on_motion_timeline_slider_changed)
+        timeline_layout.addWidget(self.motion_timeline)
+        timeline_detail = QHBoxLayout()
+        self.motion_time_spin = SpinBox(self.motion_timeline_frame)
+        self.motion_time_spin.setRange(0, 0)
+        self.motion_time_spin.setSingleStep(33)
+        self.motion_time_spin.setSuffix(" ms")
+        self.motion_time_spin.valueChanged.connect(self._on_motion_timeline_spin_changed)
+        self.motion_time_label = CaptionLabel("", self.motion_timeline_frame)
+        timeline_detail.addWidget(self.motion_time_spin)
+        timeline_detail.addWidget(self.motion_time_label, 1)
+        timeline_layout.addLayout(timeline_detail)
+        self.motion_timeline_frame.setVisible(False)
+        pose_layout.addWidget(self.motion_timeline_frame)
+        self.save_pose_scheme_btn.setParent(self.pose_controls_card)
+        pose_layout.addWidget(self.save_pose_scheme_btn)
+        action_layout.addWidget(self.pose_controls_card)
         action_layout.addWidget(self.advanced_panel, 1)
 
         # 添加到分割器
@@ -1778,6 +1840,7 @@ class PreviewPage(QFrame):
         self._parameter_sync_timer.setInterval(80)
         self._parameter_sync_timer.timeout.connect(self._sync_live_parameter_controls)
         self._set_motion_debug_visible(False)
+        self._restore_preview_ui_state()
 
     def retranslate_ui(self):
         self.title_label.setText(tr("preview.title"))
@@ -1814,6 +1877,14 @@ class PreviewPage(QFrame):
             self.auto_play_motion_check.setText(tr("preview.auto_play_motion"))
         if self.save_pose_scheme_btn:
             self.save_pose_scheme_btn.setText(tr("preview.save_psd_pose_scheme"))
+        if self.pose_controls_title:
+            self.pose_controls_title.setText(tr("preview.advanced_settings"))
+        if self.freeze_motion_check:
+            self.freeze_motion_check.setText(tr("preview.enable_advanced_overrides"))
+        if self.refresh_pose_params_btn:
+            self.refresh_pose_params_btn.setText(tr("preview.refresh_current_model"))
+        if self.reset_pose_params_btn:
+            self.reset_pose_params_btn.setText(tr("preview.reset_advanced_params"))
         if self.motion_hint_label:
             self.motion_hint_label.setText(tr("preview.trigger_motion_hint"))
         if self.image_preview_panel:
@@ -1843,6 +1914,7 @@ class PreviewPage(QFrame):
             return
         widget.setVisible(not widget.isVisible())
         self._update_sidebar_button_text()
+        self._save_preview_ui_state()
 
     def _update_sidebar_button_text(self):
         if self.left_sidebar_btn and self.left_sidebar:
@@ -1851,6 +1923,80 @@ class PreviewPage(QFrame):
         if self.right_sidebar_btn and self.right_sidebar:
             key = "preview.show_right_sidebar" if self.right_sidebar.isHidden() else "preview.hide_right_sidebar"
             self.right_sidebar_btn.setText(tr(key))
+
+    def _restore_preview_ui_state(self):
+        state = dict(self.settings_manager.get("preview.ui_state", {}) or {})
+        panel = self.settings_panel
+        if panel:
+            controls = (
+                (panel.opacity_slider, int(state.get("opacity", 100))),
+                (panel.rotation_slider, int(state.get("rotation", 0))),
+                (panel.scale_slider, int(state.get("scale", 100))),
+                (panel.position_x_spinbox, int(state.get("offset_x", 0))),
+                (panel.position_y_spinbox, int(state.get("offset_y", 0))),
+                (panel.bg_transparent_check, bool(state.get("transparent_bg", True))),
+                (panel.mouse_tracking_check, bool(state.get("mouse_tracking", True))),
+                (panel.auto_blink_check, bool(state.get("auto_blink", True))),
+                (panel.auto_breath_check, bool(state.get("auto_breath", True))),
+            )
+            for control, value in controls:
+                if control is None:
+                    continue
+                control.blockSignals(True)
+                control.setChecked(value) if isinstance(value, bool) else control.setValue(value)
+                control.blockSignals(False)
+        if self.loop_motion_check:
+            self.loop_motion_check.blockSignals(True)
+            self.loop_motion_check.setChecked(bool(state.get("motion_loop", False)))
+            self.loop_motion_check.blockSignals(False)
+        if self.auto_play_motion_check:
+            self.auto_play_motion_check.blockSignals(True)
+            self.auto_play_motion_check.setChecked(bool(state.get("motion_auto_play", False)))
+            self.auto_play_motion_check.blockSignals(False)
+        if self.freeze_motion_check:
+            freeze_pose = bool(state.get("freeze_pose", False))
+            self.freeze_motion_check.blockSignals(True)
+            self.freeze_motion_check.setChecked(freeze_pose)
+            self.freeze_motion_check.blockSignals(False)
+            if self.advanced_panel and self.advanced_panel.advanced_enable_check:
+                self.advanced_panel.advanced_enable_check.blockSignals(True)
+                self.advanced_panel.advanced_enable_check.setChecked(freeze_pose)
+                self.advanced_panel.advanced_enable_check.blockSignals(False)
+        if self.left_sidebar and not bool(state.get("left_sidebar_visible", True)):
+            self.left_sidebar.hide()
+        if self.right_sidebar and not bool(state.get("right_sidebar_visible", True)):
+            self.right_sidebar.hide()
+        self._update_sidebar_button_text()
+
+    def _save_preview_ui_state(self, *_args):
+        panel = self.settings_panel
+        if panel is None:
+            return
+        selected_motion = ""
+        if self.motion_combo and self.motion_combo.currentIndex() >= 0:
+            selected_motion = str(self.motion_combo.currentData() or "")
+        self.settings_manager.set(
+            "preview.ui_state",
+            {
+                "opacity": panel.opacity_slider.value(),
+                "rotation": panel.rotation_slider.value(),
+                "scale": panel.scale_slider.value(),
+                "offset_x": panel.position_x_spinbox.value(),
+                "offset_y": panel.position_y_spinbox.value(),
+                "transparent_bg": panel.bg_transparent_check.isChecked(),
+                "mouse_tracking": panel.mouse_tracking_check.isChecked(),
+                "auto_blink": panel.auto_blink_check.isChecked(),
+                "auto_breath": panel.auto_breath_check.isChecked(),
+                "motion_loop": bool(self.loop_motion_check and self.loop_motion_check.isChecked()),
+                "motion_auto_play": bool(
+                    self.auto_play_motion_check and self.auto_play_motion_check.isChecked()
+                ),
+                "freeze_pose": bool(self.freeze_motion_check and self.freeze_motion_check.isChecked()),
+                "left_sidebar_visible": bool(self.left_sidebar and not self.left_sidebar.isHidden()),
+                "right_sidebar_visible": bool(self.right_sidebar and not self.right_sidebar.isHidden()),
+                "selected_motion": selected_motion,
+            },
+        )
 
     def on_preview_image_limit_changed(self, value: int):
         self.settings_manager.set("preview.image_limit", int(value))
@@ -2184,6 +2330,10 @@ class PreviewPage(QFrame):
 
     def _populate_motion_controls(self, motions: list[dict]):
         previous = str(self.motion_combo.currentData() or "") if self.motion_combo else ""
+        if not previous:
+            previous = str(
+                self.settings_manager.get("preview.ui_state.selected_motion", "") or ""
+            )
         self._motion_items = list(motions or [])
         if not self.motion_combo or not self.play_motion_btn:
             return
@@ -2215,6 +2365,8 @@ class PreviewPage(QFrame):
     def _set_motion_debug_visible(self, visible: bool):
         if self.motion_group:
             self.motion_group.setEnabled(bool(visible))
+        if self.pose_controls_card:
+            self.pose_controls_card.setEnabled(bool(visible))
         if self.advanced_panel:
             self.advanced_panel.setEnabled(bool(visible))
         if self._parameter_sync_timer:
@@ -2261,6 +2413,94 @@ class PreviewPage(QFrame):
         )
         if self.auto_play_motion_check and self.auto_play_motion_check.isChecked():
             self.play_selected_motion()
+        self._update_motion_timeline_visibility()
+        self._save_preview_ui_state()
+
+    def _on_pose_freeze_toggled(self, frozen: bool):
+        if self._freeze_syncing:
+            return
+        self._freeze_syncing = True
+        try:
+            if self.advanced_panel and self.advanced_panel.advanced_enable_check:
+                control = self.advanced_panel.advanced_enable_check
+                control.blockSignals(True)
+                control.setChecked(bool(frozen))
+                control.blockSignals(False)
+            self.on_advanced_settings_changed(
+                self.advanced_panel.get_settings() if self.advanced_panel else {}
+            )
+            self.on_motion_freeze_changed(bool(frozen))
+        finally:
+            self._freeze_syncing = False
+        self._update_motion_timeline_visibility()
+        self._save_preview_ui_state()
+
+    def _selected_motion_item(self) -> dict | None:
+        if not self.motion_combo:
+            return None
+        index = self.motion_combo.currentIndex()
+        return self._motion_items[index] if 0 <= index < len(self._motion_items) else None
+
+    def _update_motion_timeline_visibility(self):
+        motion = self._selected_motion_item()
+        duration = float((motion or {}).get("duration") or 0.0)
+        visible = bool(
+            self.freeze_motion_check
+            and self.freeze_motion_check.isChecked()
+            and motion
+            and duration > 0.0
+        )
+        if not self.motion_timeline_frame:
+            return
+        self.motion_timeline_frame.setVisible(visible)
+        if not visible:
+            return
+        maximum_ms = max(1, int(round(duration * 1000)))
+        self._timeline_sync = True
+        try:
+            self.motion_time_spin.setRange(0, maximum_ms)
+            current_ms = min(self.motion_time_spin.value(), maximum_ms)
+            self.motion_time_spin.setValue(current_ms)
+            self.motion_timeline.setValue(int(round(current_ms / maximum_ms * 1000)))
+            self.motion_time_label.setText(
+                tr("preview.motion_timeline_position", current=current_ms / 1000, total=duration)
+            )
+        finally:
+            self._timeline_sync = False
+
+    def _on_motion_timeline_slider_changed(self, value: int):
+        if self._timeline_sync or not self.motion_time_spin:
+            return
+        maximum = max(1, self.motion_time_spin.maximum())
+        self._set_motion_timeline_ms(int(round(value / 1000 * maximum)))
+
+    def _on_motion_timeline_spin_changed(self, value: int):
+        if self._timeline_sync:
+            return
+        self._set_motion_timeline_ms(int(value))
+
+    def _set_motion_timeline_ms(self, milliseconds: int):
+        motion = self._selected_motion_item()
+        if not motion or not self.live2d_preview or not self.motion_time_spin:
+            return
+        maximum = max(1, self.motion_time_spin.maximum())
+        target = min(max(0, int(milliseconds)), maximum)
+        self._timeline_sync = True
+        try:
+            self.motion_time_spin.setValue(target)
+            self.motion_timeline.setValue(int(round(target / maximum * 1000)))
+            self.motion_time_label.setText(
+                tr(
+                    "preview.motion_timeline_position",
+                    current=target / 1000,
+                    total=float(motion.get("duration") or 0.0),
+                )
+            )
+        finally:
+            self._timeline_sync = False
+        values = self.live2d_preview.set_motion_time(motion, target / 1000)
+        if values and self.advanced_panel:
+            self.advanced_panel.set_advanced_param_values(values)
 
     def on_motion_freeze_changed(self, frozen: bool):
         if not self.live2d_preview:
@@ -2268,14 +2508,20 @@ class PreviewPage(QFrame):
         self.live2d_preview.set_motion_frozen(bool(frozen))
         if frozen:
             self._sync_live_parameter_controls(force=True)
+        self._update_motion_timeline_visibility()
 
     def on_motion_loop_changed(self, enabled: bool):
         if self.live2d_preview:
             self.live2d_preview.set_motion_loop(bool(enabled))
+        self._save_preview_ui_state()
 
     def on_advanced_settings_changed(self, settings: dict):
         if self.live2d_preview and self.advanced_panel:
             editing_pose = bool(settings.get("advanced_enabled", False))
+            if self.freeze_motion_check and not self._freeze_syncing:
+                self.freeze_motion_check.blockSignals(True)
+                self.freeze_motion_check.setChecked(editing_pose)
+                self.freeze_motion_check.blockSignals(False)
             self.on_motion_freeze_changed(editing_pose)
             self.live2d_preview.apply_settings(
                 self.advanced_panel.get_advanced_settings()
@@ -2808,13 +3054,13 @@ class PreviewPage(QFrame):
             settings.update({
                 "fit_to_dock": True,
                 "selected_motion_on_click": True,
-                "motion_frozen": False,
+                "motion_frozen": bool(
+                    self.freeze_motion_check and self.freeze_motion_check.isChecked()
+                ),
                 "motion_loop": bool(self.loop_motion_check and self.loop_motion_check.isChecked()),
             })
             preview.apply_settings(settings)
             preview.show()
-            if self.freeze_motion_check:
-                self.freeze_motion_check.setChecked(False)
             self._set_motion_debug_visible(True)
             self._on_motion_selection_changed(self.motion_combo.currentIndex())
             QTimer.singleShot(120, lambda: self._refresh_parameter_controls(5))
@@ -2917,6 +3163,7 @@ class PreviewPage(QFrame):
         """Apply display settings directly to the embedded OpenGL widget."""
         if self.live2d_preview:
             self.live2d_preview.apply_settings(settings)
+        self._save_preview_ui_state()
 
     def on_request_refresh_params(self):
         """Refresh motions and parameter metadata from the embedded model."""
