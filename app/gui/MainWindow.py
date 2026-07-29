@@ -178,6 +178,13 @@ class MainWindow(FluentWindow):
         )
         if unified_preview_requested is not None and hasattr(unified_preview_requested, "connect"):
             unified_preview_requested.connect(self.open_psd_preview)
+        mod_preview_requested = getattr(
+            self.live2dModPage,
+            "previewModelRequested",
+            None,
+        )
+        if mod_preview_requested is not None and hasattr(mod_preview_requested, "connect"):
+            mod_preview_requested.connect(self.open_live2d_mod_preview)
         pose_scheme_requested = getattr(self.previewPage, "poseSchemeRequested", None)
         pose_scheme_handler = getattr(
             self.psdReconstructionPage,
@@ -389,6 +396,12 @@ class MainWindow(FluentWindow):
         handler = getattr(self.previewPage, "open_psd_project_preview", None)
         if callable(handler):
             handler(model_json_path, project_file)
+
+    def open_live2d_mod_preview(self, model_json_path: str):
+        self.switchTo(self.previewPage)
+        handler = getattr(self.previewPage, "open_model_preview_source", None)
+        if callable(handler):
+            handler(model_json_path)
 
     def save_psd_pose_scheme(self, payload: dict):
         handler = getattr(

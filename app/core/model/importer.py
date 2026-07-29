@@ -31,7 +31,7 @@ def prepare_live2d_source_import(
 ) -> Live2DSourceImportResult:
     source_path = Path(source).resolve()
     try:
-        return Live2DSourceImportResult(package=resolve_live2d_package(source_path))
+        return Live2DSourceImportResult(package=_resolve_local_live2d_package(source_path))
     except Live2DPackageError:
         pass
 
@@ -69,17 +69,8 @@ def import_texture_source_to_workspace(
     workspace_path.mkdir(parents=True, exist_ok=True)
     suffixes = {suffix.lower() for suffix in (image_suffixes or {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tga"})}
 
-    if source_path.is_file() and source_path.suffix.lower() in suffixes:
-        copied = _copy_unique_file(source_path, workspace_path / source_path.name)
-        return ImportedTextureSource(
-            source=source_path,
-            workspace_dir=workspace_path,
-            model_json=None,
-            texture_paths=[copied],
-        )
-
     try:
-        package = resolve_live2d_package(source_path)
+        package = _resolve_local_live2d_package(source_path)
         if workspace_path.exists():
             shutil.rmtree(workspace_path)
         shutil.copytree(
@@ -95,6 +86,14 @@ def import_texture_source_to_workspace(
             texture_paths=[path for path in copied_package.texture_paths if path.is_file()],
         )
     except Live2DPackageError:
+        if source_path.is_file() and source_path.suffix.lower() in suffixes:
+            copied = _copy_unique_file(source_path, workspace_path / source_path.name)
+            return ImportedTextureSource(
+                source=source_path,
+                workspace_dir=workspace_path,
+                model_json=None,
+                texture_paths=[copied],
+            )
         direct_images = _collect_images(source_path, suffixes)
         if direct_images:
             copied_images = [_copy_unique_file(path, workspace_path / path.name) for path in direct_images]
@@ -151,6 +150,38 @@ def _adapt_log_callback(log: LogCallback | None):
         log(f"[{level}] {message}" if level else message)
 
     return emit
+
+
+def _resolve_local_live2d_package(source_path: Path) -> Live2DPackage:
+    """Resolve a package even when the user picked a file inside its folder."""
+    direct_error: Live2DPackageError | None = None
+    try:
+        return resolve_live2d_package(source_path)
+    except Live2DPackageError as exc:
+        direct_error = exc
+        if not source_path.is_file() or source_path.suffix.lower() in {
+            ".lpk",
+            ".wpk",
+            ".zip",
+            ".7z",
+            ".rar",
+            ".assets",
+            ".sharedassets",
+            ".bundle",
+            ".unity3d",
+        }:
+            raise
+
+    # Texture, motion, physics and moc files may be nested one or two levels
+    # below model3.json.  Keep the search local so an unrelated model elsewhere
+    # in a large game directory is not selected accidentally.
+    errors: list[Exception] = []
+    for parent in list(source_path.parents)[:4]:
+        try:
+            return resolve_live2d_package(parent)
+        except Live2DPackageError as exc:
+            errors.append(exc)
+    raise errors[-1] if errors else direct_error
 
 
 def _collect_images(source_path: Path, suffixes: set[str]) -> list[Path]:

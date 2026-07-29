@@ -3091,6 +3091,24 @@ class PreviewPage(QFrame):
         }
         self.load_model_preview(str(preview_model_json), model_json_path)
 
+    def open_model_preview_source(self, model_json_path: str):
+        """Open a model sent by another workspace page without PSD context."""
+        try:
+            preview_model_json = prepare_model_json_for_preview(model_json_path)
+        except Exception as exc:
+            self.show_error(
+                tr("common.error"),
+                tr(
+                    "preview_window.error_model_load_failed",
+                    error_type=type(exc).__name__,
+                    error=exc,
+                ),
+            )
+            return
+        self._pending_psd_project_context = None
+        self._psd_project_context = None
+        self.load_model_preview(str(preview_model_json), model_json_path)
+
     def request_pose_scheme_save(self):
         context = dict(self._psd_project_context or {})
         if not context or not self.current_model_path or not self.live2d_preview:
