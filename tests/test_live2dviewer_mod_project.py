@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
-import zipfile
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 from PIL import Image
 
@@ -15,6 +15,7 @@ from app.core.live2dviewer_mod_project import (
     SKIN_MANIFEST_FILE,
     Live2DViewerModProjectError,
     add_model_to_project,
+    create_empty_project,
     create_project_from_base_source,
     delete_project_directory,
     export_live2dviewer_mod,
@@ -22,6 +23,7 @@ from app.core.live2dviewer_mod_project import (
     load_project,
     move_model_in_project,
     remove_model_from_project,
+    read_artmesh_areas,
     rename_model_skin,
     rename_project,
     save_project,
@@ -128,13 +130,17 @@ class Live2DViewerModProjectTests(unittest.TestCase):
             save_project(project.project_dir, project.data)
         )
 
-        archive = self.root / "result.zip"
-        project, archive = export_live2dviewer_mod(project, archive)
-        self.assertTrue(archive.is_file())
+        export_root = self.root / "workshop"
+        project, export_dir = export_live2dviewer_mod(project, export_root)
+        self.assertTrue(export_dir.is_dir())
+        self.assertEqual(export_dir.parent, export_root)
         self.assertTrue((project.project_dir / BUILD_DIR / SKIN_MANIFEST_FILE).is_file())
         self.assertTrue((project.project_dir / BUILD_DIR / MAPPING_TABLE_FILE).is_file())
-        with zipfile.ZipFile(archive) as package:
-            names = set(package.namelist())
+        names = {
+            path.relative_to(export_dir).as_posix()
+            for path in export_dir.rglob("*")
+            if path.is_file()
+        }
         self.assertIn(SKIN_MANIFEST_FILE, names)
         self.assertIn(MAPPING_TABLE_FILE, names)
         self.assertTrue(any(name.endswith(".model3.json") for name in names))
@@ -175,6 +181,50 @@ class Live2DViewerModProjectTests(unittest.TestCase):
         self.assertEqual(len(project.models), 1)
         self.assertFalse(removed_workspace.exists())
         self.assertEqual(load_project(project.project_file).models, project.models)
+
+    def test_empty_project_accepts_first_complete_model_as_main(self):
+        project = create_empty_project(
+            "Named First",
+            output_root=self.root / "empty-projects",
+        )
+        self.assertEqual(project.project_name, "Named First")
+        self.assertEqual(project.models, [])
+
+        project = add_model_to_project(project, self.main_source)
+
+        self.assertEqual(len(project.models), 1)
+        self.assertEqual(project.models[0]["id"], "main")
+        self.assertEqual(project.models[0]["skin_name"], "原皮")
+        self.assertTrue(project.base_model_json.is_file())
+        self.assertEqual(len(project.data["artmesh_areas"]), 2)
+
+    def test_artmesh_ids_are_read_from_moc3_when_hitareas_are_missing(self):
+        source = self._make_model(
+            "drawables_only",
+            (64, 64),
+            (80, 100, 120, 255),
+            texture_count=1,
+            include_hit_areas=False,
+        )
+        fake_model = Mock()
+        fake_model.drawable_ids.return_value = [
+            "ArtMeshHead",
+            "ArtMeshBody",
+        ]
+        fake_core = Mock()
+        fake_core.load_moc.return_value = fake_model
+
+        with patch(
+            "app.core.live2dviewer_mod_project.CubismCore",
+            return_value=fake_core,
+        ):
+            areas = read_artmesh_areas(source)
+
+        self.assertEqual(
+            [item["id"] for item in areas],
+            ["ArtMeshHead", "ArtMeshBody"],
+        )
+        self.assertTrue(all(not item["motion"] for item in areas))
 
     def test_manual_artmesh_id_is_rejected_when_model_has_no_hit_areas(self):
         source = self._make_model(

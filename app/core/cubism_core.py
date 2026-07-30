@@ -92,6 +92,18 @@ class CubismCoreModel:
     model_buffer: _AlignedBuffer
     model_pointer: ctypes.c_void_p
 
+    def drawable_ids(self) -> list[str]:
+        """Return ArtMesh/drawable IDs without building full mesh snapshots."""
+        count = int(self.core.dll.csmGetDrawableCount(self.model_pointer))
+        if count < 0:
+            raise CubismCoreError("Cubism Core returned an invalid drawable count.")
+        ids = self.core.dll.csmGetDrawableIds(self.model_pointer)
+        return [
+            ids[index].decode("utf-8", errors="replace")
+            for index in range(count)
+            if ids[index]
+        ]
+
     def drawable_snapshot(
         self,
         parameter_values: dict[str, float] | None = None,

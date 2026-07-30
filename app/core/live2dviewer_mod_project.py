@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import re
 import shutil
-import zipfile
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +10,7 @@ from typing import Any, Callable
 
 from PIL import Image
 
+from app.core.cubism_core import CubismCore
 from app.core.model import Live2DPackage, resolve_live2d_package
 from app.core.model.importer import (
     import_texture_source_to_workspace,
@@ -59,6 +59,33 @@ class Live2DViewerModProject:
         if not value:
             value = str(self.data.get("base_model_json") or "")
         return _resolve_project_path(self.project_dir, value) if value else self.project_dir
+
+
+def create_empty_project(
+    project_name: str,
+    output_root: str | Path | None = None,
+    log: LogCallback | None = None,
+) -> Live2DViewerModProject:
+    """Create a named MOD project before a main model is imported."""
+    resolved_name = sanitize_project_name(project_name)
+    project_root = _project_output_root(output_root)
+    project_dir = _unique_project_dir(project_root / resolved_name)
+    project_data = {
+        "format": PROJECT_FORMAT,
+        "version": PROJECT_VERSION,
+        "project_name": project_dir.name,
+        "models": [],
+        "base_model_json": "",
+        "artmesh_areas": [],
+        "selected_artmesh_id": "",
+        "generated_output_dir": "",
+        "generated_model_json_paths": [],
+        "last_export_path": "",
+        "warnings": [],
+    }
+    project_file = save_project(project_dir, project_data)
+    _log(log, f"Created empty Live2DViewerEX project: {project_file}")
+    return Live2DViewerModProject(project_dir, project_file, project_data)
 
 
 def create_project_from_base_source(
@@ -125,12 +152,18 @@ def add_model_to_project(
     source_path = Path(source).resolve()
     data = normalize_project_data(project.data, project.project_dir.name)
     project_dir = project.project_dir.resolve()
-    fallback_name = f"改图{len(data['models'])}版本"
+    models = list(data["models"])
+    is_main_import = not models
+    fallback_name = "原皮" if is_main_import else f"改图{len(models)}版本"
     resolved_skin_name = sanitize_skin_name(
         skin_name or fallback_name or source_path.stem,
-        f"Skin {len(data['models']) + 1}",
+        "原皮" if is_main_import else f"Skin {len(models) + 1}",
     )
-    model_id = _unique_model_id(data["models"], resolved_skin_name)
+    model_id = (
+        "main"
+        if is_main_import
+        else _unique_model_id(models, resolved_skin_name)
+    )
     workspace_dir = project_dir / SOURCES_DIR / model_id
 
     _log(log, f"Importing model source: {source_path}")
@@ -146,6 +179,10 @@ def add_model_to_project(
             raise Live2DViewerModProjectError(
                 f"No Live2D textures were found in source: {source_path}"
             )
+        if is_main_import and not imported.model_json:
+            raise Live2DViewerModProjectError(
+                "The first import in an empty project must be a complete Live2D model."
+            )
         model = _model_entry(
             model_id=model_id,
             skin_name=resolved_skin_name,
@@ -156,7 +193,6 @@ def add_model_to_project(
             texture_paths=texture_paths,
             warnings=imported.warnings,
         )
-        models = list(data["models"])
         model["texture_mappings"] = suggest_texture_mappings(
             project_dir,
             models[0] if models else None,
@@ -165,6 +201,8 @@ def add_model_to_project(
         models.append(model)
         data["models"] = models
         _sync_derived_project_fields(data)
+        if is_main_import:
+            _refresh_artmesh_state(data, project_dir)
         project_file = save_project(project_dir, data)
         _log(
             log,
@@ -591,38 +629,23 @@ def export_live2dviewer_mod(
         str(built.data.get("generated_output_dir") or BUILD_DIR),
     )
     if destination:
-        archive_path = Path(destination).resolve()
+        export_root = Path(destination).resolve()
     else:
-        archive_path = (
-            built.project_dir
-            / EXPORTS_DIR
-            / f"{sanitize_identifier(built.project_name, 'live2dviewer_mod')}.zip"
-        )
-    if archive_path.suffix.lower() != ".zip":
-        archive_path = archive_path.with_suffix(".zip")
-    if _is_relative_to(archive_path, output_dir):
+        export_root = built.project_dir / EXPORTS_DIR
+    export_root.mkdir(parents=True, exist_ok=True)
+    if export_root == output_dir or _is_relative_to(export_root, output_dir):
         raise Live2DViewerModProjectError(
-            "The export archive cannot be placed inside the build directory."
+            "The export folder cannot be placed inside the build directory."
         )
-    archive_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = archive_path.with_suffix(f"{archive_path.suffix}.tmp")
-    if temporary.exists():
-        temporary.unlink()
-    with zipfile.ZipFile(
-        temporary,
-        "w",
-        compression=zipfile.ZIP_DEFLATED,
-        compresslevel=9,
-    ) as archive:
-        for path in sorted(output_dir.rglob("*"), key=lambda item: str(item).lower()):
-            if path.is_file():
-                archive.write(path, path.relative_to(output_dir).as_posix())
-    temporary.replace(archive_path)
+    export_dir = _unique_project_dir(
+        export_root / sanitize_project_name(built.project_name)
+    )
+    shutil.copytree(output_dir, export_dir)
     data = dict(built.data)
-    data["last_export_path"] = str(archive_path)
+    data["last_export_path"] = str(export_dir)
     project_file = save_project(built.project_dir, data)
-    _log(log, f"Exported Live2DViewerEX package: {archive_path}")
-    return Live2DViewerModProject(built.project_dir, project_file, data), archive_path
+    _log(log, f"Exported Live2DViewerEX workshop folder: {export_dir}")
+    return Live2DViewerModProject(built.project_dir, project_file, data), export_dir
 
 
 def rename_project(
@@ -764,15 +787,13 @@ def sanitize_skin_name(name: Any, fallback: str = "Skin") -> str:
 
 
 def read_artmesh_areas(model_json: str | Path) -> list[dict[str, str]]:
-    """Read Live2DViewerEX-clickable ArtMesh IDs from model HitAreas."""
+    """Read clickable IDs and all ArtMesh drawables from the main model."""
     path = Path(model_json).resolve()
     data = _read_json(path)
     raw_areas = data.get("HitAreas")
-    if not isinstance(raw_areas, list):
-        return []
     result: list[dict[str, str]] = []
     seen: set[str] = set()
-    for item in raw_areas:
+    for item in raw_areas if isinstance(raw_areas, list) else []:
         if not isinstance(item, dict):
             continue
         area_id = str(item.get("Id") or item.get("id") or "").strip()
@@ -791,6 +812,29 @@ def read_artmesh_areas(model_json: str | Path) -> list[dict[str, str]]:
                 ).strip(),
             }
         )
+
+    # Many AssetStudio exports do not contain HitAreas at all.  Drawable IDs
+    # live in the MOC3 binary, so query Cubism Core and merge them with the
+    # event metadata above.  Fail softly when a test fixture or legacy model
+    # contains an invalid/missing MOC file.
+    try:
+        package = resolve_live2d_package(path)
+        if package.moc_path and package.moc_path.is_file():
+            model = CubismCore().load_moc(package.moc_path)
+            for drawable_id in model.drawable_ids():
+                area_id = str(drawable_id or "").strip()
+                if not area_id or area_id in seen:
+                    continue
+                seen.add(area_id)
+                result.append(
+                    {
+                        "id": area_id,
+                        "name": area_id,
+                        "motion": "",
+                    }
+                )
+    except Exception:
+        pass
     return result
 
 

@@ -129,6 +129,46 @@ class Live2DModPageSmokeTests(unittest.TestCase):
             finally:
                 module.SettingsManager = original
 
+    def test_project_search_opens_exact_and_unique_matches(self):
+        module = importlib.import_module("app.gui.Live2DModPage")
+        with tempfile.TemporaryDirectory() as directory:
+            settings = _TestSettings(Path(directory))
+            original = module.SettingsManager
+            module.SettingsManager = lambda: settings
+            try:
+                page = module.Live2DModPage()
+                alpha_path = str(
+                    Path(directory) / "Alpha" / module.PROJECT_FILE_NAME
+                )
+                beta_path = str(
+                    Path(directory) / "Beta Project" / module.PROJECT_FILE_NAME
+                )
+                page._project_combo_refreshing = True
+                page.project_combo.blockSignals(True)
+                page.project_combo.clear()
+                page.project_combo.addItem("Alpha", userData=alpha_path)
+                page.project_combo.addItem(
+                    "Beta Project",
+                    userData=beta_path,
+                )
+                page.project_combo.setCurrentIndex(-1)
+                page.project_combo.blockSignals(False)
+                page._project_combo_refreshing = False
+
+                loaded = []
+                page.load_project_file = loaded.append
+                page.project_combo.setText("Alpha")
+                self.assertEqual(loaded, [alpha_path])
+
+                page.project_combo.setCurrentIndex(-1)
+                page.project_combo.setText("Beta")
+                self.assertEqual(loaded, [alpha_path])
+                page.open_project_file()
+                self.assertEqual(loaded, [alpha_path, beta_path])
+                page.deleteLater()
+            finally:
+                module.SettingsManager = original
+
 
 if __name__ == "__main__":
     unittest.main()

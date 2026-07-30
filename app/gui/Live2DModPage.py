@@ -14,7 +14,6 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
-    QInputDialog,
     QLabel,
     QMessageBox,
     QScrollArea,
@@ -34,6 +33,7 @@ from qfluentwidgets import (
     InfoBar,
     InfoBarPosition,
     LineEdit,
+    MessageBoxBase,
     PrimaryPushButton,
     PushButton,
     SubtitleLabel,
@@ -44,6 +44,7 @@ from app.core.live2dviewer_mod_project import (
     PROJECT_FILE_NAME,
     Live2DViewerModProject,
     add_model_to_project,
+    create_empty_project,
     create_project_from_base_source,
     delete_project_directory,
     export_live2dviewer_mod,
@@ -52,7 +53,6 @@ from app.core.live2dviewer_mod_project import (
     move_model_in_project,
     remove_model_from_project,
     rename_project,
-    sanitize_identifier,
     sanitize_project_name,
     sanitize_skin_name,
     save_project,
@@ -102,6 +102,35 @@ class ModTaskThread(QThread):
             self.taskReady.emit(result)
         except Exception as exc:
             self.taskError.emit(str(exc))
+
+
+class ProjectNameDialog(MessageBoxBase):
+    def __init__(self, title: str, initial_name: str = "", parent=None):
+        super().__init__(parent)
+        self.title_label = SubtitleLabel(title, self.widget)
+        self.name_label = BodyLabel(
+            tr("mod.project.new_name", default="工程名称"),
+            self.widget,
+        )
+        self.name_edit = LineEdit(self.widget)
+        self.name_edit.setText(initial_name)
+        self.name_edit.setPlaceholderText(
+            tr("mod.project.name_placeholder", default="输入 MOD 工程名称…")
+        )
+        self.name_edit.selectAll()
+        self.yesButton.setText(tr("common.confirm", default="确定"))
+        self.cancelButton.setText(tr("common.cancel", default="取消"))
+        self.viewLayout.addWidget(self.title_label)
+        self.viewLayout.addWidget(self.name_label)
+        self.viewLayout.addWidget(self.name_edit)
+        self.widget.setMinimumWidth(440)
+
+    def validate(self) -> bool:
+        return bool(self.name_edit.text().strip())
+
+    @property
+    def project_name(self) -> str:
+        return sanitize_project_name(self.name_edit.text())
 
 
 class DeleteProjectDialog(QDialog):
@@ -643,6 +672,15 @@ class ModelCard(CardWidget):
         root.addLayout(content, 1)
 
 
+class ProjectSearchComboBox(EditableComboBox):
+    """Editable project selector that never creates arbitrary entries."""
+
+    def _onReturnPressed(self):
+        # The page resolves exact or unique partial matches.  The stock
+        # EditableComboBox would append unmatched search text as a new item.
+        pass
+
+
 class Live2DModPage(QFrame):
     previewModelRequested = Signal(str)
 
@@ -658,6 +696,12 @@ class Live2DModPage(QFrame):
         self.worker_kind = ""
         self.pending_sources: list[str] = []
         self._project_combo_refreshing = False
+        self._project_search_timer = QTimer(self)
+        self._project_search_timer.setSingleShot(True)
+        self._project_search_timer.setInterval(220)
+        self._project_search_timer.timeout.connect(
+            self.open_project_from_search
+        )
         self._artmesh_refreshing = False
         self._loading_ui = False
         self._dirty = False
@@ -689,12 +733,15 @@ class Live2DModPage(QFrame):
         project_layout.setContentsMargins(14, 14, 14, 14)
         project_layout.setSpacing(8)
         self.project_title = SubtitleLabel("", self.project_card)
-        self.project_name_edit = LineEdit(self.project_card)
-        self.project_name_edit.textChanged.connect(self.mark_dirty)
-        self.project_combo = EditableComboBox(self.project_card)
+        self.project_combo = ProjectSearchComboBox(self.project_card)
         self.project_combo.currentIndexChanged.connect(self.on_project_combo_changed)
+        self.project_combo.textChanged.connect(
+            self.on_project_search_text_changed
+        )
+        self.project_combo.returnPressed.connect(
+            self.open_project_from_search
+        )
         project_layout.addWidget(self.project_title)
-        project_layout.addWidget(self.project_name_edit)
         project_layout.addWidget(self.project_combo)
         project_buttons = QGridLayout()
         project_buttons.setHorizontalSpacing(8)
@@ -829,7 +876,6 @@ class Live2DModPage(QFrame):
 
     def retranslate_ui(self):
         self.project_title.setText(tr("mod.project.title"))
-        self.project_name_edit.setPlaceholderText(tr("mod.project.name_placeholder"))
         self.project_combo.setPlaceholderText(
             tr("mod.project.search_placeholder", default="搜索或选择 MOD 工程…")
         )
@@ -858,14 +904,14 @@ class Live2DModPage(QFrame):
         self.export_hint.setText(
             tr(
                 "mod.v2.export_hint",
-                default="重新生成所有皮肤模型、ArtMesh 触发参数和 JSON 映射表，再打包为 ZIP。",
+                default="生成完整模型、换装触发参数和 JSON 映射表，输出为可上传创意工坊的文件夹。",
             )
         )
         self.export_button.setText(
-            tr("mod.v3.export_short", default="导出 ZIP")
+            tr("mod.v4.export_folder", default="导出文件夹")
         )
         self.export_folder_button.setText(
-            tr("mod.v3.export_folder_short", default="导出目录")
+            tr("mod.v4.open_export", default="打开导出位置")
         )
         self.import_title.setText(
             tr("mod.v3.import_title", default="1 · 导入模型")
@@ -951,10 +997,6 @@ class Live2DModPage(QFrame):
     def set_source(self, path: str):
         self.selected_source = os.path.abspath(path)
         self.source_edit.setText(self.selected_source)
-        if not self.current_project and not self.project_name_edit.text().strip():
-            self._loading_ui = True
-            self.project_name_edit.setText(self.suggest_project_name(path))
-            self._loading_ui = False
         self.refresh_project_ui()
 
     def import_selected_source(self):
@@ -1003,7 +1045,6 @@ class Live2DModPage(QFrame):
             source=source,
             project_name=(
                 project_name.strip()
-                or self.project_name_edit.text().strip()
                 or self.suggest_project_name(source)
             ),
             output_root=self.settings_manager.get_output_dir("live2dviewer_mod"),
@@ -1011,22 +1052,31 @@ class Live2DModPage(QFrame):
         )
 
     def create_new_project(self):
-        source = self.source_edit.text().strip()
-        if not source or not Path(source).exists():
-            self.show_warning(tr("mod.warning.no_source"))
-            return
         if not self.confirm_discard_or_save():
             return
-        suggested = self.suggest_project_name(source)
-        name, accepted = QInputDialog.getText(
-            self,
-            tr("mod.project.new_title", default="新建 MOD 工程"),
-            tr("mod.project.new_name", default="工程名称"),
-            text=suggested,
+        source = self.source_edit.text().strip()
+        suggested = (
+            self.suggest_project_name(source)
+            if source and Path(source).exists()
+            else ""
         )
-        if not accepted or not name.strip():
+        dialog = ProjectNameDialog(
+            tr("mod.project.new_title", default="新建 MOD 工程"),
+            suggested,
+            self,
+        )
+        if dialog.exec() != QDialog.Accepted:
             return
-        self.start_create_project(sanitize_project_name(name))
+        try:
+            project = create_empty_project(
+                dialog.project_name,
+                output_root=self.settings_manager.get_output_dir(
+                    "live2dviewer_mod"
+                ),
+            )
+            self.set_current_project(project)
+        except Exception as exc:
+            self.show_error(str(exc))
 
     def start_next_queued_import(self):
         if self.worker or not self.current_project or not self.pending_sources:
@@ -1051,12 +1101,12 @@ class Live2DModPage(QFrame):
 
     def on_worker_ready(self, result: object):
         if self.worker_kind == "export":
-            project, archive_path = result
+            project, export_path = result
             self.set_current_project(project)
             message = tr(
                 "mod.v2.exported",
-                default="最终包已导出：{path}",
-                path=str(archive_path),
+                default="创意工坊文件夹已导出：{path}",
+                path=str(export_path),
             )
             self.append_log(message)
             InfoBar.success(
@@ -1364,14 +1414,13 @@ class Live2DModPage(QFrame):
             tr("mod.hitarea.none", default="未选择"),
             userData="",
         )
-        selected_visible = False
         for area in areas:
             area_id = str(area.get("id") or "").strip()
             name = str(area.get("name") or area_id).strip()
             if not area_id:
                 continue
             self.artmesh_combo.addItem(
-                f"{name}  ·  {area_id}",
+                area_id if name == area_id else f"{name}  ·  {area_id}",
                 userData=area_id,
             )
         for index in range(self.artmesh_combo.count()):
@@ -1421,15 +1470,21 @@ class Live2DModPage(QFrame):
             return
         if not self.flush_pending_changes():
             return
-        default_dir = self.current_project.project_dir / EXPORTS_DIR
-        default_name = (
-            f"{sanitize_identifier(self.current_project.project_name, 'live2dviewer_mod')}.zip"
+        last_export = str(
+            self.current_project.data.get("last_export_path") or ""
         )
-        path, _ = QFileDialog.getSaveFileName(
+        default_dir = (
+            Path(last_export).resolve().parent
+            if last_export
+            else self.current_project.project_dir / EXPORTS_DIR
+        )
+        path = QFileDialog.getExistingDirectory(
             self,
-            tr("mod.v2.export_dialog", default="导出 Live2DViewerEX MOD 包"),
-            str(default_dir / default_name),
-            tr("mod.v2.export_filter", default="ZIP 压缩包 (*.zip)"),
+            tr(
+                "mod.v4.export_dialog",
+                default="选择创意工坊 MOD 文件夹的保存位置",
+            ),
+            str(default_dir),
         )
         if path:
             self.start_worker(
@@ -1444,32 +1499,27 @@ class Live2DModPage(QFrame):
         last_export = str(
             self.current_project.data.get("last_export_path") or ""
         )
+        exported = Path(last_export).resolve() if last_export else None
         directory = (
-            Path(last_export).resolve().parent
-            if last_export
-            else self.current_project.project_dir / EXPORTS_DIR
+            exported
+            if exported and exported.is_dir()
+            else (
+                exported.parent
+                if exported
+                else self.current_project.project_dir / EXPORTS_DIR
+            )
         )
         directory.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory)))
 
     def open_project_file(self):
-        if not self.confirm_discard_or_save():
-            return
-        last = str(
-            self.settings_manager.get(
-                "live2dviewer_mod.last_project_file",
-                "",
+        if not self.open_project_from_search():
+            self.show_warning(
+                tr(
+                    "mod.warning.project_not_found",
+                    default="请先在上方搜索框中选择一个已有工程。",
+                )
             )
-            or ""
-        )
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            tr("mod.dialog.open_project"),
-            str(Path(last).parent) if last else "",
-            tr("mod.dialog.filter_project_files"),
-        )
-        if path:
-            self.load_project_file(path)
 
     def load_last_project(self, silent: bool = False):
         path = str(
@@ -1493,9 +1543,6 @@ class Live2DModPage(QFrame):
 
     def set_current_project(self, project: Live2DViewerModProject):
         self.current_project = project
-        self._loading_ui = True
-        self.project_name_edit.setText(project.project_name)
-        self._loading_ui = False
         self._dirty = False
         self.remember_project_file(project)
         self.refresh_project_combo(str(project.project_file))
@@ -1508,10 +1555,6 @@ class Live2DModPage(QFrame):
             return False
         try:
             data = dict(self.current_project.data)
-            data["project_name"] = sanitize_project_name(
-                self.project_name_edit.text()
-                or self.current_project.project_name
-            )
             project_file = save_project(self.current_project.project_dir, data)
             self.set_current_project(load_project(project_file))
             if not silent:
@@ -1524,19 +1567,18 @@ class Live2DModPage(QFrame):
     def rename_current_project(self):
         if not self.current_project or not self.flush_pending_changes():
             return
-        name, accepted = QInputDialog.getText(
-            self,
+        dialog = ProjectNameDialog(
             tr("mod.project.rename_title", default="重命名 MOD 工程"),
-            tr("mod.project.new_name", default="工程名称"),
-            text=self.current_project.project_name,
+            self.current_project.project_name,
+            self,
         )
-        if not accepted or not name.strip():
+        if dialog.exec() != QDialog.Accepted:
             return
         old_path = str(self.current_project.project_file.resolve())
         try:
             renamed = rename_project(
                 self.current_project,
-                sanitize_project_name(name),
+                dialog.project_name,
             )
             self.forget_project_file(old_path, hide_from_discovery=False)
             self.set_current_project(renamed)
@@ -1580,7 +1622,7 @@ class Live2DModPage(QFrame):
         box.setText(
             tr(
                 "mod.v3.unsaved_message",
-                default="皮肤名称、工程名称或 ArtMesh 触发区有未保存修改。",
+                default="皮肤名称或 ArtMesh 触发区有未保存修改。",
             )
         )
         box.setStandardButtons(
@@ -1600,9 +1642,6 @@ class Live2DModPage(QFrame):
     def clear_current_project(self):
         self.current_project = None
         self._dirty = False
-        self._loading_ui = True
-        self.project_name_edit.clear()
-        self._loading_ui = False
         self.refresh_project_combo()
         self.refresh_artmesh_combo()
         self.refresh_model_cards()
@@ -1714,8 +1753,79 @@ class Live2DModPage(QFrame):
             if str(self.project_combo.itemData(index) or "") == selected:
                 self.project_combo.setCurrentIndex(index)
                 break
+        else:
+            self.project_combo.setCurrentIndex(-1)
         self.project_combo.blockSignals(False)
         self._project_combo_refreshing = False
+
+    def project_path_from_search(
+        self,
+        query: str | None = None,
+        *,
+        allow_partial: bool = True,
+    ) -> str:
+        text = str(
+            self.project_combo.currentText() if query is None else query
+        ).strip()
+        if not text:
+            return ""
+        folded = text.casefold()
+        entries = [
+            (
+                str(self.project_combo.itemText(index)).strip(),
+                str(self.project_combo.itemData(index) or ""),
+            )
+            for index in range(self.project_combo.count())
+            if self.project_combo.itemData(index)
+        ]
+        exact = [path for name, path in entries if name.casefold() == folded]
+        if len(exact) == 1:
+            return exact[0]
+        if not allow_partial:
+            return ""
+        partial = [
+            path for name, path in entries if folded in name.casefold()
+        ]
+        return partial[0] if len(partial) == 1 else ""
+
+    def on_project_search_text_changed(self, text: str):
+        if self._project_combo_refreshing:
+            return
+        self._project_search_timer.stop()
+        index = self.project_combo.currentIndex()
+        if (
+            index >= 0
+            and self.project_combo.itemData(index)
+            and str(self.project_combo.itemText(index)).strip().casefold()
+            == str(text).strip().casefold()
+        ):
+            return
+        if len(str(text).strip()) >= 2:
+            self._project_search_timer.start()
+
+    def open_project_from_search(self) -> bool:
+        self._project_search_timer.stop()
+        path = self.project_path_from_search()
+        if not path:
+            return False
+        return self.switch_to_project(path)
+
+    def switch_to_project(self, path: str) -> bool:
+        if (
+            self.current_project
+            and str(self.current_project.project_file.resolve())
+            == str(Path(path).resolve())
+        ):
+            return True
+        if not self.confirm_discard_or_save():
+            self.refresh_project_combo(
+                str(self.current_project.project_file)
+                if self.current_project
+                else ""
+            )
+            return False
+        self.load_project_file(path)
+        return True
 
     def on_project_combo_changed(self, *_args):
         if self._project_combo_refreshing:
@@ -1723,20 +1833,7 @@ class Live2DModPage(QFrame):
         path = str(self.project_combo.currentData() or "")
         if not path:
             return
-        if (
-            self.current_project
-            and str(self.current_project.project_file.resolve())
-            == str(Path(path).resolve())
-        ):
-            return
-        if not self.confirm_discard_or_save():
-            self.refresh_project_combo(
-                str(self.current_project.project_file)
-                if self.current_project
-                else ""
-            )
-            return
-        self.load_project_file(path)
+        self.switch_to_project(path)
 
     def mark_dirty(self, *_args):
         if self._loading_ui or not self.current_project:
@@ -1747,12 +1844,9 @@ class Live2DModPage(QFrame):
 
     def refresh_title(self):
         name = (
-            self.project_name_edit.text().strip()
-            or (
-                self.current_project.project_name
-                if self.current_project
-                else tr("mod.v3.untitled", default="未命名")
-            )
+            self.current_project.project_name
+            if self.current_project
+            else tr("mod.v3.untitled", default="未命名")
         )
         suffix = " *" if self._dirty else ""
         self.title_label.setText(
@@ -1783,7 +1877,10 @@ class Live2DModPage(QFrame):
         self.import_button.setText(
             tr("mod.v2.add_model", default="添加到工程")
             if has_project
-            else tr("mod.project.new")
+            else tr(
+                "mod.v4.auto_create_import",
+                default="自动建工程并导入",
+            )
         )
         if has_project:
             self.project_status.setText(

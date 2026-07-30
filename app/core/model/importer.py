@@ -9,7 +9,11 @@ from typing import Callable
 from app.core.extract import ExtractMode, ExtractSourceType, detect_source_type
 from app.core.extract.unity import extract_unity
 from app.core.model.live2d_package import Live2DPackage
-from app.core.model.resolver import Live2DPackageError, resolve_live2d_package
+from app.core.model.resolver import (
+    Live2DPackageError,
+    is_model_json_path,
+    resolve_live2d_package,
+)
 from app.core.preview.session import prepare_preview_import
 from app.core.settings_manager import SettingsManager
 
@@ -159,28 +163,56 @@ def _resolve_local_live2d_package(source_path: Path) -> Live2DPackage:
         return resolve_live2d_package(source_path)
     except Live2DPackageError as exc:
         direct_error = exc
-        if not source_path.is_file() or source_path.suffix.lower() in {
-            ".lpk",
-            ".wpk",
-            ".zip",
-            ".7z",
-            ".rar",
-            ".assets",
-            ".sharedassets",
-            ".bundle",
-            ".unity3d",
-        }:
+        if not source_path.is_file():
             raise
 
-    # Texture, motion, physics and moc files may be nested one or two levels
-    # below model3.json.  Keep the search local so an unrelated model elsewhere
-    # in a large game directory is not selected accidentally.
+    # Extensionless AssetBundles are common.  They must go through Unity
+    # extraction instead of being mistaken for an arbitrary file beside an
+    # already-extracted, unrelated model.
+    if detect_source_type(source_path) in {
+        ExtractSourceType.LPK,
+        ExtractSourceType.WPK,
+        ExtractSourceType.UNITY,
+    }:
+        raise direct_error
+
+    companion_suffixes = {
+        ".json",
+        ".moc",
+        ".moc3",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".bmp",
+        ".gif",
+        ".webp",
+        ".tga",
+        ".wav",
+        ".mp3",
+        ".ogg",
+    }
+    if source_path.suffix.lower() not in companion_suffixes:
+        raise direct_error
+
+    # Texture, motion, physics and moc files may be nested below model3.json.
+    # Only inspect model JSON files directly in each ancestor.  Recursive
+    # ancestor resolution can cross into sibling character folders and silently
+    # select the first unrelated model there.
     errors: list[Exception] = []
     for parent in list(source_path.parents)[:4]:
-        try:
-            return resolve_live2d_package(parent)
-        except Live2DPackageError as exc:
-            errors.append(exc)
+        candidates = sorted(
+            (
+                path
+                for path in parent.glob("*.json")
+                if path.is_file() and is_model_json_path(path)
+            ),
+            key=lambda path: path.name.lower(),
+        )
+        for candidate in candidates:
+            try:
+                return resolve_live2d_package(candidate)
+            except Live2DPackageError as exc:
+                errors.append(exc)
     raise errors[-1] if errors else direct_error
 
 
