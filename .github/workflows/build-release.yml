@@ -21,6 +21,7 @@ jobs:
         $url = "https://github.com/aelurum/AssetStudio/releases/download/v0.19.0/AssetStudioModCLI_net472_win32_64.zip"
         $expectedHash = "cad5b9e2084dda85007012f94c6d3ad1944ba153796c4e80027792d0ba7be285"
         $archive = Join-Path $env:RUNNER_TEMP "AssetStudioModCLI_net472_win32_64.zip"
+        $extractRoot = Join-Path $env:RUNNER_TEMP "AssetStudioModCLI"
         $target = Join-Path $PWD "app/tools/AssetStudioCLI"
 
         Invoke-WebRequest -Uri $url -OutFile $archive
@@ -29,10 +30,16 @@ jobs:
           throw "AssetStudioModCLI checksum mismatch: $actualHash"
         }
 
+        Expand-Archive -Path $archive -DestinationPath $extractRoot -Force
+        $assetStudioExe = Get-ChildItem -Path $extractRoot -Recurse -Filter "AssetStudioModCLI.exe" | Select-Object -First 1
+        if (-Not $assetStudioExe) {
+          throw "AssetStudioModCLI.exe was not found in the downloaded archive."
+        }
+
         New-Item -ItemType Directory -Path $target -Force | Out-Null
-        Expand-Archive -Path $archive -DestinationPath $target -Force
+        Copy-Item -Path (Join-Path $assetStudioExe.Directory.FullName "*") -Destination $target -Recurse -Force
         if (-Not (Test-Path (Join-Path $target "AssetStudioModCLI.exe"))) {
-          throw "AssetStudioModCLI.exe was not found after extraction."
+          throw "AssetStudioModCLI.exe was not copied into the build tools directory."
         }
     
     - name: Set up pixi
