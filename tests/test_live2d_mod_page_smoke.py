@@ -116,6 +116,24 @@ class Live2DModPageSmokeTests(unittest.TestCase):
                 )
                 page.set_current_project(project)
                 self.assertEqual(len(page.findChildren(module.ModelCard)), 2)
+                self.assertIsInstance(
+                    page.models_container,
+                    module.ModelListContainer,
+                )
+                card_buttons = [
+                    button.text()
+                    for card in page.findChildren(module.ModelCard)
+                    for button in card.findChildren(module.PushButton)
+                ]
+                self.assertNotIn(module.tr("mod.models.move_up"), card_buttons)
+                self.assertNotIn(
+                    module.tr("mod.models.move_down"),
+                    card_buttons,
+                )
+                self.assertIn(
+                    module.tr("mod.models.make_main"),
+                    card_buttons,
+                )
                 self.assertTrue(page.export_button.isEnabled())
                 self.assertEqual(
                     page.artmesh_combo.currentData(),

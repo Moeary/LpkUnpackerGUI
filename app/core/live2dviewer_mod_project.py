@@ -286,18 +286,17 @@ def move_model_in_project(
     if source_index < 0:
         raise Live2DViewerModProjectError(f"Model does not exist: {model_id}")
     target_index = max(0, min(int(target_index), len(models) - 1))
-    if target_index == 0:
-        model_json = _resolve_project_path(
-            project.project_dir,
-            str(models[source_index].get("model_json") or ""),
-        )
-        if not model_json.is_file():
-            raise Live2DViewerModProjectError(
-                "Only a complete Live2D model can be placed in the main-model position."
-            )
     main_changed = source_index == 0 or target_index == 0
     model = models.pop(source_index)
     models.insert(target_index, model)
+    main_model_json = _resolve_project_path(
+        project.project_dir,
+        str(models[0].get("model_json") or ""),
+    )
+    if not main_model_json.is_file():
+        raise Live2DViewerModProjectError(
+            "Only a complete Live2D model can be placed in the main-model position."
+        )
     data["models"] = models
     if main_changed:
         _refresh_all_mappings(project.project_dir, models)
@@ -487,8 +486,9 @@ def generate_live2dviewer_mod(
     _copy_workspace(main_package.root_dir, output_dir)
 
     generated_package = resolve_live2d_package(output_dir)
-    generated_main_json = generated_package.model_json
-    main_json_data = _read_json(generated_main_json)
+    source_main_json = generated_package.model_json
+    generated_main_json = output_dir / "model0.json"
+    main_json_data = _read_json(source_main_json)
     main_texture_refs = _texture_refs(main_json_data)
     generated_models: list[dict[str, Any]] = [
         {
@@ -528,7 +528,7 @@ def generate_live2dviewer_mod(
             copied = _copy_skin_texture(
                 source,
                 output_dir,
-                model_id,
+                index,
                 target_index,
                 main_texture_refs[target_index],
             )
@@ -539,7 +539,7 @@ def generate_live2dviewer_mod(
                 f"No valid texture mapping could be applied for {model.get('skin_name') or model_id}."
             )
         _set_texture_refs(model_json_data, new_refs)
-        model_file_name = f"model_{index:03d}_{model_id}.model3.json"
+        model_file_name = f"model{index}.json"
         model_path = output_dir / model_file_name
         generated_payloads.append((model_path, model_json_data))
         generated_models.append(
@@ -1023,9 +1023,8 @@ def _refresh_all_mappings(
 def _invalidate_build(project_dir: str | Path, data: dict[str, Any]) -> None:
     data["generated_output_dir"] = ""
     data["generated_model_json_paths"] = []
-    build_dir = Path(project_dir).resolve() / BUILD_DIR
-    if build_dir.exists():
-        shutil.rmtree(build_dir, ignore_errors=True)
+    # The next build always recreates BUILD_DIR.  Deleting a previous build
+    # here can block the GUI for seconds when it contains large textures.
 
 
 def _remove_owned_model_workspace(project_dir: Path, workspace: Path) -> None:
@@ -1191,19 +1190,14 @@ def _set_texture_refs(model_data: dict[str, Any], texture_refs: list[str]) -> No
 def _copy_skin_texture(
     source: Path,
     output_dir: Path,
-    model_id: str,
+    model_index: int,
     target_index: int,
     target_ref: str,
 ) -> Path:
-    texture_dir = output_dir / "textures" / model_id
-    texture_dir.mkdir(parents=True, exist_ok=True)
-    target_name = (
-        Path(target_ref.replace("\\", "/")).name
-        or f"texture_{target_index}.png"
-    )
-    target_path = texture_dir / target_name
-    if source.suffix and source.suffix.lower() != target_path.suffix.lower():
-        target_path = target_path.with_suffix(source.suffix.lower())
+    suffix = source.suffix.lower() or Path(
+        target_ref.replace("\\", "/")
+    ).suffix.lower() or ".png"
+    target_path = output_dir / f"{model_index}_{target_index}{suffix}"
     shutil.copy2(source, target_path)
     return target_path
 
@@ -1262,12 +1256,33 @@ def _inject_switch_menu(
         ):
             item["Id"] = selected_artmesh_id
             item["Motion"] = menu_motion
+            item["Order"] = max(
+                [
+                    int(area.get("Order") or area.get("order") or 0)
+                    for area in hit_areas
+                    if isinstance(area, dict)
+                ]
+                or [0]
+            ) + 1
+            item["IgnoreVisibility"] = True
+            item["Enabled"] = True
             return
+    highest_order = max(
+        [
+            int(area.get("Order") or area.get("order") or 0)
+            for area in hit_areas
+            if isinstance(area, dict)
+        ]
+        or [0]
+    )
     hit_areas.append(
         {
             "Name": "Switch Skin",
             "Id": selected_artmesh_id,
+            "Order": highest_order + 1,
+            "IgnoreVisibility": True,
             "Motion": menu_motion,
+            "Enabled": True,
         }
     )
 

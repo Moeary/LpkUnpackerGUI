@@ -117,11 +117,15 @@ class Live2DViewerModProjectTests(unittest.TestCase):
         )
         self.assertEqual(project.models[1]["skin_name"], "Night Blue")
 
+        stale_build = project.project_dir / BUILD_DIR / "stale.bin"
+        stale_build.parent.mkdir(parents=True, exist_ok=True)
+        stale_build.write_bytes(b"old build")
         project = move_model_in_project(
             project,
             project.models[1]["id"],
             0,
         )
+        self.assertTrue(stale_build.is_file())
         self.assertEqual(project.models[0]["skin_name"], "Night Blue")
         self.assertEqual(len(project.models[1]["texture_mappings"]), 2)
         self.assertEqual(len(project.data["artmesh_areas"]), 2)
@@ -143,7 +147,10 @@ class Live2DViewerModProjectTests(unittest.TestCase):
         }
         self.assertIn(SKIN_MANIFEST_FILE, names)
         self.assertIn(MAPPING_TABLE_FILE, names)
-        self.assertTrue(any(name.endswith(".model3.json") for name in names))
+        self.assertIn("model0.json", names)
+        self.assertIn("model1.json", names)
+        self.assertIn("1_0.png", names)
+        self.assertIn("1_1.png", names)
         manifest = json.loads(
             (project.project_dir / BUILD_DIR / SKIN_MANIFEST_FILE).read_text(
                 encoding="utf-8"
@@ -172,6 +179,18 @@ class Live2DViewerModProjectTests(unittest.TestCase):
                 if item["Id"] == "ArtMeshBody"
             )
             self.assertEqual(selected_area["Motion"], "TapSwitchSkin")
+            self.assertTrue(selected_area["IgnoreVisibility"])
+            self.assertTrue(selected_area["Enabled"])
+            switch_events = generated["FileReferences"]["Motions"][
+                "SwitchSkin"
+            ]
+            self.assertEqual(
+                [event["Command"] for event in switch_events],
+                [
+                    "change_model model0.json",
+                    "change_model model1.json",
+                ],
+            )
 
         removed_id = project.models[1]["id"]
         removed_workspace = (

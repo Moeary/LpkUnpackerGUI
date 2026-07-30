@@ -1,13 +1,35 @@
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 from typing import Any
 
 from PIL import Image
-from PySide6.QtCore import Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent, QPixmap
+from PySide6.QtCore import (
+    QEvent,
+    QMimeData,
+    QPoint,
+    QSize,
+    Qt,
+    QThread,
+    QTimer,
+    QUrl,
+    Signal,
+)
+from PySide6.QtGui import (
+    QColor,
+    QDesktopServices,
+    QDrag,
+    QDragEnterEvent,
+    QDropEvent,
+    QImageReader,
+    QPainter,
+    QPen,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
+    QApplication,
     QDialog,
     QFileDialog,
     QFrame,
@@ -16,7 +38,6 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QMessageBox,
-    QScrollArea,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -30,13 +51,16 @@ from qfluentwidgets import (
     CheckBox,
     ComboBox,
     EditableComboBox,
+    FluentIcon,
     InfoBar,
     InfoBarPosition,
     LineEdit,
     MessageBoxBase,
     PrimaryPushButton,
     PushButton,
+    ScrollArea,
     SubtitleLabel,
+    TransparentToolButton,
 )
 
 from app.core.live2dviewer_mod_project import (
@@ -60,6 +84,52 @@ from app.core.live2dviewer_mod_project import (
 )
 from app.core.settings_manager import SettingsManager
 from app.i18n import get_i18n, tr
+
+
+MODEL_DRAG_MIME = "application/x-live2d-mod-model"
+_TEXTURE_PIXMAP_CACHE: dict[tuple[str, int, int, int], QPixmap] = {}
+_TEXTURE_HASH_CACHE: dict[tuple[str, int, int], str] = {}
+
+
+def _scaled_texture_pixmap(path: Path, width: int, height: int) -> QPixmap:
+    try:
+        stat = path.stat()
+        key = (str(path.resolve()), stat.st_mtime_ns, width, height)
+    except OSError:
+        return QPixmap()
+    cached = _TEXTURE_PIXMAP_CACHE.get(key)
+    if cached is not None:
+        return cached
+    reader = QImageReader(str(path))
+    reader.setAutoTransform(True)
+    source_size = reader.size()
+    if source_size.isValid():
+        reader.setScaledSize(
+            source_size.scaled(
+                QSize(max(1, width), max(1, height)),
+                Qt.KeepAspectRatio,
+            )
+        )
+    pixmap = QPixmap.fromImage(reader.read())
+    if len(_TEXTURE_PIXMAP_CACHE) >= 96:
+        _TEXTURE_PIXMAP_CACHE.pop(next(iter(_TEXTURE_PIXMAP_CACHE)))
+    _TEXTURE_PIXMAP_CACHE[key] = pixmap
+    return pixmap
+
+
+def _texture_sha256(path: Path) -> str:
+    stat = path.stat()
+    key = (str(path.resolve()), stat.st_mtime_ns, stat.st_size)
+    cached = _TEXTURE_HASH_CACHE.get(key)
+    if cached:
+        return cached
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    result = digest.hexdigest()
+    _TEXTURE_HASH_CACHE[key] = result
+    return result
 
 
 class ModTaskThread(QThread):
@@ -373,6 +443,7 @@ class TextureGalleryDialog(QDialog):
         layout.addWidget(self.image_label, 1)
         self.detail_label = CaptionLabel("", self)
         self.detail_label.setAlignment(Qt.AlignCenter)
+        self.detail_label.setWordWrap(True)
         layout.addWidget(self.detail_label)
 
         buttons = QHBoxLayout()
@@ -430,22 +501,89 @@ class TextureGalleryDialog(QDialog):
             self.detail_label.clear()
             return
         path = self.textures[self.current_index]
-        pixmap = QPixmap(str(path))
+        available_width = max(1, self.image_label.width() - 16)
+        available_height = max(1, self.image_label.height() - 16)
+        pixmap = _scaled_texture_pixmap(
+            path,
+            available_width,
+            available_height,
+        )
         if pixmap.isNull():
             self.image_label.setPixmap(QPixmap())
             self.image_label.setText(path.name)
             return
         self.image_label.setText("")
-        self.image_label.setPixmap(
-            pixmap.scaled(
-                max(1, self.image_label.width() - 16),
-                max(1, self.image_label.height() - 16),
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation,
+        self.image_label.setPixmap(pixmap)
+        try:
+            with Image.open(path) as image:
+                width, height = image.size
+                image_format = str(image.format or path.suffix.lstrip(".")).upper()
+                image_mode = str(image.mode)
+            size_bytes = path.stat().st_size
+            digest = _texture_sha256(path)
+            exact_matches: list[int] = []
+            same_dimensions: list[int] = []
+            for index, candidate in enumerate(self.textures):
+                if index == self.current_index:
+                    continue
+                reader = QImageReader(str(candidate))
+                candidate_size = reader.size()
+                if (
+                    candidate_size.isValid()
+                    and candidate_size.width() == width
+                    and candidate_size.height() == height
+                ):
+                    same_dimensions.append(index + 1)
+                if (
+                    candidate.stat().st_size == size_bytes
+                    and _texture_sha256(candidate) == digest
+                ):
+                    exact_matches.append(index + 1)
+            duplicate_text = (
+                tr(
+                    "mod.gallery.exact_duplicates",
+                    default="完全相同：第 {indexes} 张",
+                    indexes="、".join(map(str, exact_matches)),
+                )
+                if exact_matches
+                else tr(
+                    "mod.gallery.no_exact_duplicate",
+                    default="未发现内容完全相同的贴图",
+                )
             )
-        )
-        self.detail_label.setText(
-            tr(
+            same_size_text = (
+                tr(
+                    "mod.gallery.same_dimensions",
+                    default="同尺寸：第 {indexes} 张",
+                    indexes="、".join(map(str, same_dimensions)),
+                )
+                if same_dimensions
+                else tr(
+                    "mod.gallery.unique_dimensions",
+                    default="没有其他同尺寸贴图",
+                )
+            )
+            detail = tr(
+                "mod.gallery.detail_extended",
+                default=(
+                    "{index}/{count} · {width} × {height} · {format}/{mode} · "
+                    "{size} MiB · SHA-256 {hash}\n"
+                    "{duplicates}；{same_dimensions}\n{path}"
+                ),
+                index=self.current_index + 1,
+                count=len(self.textures),
+                width=width,
+                height=height,
+                format=image_format,
+                mode=image_mode,
+                size=f"{size_bytes / (1024 * 1024):.2f}",
+                hash=digest[:16],
+                duplicates=duplicate_text,
+                same_dimensions=same_size_text,
+                path=str(path),
+            )
+        except Exception:
+            detail = tr(
                 "mod.gallery.detail",
                 default="{index}/{count} · {width} × {height} · {path}",
                 index=self.current_index + 1,
@@ -454,11 +592,88 @@ class TextureGalleryDialog(QDialog):
                 height=pixmap.height(),
                 path=str(path),
             )
+        self.detail_label.setText(
+            detail
         )
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.refresh_image()
+
+
+class ModelListContainer(QWidget):
+    reorderRequested = Signal(str, int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.cards: list[ModelCard] = []
+        self.drop_index = -1
+
+    def set_cards(self, cards: list["ModelCard"]):
+        self.cards = cards
+        self.drop_index = -1
+        self.update()
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasFormat(MODEL_DRAG_MIME):
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event):
+        if not event.mimeData().hasFormat(MODEL_DRAG_MIME):
+            return
+        y = event.position().toPoint().y()
+        self.drop_index = len(self.cards)
+        for index, card in enumerate(self.cards):
+            if y < card.geometry().center().y():
+                self.drop_index = index
+                break
+        self.update()
+        event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event):
+        self.drop_index = -1
+        self.update()
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event: QDropEvent):
+        if not event.mimeData().hasFormat(MODEL_DRAG_MIME):
+            return
+        model_id = bytes(
+            event.mimeData().data(MODEL_DRAG_MIME)
+        ).decode("utf-8", errors="ignore")
+        source_index = next(
+            (
+                index
+                for index, card in enumerate(self.cards)
+                if card.model_id == model_id
+            ),
+            -1,
+        )
+        target_index = self.drop_index
+        self.drop_index = -1
+        self.update()
+        if source_index < 0:
+            return
+        if target_index > source_index:
+            target_index -= 1
+        target_index = max(0, min(target_index, len(self.cards) - 1))
+        if target_index != source_index:
+            self.reorderRequested.emit(model_id, target_index)
+        event.acceptProposedAction()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self.drop_index < 0 or not self.cards:
+            return
+        if self.drop_index < len(self.cards):
+            y = self.cards[self.drop_index].geometry().top() - 4
+        else:
+            y = self.cards[-1].geometry().bottom() + 4
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(QPen(QColor("#00a6ad"), 3))
+        painter.drawLine(8, y, max(8, self.width() - 14), y)
 
 
 class ModelCard(CardWidget):
@@ -474,9 +689,7 @@ class ModelCard(CardWidget):
         self,
         model: dict[str, Any],
         index: int,
-        total: int,
         textures: list[Path],
-        next_can_be_main: bool,
         parent=None,
     ):
         super().__init__(parent)
@@ -515,7 +728,7 @@ class ModelCard(CardWidget):
                 "QLabel { background: rgba(127,127,127,0.08); "
                 "border: 1px solid rgba(127,127,127,0.22); border-radius: 8px; }"
             )
-            pixmap = QPixmap(str(texture))
+            pixmap = _scaled_texture_pixmap(texture, 78, 90)
             if pixmap.isNull():
                 label.setText(texture.name)
             else:
@@ -538,6 +751,17 @@ class ModelCard(CardWidget):
         content = QVBoxLayout()
         content.setSpacing(6)
         header = QHBoxLayout()
+        self.drag_handle = TransparentToolButton(FluentIcon.MOVE, self)
+        self.drag_handle.setFixedSize(34, 30)
+        self.drag_handle.setCursor(Qt.OpenHandCursor)
+        self.drag_handle.setToolTip(
+            tr(
+                "mod.models.drag_tooltip",
+                default="按住拖动以调整顺序；拖到顶部会设为主模型",
+            )
+        )
+        self.drag_handle.installEventFilter(self)
+        self._drag_start = QPoint()
         role = (
             tr("mod.models.main_badge", default="主模型")
             if index == 0
@@ -560,6 +784,7 @@ class ModelCard(CardWidget):
                 self.skin_name_edit.text().strip(),
             )
         )
+        header.addWidget(self.drag_handle)
         header.addWidget(role_label)
         header.addWidget(name_label)
         header.addWidget(self.skin_name_edit, 1)
@@ -607,8 +832,14 @@ class ModelCard(CardWidget):
             tr("mod.models.mapping_short", default="映射"),
             self,
         )
-        move_up = PushButton(tr("mod.models.move_up", default="上移"), self)
-        move_down = PushButton(tr("mod.models.move_down", default="下移"), self)
+        make_main_button = PushButton(
+            (
+                tr("mod.models.current_main", default="当前主模型")
+                if index == 0
+                else tr("mod.models.make_main", default="设为主模型")
+            ),
+            self,
+        )
         folder_button = PushButton(
             tr("mod.models.open_folder", default="目录"),
             self,
@@ -621,10 +852,7 @@ class ModelCard(CardWidget):
         view_button.setEnabled(bool(textures))
         preview_button.setEnabled(has_model)
         mapping_button.setEnabled(index > 0 and bool(textures))
-        move_up.setEnabled(index > 1 or (index == 1 and has_model))
-        move_down.setEnabled(
-            index < total - 1 and (index > 0 or next_can_be_main)
-        )
+        make_main_button.setEnabled(index > 0 and has_model)
         view_button.clicked.connect(
             lambda: self.texturesRequested.emit(self.model_id)
         )
@@ -634,11 +862,8 @@ class ModelCard(CardWidget):
         mapping_button.clicked.connect(
             lambda: self.mappingRequested.emit(self.model_id)
         )
-        move_up.clicked.connect(
-            lambda: self.moveRequested.emit(self.model_id, self.index - 1)
-        )
-        move_down.clicked.connect(
-            lambda: self.moveRequested.emit(self.model_id, self.index + 1)
+        make_main_button.clicked.connect(
+            lambda: self.moveRequested.emit(self.model_id, 0)
         )
         folder_button.clicked.connect(
             lambda: self.folderRequested.emit(self.model_id)
@@ -658,18 +883,44 @@ class ModelCard(CardWidget):
             view_button,
             preview_button,
             mapping_button,
-            move_up,
-            move_down,
+            make_main_button,
             folder_button,
             remove_button,
         ):
             button.setMinimumWidth(50)
-            button.setMaximumWidth(82)
+            button.setMaximumWidth(104)
             button.setMinimumHeight(30)
             actions.addWidget(button)
         actions.addStretch(1)
         content.addLayout(actions)
         root.addLayout(content, 1)
+
+    def eventFilter(self, watched, event):
+        if watched is getattr(self, "drag_handle", None):
+            if (
+                event.type() == QEvent.MouseButtonPress
+                and event.button() == Qt.LeftButton
+            ):
+                self._drag_start = event.position().toPoint()
+                self.drag_handle.setCursor(Qt.ClosedHandCursor)
+            elif (
+                event.type() == QEvent.MouseMove
+                and event.buttons() & Qt.LeftButton
+                and (
+                    event.position().toPoint() - self._drag_start
+                ).manhattanLength()
+                >= QApplication.startDragDistance()
+            ):
+                mime = QMimeData()
+                mime.setData(MODEL_DRAG_MIME, self.model_id.encode("utf-8"))
+                drag = QDrag(self)
+                drag.setMimeData(mime)
+                drag.exec(Qt.MoveAction)
+                self.drag_handle.setCursor(Qt.OpenHandCursor)
+                return True
+            elif event.type() == QEvent.MouseButtonRelease:
+                self.drag_handle.setCursor(Qt.OpenHandCursor)
+        return super().eventFilter(watched, event)
 
 
 class ProjectSearchComboBox(EditableComboBox):
@@ -776,6 +1027,7 @@ class Live2DModPage(QFrame):
         artmesh_layout.setSpacing(8)
         self.artmesh_title = SubtitleLabel("", self.artmesh_card)
         self.artmesh_combo = EditableComboBox(self.artmesh_card)
+        self.artmesh_combo.setMaxVisibleItems(12)
         self.artmesh_combo.currentIndexChanged.connect(self.on_artmesh_combo_changed)
         artmesh_layout.addWidget(self.artmesh_title)
         artmesh_layout.addWidget(self.artmesh_combo)
@@ -813,13 +1065,6 @@ class Live2DModPage(QFrame):
         import_layout.setSpacing(8)
         self.import_title = SubtitleLabel("", self.import_card)
         import_layout.addWidget(self.import_title)
-        self.drop_frame = QFrame(self.import_card)
-        self.drop_frame.setObjectName("modDropFrame")
-        drop_layout = QVBoxLayout(self.drop_frame)
-        drop_layout.setContentsMargins(14, 10, 14, 10)
-        self.drop_main_label = BodyLabel("", self.drop_frame)
-        drop_layout.addWidget(self.drop_main_label)
-        import_layout.addWidget(self.drop_frame)
         source_row = QHBoxLayout()
         self.source_edit = LineEdit(self.import_card)
         self.source_edit.setReadOnly(True)
@@ -858,15 +1103,18 @@ class Live2DModPage(QFrame):
         self.models_hint.setWordWrap(True)
         right_layout.addWidget(self.models_hint)
 
-        self.models_scroll = QScrollArea(right)
+        self.models_scroll = ScrollArea(right)
         self.models_scroll.setWidgetResizable(True)
         self.models_scroll.setFrameShape(QFrame.NoFrame)
         self.models_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.models_container = QWidget(self.models_scroll)
+        self.models_scroll.enableTransparentBackground()
+        self.models_container = ModelListContainer(self.models_scroll)
+        self.models_container.reorderRequested.connect(self.move_model)
         self.models_layout = QVBoxLayout(self.models_container)
         self.models_layout.setContentsMargins(0, 0, 5, 0)
         self.models_layout.setSpacing(8)
         self.models_scroll.setWidget(self.models_container)
+        self.models_scroll.enableTransparentBackground()
         right_layout.addWidget(self.models_scroll, 1)
 
         self.splitter.addWidget(left)
@@ -916,16 +1164,10 @@ class Live2DModPage(QFrame):
         self.import_title.setText(
             tr("mod.v3.import_title", default="1 · 导入模型")
         )
-        self.drop_main_label.setText(
-            tr(
-                "mod.v2.drop_main",
-                default="拖入任意 Live2D 相关文件或文件夹",
-            )
-        )
         self.source_edit.setPlaceholderText(
             tr(
-                "mod.v2.source_placeholder",
-                default="选择文件或文件夹，也可以直接拖入…",
+                "mod.v5.source_placeholder",
+                default="把任意 Live2D 相关文件或文件夹拖到这里，也可浏览选择…",
             )
         )
         self.browse_file_button.setText(tr("mod.source.browse_file"))
@@ -936,7 +1178,7 @@ class Live2DModPage(QFrame):
         self.models_hint.setText(
             tr(
                 "mod.v3.models_hint",
-                default="第一项自然作为主模型；通过上移/下移改变主模型和皮肤顺序，不再使用额外设置按钮。",
+                default="拖动左侧手柄自由排序；拖到最上方或点击“设为主模型”即可更换主模型。",
             )
         )
         self.add_file_button.setText(tr("mod.v2.add_file", default="添加文件"))
@@ -1165,6 +1407,7 @@ class Live2DModPage(QFrame):
     def refresh_model_cards(self):
         if not hasattr(self, "models_layout"):
             return
+        scroll_value = self.models_scroll.verticalScrollBar().value()
         while self.models_layout.count():
             item = self.models_layout.takeAt(0)
             widget = item.widget()
@@ -1189,21 +1432,16 @@ class Live2DModPage(QFrame):
             empty.setAlignment(Qt.AlignCenter)
             empty.setMinimumHeight(180)
             self.models_layout.addWidget(empty)
+        cards: list[ModelCard] = []
         for index, model in enumerate(models):
             textures = model_texture_paths(
                 self.current_project,
                 str(model.get("id") or ""),
             )
-            next_can_be_main = bool(
-                index + 1 < len(models)
-                and str(models[index + 1].get("model_json") or "")
-            )
             card = ModelCard(
                 model,
                 index,
-                len(models),
                 textures,
-                next_can_be_main,
                 self.models_container,
             )
             card.moveRequested.connect(self.move_model)
@@ -1214,7 +1452,15 @@ class Live2DModPage(QFrame):
             card.previewRequested.connect(self.preview_model)
             card.folderRequested.connect(self.open_model_folder)
             self.models_layout.addWidget(card)
+            cards.append(card)
         self.models_layout.addStretch(1)
+        self.models_container.set_cards(cards)
+        QTimer.singleShot(
+            0,
+            lambda value=scroll_value: self.models_scroll.verticalScrollBar().setValue(
+                min(value, self.models_scroll.verticalScrollBar().maximum())
+            ),
+        )
 
     def model_by_id(self, model_id: str) -> dict[str, Any] | None:
         if not self.current_project:
@@ -1231,14 +1477,24 @@ class Live2DModPage(QFrame):
     def move_model(self, model_id: str, target_index: int):
         if not self.current_project or not self.flush_pending_changes():
             return
+        old_main_id = str(
+            self.current_project.models[0].get("id") or ""
+        ) if self.current_project.models else ""
         try:
-            self.set_current_project(
-                move_model_in_project(
-                    self.current_project,
-                    model_id,
-                    target_index,
-                )
+            moved = move_model_in_project(
+                self.current_project,
+                model_id,
+                target_index,
             )
+            self.current_project = moved
+            self._dirty = False
+            new_main_id = (
+                str(moved.models[0].get("id") or "") if moved.models else ""
+            )
+            if new_main_id != old_main_id:
+                self.refresh_artmesh_combo()
+            self.refresh_model_cards()
+            self.refresh_project_ui()
             self.append_log(
                 tr(
                     "mod.v2.order_updated",
@@ -1964,11 +2220,6 @@ class Live2DModPage(QFrame):
     def _apply_styles(self):
         self.setStyleSheet(
             """
-            QFrame#modDropFrame {
-                border: 1px dashed rgba(91, 141, 239, 0.75);
-                border-radius: 10px;
-                background: rgba(91, 141, 239, 0.055);
-            }
             CardWidget#mainModelCard {
                 border: 2px solid rgba(91, 141, 239, 0.9);
             }
