@@ -14,6 +14,26 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+
+    - name: Download AssetStudioModCLI
+      shell: pwsh
+      run: |
+        $url = "https://github.com/aelurum/AssetStudio/releases/download/v0.19.0/AssetStudioModCLI_net472_win32_64.zip"
+        $expectedHash = "cad5b9e2084dda85007012f94c6d3ad1944ba153796c4e80027792d0ba7be285"
+        $archive = Join-Path $env:RUNNER_TEMP "AssetStudioModCLI_net472_win32_64.zip"
+        $target = Join-Path $PWD "app/tools/AssetStudioCLI"
+
+        Invoke-WebRequest -Uri $url -OutFile $archive
+        $actualHash = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actualHash -ne $expectedHash) {
+          throw "AssetStudioModCLI checksum mismatch: $actualHash"
+        }
+
+        New-Item -ItemType Directory -Path $target -Force | Out-Null
+        Expand-Archive -Path $archive -DestinationPath $target -Force
+        if (-Not (Test-Path (Join-Path $target "AssetStudioModCLI.exe"))) {
+          throw "AssetStudioModCLI.exe was not found after extraction."
+        }
     
     - name: Set up pixi
       uses: prefix-dev/setup-pixi@v0.9.3

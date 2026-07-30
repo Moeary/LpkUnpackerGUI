@@ -66,7 +66,13 @@ pixi run python -m nuitka --msvc=list
 
 ## GitHub Actions
 
-The release workflow installs pixi and runs:
+`app/tools/AssetStudioCLI/` is intentionally ignored by Git. Before compiling,
+the release workflow downloads the official AssetStudioModCLI v0.19.0
+`net472_win32_64` archive and verifies its SHA-256 digest. This keeps external
+binaries out of the repository while still including the Unity extraction
+backend in release packages.
+
+The release workflow then installs pixi and runs:
 
 ```powershell
 pixi run build
