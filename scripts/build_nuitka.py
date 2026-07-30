@@ -75,6 +75,7 @@ def build_nuitka_args(compiler: str) -> list[str]:
         "-m",
         "nuitka",
         "--standalone",
+        "--assume-yes-for-downloads",
         *compiler_args,
         "--enable-plugin=pyside6",
         "--output-dir=build",

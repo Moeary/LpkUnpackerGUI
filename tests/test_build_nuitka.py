@@ -5,10 +5,15 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.build_nuitka import ROOT, run_msvc_build
+from scripts.build_nuitka import ROOT, build_nuitka_args, run_msvc_build
 
 
 class BuildNuitkaTests(unittest.TestCase):
+    def test_build_allows_required_nuitka_helper_downloads(self):
+        args = build_nuitka_args("msvc")
+
+        self.assertIn("--assume-yes-for-downloads", args)
+
     def test_msvc_build_uses_batch_file_without_escaped_vsdevcmd_quotes(self):
         captured: dict[str, object] = {}
 

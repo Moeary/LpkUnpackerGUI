@@ -54,7 +54,11 @@ The local toolchain has been verified to expose:
 
 ## Download Behavior
 
-The build command intentionally does not use `--assume-yes-for-downloads`, and the build script redirects stdin to `NUL`. That means Nuitka should not silently consent to downloading helper tools or a fallback compiler. If MSVC or Windows SDK detection fails, fix the local Visual Studio installation or the `VsDevCmd.bat` path instead of letting Nuitka fall back to MinGW.
+The build command uses `--assume-yes-for-downloads` because a clean GitHub-hosted
+Windows runner needs Nuitka to download Dependency Walker for standalone DLL
+analysis. Standard input remains redirected to `NUL`, so the build stays
+non-interactive. MSVC is still selected explicitly through `VsDevCmd.bat` and
+`--msvc=14.3`; this option does not change the configured compiler backend.
 
 Useful diagnostics:
 
