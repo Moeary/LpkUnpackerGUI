@@ -4,6 +4,7 @@ import argparse
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -95,6 +96,33 @@ def build_nuitka_args(compiler: str) -> list[str]:
     ]
 
 
+def run_msvc_build(vsdevcmd: Path, nuitka_args: list[str]) -> int:
+    """Activate MSVC in a temporary batch file, then invoke Nuitka.
+
+    Passing the complete ``call "...\VsDevCmd.bat" && ...`` expression as a
+    list element makes Python escape its embedded quotes as ``\"`` on
+    Windows.  ``cmd.exe`` treats those backslashes literally, so paths under
+    ``Program Files`` fail on GitHub-hosted runners.  A batch file avoids that
+    second layer of command-line quoting entirely.
+    """
+    command = subprocess.list2cmdline(nuitka_args)
+    batch_text = (
+        "@echo off\n"
+        f'call "{vsdevcmd}" -arch=x64 -host_arch=x64 -no_logo\n'
+        "if errorlevel 1 exit /b %errorlevel%\n"
+        f"{command}\n"
+        "exit /b %errorlevel%\n"
+    )
+    with tempfile.TemporaryDirectory(prefix="lpk_nuitka_") as temp_dir:
+        batch_file = Path(temp_dir) / "build.cmd"
+        batch_file.write_text(batch_text, encoding="utf-8")
+        return subprocess.call(
+            ["cmd.exe", "/d", "/c", str(batch_file)],
+            cwd=ROOT,
+            stdin=subprocess.DEVNULL,
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Build LpkUnpackerGUI with Nuitka.")
     parser.add_argument(
@@ -110,15 +138,7 @@ def main() -> int:
         return subprocess.call(nuitka_args, cwd=ROOT, stdin=subprocess.DEVNULL)
 
     vsdevcmd = find_vsdevcmd()
-    command = (
-        f'call "{vsdevcmd}" -arch=x64 -host_arch=x64 -no_logo '
-        f"&& {subprocess.list2cmdline(nuitka_args)}"
-    )
-    return subprocess.call(
-        ["cmd.exe", "/d", "/s", "/c", command],
-        cwd=ROOT,
-        stdin=subprocess.DEVNULL,
-    )
+    return run_msvc_build(vsdevcmd, nuitka_args)
 
 
 if __name__ == "__main__":
