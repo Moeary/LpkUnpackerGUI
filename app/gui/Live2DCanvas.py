@@ -1,5 +1,4 @@
 import math
-import math
 import numpy as np
 from typing import Optional, List, Dict, Any
 
@@ -131,6 +130,7 @@ class ADPOpenGLCanvas(QOpenGLWindow):
         self._fbo_width = 0
         self._fbo_height = 0
         self._source_aspect_ratio = 1.0
+        self._antialias = True
 
     def __create_program(self):
         vertex_shader = """#version 330 core
@@ -234,9 +234,14 @@ class ADPOpenGLCanvas(QOpenGLWindow):
         # models instead of forcing them through a short-edge square.
         longest = max(
             1,
-            int(math.ceil(max(logical_width, logical_height) * self._dpr)),
+            int(math.ceil(max(logical_width, logical_height) * self._dpr
+                          * max(1.0, self.__model_scale)
+                          * (1.5 if self._antialias else 1.0))),
         )
         aspect = max(0.01, float(self._source_aspect_ratio))
+        # Bound GPU allocation at 32 megapixels / 8192 per edge. Re-render at
+        # zoom-aware resolution instead of magnifying a low-resolution FBO.
+        longest = min(longest, 8192, int(math.sqrt(32 * 1024 * 1024 * max(aspect, 1 / aspect))))
         if aspect >= 1.0:
             return longest, max(1, int(round(longest / aspect)))
         return max(1, int(round(longest * aspect))), longest
@@ -310,6 +315,11 @@ class ADPOpenGLCanvas(QOpenGLWindow):
         self.on_resize(self._fbo_width, self._fbo_height)
 
     def paintGL(self):
+        # Only allocate/delete GL resources while this window's context is current.
+        wanted = self._desired_canvas_size()
+        if wanted != (self._fbo_width, self._fbo_height):
+            self.__create_canvas_framebuffer()
+            self.on_resize(self._fbo_width, self._fbo_height)
         if not self._canvas_framebuffer or not self._canvas_texture:
             return
         # First render to offscreen canvas
@@ -362,11 +372,15 @@ class ADPOpenGLCanvas(QOpenGLWindow):
 
     def setModelTransform(self, scale: float, offset_x: float, offset_y: float):
         """Apply responsive model scale and offsets at the final composition pass."""
-        self.__model_scale = max(0.25, min(3.0, float(scale)))
+        self.__model_scale = max(0.25, min(4.0, float(scale)))
         self.__model_offset = (
             max(-1.0, min(1.0, float(offset_x))),
             max(-1.0, min(1.0, -float(offset_y))),
         )
+        self.update()
+
+    def setAntialias(self, enabled: bool):
+        self._antialias = bool(enabled)
         self.update()
 
     def setBackground(self, transparent: bool, qcolor):

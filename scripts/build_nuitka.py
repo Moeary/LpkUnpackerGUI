@@ -7,8 +7,11 @@ import sys
 import tempfile
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.verify_native_build import validate_native_sources  # noqa: E402
 
 
 def existing_file(path: str | Path | None) -> Path | None:
@@ -65,12 +68,19 @@ def find_vsdevcmd() -> Path:
     )
 
 
-def build_nuitka_args(compiler: str) -> list[str]:
+def build_nuitka_args(compiler: str, *, require_native: bool = False) -> list[str]:
+    if require_native:
+        # Release builds must fail before Nuitka starts when a locally built
+        # native artifact is absent.  The optional developer invocation keeps
+        # the old source-only behavior for contributors who only need to
+        # inspect the Python application.
+        validate_native_sources(ROOT, require_notices=True)
+
     compiler_args = ["--msvc=14.3"]
     if compiler == "mingw":
         compiler_args = ["--mingw64", "--low-memory", "--jobs=1", "--lto=no"]
 
-    return [
+    args = [
         sys.executable,
         "-m",
         "nuitka",
@@ -95,6 +105,32 @@ def build_nuitka_args(compiler: str) -> list[str]:
         "--remove-output",
         "app/main.py",
     ]
+    native_converter = ROOT / "runtime" / "tools" / "SpineSkeletonDataConverter" / "lpk_spine_converter.dll"
+    if native_converter.is_file():
+        args.insert(
+            -1,
+            f"--include-data-file={native_converter}=tools/SpineSkeletonDataConverter/lpk_spine_converter.dll",
+        )
+        for name in ("LICENSE", "SOURCE_METADATA.json", "THIRD_PARTY_NOTICES.md"):
+            source = ROOT / "third_party" / "wang606_spine_converter" / name
+            if source.is_file():
+                args.insert(-1, f"--include-data-file={source}=tools/SpineSkeletonDataConverter/{name}")
+    # Include only runtime artifacts and their provenance, never downloaded
+    # source archives, CMake build trees, or test models.
+    native_root = ROOT / "runtime" / "tools" / "spine_native"
+    for family in ("3.8.75", "4.0"):
+        library = native_root / family / "spine_bridge.dll"
+        if not library.is_file():
+            continue
+        for name in ("spine_bridge.dll", "spine_native.json", "LICENSE"):
+            source = library.parent / name
+            if source.is_file():
+                target = f"tools/spine_native/{library.parent.name}/{name}"
+                args.insert(-1, f"--include-data-file={source}={target}")
+    bridge_source = ROOT / "native" / "spine_bridge"
+    if bridge_source.is_dir():
+        args.insert(-1, f"--include-data-dir={bridge_source}=native/spine_bridge")
+    return args
 
 
 def run_msvc_build(vsdevcmd: Path, nuitka_args: list[str]) -> int:
@@ -132,9 +168,14 @@ def main() -> int:
         default="msvc",
         help="Backend compiler preset. Default: msvc.",
     )
+    parser.add_argument(
+        "--require-native",
+        action="store_true",
+        help="Require the converter and both native Spine bridge families before building.",
+    )
     args = parser.parse_args()
 
-    nuitka_args = build_nuitka_args(args.compiler)
+    nuitka_args = build_nuitka_args(args.compiler, require_native=args.require_native)
     if args.compiler == "mingw":
         return subprocess.call(nuitka_args, cwd=ROOT, stdin=subprocess.DEVNULL)
 

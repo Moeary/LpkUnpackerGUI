@@ -1,91 +1,74 @@
 # Spine skeleton converter
 
-当前开发机手动安装的是上游项目 [wang606/SpineSkeletonDataConverter](https://github.com/wang606/SpineSkeletonDataConverter) 的 Windows Release `v3.8`。这些 EXE 位于本机 `runtime/tools/SpineSkeletonDataConverter/`；`runtime/` 和 `*.exe` 被 Git 忽略，因此不会随源码分发。Release 发布时间为 2026-07-19，源码提交为 `5ecb2139b0a1af266974f95abeec6bb8562d1249`。当前安装目录还保留：
+应用内置的是上游 [wang606/SpineSkeletonDataConverter](https://github.com/wang606/SpineSkeletonDataConverter) 的 C++ 读取器、写入器和跨版本转换逻辑，并在固定提交上增加了一个很薄的 C ABI。GUI 通过 `ctypes` 直接调用 DLL，不需要 `SpineSkeletonDataConverter.exe`、`SpineAtlasDowngrade.exe` 或 Spine 编辑器安装。
 
-- `runtime/tools/SpineSkeletonDataConverter/SpineSkeletonDataConverter.exe`
-- `runtime/tools/SpineSkeletonDataConverter/SpineAtlasDowngrade.exe`（处理 atlas 的配套工具）
-- `runtime/tools/SpineSkeletonDataConverter/LICENSE`
-- `runtime/tools/SpineSkeletonDataConverter/SOURCE_METADATA.json`（下载地址、Release digest 与本地 SHA-256）
+当前固定上游提交为 `5ecb2139b0a1af266974f95abeec6bb8562d1249`（Release `v3.8` 对应源码）。源码和许可证位于仓库的 `third_party/wang606_spine_converter/`；本机编译出的 DLL 位于 `runtime/tools/SpineSkeletonDataConverter/lpk_spine_converter.dll`。`runtime/` 被 Git 忽略，DLL 是当前机器的本地构建产物，不会随源码自动分发。
 
-## Skeleton CLI
+## 构建内置 DLL
 
-```text
-SpineSkeletonDataConverter.exe <input_file> <output_file> [options]
-```
-
-输入与输出格式由扩展名决定：`.json` 是 Spine JSON，`.skel` 是 Spine 二进制格式。输入 Spine 版本由文件内容自动检测；不传 `-v` 时输出版本默认为输入版本。跨版本转换时，目标版本必须写完整的 `x.y.z`，例如 `3.8.99`，不能只写 `3.8`。
+要求 CMake 3.15 或更高版本、支持 C++20 的编译器和 PowerShell。使用项目附带的可复现脚本：
 
 ```powershell
-& runtime/tools/SpineSkeletonDataConverter/SpineSkeletonDataConverter.exe `
-  input.json output.skel -v 3.8.99
+pixi run native-converter
 ```
 
-可用选项：
+或直接调用脚本并指定生成器：
 
-- `-v x.y.z`：指定输出 Spine 版本。
-- `--remove-curve`：跨 3.x/4.x 转换时移除动画曲线，而不是尝试转换曲线。
-- `--help`：显示用法。
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File third_party/wang606_spine_converter/build_native.ps1 `
+  -Generator "MinGW Makefiles"
+```
 
-上游当前列出的版本范围为 3.5.x、3.6.x、3.7.x、3.8.x、4.0.x、4.1.x 和 4.2.x。`SpineSkeletonDataConverter.exe --help` 已在本机成功运行并返回 0；未对大批样本执行转换。
+脚本按生成器把中间文件放在 `runtime/build/spine-converter-mingw/` 或
+`runtime/build/spine-converter-msvc/`，并把结果安装到：
+
+```text
+runtime/tools/SpineSkeletonDataConverter/lpk_spine_converter.dll
+```
+
+也可以通过 `-BuildDirectory` 和 `-OutputPath` 指定临时构建目录与 DLL 目标路径。构建目标名为 `lpk_spine_converter`，ABI 版本为 `1`。导出的函数为：
+
+```text
+spine_converter_convert(input_file, output_file, target_version,
+                        output_format, remove_curve,
+                        error_buffer, error_buffer_size)
+```
+
+输入路径、输出路径和目标版本使用 UTF-8；返回 `0` 表示成功，非零值及错误缓冲区内容表示失败。`target_version` 必须是完整的 `x.y.z`，`output_format` 只能是 `json` 或 `skel`。
 
 ## GUI 使用说明
 
-选择一个 `.json`/`.skel` 文件，或选择一个只包含一个目标骨骼的目录。目录选择如果找不到骨骼，或发现多个 `.json`/`.skel` 而无法确定唯一目标，GUI 会拒绝继续并要求用户明确选择；目录模式不是批量递归转换。源文件始终保留，输出写入独立副本。
+选择一个 `.json`/`.skel` 文件，或选择一个只包含唯一目标骨骼的目录。目录中没有骨骼、存在多个无法消歧的骨骼，或模型配置指向多个骨骼时，GUI 会拒绝继续；目录选择不是批量递归转换。手动转换始终可用，GUI 不显示外部 EXE 路径，也不会启动外部转换进程。
 
-正常预览的目标版本默认使用完整版本 `3.8.75`。精确的 `3.8.75` 不能使用当前官方 3.8 分支 runtime；应用设置中必须选择专用的历史 `spine-ts` runtime。当前机器的历史 runtime 位于 `runtime/tools/spine/3.8.75/`，来自官方提交 `c0699e23a0c8799710323bdf0e076e18f6ba41a2`，已用 JSON 与 SKEL 样本分别验收加载、动画、暂停和 seek。它不是官方 `3.8.75` tag，跨机器使用前仍应按本文来源与哈希复核。输出格式只能选择 JSON 或 SKEL，没有 `same` 或其他格式选项。默认转换动画曲线；需要舍弃曲线时勾选“移除曲线”，由 GUI 传递 `--remove-curve`。
+目标版本默认是完整版本 `3.8.75`，可在设置中配置。输出格式只能选择 `json` 或 `skel`，没有 `same` 或其他格式选项。默认保留并转换动画曲线；勾选“移除曲线”时，跨 3.x/4.x 转换会舍弃曲线数据。源文件始终保留，转换结果写入独立副本，GUI 会把关联的 atlas 和贴图一并复制到该副本。
 
-GUI 需要提示：版本降级可能丢失目标版本不存在的数据，不能保证无损，也不能保证结果能够还原为 `.spine` 工程。转换器处理的是 skeleton data（JSON/SKEL），不是 Spine 编辑器工程文件、图片工程或完整项目资产。
+版本降级可能丢失目标版本不存在的数据，不能保证无损，也不能保证结果能够还原为 `.spine` 工程。转换器处理的是 skeleton data（JSON/SKEL），不是 Spine 编辑器工程文件或完整项目资产。
 
-## 版本差异与限制
+目标为 `3.8.75` 时，内置转换器会写出完整的 `3.8.75` 版本字段。能否预览由所选 runtime 是否接受该精确版本决定；编辑器导入和无损往返均不保证。应用不会通过改写版本字符串来伪装兼容性。
 
-上游的[版本差异记录](https://github.com/wang606/SpineSkeletonDataConverter/blob/main/%E7%89%88%E6%9C%AC%E5%B7%AE%E5%BC%82%E8%AE%B0%E5%BD%95.md)列出了字段和语义变化。使用时尤其要注意：
+## 支持范围与限制
 
-- 3.8 与 4.x 的曲线表示不同；4.x 曲线控制点与端点数值相关，3.8 使用固定端点的四个曲线键。跨越 3.x/4.x 时，曲线转换可能改变动画表现；`--remove-curve` 会明确舍弃这些曲线。
-- 当前官方 3.8 分支 runtime 在 `runtime/tools/spine/3.8/spine-ts/build/spine-webgl.js` 的 JSON/SKEL 读取路径（约第 5555/4143 行）硬编码拒绝 `3.8.75`。精确 `3.8.75` 预览应选择设置中的专用历史 runtime；该历史构建来自拒绝检查加入前的官方提交，构建文件没有删除检查或篡改版本字符串。不能通过改写 JSON/SKEL 中的版本字符串来伪装转换或绕过兼容性检查。
-- 3.x 与 4.x 的旋转语义不同。4.x 可以表达相对 setup pose 的连续大角度旋转，3.x 按相邻关键帧的最短路径解释；降级时可能需要插入辅助 key，无法承诺逐帧等价。
-- 3.8、4.0、4.1、4.2 之间有字段重命名、字段合并/删除、默认值变化和约束枚举差异；3.7 及更早版本也存在曲线、默认值和 skin/constraint 字段差异。
-- 转换器支持的骨骼文件边界是 `.json` 与 `.skel`。GUI 会把关联 atlas 和贴图复制到独立输出目录；目标为 3.x 时，正的有限 `scale` 会按 `1/scale` 同步缩放贴图与 atlas 度量，`pma:true` 会反预乘贴图并移除 PMA 标记。无效或非正 `scale`、缩放后变为零尺寸或越界的区域、与同一贴图冲突的 scale/PMA 引用，以及除 0/90 度外的 region rotation 会明确拒绝；未知的 3.x atlas 字段也会拒绝，以免静默丢失数据。目标为 4.x 时 atlas 与贴图按原文件复制。缺少关联 atlas 时仍会输出骨骼，但报告会警告运行时需另行提供图集与贴图。
+上游转换逻辑支持 `3.5.x`、`3.6.x`、`3.7.x`、`3.8.x`、`4.0.x`、`4.1.x` 和 `4.2.x`。输入版本由骨骼内容自动检测，目标版本必须写完整的三段式版本号。跨版本转换遵循固定提交中的字段转换规则，曲线、旋转、路径约束、约束顺序和版本特有字段可能发生变化；请在目标 runtime 中检查动画和约束效果。
 
-历史 3.8.75 runtime 来源与验证：
+Atlas 由应用后端处理。目标为 3.x 时，正的有限 `scale` 会按 `1/scale` 同步缩放贴图与 atlas 度量，`pma:true` 会反预乘贴图并移除 PMA 标记。无效或非正 `scale`、缩放后为零尺寸或越界的区域、冲突的 scale/PMA 引用，以及除 0/90 度外的 region rotation 会明确拒绝；未知的 3.x atlas 字段也会拒绝，以免静默丢失数据。目标为 4.x 时 atlas 与贴图按原文件复制。缺少关联 atlas 时仍可输出骨骼，但报告会警告运行时需另行提供图集与贴图。
 
-- 官方提交：[c0699e23a0c8799710323bdf0e076e18f6ba41a2](https://github.com/EsotericSoftware/spine-runtimes/commit/c0699e23a0c8799710323bdf0e076e18f6ba41a2)，日期为 2019-12-19；对应归档地址为 `https://github.com/EsotericSoftware/spine-runtimes/archive/c0699e23a0c8799710323bdf0e076e18f6ba41a2.zip`。
-- 当前官方 3.8 分支提交 `8b4844bd4b193ba9e54487ed397a777993cbad56` 和其构建文件明确拒绝精确 `3.8.75`；`c0699e23...` 位于该拒绝检查加入前。历史构建不含 `3.8.75` 拒绝字符串，且未对文件内容做版本字符串重写。
-- 本机历史 runtime 清单 `runtime/tools/spine/3.8.75/spine_runtime.json` 记录了来源、许可证与构建文件 SHA-256：`spine-core.js` 为 `95a70048378f2e2705a385e6f30c46ee49ac6af94a50a736bd0d6bb395c5aeba`，`spine-webgl.js` 为 `1c51e83db80fe146cd270eda3375f179a1b0b0477f6ebe7c242e64cc51dbb232`，许可证为 `6142ee6cc2c03d3a918793e4750ae772bd3755c534d4a35e559e301acf51ec39`。JSON 与 SKEL 各一份样本均已独立验收，结果可加载并操作动画控制。
+每次转换都会生成 `spine_conversion_report.json`，记录输入/输出版本、输出格式、DLL ABI、固定上游提交、警告和 atlas 处理结果。报告中的 `converter_type` 为 `in-process native DLL`；不存在可用 DLL 时会给出构建脚本路径，不会回退到 EXE。
 
-配套 atlas 用法：
+## 跨机器使用
 
-```text
-SpineAtlasDowngrade.exe <input_atlas> <output_dir>
+目标机器可以直接复制已经构建好的 `runtime/tools/SpineSkeletonDataConverter/lpk_spine_converter.dll` 到相同相对路径；也可以复制 `third_party/wang606_spine_converter/`，按上面的命令在目标机器重新构建。重新构建时应保留 `third_party/wang606_spine_converter/LICENSE`、`SOURCE_METADATA.json` 和 `THIRD_PARTY_NOTICES.md`，并核对固定提交。
+
+PowerShell 校验本机 DLL：
+
+```powershell
+Get-FileHash .\runtime\tools\SpineSkeletonDataConverter\lpk_spine_converter.dll -Algorithm SHA256
 ```
 
-该程序没有独立的 `--help` 选项；传入 `--help` 或缺少参数时会打印上述用法并返回 1。它可作为单独的命令行工具使用；GUI 的 atlas 流程仍以应用后端的实际实现和限制为准。
+当前本机构建 DLL 的 SHA-256 为 `510f49d8e20aad9f4a0d81e5028be34c688962b9aa1d3061dbd4e6bb84c093bb`。不同编译器或编译参数可能产生不同二进制哈希；来源应以固定提交和许可证哈希为准。
 
-## 跨机器安装
+## 许可证与来源
 
-1. 打开 [SpineSkeletonDataConverter v3.8 Release](https://github.com/wang606/SpineSkeletonDataConverter/releases/tag/v3.8)，下载 `SpineSkeletonDataConverter.exe`；需要手动处理 atlas 时再下载 `SpineAtlasDowngrade.exe`。
-2. 在目标机器创建任意本地工具目录。若应用使用默认路径，可复制当前机的整个 `runtime/tools/SpineSkeletonDataConverter/` 目录；至少应同时保留 `LICENSE` 和 `SOURCE_METADATA.json`。
-3. 若应用没有默认工具目录，可在设置或转换操作中手动选择 `SpineSkeletonDataConverter.exe` 的路径，不需要注册表安装。
-4. 用 PowerShell 校验下载文件的 SHA-256，并与本文“来源校验”表及 `SOURCE_METADATA.json` 比较：
+上游项目声明使用 **PolyForm Noncommercial License 1.0.0**。完整许可证保存在 `third_party/wang606_spine_converter/LICENSE`，其 SHA-256 为 `75f5f2ae732cdc31adf8ad90a42ed4ed47476b3f27fcdf90de13e79d6788309d`。来源、固定提交、构建目标和 C ABI 记录在 `third_party/wang606_spine_converter/SOURCE_METADATA.json`。再分发或修改时必须保留许可证条款及其要求的通知；该许可证只授予非商业用途范围内的权利。
 
-   ```powershell
-   Get-FileHash .\SpineSkeletonDataConverter.exe -Algorithm SHA256
-   ```
-
-   Release 资产的下载地址、大小和预期哈希以 `SOURCE_METADATA.json` 为准；不要从非官方镜像取得 EXE。
-
-若目标机器还要预览精确的 `3.8.75`，需另外复制或按本文来源取得 `runtime/tools/spine/3.8.75/`，在设置页把 Spine runtime 指向该目录（或包含它的统一 runtime 根目录）。该目录不是 Spine 编辑器安装目录，也不能用 Java 编辑器 JAR 代替 `spine-ts` 的 `spine-webgl.js`；当前官方 3.8 分支目录 `3.8/` 仍会拒绝精确 `3.8.75`。
-
-## 许可证
-
-上游项目声明使用 **PolyForm Noncommercial License 1.0.0**。完整许可证随可执行文件保存在 `runtime/tools/SpineSkeletonDataConverter/LICENSE`，许可证正文和上游来源见 [PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/)。再分发或修改时必须保留许可证条款及其要求的通知；该许可证只授予非商业用途范围内的权利。
-
-## 来源校验
-
-本地文件与 GitHub Release API 提供的 SHA-256 digest 一致：
-
-| 文件 | 大小 | SHA-256 |
-| --- | ---: | --- |
-| `SpineSkeletonDataConverter.exe` | 1,587,712 bytes | `b2ca82e46f1f4ca463abf0ccfab32e3c01eb0dd89fc7289b6478f728ca8ed68a` |
-| `SpineAtlasDowngrade.exe` | 310,272 bytes | `116a2c515650fde2077c8f679ff5680afb584fc0aa47279fe589f181377d72ce` |
-
-下载地址和许可证哈希也记录在 `SOURCE_METADATA.json`，便于后续升级时复核来源。
+上游版本差异记录见[版本差异记录](https://github.com/wang606/SpineSkeletonDataConverter/blob/main/%E7%89%88%E6%9C%AC%E5%B7%AE%E5%BC%82%E8%AE%B0%E5%BD%95.md)。

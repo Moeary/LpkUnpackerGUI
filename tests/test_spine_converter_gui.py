@@ -71,12 +71,14 @@ class SpineConverterPageTests(unittest.TestCase):
 
             with patch.object(
                 converter_page_module,
-                "discover_converter",
-                return_value=Path("C:/tools/SpineSkeletonDataConverter.exe"),
+                "discover_native_converter",
+                return_value=Path("C:/tools/lpk_spine_converter.dll"),
             ), patch.object(converter_page_module, "convert_spine", side_effect=fake_convert):
                 page = SpineConverterPage(settings_manager=SettingsManager(root / "settings.json"))
                 try:
                     self.assertEqual(page.target_version_combo.currentText(), "3.8.75")
+                    self.assertFalse(hasattr(page, "converter_edit"))
+                    self.assertIn("lpk_spine_converter.dll", page.converter_status_label.text())
                     page.source_edit.setText(str(source))
                     page.output_edit.setText(str(output))
                     page.target_version_combo.setCurrentText("3.8.75")
@@ -94,7 +96,7 @@ class SpineConverterPageTests(unittest.TestCase):
                     self.assertEqual(kwargs["output_format"], "skel")
                     self.assertEqual(
                         kwargs["converter_path"],
-                        str(Path("C:/tools/SpineSkeletonDataConverter.exe")),
+                        None,
                     )
                     self.assertTrue(kwargs["remove_curve"])
                     self.assertTrue(page.open_output_button.isEnabled())
@@ -126,7 +128,7 @@ class SpineConverterPageTests(unittest.TestCase):
                 release.wait(3.0)
                 return result
 
-            with patch.object(converter_page_module, "discover_converter", return_value=None), \
+            with patch.object(converter_page_module, "discover_native_converter", return_value=None), \
                     patch.object(converter_page_module, "convert_spine", side_effect=slow_convert):
                 page = SpineConverterPage()
                 try:
@@ -158,7 +160,7 @@ class SpineConverterPageTests(unittest.TestCase):
             def failing_convert(*_args, **_kwargs):
                 raise RuntimeError("synthetic converter failure")
 
-            with patch.object(converter_page_module, "discover_converter", return_value=None), \
+            with patch.object(converter_page_module, "discover_native_converter", return_value=None), \
                     patch.object(converter_page_module, "convert_spine", side_effect=failing_convert):
                 page = SpineConverterPage()
                 try:

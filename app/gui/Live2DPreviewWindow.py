@@ -847,6 +847,9 @@ class Live2DPreviewWindow(QWidget):
         if 'opacity' in settings and self.live2d_canvas:
             self.live2d_canvas.setCanvasOpacity(settings['opacity'])
 
+        if 'antialias' in settings and self.live2d_canvas:
+            self.live2d_canvas.setAntialias(settings['antialias'])
+
         # 模型旋转
         if 'model_rotation' in settings and self.live2d_canvas:
             self.live2d_canvas.setRotationAngle(settings['model_rotation'])
@@ -927,7 +930,7 @@ class Live2DPreviewWindow(QWidget):
         self.resize(max(240, min(int(width), max_w)), max(240, min(int(height), max_h)))
 
     def apply_dock_geometry(self, rect: dict):
-        if not rect:
+        if self._embedded or not rect:
             return
         try:
             x = int(rect.get("x", self.x()))

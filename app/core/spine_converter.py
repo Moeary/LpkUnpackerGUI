@@ -1,12 +1,12 @@
-"""Safe orchestration for the external Spine skeleton data converter.
+"""Safe orchestration for the bundled Spine skeleton data converter.
 
-The project deliberately does not embed the implementation from
-``wang606/SpineSkeletonDataConverter``.  This module discovers a user supplied
-converter executable, resolves one unambiguous skeleton, invokes the executable
-without a shell, and copies the related atlas/page files into a fresh output
-directory.  Atlas conversion is kept here because the upstream batch helper is
-permissive about missing pages and does not handle PMA pages safely for the
-3.x web runtime used by this application.
+The upstream C++ readers/writers and cross-version conversion passes are built
+as a small in-process DLL from the fixed vendored source under
+``third_party/wang606_spine_converter``.  This module loads that C ABI through
+``ctypes``, resolves one unambiguous skeleton, and copies the related atlas/page
+files into a fresh output directory.  Atlas conversion remains here because
+the upstream converter only handles skeleton data and the application must
+preserve PMA and scaled pages safely for the application's 3.x preview runtime.
 
 Upstream references (checked 2026-09-29):
 
@@ -14,18 +14,19 @@ Upstream references (checked 2026-09-29):
 * https://github.com/wang606/SpineSkeletonDataConverter/blob/main/%E7%89%88%E6%9C%AC%E5%B7%AE%E5%BC%82%E8%AE%B0%E5%BD%95.md
 * https://github.com/wang606/SpineSkeletonDataConverter/blob/main/LICENSE
 
-The upstream project is PolyForm Noncommercial 1.0.0.  No upstream source or
-binary is bundled by this module.
+The upstream project is PolyForm Noncommercial 1.0.0.  The vendored source and
+license metadata are kept under ``third_party/wang606_spine_converter``; the
+locally built DLL is an ignored runtime artifact.
 """
 
 from __future__ import annotations
 
 import json
+import ctypes
 import math
 import os
 import re
 import shutil
-import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -62,8 +63,13 @@ _ATLAS_PAGE_KEYS = frozenset({"size", "format", "filter", "repeat", "pma", "scal
 _ATLAS_REGION_KEYS = frozenset(
     {"bounds", "xy", "size", "offsets", "orig", "offset", "rotate", "index", "split", "pad"}
 )
-_CONVERTER_NAMES = ("SpineSkeletonDataConverter.exe", "SpineSkeletonDataConverter")
-_CONVERTER_TIMEOUT_SECONDS = 300
+_NATIVE_CONVERTER_RELATIVE_PATHS = (
+    Path("runtime") / "tools" / "SpineSkeletonDataConverter" / "lpk_spine_converter.dll",
+    Path("runtime") / "tools" / "lpk_spine_converter.dll",
+    Path("tools") / "SpineSkeletonDataConverter" / "lpk_spine_converter.dll",
+)
+_NATIVE_CONVERTER_ABI_VERSION = "1"
+_UPSTREAM_SOURCE_COMMIT = "5ecb2139b0a1af266974f95abeec6bb8562d1249"
 
 
 class SpineConversionError(RuntimeError):
@@ -71,7 +77,7 @@ class SpineConversionError(RuntimeError):
 
 
 class SpineConverterNotFoundError(SpineConversionError):
-    """Raised when no usable external converter executable can be found."""
+    """Raised when the bundled native converter library cannot be loaded."""
 
 
 class SpineSourceError(SpineConversionError, ValueError):
@@ -87,7 +93,7 @@ class SpineUnsupportedError(SpineConversionError, ValueError):
 
 
 class SpineConversionProcessError(SpineConversionError):
-    """Raised when the external converter fails or times out."""
+    """Raised when the native converter rejects a conversion."""
 
 
 # Compatibility aliases make the API discoverable without forcing callers to
@@ -118,6 +124,7 @@ class SpineConversionOptions:
     enabled: bool = False
     target_version: str = "3.8.75"
     output_format: str = "json"
+    # Optional explicit native DLL path; legacy EXE settings are ignored.
     converter_path: str | os.PathLike[str] | None = None
     remove_curve: bool = False
 
@@ -138,53 +145,51 @@ class _AtlasCopyState:
     transform_by_source: dict[Path, tuple[float, bool, int]] = field(default_factory=dict)
 
 
-def discover_converter(explicit: str | os.PathLike[str] | None = None) -> Path | None:
-    """Find ``SpineSkeletonDataConverter`` in the packaged runtime or PATH.
+def discover_native_converter(explicit: str | os.PathLike[str] | None = None) -> Path | None:
+    """Find the bundled native converter DLL.
 
-    An explicit path is authoritative: a non-existing explicit value returns
-    ``None`` instead of silently selecting another executable.  This mirrors
-    the other tool-discovery helpers in :mod:`app.core.toolchain` while keeping
-    the search intentionally narrow so a large source tree is never walked.
+    A supplied DLL path is authoritative.  Legacy ``.exe`` settings are
+    deliberately ignored so conversion never falls back to an external
+    process; callers receive the same clear missing-library error as any other
+    unavailable native install.
     """
 
     if explicit is not None:
         explicit_text = str(explicit).strip().strip('"')
-        if explicit_text:
+        if explicit_text and not explicit_text.casefold().endswith(".exe"):
             explicit_path = Path(explicit_text).expanduser()
-            if explicit_path.is_file():
+            if explicit_path.is_file() and explicit_path.suffix.casefold() in {".dll", ".so", ".dylib"}:
                 return _resolved_path(explicit_path)
-            found_explicit = shutil.which(explicit_text)
-            if found_explicit:
-                return _resolved_path(Path(found_explicit))
-        return None
+            # A configured native path is authoritative when it is a DLL, so
+            # do not silently replace a missing user-selected library.
+            if explicit_path.suffix.casefold() in {".dll", ".so", ".dylib"}:
+                return None
+        # Older settings may still contain the removed EXE path. Ignore that
+        # legacy value and continue with the bundled runtime candidates.
 
-    runtime_tools = PROJECT_ROOT / "runtime" / "tools"
-    direct_candidates = [runtime_tools / name for name in _CONVERTER_NAMES]
-    direct_candidates.extend(
-        runtime_tools / "SpineSkeletonDataConverter" / name for name in _CONVERTER_NAMES
+    candidates = [PROJECT_ROOT / relative for relative in _NATIVE_CONVERTER_RELATIVE_PATHS]
+    # Development builds are accepted, but only at the known third-party path;
+    # no repository-wide walk or executable discovery is performed.
+    candidates.append(
+        PROJECT_ROOT / "third_party" / "wang606_spine_converter" / "build" / "Release" / "lpk_spine_converter.dll"
     )
-    for candidate in direct_candidates:
+    candidates.append(
+        PROJECT_ROOT / "third_party" / "wang606_spine_converter" / ".build" / "lpk_spine_converter.dll"
+    )
+    for candidate in candidates:
         if candidate.is_file():
             return _resolved_path(candidate)
-
-    # Some unpacked releases put a versioned converter folder under runtime;
-    # search only this named subtree and keep the walk bounded.
-    converter_root = runtime_tools / "SpineSkeletonDataConverter"
-    if converter_root.is_dir():
-        try:
-            for candidate in sorted(converter_root.rglob("*"), key=lambda item: str(item).casefold()):
-                if candidate.is_file() and candidate.name.casefold() in {
-                    item.casefold() for item in _CONVERTER_NAMES
-                }:
-                    return _resolved_path(candidate)
-        except (OSError, RuntimeError):
-            pass
-
-    for name in _CONVERTER_NAMES:
-        found = shutil.which(name)
-        if found:
-            return _resolved_path(Path(found))
     return None
+
+
+def discover_converter(explicit: str | os.PathLike[str] | None = None) -> Path | None:
+    """Compatibility alias for :func:`discover_native_converter`.
+
+    The returned path is always a native library; this name remains exported
+    for older callers but no executable lookup is retained.
+    """
+
+    return discover_native_converter(explicit)
 
 
 def convert_spine(
@@ -213,10 +218,17 @@ def convert_spine(
         raise SpineSourceError(
             "output_dir must be independent of the source directory; source files are never overwritten."
         )
-    converter = discover_converter(converter_path)
+    converter = discover_native_converter(converter_path)
     if converter is None:
-        requested = str(converter_path) if converter_path else "SpineSkeletonDataConverter"
-        raise SpineConverterNotFoundError(f"Unable to find external converter: {requested}")
+        requested = (
+            str(converter_path)
+            if converter_path
+            else "runtime/tools/SpineSkeletonDataConverter/lpk_spine_converter.dll"
+        )
+        raise SpineConverterNotFoundError(
+            "Unable to find the bundled native Spine converter DLL: "
+            f"{requested}. Build it with third_party/wang606_spine_converter/build_native.ps1."
+        )
 
     output_root.mkdir(parents=True, exist_ok=True)
     destination = _create_output_directory(output_root, resolved.skeleton_path, target_version, format_name)
@@ -225,7 +237,7 @@ def convert_spine(
     warnings: list[str] = []
     if resolved.skeleton_path.suffix.casefold() not in {_SPINE_JSON_SUFFIX, ".skel"}:
         warnings.append(
-            f"Input skeleton uses non-standard suffix {resolved.skeleton_path.name!r}; a temporary .skel/.json name was used for the upstream CLI."
+            f"Input skeleton uses non-standard suffix {resolved.skeleton_path.name!r}; a temporary .skel/.json name was used for the native converter."
         )
 
     source_version = _safe_read_version(resolved.skeleton_path)
@@ -234,10 +246,10 @@ def convert_spine(
     cross_family = source_family is not None and source_family != target_family
     if target_version.strip() == "3.8.75":
         warnings.append(
-            "目标版本 3.8.75 需要专用的兼容历史 spine-ts runtime；当前官方 3.8 分支 runtime 会拒绝该精确版本。该转换结果的 Spine 编辑器导入路径尚未验证。"
+            "目标版本 3.8.75 已由内置 native converter 按完整版本号写出；预览能否加载取决于所选 runtime，Spine 编辑器导入和无损往返均不保证。"
         )
     if source_family is None:
-        warnings.append("Unable to pre-read the source Spine version; the external converter remains authoritative.")
+        warnings.append("Unable to pre-read the source Spine version; the native converter will report the authoritative input-version error.")
     if cross_family:
         warnings.extend(_cross_version_warnings(source_family or "unknown", target_family, remove_curve))
 
@@ -252,6 +264,9 @@ def convert_spine(
         "output_dir": str(destination),
         "skeleton_path": str(output_skeleton),
         "converter": str(converter),
+        "converter_type": "in-process native DLL",
+        "converter_abi_version": _NATIVE_CONVERTER_ABI_VERSION,
+        "converter_source_commit": _UPSTREAM_SOURCE_COMMIT,
         "converter_repository": UPSTREAM_REPOSITORY_URL,
         "converter_license": UPSTREAM_LICENSE_URL,
         "version_differences": UPSTREAM_VERSION_DIFFERENCES_URL,
@@ -266,7 +281,7 @@ def convert_spine(
     }
 
     try:
-        command, stdout, stderr, returncode = _run_converter(
+        command, stdout, stderr, returncode = _run_native_converter(
             converter,
             resolved.skeleton_path,
             output_skeleton,
@@ -327,14 +342,14 @@ def convert_spine(
         raise SpineConversionError(f"Spine conversion failed: {exc}") from exc
 
 
-def _run_converter(
+def _run_native_converter(
     converter: Path,
     source: Path,
     output: Path,
     target_version: str,
     remove_curve: bool,
 ) -> tuple[list[str], str, str, int]:
-    """Run the upstream CLI with a temporary extension-normalised input."""
+    """Call the vendored converter DLL through its stable C ABI."""
 
     output.parent.mkdir(parents=True, exist_ok=True)
     input_path = source
@@ -344,32 +359,47 @@ def _run_converter(
         normal_suffix = ".json" if _looks_like_skeleton_json_file(source) else ".skel"
         input_path = Path(temporary_dir.name) / f"input{normal_suffix}"
         shutil.copy2(source, input_path)
-    command = [str(converter), str(input_path), str(output), "-v", str(target_version)]
+    # This list is a diagnostic representation of the native call, not a
+    # command line. Keeping it in the report helps users reproduce options
+    # without implying that an executable process was launched.
+    command = [
+        str(converter),
+        "spine_converter_convert",
+        str(input_path),
+        str(output),
+        str(target_version),
+        output.suffix.lstrip(".").lower(),
+    ]
     if remove_curve:
         command.append("--remove-curve")
-    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
     try:
-        completed = subprocess.run(
-            command,
-            cwd=str(converter.parent),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            shell=False,
-            timeout=_CONVERTER_TIMEOUT_SECONDS,
-            creationflags=creationflags,
-            check=False,
+        loader_factory = getattr(ctypes, "WinDLL", ctypes.CDLL) if os.name == "nt" else ctypes.CDLL
+        library = loader_factory(str(converter))
+        native_convert = library.spine_converter_convert
+        native_convert.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_char),
+            ctypes.c_size_t,
+        ]
+        native_convert.restype = ctypes.c_int
+        error_buffer = ctypes.create_string_buffer(8192)
+        status = native_convert(
+            os.fsencode(str(input_path)),
+            os.fsencode(str(output)),
+            str(target_version).encode("utf-8"),
+            output.suffix.lstrip(".").lower().encode("ascii"),
+            int(bool(remove_curve)),
+            error_buffer,
+            ctypes.sizeof(error_buffer),
         )
-        return command, completed.stdout or "", completed.stderr or "", int(completed.returncode)
-    except subprocess.TimeoutExpired as exc:
-        stdout = _decode_process_output(exc.stdout)
-        stderr = _decode_process_output(exc.stderr)
-        raise SpineConversionProcessError(
-            f"Spine converter timed out after {_CONVERTER_TIMEOUT_SECONDS}s: {stdout} {stderr}".strip()
-        ) from exc
+        diagnostic = error_buffer.value.decode("utf-8", errors="replace")
+        return command, "", diagnostic, int(status)
     except OSError as exc:
-        raise SpineConversionProcessError(f"Unable to launch Spine converter {converter}: {exc}") from exc
+        raise SpineConverterNotFoundError(f"Unable to load native Spine converter {converter}: {exc}") from exc
     finally:
         if temporary_dir is not None:
             temporary_dir.cleanup()
@@ -1023,7 +1053,7 @@ def _cross_version_warnings(source_family: str, target_family: str, remove_curve
     if remove_curve:
         warnings.append("--remove-curve was requested; animation curves crossing 3.x/4.x are stripped instead of converted.")
     else:
-        warnings.append("Curve control points crossing 3.x/4.x are converted by the upstream CLI; inspect stepped and long-rotation animation.")
+        warnings.append("Curve control points crossing 3.x/4.x are converted by the bundled upstream conversion passes; inspect stepped and long-rotation animation.")
     return warnings
 
 
@@ -1139,5 +1169,6 @@ __all__ = [
     "SpineUnsupportedError",
     "convert_spine",
     "discover_spine_conversion_sources",
+    "discover_native_converter",
     "discover_converter",
 ]

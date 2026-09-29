@@ -374,13 +374,38 @@ class SettingsManager:
 
         self.set("tools.spine_converter_path", str(path or "").strip())
 
+    def get_spine_native_runtime_path(self) -> str:
+        """Return the common native Spine runtime root path.
+
+        ``preview.spine_runtime_dir`` is the stable persisted key shared with
+        the preview page.  The historical method name remains as a narrow
+        compatibility alias while the value now represents native bridge
+        families.
+        """
+
+        return self.get_spine_runtime_dir()
+
+    def set_spine_native_runtime_path(self, path: str):
+        """Store the common root containing native Spine runtime families."""
+
+        self.set_spine_runtime_dir(path)
+
+    # Compatibility aliases for integrations that used ``runtime_dir`` while
+    # the native builder interface was being finalized.  The stored value is
+    # deliberately kept under the preview key shared with PreviewPage.
+    def get_spine_native_runtime_dir(self) -> str:
+        return self.get_spine_native_runtime_path()
+
+    def set_spine_native_runtime_dir(self, path: str):
+        self.set_spine_native_runtime_path(path)
+
     def get_spine_runtime_dir(self) -> str:
-        """Return the configured extracted spine-ts runtime directory."""
+        """Return the configured common native Spine runtime root."""
 
         return str(self.get("preview.spine_runtime_dir", "") or "").strip()
 
     def set_spine_runtime_dir(self, path: str):
-        """Store the runtime directory used by the Spine preview backend."""
+        """Store the native runtime root used by the Spine preview backend."""
 
         self.set("preview.spine_runtime_dir", str(path or "").strip())
 

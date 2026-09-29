@@ -1,6 +1,6 @@
 import os
 
-from PySide6.QtCore import QEvent
+from PySide6.QtCore import QEvent, Qt
 from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout
 from qfluentwidgets import FluentIcon as FIF
 from qfluentwidgets import FluentWindow, NavigationItemPosition, Theme, setTheme
@@ -84,20 +84,6 @@ except Exception as e:
         def __init__(self, parent=None):
             super().__init__(parent)
             self.setObjectName("steamWorkshopPage")
-            QHBoxLayout(self).addWidget(QFrame(self))
-
-
-try:
-    from app.gui.WebPreviewPage import WebPreviewPage
-except Exception as e:
-    import traceback
-    print(f"Error importing WebPreviewPage: {e}")
-    traceback.print_exc()
-
-    class WebPreviewPage(QFrame):
-        def __init__(self, parent=None):
-            super().__init__(parent)
-            self.setObjectName("webPreviewPage")
             QHBoxLayout(self).addWidget(QFrame(self))
 
 
@@ -194,7 +180,6 @@ class MainWindow(FluentWindow):
         self.previewPage = self._create_page(PreviewPage, "previewPage")
         self.encryptionPage = None
         self.steamWorkshopPage = None
-        self.webPreviewPage = None
         self.live2dModPage = self._create_page(Live2DModPage, "live2dModPage")
         self.psdReconstructionPage = self._create_page(
             PsdReconstructionPage, "psdReconstructionPage"
@@ -274,8 +259,16 @@ class MainWindow(FluentWindow):
             max(600, int(geometry.get("height", 700))),
         )
         self.setWindowTitle(tr("main.window_title"))
+        if geometry.get("maximized", False):
+            self.setWindowState(self.windowState() | Qt.WindowState.WindowMaximized)
 
     def closeEvent(self, event):
+        settings_page = getattr(self, "settingsPage", None)
+        installing = getattr(settings_page, "is_tool_install_running", None)
+        if callable(installing) and installing():
+            settings_page.notify_close_while_installing()
+            event.ignore()
+            return
         converter_page = getattr(self, "spineConverterPage", None)
         is_conversion_running = getattr(converter_page, "is_conversion_running", None)
         if callable(is_conversion_running) and is_conversion_running():
@@ -290,7 +283,11 @@ class MainWindow(FluentWindow):
         stop_worker = getattr(spine_page, "stop_worker", None)
         if callable(stop_worker):
             stop_worker()
-        rect = self.geometry()
+        # Store the restore rectangle, not the maximized monitor rectangle.
+        # Otherwise opening the next session looks maximized but its titlebar
+        # and Windows restore state disagree.
+        maximized = self.isMaximized()
+        rect = self.normalGeometry() if maximized or self.isFullScreen() else self.geometry()
         self.settings_manager.set(
             "window_geometry",
             {
@@ -298,6 +295,7 @@ class MainWindow(FluentWindow):
                 "height": rect.height(),
                 "x": rect.x(),
                 "y": rect.y(),
+                "maximized": maximized,
             },
         )
         super().closeEvent(event)
@@ -394,7 +392,6 @@ class MainWindow(FluentWindow):
             self.previewPage,
             self.encryptionPage,
             self.steamWorkshopPage,
-            self.webPreviewPage,
             self.live2dModPage,
             self.psdReconstructionPage,
             self.spineAtlasPage,
@@ -449,7 +446,6 @@ class MainWindow(FluentWindow):
             self.previewPage,
             self.encryptionPage,
             self.steamWorkshopPage,
-            self.webPreviewPage,
             self.live2dModPage,
             self.psdReconstructionPage,
             self.spineAtlasPage,

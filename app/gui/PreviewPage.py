@@ -5,7 +5,6 @@ import subprocess
 import sys
 import tempfile
 import zipfile
-from urllib.parse import quote
 
 from PySide6.QtWidgets import (
     QFrame,
@@ -42,7 +41,6 @@ from app.core.model.motions import load_live2d_motions
 from app.core.preview import prepare_preview_import, prepare_spine_preview_import
 from app.core.spine_preview import (
     SpinePreviewPlan,
-    build_spine_web_manifest,
 )
 from app.core.preview.sources import (
     IMAGE_PREVIEW_EXTENSIONS,
@@ -826,6 +824,8 @@ class Live2DSettingsPanel(QFrame):
         self.scale_text_label = None
         self.scale_value_label = None
         self.scale_slider = None
+        self.antialias_check = None
+        self.fit_model_btn = None
         self.offset_text_label = None
         self.position_x_label = None
         self.position_y_label = None
@@ -1034,7 +1034,7 @@ class Live2DSettingsPanel(QFrame):
         self.scale_text_label = BodyLabel("", group)
         scale_layout.addWidget(self.scale_text_label)
         self.scale_slider = Slider(Qt.Horizontal, group)
-        self.scale_slider.setRange(25, 300)
+        self.scale_slider.setRange(25, 400)
         self.scale_slider.setValue(100)
         self.scale_value_label = BodyLabel("100%", group)
         self.scale_value_label.setMinimumWidth(48)
@@ -1045,6 +1045,14 @@ class Live2DSettingsPanel(QFrame):
         scale_layout.addWidget(self.scale_slider, 1)
         scale_layout.addWidget(self.scale_value_label)
         layout.addLayout(scale_layout)
+        self.antialias_check = CheckBox("", group)
+        self.antialias_check.setChecked(True)
+        self.antialias_check.toggled.connect(lambda _: self._emit_settings())
+        layout.addWidget(self.antialias_check)
+        self.fit_model_btn = PushButton("", group)
+        self.fit_model_btn.clicked.connect(self.fit_model_to_view)
+        layout.addWidget(self.fit_model_btn)
+
 
         offset_layout = QGridLayout()
         offset_layout.setHorizontalSpacing(8)
@@ -1106,6 +1114,17 @@ class Live2DSettingsPanel(QFrame):
         layout.addLayout(bg_layout)
 
         return group
+
+    def fit_model_to_view(self):
+        """Reset only the viewport transform, retaining animation and pose."""
+        for control, value in ((self.scale_slider, 100), (self.rotation_slider, 0),
+                               (self.position_x_spinbox, 0), (self.position_y_spinbox, 0)):
+            control.blockSignals(True)
+            control.setValue(value)
+            control.blockSignals(False)
+        self.scale_value_label.setText("100%")
+        self.rotation_label.setText("0°")
+        self._emit_settings()
 
     def create_interaction_settings_group(self):
         """创建交互设置组"""
@@ -1193,6 +1212,10 @@ class Live2DSettingsPanel(QFrame):
             self.model_group_title.setText(tr("preview.model_display_settings"))
         if self.rotation_text_label:
             self.rotation_text_label.setText(tr("preview.model_rotation"))
+        if self.antialias_check:
+            self.antialias_check.setText(tr("preview.antialias"))
+        if self.fit_model_btn:
+            self.fit_model_btn.setText(tr("preview.fit_model"))
         if self.scale_text_label:
             self.scale_text_label.setText(tr("preview.model_scale"))
         if self.offset_text_label:
@@ -1396,6 +1419,7 @@ class Live2DSettingsPanel(QFrame):
             'show_controls': bool(self.show_controls_check and self.show_controls_check.isVisible() and self.show_controls_check.isChecked()),
             'model_rotation': self.rotation_slider.value(),
             'model_scale': self.scale_slider.value() / 100.0,
+            'antialias': self.antialias_check.isChecked(),
             'model_offset_x': self.position_x_spinbox.value() / 100.0,
             'model_offset_y': self.position_y_spinbox.value() / 100.0,
             'transparent_bg': self.bg_transparent_check.isChecked(),
@@ -1456,11 +1480,11 @@ class Live2DSettingsPanel(QFrame):
             pass
 
 class SpineAnimationControls(CardWidget):
-    """Native controls for the embedded Spine page.
+    """Native controls for the Spine renderer.
 
     Live2D's motion widgets carry model-specific semantics and must not be
     reused for Spine.  This card talks only to ``SpinePreviewWidget``'s small
-    JavaScript bridge and keeps its own state when the preview is switched.
+    native rendering API and keeps its own state when the preview is switched.
     """
 
     skinChanged = Signal(str)
@@ -1584,7 +1608,7 @@ class SpineAnimationControls(CardWidget):
         preview_state = str(state.get("previewState") or "").lower()
         mode = str(state.get("mode") or "").lower()
         ready = preview_state == "ready"
-        self._ready = ready and mode == "runtime"
+        self._ready = ready and mode in {"native", "runtime"}
         if mode == "atlas":
             self.status.setText(tr("preview.spine_atlas_controls_hint"))
         elif preview_state == "error":
@@ -1600,7 +1624,10 @@ class SpineAnimationControls(CardWidget):
         self.play_pause_btn.setEnabled(self._ready and self.animation_combo.count() > 0)
         self.loop_check.setEnabled(self._ready and self.animation_combo.count() > 0)
         self.reset_btn.setEnabled(self._ready)
-        self.export_pose_btn.setEnabled(self._ready)
+        self.export_pose_btn.setEnabled(self._ready and bool(state.get("exportSupported", False)))
+        self.export_pose_btn.setToolTip(
+            "" if state.get("exportSupported") else tr("preview.spine_native_pose_unavailable")
+        )
         self.play_pause_btn.blockSignals(True)
         self.play_pause_btn.setChecked(bool(state.get("paused", False)))
         self.play_pause_btn.blockSignals(False)
@@ -1721,9 +1748,8 @@ class PreviewPage(QFrame):
         self._spine_preview_workers = []
         self._spine_preview_generation = 0
         self._spine_preview_temp_dirs = []
-        self._spine_web_server_port = None
         self._active_spine_plan = None
-        self._active_spine_preview_url = ""
+        self._active_spine_preview_key = ""
         self._spine_mode = False
         self._spine_sidebar_state = None
         self._image_preview_thread = None
@@ -1992,7 +2018,7 @@ class PreviewPage(QFrame):
         self.spine_preview.setVisible(False)
         self.spine_preview.documentLoaded.connect(self._on_spine_preview_document_loaded)
         self.spine_preview.previewReady.connect(self._on_spine_preview_ready)
-        self.spine_preview.previewFailed.connect(self._on_spine_preview_web_error)
+        self.spine_preview.previewFailed.connect(self._on_spine_preview_error)
         self.spine_preview.stateChanged.connect(self._on_spine_preview_state)
         self.preview_dock_layout.addWidget(self.spine_preview, 1)
         self._ensure_embedded_live2d()
@@ -2244,6 +2270,7 @@ class PreviewPage(QFrame):
                 (panel.opacity_slider, int(state.get("opacity", 100))),
                 (panel.rotation_slider, int(state.get("rotation", 0))),
                 (panel.scale_slider, int(state.get("scale", 100))),
+                (panel.antialias_check, bool(state.get("antialias", True))),
                 (panel.position_x_spinbox, int(state.get("offset_x", 0))),
                 (panel.position_y_spinbox, int(state.get("offset_y", 0))),
                 (panel.bg_transparent_check, bool(state.get("transparent_bg", True))),
@@ -2291,6 +2318,7 @@ class PreviewPage(QFrame):
             "opacity": panel.opacity_slider.value(),
             "rotation": panel.rotation_slider.value(),
             "scale": panel.scale_slider.value(),
+            "antialias": panel.antialias_check.isChecked(),
             "offset_x": panel.position_x_spinbox.value(),
             "offset_y": panel.position_y_spinbox.value(),
             "transparent_bg": panel.bg_transparent_check.isChecked(),
@@ -2641,7 +2669,7 @@ class PreviewPage(QFrame):
     def _clear_embedded_spine(self):
         preview = self.spine_preview
         self._active_spine_plan = None
-        self._active_spine_preview_url = ""
+        self._active_spine_preview_key = ""
         if self.spine_controls:
             self.spine_controls.clear()
         if preview is None:
@@ -3312,9 +3340,9 @@ class PreviewPage(QFrame):
         if temp_dir and str(temp_dir) not in self._spine_preview_temp_dirs:
             self._spine_preview_temp_dirs.append(str(temp_dir))
         try:
-            self._open_spine_web_preview(result.plan)
+            self._open_spine_native_preview(result.plan)
         except Exception as exc:
-            self._on_spine_preview_web_error(str(exc))
+            self._on_spine_preview_error(str(exc))
 
     def on_spine_preview_failed(self, error: str, source_path: str, generation=None, worker=None):
         if generation is not None and generation != self._spine_preview_generation:
@@ -3337,31 +3365,13 @@ class PreviewPage(QFrame):
             tr("preview.spine_import_failed_content", error=error),
         )
 
-    def _open_spine_web_preview(self, plan: SpinePreviewPlan):
-        from app.gui.web_server import mount_model_dir, start_server
-
+    def _open_spine_native_preview(self, plan: SpinePreviewPlan):
         if self.spine_preview is None:
-            raise RuntimeError("Embedded Spine preview widget is unavailable.")
-
-        if not self._spine_web_server_port:
-            self._spine_web_server_port = start_server(host="127.0.0.1", port=0)
-        server_url = f"http://127.0.0.1:{self._spine_web_server_port}"
-        asset_base = mount_model_dir(str(plan.asset.root_dir))
-        runtime_base = None
-        if plan.runtime:
-            runtime_base = mount_model_dir(str(plan.runtime.root_dir))
-        manifest = build_spine_web_manifest(
-            plan,
-            f"{server_url}{asset_base}",
-            f"{server_url}{runtime_base}" if runtime_base else None,
-        )
-        manifest_text = quote(json.dumps(manifest, ensure_ascii=False, separators=(",", ":")), safe="")
-        url = f"{server_url}/static/spine/preview.html?manifest={manifest_text}"
+            raise RuntimeError("Native Spine preview widget is unavailable.")
         self._active_spine_plan = plan
-        self._active_spine_preview_url = url
+        self._active_spine_preview_key = str(plan.asset.skeleton_path or plan.asset.root_dir)
         if self.spine_controls:
             self.spine_controls.clear()
-        self.spine_preview.open_url(url)
         self.model_info_text_box.setMarkdown(
             tr(
                 "preview.spine_preview_loading",
@@ -3370,9 +3380,10 @@ class PreviewPage(QFrame):
                 reason=plan.reason,
             )
         )
+        self.spine_preview.open_plan(plan)
 
     def _on_spine_preview_document_loaded(self, url: str):
-        if not self._active_spine_preview_url or str(url) != self._active_spine_preview_url:
+        if not self._active_spine_preview_key or str(url) != self._active_spine_preview_key:
             return
         plan = self._active_spine_plan
         if plan is None:
@@ -3390,7 +3401,7 @@ class PreviewPage(QFrame):
         )
 
     def _on_spine_preview_ready(self, url: str):
-        if not self._active_spine_preview_url or str(url) != self._active_spine_preview_url:
+        if not self._active_spine_preview_key or str(url) != self._active_spine_preview_key:
             return
         plan = self._active_spine_plan
         if plan is None:
@@ -3444,7 +3455,7 @@ class PreviewPage(QFrame):
         if self._spine_mode and self.spine_preview:
             self.spine_preview.export_pose_psd()
 
-    def _on_spine_preview_web_error(self, error: str):
+    def _on_spine_preview_error(self, error: str):
         self._clear_embedded_spine()
         message = tr("preview.spine_web_error_content", error=str(error))
         self._show_stage_placeholder(message)

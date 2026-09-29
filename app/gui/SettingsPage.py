@@ -1,5 +1,6 @@
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import QFileDialog, QFrame, QVBoxLayout, QHBoxLayout
+from PySide6.QtCore import QThread, Qt, QUrl, Signal
+from PySide6.QtGui import QDesktopServices
+from PySide6.QtWidgets import QFileDialog, QFrame, QVBoxLayout, QHBoxLayout, QScrollArea, QWidget
 from pathlib import Path
 from qfluentwidgets import (
     CardWidget,
@@ -12,19 +13,63 @@ from qfluentwidgets import (
     InfoBarPosition,
     LineEdit,
     PrimaryPushButton,
+    ProgressBar,
     PushButton,
 )
 
 from app.core.settings_manager import SettingsManager
 from app.core.toolchain import (
+    build_spine_native_runtime,
     find_archive_extractor,
     find_assetstudio_cli,
     find_cubism_core,
     find_photoshop,
-    find_spine_converter,
-    find_spine_runtime,
+    find_spine_native_runtime_root,
+)
+from app.core.toolchain_download import (
+    ToolDownloadProgress,
+    ToolInstallResult,
+    extract_cubism_core_from_live2d_py,
+    official_download_url,
+    download_tool_package,
 )
 from app.i18n import get_i18n, normalize_language_code, tr
+
+
+class ToolchainInstallWorker(QThread):
+    """Run a tool download/build without blocking the settings page."""
+
+    progressChanged = Signal(object)
+    resultReady = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, package_id: str, parent=None):
+        super().__init__(parent)
+        self.package_id = package_id
+
+    def run(self):
+        try:
+            callback = self.progressChanged.emit
+            cancel = self.isInterruptionRequested
+            if self.package_id == "cubism_core":
+                result = extract_cubism_core_from_live2d_py(
+                    progress=callback,
+                )
+            elif self.package_id.startswith("spine_native"):
+                result = build_spine_native_runtime(
+                    self.package_id,
+                    progress=callback,
+                    cancel=cancel,
+                )
+            else:
+                result = download_tool_package(
+                    self.package_id,
+                    progress=callback,
+                    cancel=cancel,
+                )
+            self.resultReady.emit(result)
+        except Exception as exc:
+            self.failed.emit(str(exc) or exc.__class__.__name__)
 
 
 class SettingsPage(QFrame):
@@ -43,6 +88,7 @@ class SettingsPage(QFrame):
         self._language_codes = ["en_US", "zh_CN", "ja_JP"]
         self._theme_values = ["auto", "light", "dark"]
         self._texture_viewer_values = ["internal", "system", "custom"]
+        self._spine_native_family_values = ["3.8.75", "4.0"]
         self._syncing_ui = False
 
         self.title_label = None
@@ -92,18 +138,22 @@ class SettingsPage(QFrame):
         self.spine_runtime_edit = None
         self.spine_runtime_button = None
         self.spine_runtime_auto_button = None
-        self.spine_converter_label = None
-        self.spine_converter_desc = None
-        self.spine_converter_status = None
-        self.spine_converter_edit = None
-        self.spine_converter_button = None
-        self.spine_converter_auto_button = None
         self.spine_auto_convert_label = None
         self.spine_auto_convert_desc = None
         self.spine_auto_convert_checkbox = None
         self.spine_target_version_label = None
         self.spine_target_version_desc = None
         self.spine_target_version_edit = None
+        self.tool_download_section_title = None
+        self.tool_download_desc = None
+        self.assetstudio_install_button = None
+        self.cubism_official_button = None
+        self.cubism_extract_button = None
+        self.spine_native_install_button = None
+        self.spine_native_family_combo = None
+        self.tool_download_progress = None
+        self.tool_download_status = None
+        self.tool_download_cancel = None
         self.texture_viewer_label = None
         self.texture_viewer_desc = None
         self.texture_viewer_combo = None
@@ -113,6 +163,7 @@ class SettingsPage(QFrame):
         self.setting_file_note = None
         self.detect_tools_button = None
         self.save_button = None
+        self._tool_install_worker = None
 
         self.setup_ui()
         self.retranslate_ui()
@@ -120,7 +171,18 @@ class SettingsPage(QFrame):
         self.i18n.languageChanged.connect(self.retranslate_ui)
 
     def setup_ui(self):
-        main_layout = QVBoxLayout(self)
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        self.settings_scroll = QScrollArea(self)
+        self.settings_scroll.setWidgetResizable(True)
+        self.settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.settings_scroll.setStyleSheet("QScrollArea { background: transparent; }")
+        content = QWidget()
+        content.setObjectName("settingsScrollContent")
+        content.setStyleSheet("#settingsScrollContent { background: transparent; }")
+        self.settings_scroll.setWidget(content)
+        outer_layout.addWidget(self.settings_scroll)
+        main_layout = QVBoxLayout(content)
         main_layout.setContentsMargins(20, 20, 20, 20)
         main_layout.setSpacing(16)
 
@@ -347,30 +409,6 @@ class SettingsPage(QFrame):
         spine_runtime_row.addWidget(self.spine_runtime_auto_button)
         runtime_layout.addLayout(spine_runtime_row)
 
-        spine_converter_row = QHBoxLayout()
-        spine_converter_row.setSpacing(12)
-        spine_converter_text_layout = QVBoxLayout()
-        spine_converter_text_layout.setSpacing(4)
-        self.spine_converter_label = BodyLabel("", runtime_card)
-        self.spine_converter_desc = CaptionLabel("", runtime_card)
-        self.spine_converter_desc.setWordWrap(True)
-        self.spine_converter_status = CaptionLabel("", runtime_card)
-        self.spine_converter_status.setWordWrap(True)
-        spine_converter_text_layout.addWidget(self.spine_converter_label)
-        spine_converter_text_layout.addWidget(self.spine_converter_desc)
-        spine_converter_text_layout.addWidget(self.spine_converter_status)
-        self.spine_converter_edit = LineEdit(runtime_card)
-        self.spine_converter_edit.editingFinished.connect(self.on_spine_converter_edit_finished)
-        self.spine_converter_button = PushButton("", runtime_card)
-        self.spine_converter_button.clicked.connect(self.browse_spine_converter)
-        self.spine_converter_auto_button = PushButton("", runtime_card)
-        self.spine_converter_auto_button.clicked.connect(self.auto_detect_spine_converter)
-        spine_converter_row.addLayout(spine_converter_text_layout, 1)
-        spine_converter_row.addWidget(self.spine_converter_edit, 2)
-        spine_converter_row.addWidget(self.spine_converter_button)
-        spine_converter_row.addWidget(self.spine_converter_auto_button)
-        runtime_layout.addLayout(spine_converter_row)
-
         spine_auto_convert_row = QHBoxLayout()
         spine_auto_convert_row.setSpacing(12)
         spine_auto_convert_text_layout = QVBoxLayout()
@@ -399,6 +437,53 @@ class SettingsPage(QFrame):
         spine_target_version_row.addLayout(spine_target_version_text_layout, 1)
         spine_target_version_row.addWidget(self.spine_target_version_edit, 2)
         runtime_layout.addLayout(spine_target_version_row)
+
+        self.tool_download_section_title = SubtitleLabel("", runtime_card)
+        runtime_layout.addWidget(self.tool_download_section_title)
+        self.tool_download_desc = CaptionLabel("", runtime_card)
+        self.tool_download_desc.setWordWrap(True)
+        runtime_layout.addWidget(self.tool_download_desc)
+
+        tool_download_row = QHBoxLayout()
+        tool_download_row.setSpacing(8)
+        self.assetstudio_install_button = PushButton("", runtime_card)
+        self.assetstudio_install_button.clicked.connect(
+            lambda: self.start_tool_install("assetstudio_cli")
+        )
+        self.cubism_official_button = PushButton("", runtime_card)
+        self.cubism_official_button.clicked.connect(self.open_cubism_download_page)
+        self.cubism_extract_button = PushButton("", runtime_card)
+        self.cubism_extract_button.clicked.connect(self.install_cubism_from_live2d_py)
+        tool_download_row.addWidget(self.assetstudio_install_button)
+        tool_download_row.addWidget(self.cubism_official_button)
+        tool_download_row.addWidget(self.cubism_extract_button)
+        runtime_layout.addLayout(tool_download_row)
+
+        spine_download_row = QHBoxLayout()
+        spine_download_row.setSpacing(8)
+        self.spine_native_family_combo = ComboBox(runtime_card)
+        self.spine_native_family_combo.setMinimumWidth(150)
+        spine_download_row.addWidget(self.spine_native_family_combo)
+        self.spine_native_install_button = PushButton("", runtime_card)
+        self.spine_native_install_button.clicked.connect(
+            lambda: self.start_tool_install("spine_native")
+        )
+        spine_download_row.addWidget(self.spine_native_install_button)
+        spine_download_row.addStretch(1)
+        runtime_layout.addLayout(spine_download_row)
+
+        self.tool_download_progress = ProgressBar(runtime_card)
+        self.tool_download_progress.setRange(0, 100)
+        self.tool_download_progress.setValue(0)
+        self.tool_download_progress.setVisible(False)
+        runtime_layout.addWidget(self.tool_download_progress)
+        self.tool_download_cancel = PushButton("", runtime_card)
+        self.tool_download_cancel.clicked.connect(self.cancel_tool_install)
+        self.tool_download_cancel.setVisible(False)
+        runtime_layout.addWidget(self.tool_download_cancel)
+        self.tool_download_status = CaptionLabel("", runtime_card)
+        self.tool_download_status.setWordWrap(True)
+        runtime_layout.addWidget(self.tool_download_status)
 
         texture_viewer_row = QHBoxLayout()
         texture_viewer_row.setSpacing(12)
@@ -463,8 +548,6 @@ class SettingsPage(QFrame):
                 self.photoshop_edit.setText(self.settings_manager.get_photoshop_path())
             if self.spine_runtime_edit:
                 self.spine_runtime_edit.setText(self.settings_manager.get_spine_runtime_dir())
-            if self.spine_converter_edit:
-                self.spine_converter_edit.setText(self.settings_manager.get_spine_converter_path())
             if self.spine_auto_convert_checkbox:
                 self.spine_auto_convert_checkbox.setChecked(
                     self.settings_manager.get_spine_conversion_enabled()
@@ -550,20 +633,21 @@ class SettingsPage(QFrame):
             self.photoshop_edit.setPlaceholderText(tr("settings.photoshop_placeholder"))
             self.photoshop_button.setText(tr("common.browse"))
             self.photoshop_clear_button.setText(tr("common.clear"))
-            self.spine_runtime_label.setText(tr("settings.spine_runtime_label"))
-            self.spine_runtime_desc.setText(tr("settings.spine_runtime_desc"))
+            # The single Spine path is the common native bridge root.
+            # ``preview.spine_runtime_dir`` remains the stable settings key
+            # consumed by the preview page while old web-runtime wording is
+            # intentionally no longer exposed here.
+            self.spine_runtime_label.setText(
+                tr("settings.spine_native_runtime_label")
+            )
+            self.spine_runtime_desc.setText(
+                tr("settings.spine_native_runtime_desc")
+            )
             self.spine_runtime_edit.setPlaceholderText(
-                tr("settings.spine_runtime_placeholder")
+                tr("settings.spine_native_runtime_placeholder")
             )
             self.spine_runtime_button.setText(tr("common.browse"))
             self.spine_runtime_auto_button.setText(tr("settings.tool_auto"))
-            self.spine_converter_label.setText(tr("settings.spine_converter_label"))
-            self.spine_converter_desc.setText(tr("settings.spine_converter_desc"))
-            self.spine_converter_edit.setPlaceholderText(
-                tr("settings.spine_converter_placeholder")
-            )
-            self.spine_converter_button.setText(tr("common.browse"))
-            self.spine_converter_auto_button.setText(tr("settings.tool_auto"))
             self.spine_auto_convert_label.setText(tr("settings.spine_auto_convert_label"))
             self.spine_auto_convert_desc.setText(tr("settings.spine_auto_convert_desc"))
             self.spine_auto_convert_checkbox.setText(tr("settings.spine_auto_convert_checkbox"))
@@ -571,6 +655,31 @@ class SettingsPage(QFrame):
             self.spine_target_version_desc.setText(tr("settings.spine_target_version_desc"))
             self.spine_target_version_edit.setPlaceholderText(
                 tr("settings.spine_target_version_placeholder")
+            )
+            self.tool_download_section_title.setText(
+                tr("settings.tool_download_section")
+            )
+            self.tool_download_desc.setText(tr("settings.tool_download_desc"))
+            self.tool_download_cancel.setText(tr("settings.tool_download_cancel"))
+            self.assetstudio_install_button.setText(
+                tr("settings.assetstudio_install")
+            )
+            self.cubism_official_button.setText(tr("settings.cubism_official"))
+            self.cubism_extract_button.setText(tr("settings.cubism_extract"))
+            self.spine_native_install_button.setText(
+                tr("settings.spine_native_install")
+            )
+            current_spine_family = self._current_combo_value(
+                self.spine_native_family_combo,
+                self._spine_native_family_values,
+            )
+            self.spine_native_family_combo.clear()
+            for family in self._spine_native_family_values:
+                self.spine_native_family_combo.addItem(family)
+            self._set_combo_by_value(
+                self.spine_native_family_combo,
+                self._spine_native_family_values,
+                current_spine_family,
             )
             self.texture_viewer_label.setText(tr("settings.texture_viewer_label"))
             self.texture_viewer_desc.setText(tr("settings.texture_viewer_desc"))
@@ -706,9 +815,6 @@ class SettingsPage(QFrame):
         )
         self.settings_manager.set_spine_runtime_dir(
             self.spine_runtime_edit.text() if self.spine_runtime_edit else ""
-        )
-        self.settings_manager.set_spine_converter_path(
-            self.spine_converter_edit.text() if self.spine_converter_edit else ""
         )
         self.settings_manager.set_spine_conversion_enabled(
             self.spine_auto_convert_checkbox.isChecked()
@@ -889,7 +995,7 @@ class SettingsPage(QFrame):
     def browse_spine_runtime(self):
         path = QFileDialog.getExistingDirectory(
             self,
-            tr("settings.spine_runtime_select"),
+            tr("settings.spine_native_runtime_select"),
             self.spine_runtime_edit.text() or "",
         )
         if not path:
@@ -910,33 +1016,153 @@ class SettingsPage(QFrame):
         self.settings_manager.set_spine_runtime_dir(path)
         self.refresh_tool_status_labels()
 
-    def browse_spine_converter(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            tr("settings.spine_converter_select"),
-            self.spine_converter_edit.text() or "",
-            tr("settings.spine_converter_filter"),
+    def open_cubism_download_page(self):
+        url = official_download_url("cubism_core")
+        if not url or not QDesktopServices.openUrl(QUrl(url)):
+            InfoBar.error(
+                title=tr("common.error"),
+                content=tr("settings.tool_download_open_failed", url=url or ""),
+                orient=Qt.Horizontal,
+                isClosable=True,
+                position=InfoBarPosition.TOP,
+                duration=4000,
+                parent=self,
+            )
+
+    def install_cubism_from_live2d_py(self):
+        self.start_tool_install("cubism_core")
+
+    def is_tool_install_running(self) -> bool:
+        """Return whether a download/build worker still owns a QThread."""
+
+        worker = self._tool_install_worker
+        if worker is None:
+            return False
+        try:
+            return bool(worker.isRunning())
+        except RuntimeError:
+            return False
+
+    def notify_close_while_installing(self) -> bool:
+        """Warn the host window before it destroys a running worker thread."""
+
+        if not self.is_tool_install_running():
+            return False
+        InfoBar.warning(
+            title=tr("settings.tool_download_busy_title"),
+            content=tr("settings.tool_download_busy"),
+            orient=Qt.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP,
+            duration=4000,
+            parent=self,
         )
-        if not path:
-            return
-        self.spine_converter_edit.setText(path)
-        self.save_spine_converter(path)
+        return True
 
-    def on_spine_converter_edit_finished(self):
-        if self._syncing_ui:
+    def start_tool_install(self, package_id: str):
+        if self.is_tool_install_running():
+            self.notify_close_while_installing()
             return
-        self.save_spine_converter(self.spine_converter_edit.text())
+        if package_id == "spine_native":
+            family = self._current_combo_value(
+                self.spine_native_family_combo,
+                self._spine_native_family_values,
+            )
+            package_id = "spine_native_4_0" if family == "4.0" else "spine_native"
+        worker = ToolchainInstallWorker(package_id, self)
+        self._tool_install_worker = worker
+        worker.progressChanged.connect(self._on_tool_install_progress)
+        worker.resultReady.connect(self._on_tool_install_result)
+        worker.failed.connect(self._on_tool_install_failed)
+        worker.finished.connect(self._on_tool_install_finished)
+        self._set_tool_install_busy(True)
+        worker.start()
 
-    def save_spine_converter(self, path: str):
-        self.settings_manager.set_spine_converter_path(path)
+    def cancel_tool_install(self):
+        if self.is_tool_install_running():
+            self._tool_install_worker.requestInterruption()
+            self.tool_download_cancel.setEnabled(False)
+            self.tool_download_status.setText(tr("settings.tool_download_cancelling"))
+
+    def _set_tool_install_busy(self, busy: bool):
+        self.tool_download_cancel.setVisible(busy)
+        self.tool_download_cancel.setEnabled(busy)
+        for button in (
+            self.assetstudio_install_button,
+            self.cubism_official_button,
+            self.cubism_extract_button,
+            self.spine_native_install_button,
+            self.spine_native_family_combo,
+        ):
+            if button:
+                button.setEnabled(not busy)
+        if self.tool_download_progress:
+            self.tool_download_progress.setVisible(busy)
+            if busy:
+                self.tool_download_progress.setRange(0, 100)
+                self.tool_download_progress.setValue(0)
+
+    def _on_tool_install_progress(self, value: ToolDownloadProgress):
+        if self.tool_download_status:
+            self.tool_download_status.setText(value.message or value.phase)
+        if self.tool_download_progress:
+            fraction = value.fraction
+            if fraction is None:
+                self.tool_download_progress.setRange(0, 0)
+            else:
+                self.tool_download_progress.setRange(0, 100)
+                self.tool_download_progress.setValue(round(fraction * 100))
+
+    def _on_tool_install_result(self, result: ToolInstallResult):
+        entrypoint = str(result.entrypoint) if result.entrypoint else str(result.install_dir)
+        if result.package_id == "assetstudio_cli":
+            self.settings_manager.set_assetstudio_cli_path(entrypoint)
+            self.assetstudio_tool_edit.setText(entrypoint)
+        elif result.package_id == "cubism_core":
+            self.settings_manager.set_cubism_core_dll_path(entrypoint)
+            self.cubism_core_edit.setText(entrypoint)
+        elif result.package_id.startswith("spine_native"):
+            # Keep one common root so both 3.8.75 and 4.0 installs remain
+            # discoverable.  The preview backend selects the family by the
+            # skeleton version and calls spine_native.find_native_library.
+            common_root = result.install_dir.parent
+            self.settings_manager.set_spine_runtime_dir(str(common_root))
+            self.spine_runtime_edit.setText(str(common_root))
         self.refresh_tool_status_labels()
-
-    def auto_detect_spine_converter(self):
-        self._auto_detect_single(
-            "tools.spine_converter_path",
-            self.spine_converter_edit,
-            self.save_spine_converter,
+        if self.tool_download_status:
+            self.tool_download_status.setText(
+                tr("settings.tool_download_installed", path=entrypoint)
+            )
+        InfoBar.success(
+            title=tr("common.success"),
+            content=tr("settings.tool_download_installed", path=entrypoint),
+            orient=Qt.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP,
+            duration=4000,
+            parent=self,
         )
+
+    def _on_tool_install_failed(self, message: str):
+        if self.tool_download_status:
+            self.tool_download_status.setText(tr("settings.tool_download_failed", error=message))
+        InfoBar.error(
+            title=tr("settings.tool_download_failed_title"),
+            content=tr("settings.tool_download_failed", error=message),
+            orient=Qt.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP,
+            duration=6000,
+            parent=self,
+        )
+
+    def _on_tool_install_finished(self):
+        worker = self.sender()
+        if worker is self._tool_install_worker:
+            self._tool_install_worker = None
+        self._set_tool_install_busy(False)
+        if worker:
+            worker.deleteLater()
 
     def auto_detect_toolchain(self):
         """Detect available tools and fill only currently empty settings."""
@@ -1048,13 +1274,6 @@ class SettingsPage(QFrame):
                     directory=True,
                 )
             )
-        if self.spine_converter_status:
-            self.spine_converter_status.setText(
-                self.tool_status_text(
-                    self.settings_manager.get_spine_converter_path(),
-                    self.detect_spine_converter_path,
-                )
-            )
 
     def tool_status_text(self, configured_path: str, detector, directory: bool = False):
         configured_path = str(configured_path or "").strip()
@@ -1103,15 +1322,7 @@ class SettingsPage(QFrame):
     @staticmethod
     def detect_spine_runtime_path() -> str:
         try:
-            path = find_spine_runtime()
-            return str(path) if path else ""
-        except Exception:
-            return ""
-
-    @staticmethod
-    def detect_spine_converter_path() -> str:
-        try:
-            path = find_spine_converter()
+            path = find_spine_native_runtime_root()
             return str(path) if path else ""
         except Exception:
             return ""

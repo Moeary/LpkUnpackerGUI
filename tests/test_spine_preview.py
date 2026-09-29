@@ -1,4 +1,5 @@
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,9 +7,9 @@ from unittest import mock
 
 from app.core.preview.sources import is_spine_preview_source
 from app.core.spine_preview import (
+    SpineRuntimeUnavailableError,
     SpineVersionMismatchError,
     _atlas_page_names,
-    build_spine_web_manifest,
     discover_spine_runtime,
     load_spine_asset,
     make_spine_preview_plan,
@@ -40,7 +41,7 @@ class SpinePreviewTests(unittest.TestCase):
         (self.asset_dir / "skeleton.json").write_text(
             json.dumps(
                 {
-                    "skeleton": {"spine": "3.8.99", "width": 10, "height": 12},
+                    "skeleton": {"spine": "3.8.75", "width": 10, "height": 12},
                     "bones": [{"name": "root"}],
                     "slots": [{"name": "slot", "bone": "root", "attachment": "region-a"}],
                     "skins": {"default": {"slot": {"region-a": {"type": "region", "path": "region-a"}}}},
@@ -60,13 +61,32 @@ class SpinePreviewTests(unittest.TestCase):
         )
 
     def tearDown(self):
-        import shutil
-
         shutil.rmtree(self.temp, ignore_errors=True)
+
+    def _native_root(self, *versions: str) -> Path:
+        root = self.temp / "spine_native"
+        root.mkdir(exist_ok=True)
+        for version in versions:
+            family = ".".join(version.split(".")[:2])
+            folder = root / version
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / "spine_bridge.dll").write_bytes(b"native bridge placeholder")
+            (folder / "spine_native.json").write_text(
+                json.dumps(
+                    {
+                        "package_id": "spine_native",
+                        "version": version,
+                        "runtimeFamily": family,
+                        "library": "spine_bridge.dll",
+                    }
+                ),
+                encoding="utf-8",
+            )
+        return root
 
     def test_asset_version_and_metadata_are_resolved(self):
         asset = load_spine_asset(self.asset_dir)
-        self.assertEqual(asset.spine_version, "3.8.99")
+        self.assertEqual(asset.spine_version, "3.8.75")
         self.assertEqual(asset.family, "3.8")
         self.assertEqual([path.name for path in asset.atlas_paths], ["sample.atlas"])
         self.assertEqual({path.name for path in asset.texture_paths}, {"page.png", "page2.png"})
@@ -83,200 +103,78 @@ class SpinePreviewTests(unittest.TestCase):
         self.assertTrue(is_spine_preview_source(atlas_txt))
 
     def test_atlas_page_names_do_not_include_region_names(self):
-        self.assertEqual(
-            _atlas_page_names(self.asset_dir / "sample.atlas"),
-            ["page.png", "page2.png"],
-        )
+        self.assertEqual(_atlas_page_names(self.asset_dir / "sample.atlas"), ["page.png", "page2.png"])
 
-    def test_web_pose_export_uses_draw_order_and_restores_slots(self):
-        html = (Path(__file__).parents[1] / "assets" / "spine" / "preview.html").read_text(encoding="utf-8")
-        self.assertIn("const drawOrder = Array.from(skeleton.drawOrder || []);", html)
-        self.assertIn("maximum is \" + MAX_POSE_LAYERS", html)
-        self.assertIn("Pose export blocked: unsupported asset features", html)
-        self.assertIn("try {\n        // Spine's drawOrder", html)
-        self.assertIn("} finally {\n        // WebGL capture or canvas encoding", html)
-        self.assertIn("slot.setAttachment(saved[index])", html)
-        self.assertIn("if (!manifest.runtime.combined) await loadScript(manifest.runtime.core);", html)
-        self.assertIn("assetManager.hasErrors()", html)
-        self.assertIn('document.body.dataset.previewState = "loading";', html)
-        self.assertIn('setPreviewState("ready")', html)
-        self.assertIn("manifest.runtime.api === \"flat\"", html)
-        self.assertIn("atlas.pages.forEach", html)
-        self.assertIn("track.getAnimationTime()", html)
+    def test_native_plan_uses_bridge_and_keeps_metadata(self):
+        root = self._native_root("3.8.75")
+        plan = make_spine_preview_plan(load_spine_asset(self.asset_dir), root)
+        self.assertEqual(plan.mode, "native")
+        self.assertTrue(plan.can_animate)
+        self.assertIsNotNone(plan.runtime)
+        self.assertEqual(plan.runtime.family, "3.8")
+        self.assertEqual(plan.runtime.version, "3.8.75")
+        self.assertEqual(plan.runtime.library_path.name, "spine_bridge.dll")
+        self.assertEqual(plan.runtime.api_style, "native")
+        self.assertEqual(plan.asset.animation_names, ("idle", "walk"))
+        self.assertEqual(plan.asset.skin_names, ("default",))
 
-    def test_web_preview_initial_animation_prefers_normal_or_idle(self):
-        html = (Path(__file__).parents[1] / "assets" / "spine" / "preview.html").read_text(encoding="utf-8")
-        self.assertIn("function chooseInitialAnimation(animations)", html)
-        self.assertIn('name === "normal" || name === "idle"', html)
-        self.assertIn("Number(item.duration || 0) > 0.01", html)
-        self.assertIn("fillControls(initialAnimationName)", html)
-        self.assertNotIn(
-            "state.setAnimation(0, data.animations[0].name, true)",
-            html,
-        )
+    def test_native_runtime_discovery_uses_exact_version_child(self):
+        root = self._native_root("3.8.75", "3.8.99", "4.0")
+        found = discover_spine_runtime(root, requested_family="3.8", requested_version="3.8.75")
+        self.assertEqual(found.root_dir, (root / "3.8.75").resolve())
+        self.assertEqual(found.library_path, (root / "3.8.75" / "spine_bridge.dll").resolve())
+        self.assertEqual(found.source_manifest, (root / "3.8.75" / "spine_native.json").resolve())
 
-    def test_without_user_runtime_plan_is_explicit_atlas_fallback(self):
-        plan = make_spine_preview_plan(load_spine_asset(self.asset_dir))
-        self.assertEqual(plan.mode, "atlas")
-        self.assertIn("runtime", plan.reason)
-
-    def test_runtime_manifest_must_match_skeleton_family(self):
-        runtime = self.temp / "runtime"
-        runtime.mkdir()
-        (runtime / "spine-core.js").write_text("// user supplied core", encoding="utf-8")
-        (runtime / "spine-webgl.js").write_text("// user supplied webgl", encoding="utf-8")
-        (runtime / "spine_runtime.json").write_text(
-            json.dumps({"version": "3.8.99", "core": "spine-core.js", "webgl": "spine-webgl.js"}),
-            encoding="utf-8",
-        )
-        found = discover_spine_runtime(runtime, requested_family="3.8")
-        self.assertEqual(found.family, "3.8")
-        plan = make_spine_preview_plan(load_spine_asset(self.asset_dir), runtime)
-        self.assertEqual(plan.mode, "runtime")
-        self.assertEqual(plan.runtime, found)
-
-        (runtime / "spine_runtime.json").write_text(
-            json.dumps({"version": "4.2.40", "core": "spine-core.js", "webgl": "spine-webgl.js"}),
-            encoding="utf-8",
-        )
-        with self.assertRaises(SpineVersionMismatchError):
-            discover_spine_runtime(runtime, requested_family="3.8")
-
-    def test_combined_webgl_manifest_does_not_schedule_core_twice(self):
-        runtime = self.temp / "combined-runtime"
-        runtime.mkdir()
-        (runtime / "spine-core.js").write_text("// official core artifact", encoding="utf-8")
-        (runtime / "spine-webgl.js").write_text("// official self-contained webgl artifact", encoding="utf-8")
-        (runtime / "spine_runtime.json").write_text(
-            json.dumps(
-                {
-                    "version": "3.8",
-                    "core": "spine-core.js",
-                    "webgl": "spine-webgl.js",
-                    "combined": True,
-                }
-            ),
-            encoding="utf-8",
-        )
-        found = discover_spine_runtime(runtime, requested_family="3.8")
-        self.assertTrue(found.combined_webgl)
-        self.assertEqual(found.scripts, (found.webgl_script,))
-        self.assertEqual(found.core_script.name, "spine-core.js")
-        self.assertEqual(found.api_style, "legacy")
-
-    def test_four_zero_runtime_uses_flat_official_api(self):
-        asset = self.asset_dir / "four-zero.json"
-        asset.write_text(
-            json.dumps(
-                {
-                    "skeleton": {"spine": "4.0.37", "width": 10, "height": 12},
-                    "bones": [{"name": "root"}],
-                    "slots": [{"name": "slot", "bone": "root", "attachment": "region-a"}],
-                    "skins": {"default": {"slot": {"region-a": {"type": "region", "path": "region-a"}}}},
-                    "animations": {"idle": {}},
-                }
-            ),
-            encoding="utf-8",
-        )
-        runtime = self.temp / "spine" / "4.0"
-        runtime.mkdir(parents=True)
-        (runtime / "spine-webgl.js").write_text("// official 4.0 self-contained webgl", encoding="utf-8")
-        (runtime / "spine_runtime.json").write_text(
-            json.dumps(
-                {
-                    "version": "4.0.31",
-                    "api": "flat",
-                    "webgl": "spine-webgl.js",
-                    "combined": True,
-                }
-            ),
-            encoding="utf-8",
-        )
-        found = discover_spine_runtime(self.temp / "spine", requested_family="4.0")
-        self.assertEqual(found.family, "4.0")
-        self.assertEqual(found.api_style, "flat")
-        self.assertTrue(found.combined_webgl)
-        plan = make_spine_preview_plan(load_spine_asset(asset), self.temp / "spine")
-        self.assertEqual(plan.mode, "runtime")
-        self.assertEqual(plan.runtime, found)
-        manifest = build_spine_web_manifest(plan, "http://127.0.0.1:1/assets", "http://127.0.0.1:1/runtime")
-        self.assertEqual(manifest["runtime"]["api"], "flat")
-        self.assertIsNone(manifest["runtime"]["core"])
-
-    def test_unified_runtime_root_selects_requested_sibling_family(self):
-        root = self.temp / "spine"
-        for family in ("3.8", "4.0"):
-            folder = root / family
-            folder.mkdir(parents=True)
-            (folder / "spine-webgl.js").write_text(f"// {family}", encoding="utf-8")
-            (folder / "spine_runtime.json").write_text(
-                json.dumps(
-                    {
-                        "version": family,
-                        "webgl": "spine-webgl.js",
-                        "combined": True,
-                        "api": "flat" if family == "4.0" else "legacy",
-                    }
-                ),
-                encoding="utf-8",
-            )
-        three = discover_spine_runtime(root, requested_family="3.8")
-        four = discover_spine_runtime(root, requested_family="4.0")
-        self.assertEqual(three.family, "3.8")
-        self.assertEqual(three.root_dir, (root / "3.8").resolve())
-        self.assertEqual(three.api_style, "legacy")
-        self.assertEqual(four.family, "4.0")
+        four = discover_spine_runtime(root, requested_family="4.0", requested_version="4.0.37")
         self.assertEqual(four.root_dir, (root / "4.0").resolve())
-        self.assertEqual(four.api_style, "flat")
+        self.assertEqual(four.family, "4.0")
 
-    def test_direct_runtime_manifests_ignore_broken_dependency_tree(self):
-        cases = (
-            ("3.8", self.temp / "runtime-direct", False),
-            ("4.0", self.temp / "runtime-versioned", True),
-        )
-        for family, root, versioned in cases:
-            root.mkdir()
-            manifest_root = root / family if versioned else root
-            if versioned:
-                manifest_root.mkdir()
-            (manifest_root / "spine-webgl.js").write_text(
-                f"// official {family} self-contained webgl",
-                encoding="utf-8",
-            )
-            (manifest_root / "spine_runtime.json").write_text(
-                json.dumps(
-                    {
-                        "version": f"{family}.99",
-                        "webgl": "spine-webgl.js",
-                        "combined": True,
-                        "api": "flat" if family == "4.0" else "legacy",
-                    }
-                ),
-                encoding="utf-8",
-            )
-            dependency = root / "node_modules" / "broken-dependency"
-            dependency.mkdir(parents=True)
-            (dependency / "manifest.json").write_text("{broken", encoding="utf-8")
-            (root / ".git").mkdir()
+    def test_native_runtime_rejects_wrong_exact_bridge(self):
+        root = self._native_root("3.8.99")
+        with self.assertRaises(SpineVersionMismatchError) as context:
+            discover_spine_runtime(root, requested_family="3.8", requested_version="3.8.75")
+        self.assertIn("3.8.75", str(context.exception))
+        self.assertIn("3.8.99", str(context.exception))
 
-            # A broken dependency traversal must not prevent the direct
-            # manifest (or requested version child) from being selected.
-            with mock.patch.object(Path, "rglob", side_effect=OSError("broken link")) as recursive:
-                found = discover_spine_runtime(root, requested_family=family)
+    def test_native_runtime_rejects_reverse_exact_bridge(self):
+        root = self._native_root("3.8.75")
+        with self.assertRaises(SpineVersionMismatchError):
+            discover_spine_runtime(root, requested_family="3.8", requested_version="3.8.99")
 
-            self.assertFalse(recursive.called)
-            self.assertEqual(found.family, family)
-            self.assertEqual(found.root_dir, manifest_root.resolve())
-            self.assertEqual(found.webgl_script, (manifest_root / "spine-webgl.js").resolve())
+    def test_explicit_runtime_root_does_not_fallback_to_other_family(self):
+        root = self._native_root("3.8.75", "4.0")
+        with self.assertRaises(SpineRuntimeUnavailableError):
+            discover_spine_runtime(root / "4.0", requested_family="3.8", requested_version="3.8.75")
 
-    def test_spine_21_binary_or_json_is_downgraded(self):
+    def test_missing_native_runtime_is_explicit_atlas_fallback(self):
+        missing = self.temp / "missing-native"
+        missing.mkdir()
+        plan = make_spine_preview_plan(load_spine_asset(self.asset_dir), missing)
+        self.assertEqual(plan.mode, "atlas")
+        self.assertFalse(plan.can_animate)
+        self.assertIn("native bridge", plan.reason)
+        self.assertTrue(any("runtime/tools/spine_native" in warning for warning in plan.warnings))
+
+    def test_default_discovery_reports_missing_native_install(self):
+        with mock.patch("app.core.spine_preview.find_native_library", return_value=None):
+            with self.assertRaises(SpineRuntimeUnavailableError) as context:
+                discover_spine_runtime(None, requested_family="3.8", requested_version="3.8.75")
+        self.assertIn("native Spine bridge", str(context.exception))
+
+    def test_atlas_only_asset_is_never_claimed_as_animated(self):
+        plan = make_spine_preview_plan(load_spine_asset(self.asset_dir / "sample.atlas"), self._native_root("3.8.75"))
+        self.assertEqual(plan.mode, "atlas")
+        self.assertFalse(plan.can_animate)
+        self.assertIn("skeleton", plan.reason)
+
+    def test_spine_21_is_downgraded(self):
         path = self.asset_dir / "old.json"
         path.write_text(
             json.dumps({"skeleton": {"spine": "2.1.27"}, "bones": [{"name": "root"}]}),
             encoding="utf-8",
         )
         self.assertEqual(read_spine_version(path), "2.1.27")
-        plan = make_spine_preview_plan(load_spine_asset(path))
+        plan = make_spine_preview_plan(load_spine_asset(path), self._native_root("3.8.75"))
         self.assertEqual(plan.mode, "atlas")
         self.assertIn("2.1", plan.reason)
 

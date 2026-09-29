@@ -9,7 +9,6 @@ object from recursively importing one of the tool backends.
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import shutil
@@ -19,6 +18,33 @@ from pathlib import Path
 from typing import Iterable, Mapping
 
 from app.paths import PROJECT_ROOT
+
+# The pure download/install API lives in a separate module so discovery stays
+# lightweight.  Re-export it here for callers that already use toolchain.py.
+from app.core.toolchain_download import (  # noqa: E402
+    ToolDownloadProgress,
+    ToolInstallResult,
+    ToolchainBuildRequiredError,
+    ToolchainCancelledError,
+    ToolchainDownloadError,
+    ToolchainInstallError,
+    ToolchainIntegrityError,
+    build_spine_native_runtime,
+    download_pinned_archive,
+    download_tool_package,
+    extract_cubism_core_from_live2d_py,
+    list_tool_package_manifests,
+    official_download_url,
+    register_tool_package_manifest,
+)
+from app.core.toolchain_manifest import (  # noqa: E402
+    ASSETSTUDIO_MANIFEST,
+    CUBISM_CORE_MANIFEST,
+    SPINE_NATIVE_40_MANIFEST,
+    SPINE_NATIVE_MANIFEST,
+    ToolPackageManifest,
+    get_tool_package_manifest,
+)
 
 
 ARCHIVE_TOOL_NAMES = (
@@ -40,8 +66,7 @@ ARCHIVE_TOOL_NAMES = (
 ASSETSTUDIO_TOOL_NAMES = ("AssetStudioModCLI.exe", "AssetStudioModCLI")
 CUBISM_CORE_NAMES = ("Live2DCubismCore.dll",)
 SPINE_CONVERTER_NAMES = ("SpineSkeletonDataConverter.exe", "SpineSkeletonDataConverter")
-SPINE_WEBGL_NAMES = {"spine-webgl.js", "spine-webgl.min.js"}
-SPINE_CORE_NAMES = {"spine-core.js", "spine-core.min.js"}
+SPINE_NATIVE_SUFFIXES = {".dll", ".so", ".dylib"}
 PHOTOSHOP_NAMES = ("Photoshop.exe", "Photoshop")
 
 
@@ -134,9 +159,18 @@ def _iter_files(root: Path, names: Iterable[str]) -> Iterable[Path]:
         # the large Spine source checkout merely to find AssetStudio or 7-Zip
         # beside it.  The dedicated Spine detector below performs its own
         # recursive scan when needed.
-        skip_dirs = {".git", "node_modules", "__pycache__", "examples", "tests", "test"}
-        if not (wanted & (SPINE_WEBGL_NAMES | SPINE_CORE_NAMES)):
-            skip_dirs.update({"spine", "spine-runtimes"})
+        skip_dirs = {
+            ".git",
+            "node_modules",
+            "__pycache__",
+            "examples",
+            "tests",
+            "test",
+            # Native Spine discovery has its own bounded scan.  Do not make
+            # generic executable discovery walk source checkouts.
+            "spine",
+            "spine-runtimes",
+        }
         root_depth = len(root.parts)
         for current, dirnames, filenames in os.walk(root):
             current_path = Path(current)
@@ -342,165 +376,124 @@ def find_photoshop_path(value: str | os.PathLike[str] | None) -> Path | None:
     return None
 
 
-def _contains_spine_scripts(root: Path) -> bool:
-    if _manifest_webgl_script(root) is not None:
-        return True
-    pending = [root]
-    try:
-        while pending:
-            current = pending.pop()
-            with os.scandir(current) as entries:
-                children = sorted(entries, key=lambda item: item.name.casefold(), reverse=True)
-            for entry in children:
-                try:
-                    name = entry.name.casefold()
-                    if name in {".git", "node_modules"}:
-                        continue
-                    if entry.is_dir(follow_symlinks=False):
-                        pending.append(Path(entry.path))
-                    elif entry.is_file(follow_symlinks=False) and name in SPINE_WEBGL_NAMES:
-                        return True
-                except (OSError, RuntimeError):
-                    continue
-    except (OSError, RuntimeError):
-        pass
-    return False
-
-
-def _manifest_webgl_script(root: Path) -> Path | None:
-    """Resolve a manifest's WebGL path before walking a runtime tree."""
-
-    for name in ("spine_runtime.json", "runtime.json", "manifest.json"):
-        manifest = root / name
-        try:
-            if not manifest.is_file():
-                continue
-            data = json.loads(manifest.read_text(encoding="utf-8-sig"))
-            if not isinstance(data, dict):
-                continue
-            raw = data.get("webgl") or data.get("spineWebgl") or data.get("webGL")
-            if not isinstance(raw, str) or not raw:
-                continue
-            script = (manifest.parent / raw).resolve()
-            if script.is_file() and script.suffix.casefold() == ".js":
-                return script
-        except (OSError, RuntimeError, UnicodeError, json.JSONDecodeError):
-            continue
-    return None
-
-
-def _has_spine_manifest(root: Path) -> bool:
-    try:
-        return any(
-            (root / name).is_file()
-            for name in ("spine_runtime.json", "runtime.json", "manifest.json")
-        )
-    except (OSError, RuntimeError):
-        return False
-
-
-def _has_multiple_versioned_spine_runtimes(root: Path) -> bool:
-    """Return whether *root* is a usable common root for versioned builds."""
-
-    matches = 0
-    try:
-        for child in root.iterdir():
-            if not child.is_dir() or not re.fullmatch(r"\d+\.\d+(?:\.\d+)?", child.name):
-                continue
-            if _has_spine_manifest(child) and _contains_spine_scripts(child):
-                matches += 1
-                if matches > 1:
-                    return True
-    except (OSError, RuntimeError):
-        return False
-    return False
-
-
 def find_spine_runtime(
     explicit: str | os.PathLike[str] | None = None,
 ) -> Path | None:
-    """Find an extracted spine-ts core/webgl runtime directory.
+    """Backward-compatible alias for the native Spine common-root detector.
 
-    A zip file is intentionally not returned: the preview backend needs the
-    JavaScript files on disk and cannot load a runtime directly from an
-    archive.  The caller can still select an extracted directory manually.
+    Older callers used this name for the removed spine-ts/WebGL runtime.  The
+    settings path is now deliberately a native bridge root, so returning a JS
+    directory here would silently make native preview fail.
     """
 
-    configured = _existing_dir(explicit)
-    if configured and (_contains_spine_scripts(configured) or _has_spine_manifest(configured)):
-        return configured
+    return find_spine_native_runtime_root(explicit)
 
-    roots = tool_roots()
-    for root in roots:
+
+def find_spine_native_runtime(
+    explicit: str | os.PathLike[str] | None = None,
+) -> Path | None:
+    """Find a native Spine runtime entry point, usually a DLL.
+
+    The common project/runtime tool roots remain supported, including their
+    historical ``native`` and ``spine_native`` subdirectories.
+    """
+
+    configured = _existing_file(explicit)
+    if configured and configured.suffix.casefold() in SPINE_NATIVE_SUFFIXES:
+        return configured
+    for env_name in ("LPK_SPINE_NATIVE_RUNTIME", "LPK_SPINE_NATIVE_RUNTIME_PATH"):
+        candidate = _existing_file(os.environ.get(env_name))
+        if candidate and candidate.suffix.casefold() in SPINE_NATIVE_SUFFIXES:
+            return candidate
+
+    preferred_names = (
+        "spine_native.dll",
+        "spine_runtime.dll",
+        "libspine_native.dll",
+        "libspine_runtime.dll",
+        "spine_embed.dll",
+        "libspine_embed.dll",
+    )
+    for root in tool_roots():
         if not root.is_dir():
             continue
-        # Prefer an explicitly packaged/versioned runtime root.  A source
-        # checkout may contain several example builds; returning its first
-        # lexicographic ``build`` directory would make the settings path
-        # fragile and bypass a manifest placed at ``spine/3.8``.
+        search_roots = [root]
         try:
-            known_spine_roots = [root]
-            if root.name.casefold() != "spine":
-                known_spine_roots.append(root / "spine")
-            common_roots = sorted(
-                (path for path in known_spine_roots if _has_multiple_versioned_spine_runtimes(path)),
-                key=lambda path: (len(path.parts), str(path).casefold()),
-            )
-            if common_roots:
-                return common_roots[0].resolve()
-
-            candidates = [root]
-            candidates.extend(
+            search_roots.extend(
                 path
                 for path in root.rglob("*")
                 if path.is_dir()
-                and path.name.casefold() in {"3.8", "runtime", "spine", "spine-ts"}
+                and path.name.casefold()
+                in {"native", "spine_native", "spine-embed", "spine_embed"}
             )
-            unique_candidates = _unique_paths(candidates)
-            common_roots = sorted(
-                (path for path in unique_candidates if _has_multiple_versioned_spine_runtimes(path)),
-                key=lambda path: (len(path.parts), str(path).casefold()),
-            )
-            if common_roots:
-                return common_roots[0].resolve()
-            candidates = sorted(
-                unique_candidates,
-                key=lambda path: (
-                    0 if _has_spine_manifest(path) else 1,
-                    len(path.parts),
-                    str(path).casefold(),
-                ),
-            )
-            for candidate in candidates:
-                if _has_spine_manifest(candidate) and _contains_spine_scripts(candidate):
-                    return candidate.resolve()
-        except (OSError, RuntimeError):
-            pass
-        try:
-            webgl_scripts = [
-                path
-                for path in root.rglob("*.js")
-                if path.name.casefold() in SPINE_WEBGL_NAMES
-            ]
         except (OSError, RuntimeError):
             continue
-        for script in sorted(webgl_scripts, key=lambda item: str(item).casefold()):
-            # Prefer the directory that directly contains both scripts.  If
-            # core is in a sibling folder, the parent remains discoverable by
-            # ``discover_spine_runtime`` and is a better setting value.
-            parent = script.parent
+        for search_root in _unique_paths(search_roots):
             try:
-                sibling_core = any(
-                    path.name.casefold() in SPINE_CORE_NAMES
-                    for path in parent.rglob("*.js")
-                )
+                candidates: list[Path] = []
+                root_depth = len(search_root.parts)
+                for current, dirnames, filenames in os.walk(search_root):
+                    current_path = Path(current)
+                    if len(current_path.parts) - root_depth >= 6:
+                        dirnames[:] = []
+                    else:
+                        dirnames[:] = [
+                            name
+                            for name in dirnames
+                            if name.casefold() not in {".git", "node_modules", "__pycache__", "tests"}
+                        ]
+                    for filename in filenames:
+                        path = current_path / filename
+                        lower_name = filename.casefold()
+                        if path.suffix.casefold() not in SPINE_NATIVE_SUFFIXES:
+                            continue
+                        if lower_name in {name.casefold() for name in preferred_names}:
+                            candidates.append(path)
+                        elif any(token in lower_name for token in ("spine", "runtime", "embed")):
+                            candidates.append(path)
+                if candidates:
+                    return sorted(
+                        (path.resolve() for path in candidates),
+                        key=lambda path: str(path).casefold(),
+                    )[0]
             except (OSError, RuntimeError):
-                sibling_core = False
-            if sibling_core:
-                return parent.resolve()
-            if _contains_spine_scripts(parent.parent):
-                return parent.parent.resolve()
-            return parent.resolve()
+                continue
+    return None
+
+
+def find_spine_native_runtime_root(
+    explicit: str | os.PathLike[str] | None = None,
+) -> Path | None:
+    """Find the common directory containing installed native Spine families."""
+
+    configured = _existing_dir(explicit)
+    candidates: list[Path] = []
+    if configured:
+        candidates.append(configured)
+    for env_name in ("LPK_SPINE_NATIVE_RUNTIME_ROOT",):
+        candidate = _existing_dir(os.environ.get(env_name))
+        if candidate:
+            candidates.append(candidate)
+    for root in tool_roots():
+        candidates.extend(
+            root / relative
+            for relative in (
+                Path("spine_native"),
+                Path("spine") / "native",
+                Path("native") / "spine",
+            )
+        )
+    for candidate in _unique_paths(candidates):
+        if not candidate.is_dir():
+            continue
+        try:
+            if any(
+                path.is_file() and path.name.casefold() in {"spine_bridge.dll", "spine_bridge.so"}
+                for path in candidate.rglob("*")
+            ):
+                return candidate.resolve()
+        except (OSError, RuntimeError):
+            continue
     return None
 
 
@@ -522,7 +515,8 @@ def detect_toolchain_paths(
         ("tools.cubism_core_dll_path", find_cubism_core),
         ("tools.photoshop_path", find_photoshop),
         ("tools.spine_converter_path", find_spine_converter),
-        ("preview.spine_runtime_dir", find_spine_runtime),
+        # The single persisted Spine path is the common native bridge root.
+        ("preview.spine_runtime_dir", find_spine_native_runtime_root),
     )
     for key, detector in detectors:
         try:
@@ -548,5 +542,27 @@ __all__ = [
     "find_photoshop_path",
     "find_spine_converter",
     "find_spine_runtime",
+    "find_spine_native_runtime",
+    "find_spine_native_runtime_root",
     "tool_roots",
+    "ToolDownloadProgress",
+    "ToolInstallResult",
+    "ToolchainBuildRequiredError",
+    "ToolchainCancelledError",
+    "ToolchainDownloadError",
+    "ToolchainInstallError",
+    "ToolchainIntegrityError",
+    "build_spine_native_runtime",
+    "download_pinned_archive",
+    "download_tool_package",
+    "extract_cubism_core_from_live2d_py",
+    "list_tool_package_manifests",
+    "official_download_url",
+    "register_tool_package_manifest",
+    "ASSETSTUDIO_MANIFEST",
+    "CUBISM_CORE_MANIFEST",
+    "SPINE_NATIVE_MANIFEST",
+    "SPINE_NATIVE_40_MANIFEST",
+    "ToolPackageManifest",
+    "get_tool_package_manifest",
 ]

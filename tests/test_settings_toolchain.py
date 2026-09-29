@@ -16,28 +16,28 @@ def _make_tool_layout(root: Path) -> dict[str, Path]:
     )
     cubism = root / "app" / "tools" / "CubismCore" / "Live2DCubismCore.dll"
     archive = root / "runtime" / "tools" / "archive" / "bz.exe"
-    spine_root = root / "runtime" / "tools" / "spine" / "3.8"
+    spine_common_root = root / "runtime" / "tools" / "spine_native"
+    spine_root = spine_common_root / "3.8.75"
     for path in (assetstudio, cubism, archive):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"tool")
     spine_root.mkdir(parents=True, exist_ok=True)
-    (spine_root / "spine_runtime.json").write_text(
+    (spine_root / "spine_bridge.dll").write_bytes(b"native-spine")
+    (spine_root / "spine_native.json").write_text(
         json.dumps(
             {
-                "version": "3.8.99",
-                "webgl": "spine-webgl.js",
-                "core": "spine-core.js",
+                "version": "3.8.75",
+                "runtimeFamily": "3.8",
+                "entrypoint": "spine_bridge.dll",
             }
         ),
         encoding="utf-8",
     )
-    (spine_root / "spine-webgl.js").write_text("// webgl", encoding="utf-8")
-    (spine_root / "spine-core.js").write_text("// core", encoding="utf-8")
     return {
         "assetstudio": assetstudio,
         "cubism": cubism,
         "archive": archive,
-        "spine": spine_root,
+        "spine": spine_common_root,
     }
 
 

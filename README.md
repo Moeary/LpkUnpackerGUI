@@ -95,7 +95,7 @@ LPK 解包演示：
 资源预览页可以直接接收模型、图片、Unity 资源、压缩包或文件夹，并自动选择合适的预览方式：
 
 - 在程序内预览 Live2D 模型。
-- 使用本地网页预览器查看 Live2D。
+- 使用原生 Qt/OpenGL 查看 Live2D 和 Spine，无需浏览器或本地 HTTP 服务。
 - 浏览单张或多张图片。
 - 临时提取 Unity 图片进行查看，不污染正式输出目录。
 - 从 ZIP/7Z/RAR 中寻找可预览内容。
@@ -108,7 +108,7 @@ LPK 解包演示：
 
 ### Spine 版本转换
 
-“Spine 版本转换”入口调用本机可用的 `SpineSkeletonDataConverter`，可将 `.json`、`.skel` 或包含骨骼文件的目录转换到目标运行时版本，并选择 JSON 或 binary 输出，默认目标为 `3.8.99`。转换结果会写入指定输出父目录，可直接打开目录或送入资源预览检查。`3.8.75` 选项仍保留，但当前程序 runtime 无法预览该版本，编辑器导入也尚未验证。输出始终写入独立副本，跨版本转换可能丢失或改变动画、约束及曲线效果；该工具不导出 `.spine` 工程文件。
+“Spine 版本转换”入口直接调用随项目源码构建的 native DLL，不需要外部 EXE 或网页运行时。它支持 `.json`、`.skel` 和只包含唯一骨骼的目录，输出可选 JSON 或 SKEL，默认目标为完整版本 `3.8.75`；转换结果始终写入独立副本，可直接送入资源预览检查。默认转换曲线，必要时可选择移除曲线。跨版本转换可能丢失或改变动画、约束及曲线效果，不能保证无损或还原 `.spine` 工程。固定上游提交、PolyForm 许可证和构建方法见 [`assets/docs/spine-converter.md`](assets/docs/spine-converter.md)。
 
 软件渲染预览：
 
@@ -317,7 +317,7 @@ AssetStudio/AssetStudioModCLI 作为外部命令行工具随包提供，采用 M
 - [x] 文件夹递归扫描与 Steam 创意工坊批量处理
 - [x] Unity 图片及 Live2D 候选资源提取
 - [x] ZIP/7Z/RAR、Live2D、图片和 Unity 资源统一预览
-- [x] 软件渲染与网页 Live2D 预览
+- [x] 原生 Live2D / Spine 预览与高 DPI 抗锯齿
 - [x] Live2D PSD 工程、参数姿态、PSD 导出与贴图回写
 - [x] 多 PSD 优先级合成和回写版本预览
 - [x] Live2DViewerEX 多皮肤 MOD 工程

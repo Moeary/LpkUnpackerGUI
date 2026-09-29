@@ -1,8 +1,7 @@
-"""GUI for converting Spine skeleton data between runtime versions."""
+"""GUI for converting Spine skeleton data with the bundled native DLL."""
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any
 
@@ -44,10 +43,10 @@ except ImportError:  # pragma: no cover - bundled with PySide6 in normal builds
 
 
 try:
-    from app.core.spine_converter import convert_spine, discover_converter
+    from app.core.spine_converter import convert_spine, discover_native_converter
 except ImportError:  # Keep the page importable while the optional backend is absent.
     convert_spine = None
-    discover_converter = None
+    discover_native_converter = None
 
 
 def _thread_is_running(thread) -> bool:
@@ -60,24 +59,6 @@ def _result_value(result: Any, name: str, default: Any = "") -> Any:
     if isinstance(result, dict):
         return result.get(name, default)
     return getattr(result, name, default)
-
-
-def _converter_path(value: Any) -> str:
-    """Get a usable executable path from a backend discovery result."""
-
-    if value is None:
-        return ""
-    if isinstance(value, (str, os.PathLike)):
-        return os.fspath(value)
-    if isinstance(value, dict):
-        for key in ("path", "converter_path", "executable", "exe"):
-            if value.get(key):
-                return str(value[key])
-    for attr in ("path", "converter_path", "executable", "exe"):
-        candidate = getattr(value, attr, None)
-        if candidate:
-            return str(candidate)
-    return str(value) if value else ""
 
 
 class _SpineConverterDropFrame(QFrame):
@@ -141,7 +122,7 @@ class SpineConverterWorker(QThread):
 
 
 class SpineConverterPage(_SpineConverterDropFrame):
-    """Standalone Spine version conversion utility."""
+    """Standalone conversion utility with no external executable entry point."""
 
     previewRequested = Signal(str)
 
@@ -180,9 +161,10 @@ class SpineConverterPage(_SpineConverterDropFrame):
         output_format = self.settings_manager.get_spine_conversion_output_format()
         if output_format in self.OUTPUT_FORMATS:
             self.output_format_combo.setCurrentText(output_format)
-        converter_path = self.settings_manager.get_spine_converter_path()
-        self.converter_edit.setText(converter_path)
-        self._converter_info = converter_path or None
+        # The converter is bundled as a native DLL.  The old EXE setting is
+        # intentionally not surfaced here; the backend may ignore that legacy
+        # value while discovering the installed DLL.
+        self._converter_info = None
 
     def _build_ui(self):
         self.main_layout = QVBoxLayout(self)
@@ -244,21 +226,6 @@ class SpineConverterPage(_SpineConverterDropFrame):
         options_row.addStretch(1)
         self.main_layout.addLayout(options_row)
 
-        converter_row = QHBoxLayout()
-        self.converter_label = BodyLabel(self)
-        self.converter_edit = LineEdit(self)
-        self.converter_edit.setReadOnly(True)
-        self.converter_browse_button = PushButton(self)
-        self.converter_browse_button.setIcon(FluentIcon.FOLDER)
-        self.converter_browse_button.clicked.connect(self.browse_converter)
-        self.converter_detect_button = PushButton(self)
-        self.converter_detect_button.clicked.connect(self._detect_converter)
-        converter_row.addWidget(self.converter_label)
-        converter_row.addWidget(self.converter_edit, 1)
-        converter_row.addWidget(self.converter_browse_button)
-        converter_row.addWidget(self.converter_detect_button)
-        self.main_layout.addLayout(converter_row)
-
         self.converter_status_label = CaptionLabel(self)
         self.converter_status_label.setWordWrap(True)
         self.main_layout.addWidget(self.converter_status_label)
@@ -317,9 +284,6 @@ class SpineConverterPage(_SpineConverterDropFrame):
         self.target_version_label.setText(tr("spine_converter.target_version"))
         self.output_format_label.setText(tr("spine_converter.output_format"))
         self.remove_curve_checkbox.setText(tr("spine_converter.remove_curve"))
-        self.converter_label.setText(tr("spine_converter.converter"))
-        self.converter_browse_button.setText(tr("spine_converter.browse_converter"))
-        self.converter_detect_button.setText(tr("spine_converter.detect_converter"))
         self.warning_label.setText(tr("spine_converter.warning"))
         self.convert_button.setText(tr("spine_converter.convert"))
         self.open_output_button.setText(tr("spine_converter.open_output"))
@@ -336,13 +300,13 @@ class SpineConverterPage(_SpineConverterDropFrame):
 
         super().showEvent(event)
         # Never rewrite controls while a conversion is active.  The settings
-        # page may save a new target or converter path while this page is
-        # hidden; reload it the next time the page becomes visible.
+        # page may save a new target while this page is hidden; reload it the
+        # next time the page becomes visible.
         if self.is_conversion_running():
             return
         self.settings_manager.reload_settings()
         self._load_saved_conversion_settings()
-        self._detect_converter()
+        self._detect_native_converter()
 
     def _accept_dropped_paths(self, paths: list[str]):
         if self._worker is not None:
@@ -381,41 +345,26 @@ class SpineConverterPage(_SpineConverterDropFrame):
         if path:
             self.output_edit.setText(path)
 
-    def browse_converter(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            tr("spine_converter.choose_converter"),
-            "",
-            tr("spine_converter.converter_filter"),
-        )
-        if path:
-            self.converter_edit.setText(path)
-            self._converter_info = path
-            self._render_converter_status()
-
-    def _detect_converter(self):
-        if discover_converter is None:
+    def _detect_native_converter(self):
+        if discover_native_converter is None:
             self._converter_info = None
-            self.converter_edit.clear()
             self._render_converter_status()
             return None
-        explicit = str(self.converter_edit.text() or "").strip() or None
         try:
-            self._converter_info = discover_converter(explicit=explicit)
+            self._converter_info = discover_native_converter()
         except Exception as exc:
             self._converter_info = None
-            self.converter_edit.clear()
             self._show_error(str(exc))
-        path = _converter_path(self._converter_info)
-        if path:
-            self.converter_edit.setText(path)
-        elif explicit is None:
-            self.converter_edit.clear()
         self._render_converter_status()
         return self._converter_info
 
+    # Kept as a small compatibility hook for callers that used the old
+    # auto-detect action; it never accepts or launches an executable.
+    def _detect_converter(self):
+        return self._detect_native_converter()
+
     def _render_converter_status(self):
-        path = str(self.converter_edit.text() or "").strip()
+        path = str(self._converter_info or "").strip()
         if path:
             self.converter_status_label.setText(tr("spine_converter.converter_found", path=path))
         else:
@@ -429,8 +378,6 @@ class SpineConverterPage(_SpineConverterDropFrame):
             self.target_version_combo,
             self.output_format_combo,
             self.remove_curve_checkbox,
-            self.converter_browse_button,
-            self.converter_detect_button,
             self.convert_button,
         ):
             control.setEnabled(bool(enabled))
@@ -513,7 +460,6 @@ class SpineConverterPage(_SpineConverterDropFrame):
             self._show_error(tr("spine_converter.error_format"))
             return
 
-        converter_path = str(self.converter_edit.text() or "").strip() or None
         self._conversion_generation += 1
         generation = self._conversion_generation
         worker = SpineConverterWorker(
@@ -521,7 +467,7 @@ class SpineConverterPage(_SpineConverterDropFrame):
             output_dir,
             target_version,
             output_format,
-            converter_path,
+            None,
             self.remove_curve_checkbox.isChecked(),
         )
         self._worker = worker

@@ -48,6 +48,32 @@ jobs:
         pixi-version: v0.61.0
         cache: true
 
+    - name: Set up MSVC native compiler
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x64
+
+    - name: Verify native build toolchain
+      shell: pwsh
+      run: |
+        if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
+          throw "CMake is required for native Spine and converter builds."
+        }
+        cmake --version
+        if (-not (Get-Command cl -ErrorAction SilentlyContinue)) {
+          throw "The MSVC C++ compiler was not activated by msvc-dev-cmd."
+        }
+
+    - name: Cache pinned Spine source archives
+      uses: actions/cache@v4
+      with:
+        path: |
+          runtime/tools/spine_native
+          runtime/build/native-source-cache
+        key: spine-native-${{ hashFiles('app/core/toolchain_manifest.py', 'native/spine_bridge/CMakeLists.txt') }}
+        restore-keys: |
+          spine-native-
+
     - name: Cache Nuitka downloads
       uses: actions/cache@v4
       with:
@@ -70,6 +96,25 @@ jobs:
         }
         echo "DIST_DIR=$($exe.Directory.FullName)" >> $env:GITHUB_OUTPUT
         Write-Host "Build successful: $($exe.FullName)"
+
+    - name: Verify bundled native artifacts
+      shell: pwsh
+      run: |
+        pixi run python scripts/verify_native_build.py --dist "${{ steps.verify.outputs.DIST_DIR }}" --require-notices
+        $dist = "${{ steps.verify.outputs.DIST_DIR }}"
+        $bridgeDlls = @(
+          (Join-Path $dist "tools/SpineSkeletonDataConverter/lpk_spine_converter.dll"),
+          (Join-Path $dist "tools/spine_native/3.8.75/spine_bridge.dll"),
+          (Join-Path $dist "tools/spine_native/4.0/spine_bridge.dll")
+        ) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf }
+        $licenses = @(
+          (Join-Path $dist "tools/SpineSkeletonDataConverter/LICENSE"),
+          (Join-Path $dist "tools/spine_native/3.8.75/LICENSE"),
+          (Join-Path $dist "tools/spine_native/4.0/LICENSE")
+        ) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf }
+        if ($bridgeDlls.Count -ne 3 -or $licenses.Count -ne 3) {
+          throw "Release bundle must contain exactly the three required native DLLs and three licenses."
+        }
     
     - name: Package build output
       id: package

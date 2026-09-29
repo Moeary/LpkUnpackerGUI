@@ -1,25 +1,22 @@
-"""Spine preview discovery, runtime gating, and pose export helpers.
+"""Spine asset discovery, native-runtime gating, and pose export helpers.
 
-The application does not ship a Spine runtime.  A user may point the preview
-page at an official ``spine-ts`` runtime directory containing a matching
-``spine-core``/``spine-webgl`` build.  This module only reads that directory;
-it never downloads, copies, or mutates runtime or model files.
-
-Spine editor and runtime major/minor versions must match.  Spine 2.1 assets
-are intentionally downgraded to atlas-page preview.  The validated dynamic
-families are 3.8 and 4.0; newer families remain explicit and are not silently
-loaded by an older runtime.
+The preview uses the versioned native Spine bridge installed under
+``runtime/tools/spine_native`` (or a user-selected native runtime root).  No
+browser, ``spine-ts`` bundle, HTML manifest, or web runtime is involved here.
+Spine 2.1 and assets without a skeleton remain explicit atlas-only fallbacks;
+validated native families are 3.8 and 4.0.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
+
+from app.core.spine_native import find_native_library
 
 
 SPINE_RUNTIME_SUPPORTED_FAMILIES = frozenset({"3.8", "4.0"})
@@ -27,14 +24,6 @@ SPINE_RUNTIME_KNOWN_FAMILIES = frozenset({"3.8", "4.0", "4.2"})
 MAX_POSE_CANVAS_PIXELS = 64 * 1024 * 1024
 MAX_POSE_LAYER_PIXELS = 128 * 1024 * 1024
 SPINE_VERSION_RE = re.compile(r"(?<!\d)(\d+)\.(\d+)(?:\.(\d+))?(?!\d)")
-SPINE_SCRIPT_NAMES = {
-    "spine-core.js",
-    "spine-core.min.js",
-    "spine-webgl.js",
-    "spine-webgl.min.js",
-}
-_SPINE_RUNTIME_MANIFEST_NAMES = frozenset({"spine_runtime.json", "runtime.json", "manifest.json"})
-_SPINE_RUNTIME_SKIP_DIR_NAMES = frozenset({".git", "node_modules"})
 SPINE_ATLAS_SUFFIXES = (".atlas", ".atlas.txt", ".atlas.bytes")
 SPINE_SKEL_SUFFIXES = (".skel", ".skel.bytes")
 
@@ -65,20 +54,23 @@ class SpinePoseExportError(SpinePreviewError):
 
 @dataclass(frozen=True)
 class SpineRuntime:
-    """A user-provided official spine-ts runtime build."""
+    """One verified native Spine bridge and its provenance metadata.
+
+    ``webgl_script`` and ``core_script`` remain as optional compatibility
+    fields for callers that used the old description object.  Native callers
+    must use ``library_path`` (or resolve it again from ``root_dir`` and
+    ``family``); no JavaScript runtime is ever returned.
+    """
 
     root_dir: Path
-    webgl_script: Path
+    webgl_script: Path | None = None
     core_script: Path | None = None
     version: str | None = None
     source_manifest: Path | None = None
-    combined_webgl: bool = False
+    combined_webgl: bool = True
     compatible_exact_versions: tuple[str, ...] = ()
-    # spine-ts 3.8 exposes WebGL classes under ``spine.webgl`` while 4.0
-    # publishes one self-contained IIFE whose WebGL classes are top-level.
-    # Keep this in the runtime description so the browser renderer can select
-    # the API from the verified manifest rather than guessing from script text.
-    api_style: str = "legacy"
+    api_style: str = "native"
+    library_path: Path | None = None
 
     @property
     def family(self) -> str | None:
@@ -86,12 +78,19 @@ class SpineRuntime:
 
     @property
     def scripts(self) -> tuple[Path, ...]:
+        """Return the native bridge as a one-item compatibility tuple."""
+
+        library = self.library_path or self.webgl_script
+        if library is None:
+            return ()
+        if self.library_path is not None:
+            return (self.library_path,)
         if self.combined_webgl:
-            return (self.webgl_script,)
+            return (library,)
         values = []
-        if self.core_script and self.core_script != self.webgl_script:
+        if self.core_script and self.core_script != library:
             values.append(self.core_script)
-        values.append(self.webgl_script)
+        values.append(library)
         return tuple(values)
 
 
@@ -133,7 +132,13 @@ class SpinePreviewPlan:
 
     @property
     def dynamic(self) -> bool:
-        return self.mode == "runtime" and self.runtime is not None
+        return self.mode in {"native", "runtime"} and self.runtime is not None
+
+    @property
+    def can_animate(self) -> bool:
+        """Whether a native/runtime bridge is available for animation."""
+
+        return self.dynamic
 
 
 @dataclass(frozen=True)
@@ -242,219 +247,229 @@ def find_spine_asset(source: str | Path) -> SpinePreviewAsset | None:
 
 
 def discover_spine_runtime(
-    root: str | Path,
+    root: str | Path | None = None,
     requested_family: str | None = None,
     requested_version: str | None = None,
 ) -> SpineRuntime:
-    """Find a user-provided core/webgl runtime pair.
+    """Find a versioned native bridge for a Spine family.
 
-    A small ``spine_runtime.json``/``runtime.json`` manifest is preferred when
-    present.  Without one, official script names are located recursively and
-    the version is inferred from the manifest/path/file name when possible.
-    ``requested_version`` is used for exact-version builds such as the
-    historical 3.8.75 runtime; ordinary 3.8/4.0 requests retain family-level
-    compatibility when a runtime manifest does not declare an exact set.
+    ``root`` may be a selected family/version directory or the common
+    ``spine_native`` directory.  With no root, the installed common directory
+    is searched through :func:`find_native_library`.  A selected directory is
+    never replaced with a global fallback, and an exact model version is only
+    accepted when the sibling ``spine_native.json`` identifies that version.
     """
 
-    base = Path(root).expanduser().resolve()
-    if not base.is_dir():
-        raise SpineRuntimeUnavailableError(f"Spine runtime directory does not exist: {base}")
     requested = str(requested_family or "").strip() or None
     exact_requested = normalize_spine_version(requested_version) if requested_version else None
+    if requested is None and exact_requested:
+        requested = spine_version_family(exact_requested)
 
-    explicit_manifest_families: list[str] = []
-    explicit_manifest_versions: list[str] = []
-
-    # The configured path may be a unified ``tools/spine`` root.  Check only
-    # its own manifest and the requested version directory first, so a large
-    # source checkout or a broken dependency link cannot block a valid build.
-    prioritized = list(_direct_runtime_manifests(base))
-    if exact_requested:
-        requested_dir = _requested_runtime_version_dir(base, exact_requested)
-        if requested_dir is not None:
-            prioritized.extend(_direct_runtime_manifests(requested_dir))
-    if requested:
-        requested_dir = _requested_runtime_family_dir(base, requested)
-        if requested_dir is not None:
-            prioritized.extend(_direct_runtime_manifests(requested_dir))
-
-    seen_manifests: set[Path] = set()
-
-    def inspect_manifest(manifest: Path) -> SpineRuntime | None:
-        try:
-            identity = manifest.resolve()
-        except (OSError, RuntimeError):
-            identity = manifest
-        if identity in seen_manifests:
-            return None
-        seen_manifests.add(identity)
-        manifest_data = _try_read_json(manifest)
-        manifest_family = (
-            spine_version_family(
-                manifest_data.get("version")
-                or manifest_data.get("spineVersion")
-                or manifest_data.get("runtimeVersion")
-            )
-            if isinstance(manifest_data, Mapping)
-            else None
-        )
-        if manifest_family:
-            explicit_manifest_families.append(manifest_family)
-        manifest_version = (
-            normalize_spine_version(
-                manifest_data.get("version")
-                or manifest_data.get("spineVersion")
-                or manifest_data.get("runtimeVersion")
-            )
-            if isinstance(manifest_data, Mapping)
-            else None
-        )
-        if manifest_version:
-            explicit_manifest_versions.append(manifest_version)
-        try:
-            return _runtime_from_manifest(manifest, requested, exact_requested)
-        except (OSError, RuntimeError):
-            return None
-
-    for manifest in prioritized:
-        runtime = inspect_manifest(manifest)
-        if runtime is not None:
-            return runtime
-
-    # Recursive discovery is deliberately a fallback.  The iterator prunes
-    # dependency/source metadata directories and treats disappearing or
-    # inaccessible entries as non-matches rather than aborting discovery.
-    manifests = sorted(
-        _iter_runtime_files(base, names=_SPINE_RUNTIME_MANIFEST_NAMES),
-        key=lambda path: str(path).casefold(),
-    )
-    for manifest in manifests:
-        runtime = inspect_manifest(manifest)
-        if runtime is not None:
-            return runtime
-    if exact_requested and explicit_manifest_versions and exact_requested not in explicit_manifest_versions:
-        raise SpineVersionMismatchError(
-            f"Requested Spine runtime {exact_requested}, manifests declare {', '.join(sorted(set(explicit_manifest_versions)))}"
-        )
-    if requested and explicit_manifest_families and requested not in explicit_manifest_families:
-        raise SpineVersionMismatchError(
-            f"Requested Spine runtime {requested}, manifests declare {', '.join(sorted(set(explicit_manifest_families)))}"
-        )
-
-    scripts = list(_iter_runtime_files(base, names=SPINE_SCRIPT_NAMES))
-    if not scripts:
+    explicit_root = Path(root).expanduser().resolve() if root else None
+    if explicit_root is not None and not explicit_root.is_dir():
         raise SpineRuntimeUnavailableError(
-            f"No official spine-core.js/spine-webgl.js build found under {base}"
+            f"Native Spine runtime directory does not exist: {explicit_root}"
         )
-    webgl = _pick_script(scripts, "spine-webgl", requested, exact_requested)
-    if webgl is None:
-        if requested:
-            found_families = sorted({family for family in (_infer_runtime_family(path) for path in scripts if path.stem.lower().startswith("spine-webgl")) if family})
-            if found_families:
-                raise SpineVersionMismatchError(
-                    f"Requested Spine runtime {requested}, found {', '.join(found_families)} under {base}"
-                )
-        raise SpineRuntimeUnavailableError(f"No matching spine-webgl.js build found under {base}")
-    family = _infer_runtime_family(webgl)
-    core = _pick_script(scripts, "spine-core", requested or family, exact_requested)
-    combined = core is None
-    if requested and family and family != requested:
-        raise SpineVersionMismatchError(
-            f"Requested Spine runtime {requested}, found {family} at {webgl}"
-        )
-    version = _infer_runtime_version(webgl) or family or requested
-    if exact_requested == "3.8.75" and version != exact_requested:
-        raise SpineVersionMismatchError(
-            f"Requested exact Spine runtime {exact_requested}, but the selected build reports {version} at {webgl}"
-        )
-    return SpineRuntime(
-        root_dir=base,
-        webgl_script=webgl,
-        core_script=core,
-        version=version,
-        combined_webgl=combined,
-        api_style=_runtime_api_style(None, version or family or requested),
-    )
 
-
-def _direct_runtime_manifests(root: Path) -> tuple[Path, ...]:
-    """Return manifest files directly below *root*, tolerating stale entries."""
-
-    candidates: list[Path] = []
-    try:
-        with os.scandir(root) as entries:
-            for entry in entries:
-                try:
-                    if entry.name.casefold() not in _SPINE_RUNTIME_MANIFEST_NAMES:
-                        continue
-                    if entry.is_file(follow_symlinks=False):
-                        candidates.append(Path(entry.path))
-                except (OSError, RuntimeError):
-                    continue
-    except (OSError, RuntimeError):
-        return ()
-    return tuple(sorted(candidates, key=lambda path: str(path).casefold()))
-
-
-def _requested_runtime_family_dir(base: Path, requested: str) -> Path | None:
-    """Resolve a direct requested-family child without allowing parent escape."""
-
-    try:
-        candidate = (base / requested).resolve()
-        if candidate == base or candidate.parent != base or not candidate.is_dir():
-            return None
-    except (OSError, RuntimeError):
-        return None
-    return candidate
-
-
-def _requested_runtime_version_dir(base: Path, requested: str) -> Path | None:
-    """Resolve a direct exact-version child for a precise runtime request."""
-
-    try:
-        candidate = (base / requested).resolve()
-        if candidate == base or candidate.parent != base or not candidate.is_dir():
-            return None
-    except (OSError, RuntimeError):
-        return None
-    return candidate
-
-
-def _iter_runtime_files(
-    root: Path,
-    *,
-    names: Iterable[str] = (),
-    suffixes: Iterable[str] = (),
-) -> Iterable[Path]:
-    """Walk below *root* without following links into broken dependencies."""
-
-    wanted_names = {str(name).casefold() for name in names}
-    wanted_suffixes = tuple(str(suffix).casefold() for suffix in suffixes)
-    pending = [Path(root)]
-    while pending:
-        current = pending.pop()
+    default_root = _default_native_runtime_root()
+    roots: list[Path] = []
+    if explicit_root is not None:
+        roots.append(explicit_root)
+    else:
+        # Keep the native adapter as the source of truth for default lookup.
+        # Its result also tells us which versioned child should be inspected.
         try:
-            with os.scandir(current) as entries:
-                children = sorted(entries, key=lambda item: item.name.casefold(), reverse=True)
+            default_library = find_native_library(None, requested)
+        except (OSError, RuntimeError):
+            default_library = None
+        if default_library is not None:
+            roots.append(default_library.resolve().parent)
+        if default_root.is_dir():
+            roots.append(default_root)
+
+    candidates: list[tuple[Path, Path, Mapping[str, Any] | None]] = []
+    for candidate_root in _native_runtime_dirs(roots):
+        try:
+            library = find_native_library(candidate_root, requested)
+        except (OSError, RuntimeError):
+            library = None
+        if library is None or not library.is_file():
+            continue
+        library = library.resolve()
+        actual_root = library.parent.resolve()
+        metadata = _native_runtime_metadata(actual_root)
+        metadata_family = _native_metadata_family(metadata)
+        if requested and metadata_family and metadata_family != requested:
+            continue
+        candidates.append((actual_root, library, metadata))
+
+    # ``find_native_library`` can search an installed common root recursively;
+    # include its direct result even when the runtime directory had no obvious
+    # child entry (for example, a junction or a packaged one-file layout).
+    if not candidates:
+        try:
+            library = find_native_library(explicit_root, requested) if explicit_root else find_native_library(None, requested)
+        except (OSError, RuntimeError):
+            library = None
+        if library is not None and library.is_file():
+            library = library.resolve()
+            candidates.append((library.parent.resolve(), library, _native_runtime_metadata(library.parent)))
+
+    if not candidates:
+        selected = explicit_root or default_root
+        family_text = requested or "the requested"
+        raise SpineRuntimeUnavailableError(
+            f"No native Spine bridge is installed for family {family_text} under {selected}. "
+            "Install the matching runtime/tools/spine_native/<version> package."
+        )
+
+    if exact_requested:
+        exact_matches = [
+            item for item in candidates
+            if _native_metadata_version(item[2])
+            and normalize_spine_version(_native_metadata_version(item[2])) == exact_requested
+        ]
+        # The installed 4.0 bridge is intentionally marked as family-only
+        # (``version: 4.0``) and has been validated with 4.0.37 assets.  A
+        # family-only bridge is therefore valid for ordinary 4.0 requests;
+        # the historical 3.8.75 bridge remains an exact-version exception.
+        if not exact_matches and exact_requested != "3.8.75":
+            exact_matches = [
+                item for item in candidates
+                if _native_metadata_family(item[2]) == requested
+                and not _native_metadata_has_patch(item[2])
+            ]
+        if not exact_matches:
+            found_versions = sorted(
+                {
+                    _native_metadata_version(metadata) or _native_version_from_path(runtime_root)
+                    for runtime_root, _library, metadata in candidates
+                    if _native_metadata_version(metadata) or _native_version_from_path(runtime_root)
+                }
+            )
+            found_text = ", ".join(found_versions) if found_versions else "unknown"
+            raise SpineVersionMismatchError(
+                f"Requested exact Spine runtime {exact_requested}, but the native installation "
+                f"provides {found_text}; an exact-version bridge is required for this model."
+            )
+        candidates = exact_matches
+
+    runtime_root, library, metadata = sorted(
+        candidates,
+        key=lambda item: str(item[1]).casefold(),
+    )[0]
+    runtime = _runtime_from_native_library(runtime_root, library, metadata, requested)
+    if runtime.family and requested and runtime.family != requested:
+        raise SpineVersionMismatchError(
+            f"Skeleton Spine {requested} does not match native runtime {runtime.family}."
+        )
+    return runtime
+
+
+def _default_native_runtime_root() -> Path:
+    return Path(__file__).resolve().parents[2] / "runtime" / "tools" / "spine_native"
+
+
+def _native_runtime_dirs(roots: Iterable[Path]) -> tuple[Path, ...]:
+    """Return selected roots and their direct versioned children only."""
+
+    values: list[Path] = []
+    seen: set[Path] = set()
+    for root in roots:
+        try:
+            resolved = root.resolve()
         except (OSError, RuntimeError):
             continue
-        for entry in children:
-            try:
-                entry_name = entry.name.casefold()
-                if entry_name in _SPINE_RUNTIME_SKIP_DIR_NAMES:
-                    continue
-                if entry.is_dir(follow_symlinks=False):
-                    pending.append(Path(entry.path))
-                    continue
-                if not entry.is_file(follow_symlinks=False):
-                    continue
-                if wanted_names and entry_name not in wanted_names:
-                    continue
-                if wanted_suffixes and not entry_name.endswith(wanted_suffixes):
-                    continue
-                yield Path(entry.path)
-            except (OSError, RuntimeError):
-                continue
+        if not resolved.is_dir() or resolved in seen:
+            continue
+        seen.add(resolved)
+        values.append(resolved)
+        try:
+            children = sorted(resolved.iterdir(), key=lambda item: item.name.casefold())
+        except (OSError, RuntimeError):
+            children = ()
+        for child in children:
+            if child.is_dir() and not child.name.startswith(".") and child not in seen:
+                seen.add(child)
+                values.append(child)
+    return tuple(values)
+
+
+def _native_runtime_metadata(root: Path) -> Mapping[str, Any] | None:
+    data = _try_read_json(root / "spine_native.json")
+    return data if isinstance(data, Mapping) else None
+
+
+def _native_metadata_family(metadata: Mapping[str, Any] | None) -> str | None:
+    if not isinstance(metadata, Mapping):
+        return None
+    declared = metadata.get("runtimeFamily") or metadata.get("family")
+    return spine_version_family(declared) if declared else spine_version_family(_native_metadata_version(metadata))
+
+
+def _native_metadata_version(metadata: Mapping[str, Any] | None) -> str | None:
+    if not isinstance(metadata, Mapping):
+        return None
+    raw = metadata.get("version") or metadata.get("spineVersion") or metadata.get("runtimeVersion")
+    parsed = parse_spine_version(raw)
+    if parsed is None:
+        return None
+    # Preserve family-only metadata such as the installed 4.0 bridge while
+    # keeping exact patch versions such as 3.8.75 exact.
+    text = str(raw)
+    return f"{parsed[0]}.{parsed[1]}.{parsed[2]}" if len(text.split(".")) >= 3 else f"{parsed[0]}.{parsed[1]}"
+
+
+def _native_metadata_has_patch(metadata: Mapping[str, Any] | None) -> bool:
+    if not isinstance(metadata, Mapping):
+        return False
+    raw = metadata.get("version") or metadata.get("spineVersion") or metadata.get("runtimeVersion")
+    match = SPINE_VERSION_RE.search(str(raw or ""))
+    return bool(match and match.group(3) is not None)
+
+
+def _native_version_from_path(root: Path) -> str | None:
+    return normalize_spine_version(root.name)
+
+
+def _runtime_from_native_library(
+    root: Path,
+    library: Path,
+    metadata: Mapping[str, Any] | None,
+    requested: str | None,
+) -> SpineRuntime:
+    version = _native_metadata_version(metadata) or _native_version_from_path(root) or requested
+    exact_versions: list[str] = []
+    if isinstance(metadata, Mapping):
+        raw_exact = metadata.get("compatibleExactVersions") or metadata.get("compatibleVersions") or ()
+        if isinstance(raw_exact, (str, bytes)):
+            raw_exact = (raw_exact,)
+        if isinstance(raw_exact, Iterable):
+            exact_versions.extend(
+                normalized
+                for item in raw_exact
+                for normalized in [normalize_spine_version(item)]
+                if normalized
+            )
+    raw_version = metadata.get("version") if isinstance(metadata, Mapping) else None
+    if raw_version is not None and len(str(raw_version).split(".")) >= 3:
+        normalized = normalize_spine_version(version)
+        if normalized:
+            exact_versions.append(normalized)
+    manifest = root / "spine_native.json"
+    source_manifest = manifest.resolve() if manifest.is_file() else None
+    library = library.resolve()
+    return SpineRuntime(
+        root_dir=root.resolve(),
+        webgl_script=library,
+        core_script=None,
+        version=version,
+        source_manifest=source_manifest,
+        combined_webgl=True,
+        compatible_exact_versions=tuple(dict.fromkeys(exact_versions)),
+        api_style="native",
+        library_path=library,
+    )
 
 
 def make_spine_preview_plan(
@@ -463,11 +478,12 @@ def make_spine_preview_plan(
     *,
     allow_unverified_runtime: bool = False,
 ) -> SpinePreviewPlan:
-    """Choose dynamic runtime or explicit atlas fallback.
+    """Choose the native bridge or an explicit atlas-only fallback.
 
-    2.1 and unverified families remain viewable as atlas pages.  A supplied
-    runtime with a different family is rejected so a user cannot accidentally
-    parse a 3.8 skeleton with a 4.2 runtime (or vice versa).
+    A missing bridge is reported in the returned plan so the UI can explain
+    how to install it.  A selected bridge with the wrong family or exact
+    version remains an error: silently loading a 3.8.75 model with a 3.8.99
+    bridge would produce misleading preview results.
     """
 
     family = asset.family
@@ -482,8 +498,8 @@ def make_spine_preview_plan(
         return SpinePreviewPlan(
             mode="atlas",
             asset=asset,
-            reason="Spine 2.1 与当前动态 runtime 不兼容，已降级为 atlas 页面预览。",
-            warnings=asset.warnings + ("Spine 2.1 不进入动态 runtime。",),
+            reason="Spine 2.1 与当前 native bridge 不兼容，已降级为 atlas 页面预览。",
+            warnings=asset.warnings + ("Spine 2.1 不进入 native 动画预览。",),
         )
     if not family:
         return SpinePreviewPlan(
@@ -499,18 +515,19 @@ def make_spine_preview_plan(
             reason=f"Spine {family} 尚未在本程序中验证，已降级为 atlas 页面预览。",
             warnings=asset.warnings + (f"未声明支持 Spine {family} 动态 runtime。",),
         )
-    if not runtime_root:
+    try:
+        runtime = discover_spine_runtime(
+            runtime_root,
+            requested_family=family,
+            requested_version=asset.spine_version,
+        )
+    except SpineRuntimeUnavailableError as exc:
         return SpinePreviewPlan(
             mode="atlas",
             asset=asset,
-            reason="未配置匹配的官方 Spine runtime，已降级为 atlas 页面预览。",
-            warnings=asset.warnings + ("请在设置中选择同主次版本的 spine-ts core/webgl。",),
+            reason="未找到匹配的 Spine native bridge，已降级为 atlas 页面预览。",
+            warnings=asset.warnings + (str(exc), "请安装匹配的 runtime/tools/spine_native/<version>。"),
         )
-    runtime = discover_spine_runtime(
-        runtime_root,
-        requested_family=family,
-        requested_version=asset.spine_version,
-    )
     runtime_family = runtime.family
     if runtime_family and runtime_family != family:
         raise SpineVersionMismatchError(
@@ -536,14 +553,14 @@ def make_spine_preview_plan(
         return SpinePreviewPlan(
             mode="atlas",
             asset=asset,
-            reason=f"Spine runtime {runtime_family} 尚未完成真实样本验证，已降级为 atlas 页面预览。",
-            warnings=asset.warnings + (f"runtime {runtime_family} 仅记录版本，不宣称动态支持。",),
+            reason=f"Spine native runtime {runtime_family} 尚未完成真实样本验证，已降级为 atlas 页面预览。",
+            warnings=asset.warnings + (f"native runtime {runtime_family} 仅记录版本，不宣称动态支持。",),
         )
     return SpinePreviewPlan(
-        mode="runtime",
+        mode="native",
         asset=asset,
         runtime=runtime,
-        reason=f"使用官方 Spine {runtime_family} core/webgl runtime。",
+        reason=f"使用 Spine {runtime_family} native bridge。",
         warnings=asset.warnings,
     )
 
@@ -598,46 +615,6 @@ class SpinePreviewImportResult:
     asset: SpinePreviewAsset
     plan: SpinePreviewPlan
     temp_dir: Path | None = None
-
-
-def build_spine_web_manifest(
-    plan: SpinePreviewPlan,
-    asset_base_url: str,
-    runtime_base_url: str | None = None,
-) -> dict[str, Any]:
-    """Build URL-only data for ``assets/spine/preview.html``."""
-
-    asset = plan.asset
-    root = asset.root_dir.resolve()
-    manifest: dict[str, Any] = {
-        "mode": plan.mode,
-        "reason": plan.reason,
-        "warnings": list(plan.warnings),
-        "version": asset.spine_version,
-        "family": asset.family,
-        "skeletonFormat": asset.skeleton_format,
-        "skeleton": _relative_url(asset.skeleton_path, root, asset_base_url),
-        "atlases": [_relative_url(path, root, asset_base_url) for path in asset.atlas_paths],
-        "textures": [_relative_url(path, root, asset_base_url) for path in asset.texture_paths],
-        "skins": list(asset.skin_names),
-        "animations": list(asset.animation_names),
-        "attachments": list(asset.attachment_names),
-        "unsupported": list(asset.unsupported_features),
-    }
-    if plan.runtime:
-        runtime_root = plan.runtime.root_dir.resolve()
-        runtime_base_url = runtime_base_url or asset_base_url
-        manifest["runtime"] = {
-            "version": plan.runtime.version,
-            "family": plan.runtime.family,
-            "core": _relative_url(plan.runtime.core_script, runtime_root, runtime_base_url),
-            "webgl": _relative_url(plan.runtime.webgl_script, runtime_root, runtime_base_url),
-            "combined": plan.runtime.combined_webgl,
-            "api": plan.runtime.api_style,
-        }
-    else:
-        manifest["runtime"] = None
-    return manifest
 
 
 def export_spine_pose_psd(
@@ -1002,155 +979,6 @@ def _skeleton_metadata(data: Mapping[str, Any] | None) -> tuple[tuple[str, ...],
     return tuple(skins), animations, tuple(attachments), tuple(dict.fromkeys(unsupported))
 
 
-def _runtime_from_manifest(
-    path: Path,
-    requested: str | None,
-    requested_version: str | None = None,
-) -> SpineRuntime | None:
-    data = _try_read_json(path)
-    if not isinstance(data, Mapping):
-        return None
-    version = normalize_spine_version(data.get("version") or data.get("spineVersion") or data.get("runtimeVersion"))
-    family = spine_version_family(version)
-    if requested and family and family != requested:
-        return None
-    exact_versions = tuple(
-        dict.fromkeys(
-            normalized
-            for item in (data.get("compatibleExactVersions") or data.get("compatibleVersions") or ())
-            for normalized in [normalize_spine_version(item)]
-            if normalized
-        )
-    )
-    if requested_version:
-        if exact_versions and requested_version not in exact_versions:
-            return None
-        # 3.8.75 is deliberately distributed as a dedicated historical build;
-        # never silently substitute the current 3.8.99 runtime for it.
-        if requested_version == "3.8.75" and version and version != requested_version:
-            return None
-    # Official spine-ts 3.8 backend builds are self-contained: the WebGL
-    # artifact includes the core classes.  A manifest may still record the
-    # separate core artifact for provenance, but callers must not load it a
-    # second time before the combined WebGL build.
-    combined = bool(data.get("combined") or data.get("webglIncludesCore"))
-    core = _manifest_script(path.parent, data.get("core") or data.get("spineCore"))
-    webgl = _manifest_script(path.parent, data.get("webgl") or data.get("spineWebgl") or data.get("webGL"))
-    if webgl is None:
-        scripts = list(_iter_runtime_files(path.parent, names=SPINE_SCRIPT_NAMES))
-        webgl = _pick_script(scripts, "spine-webgl", requested or family, requested_version)
-    if webgl is None:
-        return None
-    if core is None and not combined:
-        core = _pick_script(
-            [webgl.parent / "spine-core.js", *_iter_runtime_files(webgl.parent, suffixes=(".js",))],
-            "spine-core",
-            requested or family,
-            requested_version,
-        )
-    return SpineRuntime(
-        root_dir=path.parent.resolve(),
-        webgl_script=webgl,
-        core_script=core,
-        version=version or _infer_runtime_version(webgl) or family or requested,
-        source_manifest=path.resolve(),
-        combined_webgl=combined or core is None,
-        compatible_exact_versions=exact_versions,
-        api_style=_runtime_api_style(
-            data.get("api") or data.get("apiStyle") or data.get("namespace"),
-            version or _infer_runtime_version(webgl) or family or requested,
-        ),
-    )
-
-
-def _manifest_script(root: Path, raw: Any) -> Path | None:
-    if not isinstance(raw, str) or not raw:
-        return None
-    try:
-        path = (root / raw).resolve()
-        return path if path.is_file() and path.suffix.lower() == ".js" else None
-    except (OSError, RuntimeError):
-        return None
-
-
-def _pick_script(
-    scripts: Sequence[Path],
-    stem: str,
-    family: str | None,
-    exact_version: str | None = None,
-) -> Path | None:
-    candidates: list[Path] = []
-    for path in scripts:
-        try:
-            if path.is_file() and path.stem.lower().startswith(stem):
-                candidates.append(path.resolve())
-        except (OSError, RuntimeError):
-            continue
-    if family:
-        matching = [path for path in candidates if _infer_runtime_family(path) == family]
-        if matching:
-            candidates = matching
-        elif candidates and any(_infer_runtime_family(path) for path in candidates):
-            return None
-    if exact_version:
-        exact = [path for path in candidates if _infer_runtime_version(path) == exact_version]
-        if exact:
-            candidates = exact
-        elif exact_version == "3.8.75":
-            return None
-    return sorted(candidates, key=lambda path: (len(path.parts), str(path).lower()))[0] if candidates else None
-
-
-def _infer_runtime_version(path: Path) -> str | None:
-    for value in (path.name, *path.parts[::-1]):
-        version = normalize_spine_version(value)
-        if version:
-            return version
-    return None
-
-
-def _infer_runtime_family(path: Path) -> str | None:
-    return spine_version_family(_infer_runtime_version(path))
-
-
-def _runtime_api_style(value: Any, version_or_family: Any) -> str:
-    """Return the browser API layout for a validated spine-ts build.
-
-    The 3.8 repository keeps WebGL classes under ``spine.webgl``.  Starting
-    with the 4.0 runtime, the IIFE build exports those classes directly on
-    ``spine``.  A manifest may state the layout explicitly; otherwise the
-    major/minor family is sufficient for official builds.
-    """
-
-    value_text = str(value or "").strip().casefold().replace("-", "_")
-    if value_text in {"flat", "top_level", "toplevel", "modern"}:
-        return "flat"
-    if value_text in {"legacy", "nested", "webgl_namespace", "webgl"}:
-        return "legacy"
-    family = spine_version_family(version_or_family)
-    if family:
-        major = int(family.split(".", 1)[0])
-        if major >= 4:
-            return "flat"
-    return "legacy"
-
-
-def _relative_url(path: Path | None, root: Path, base_url: str) -> str | None:
-    if path is None:
-        return None
-    try:
-        relative = path.resolve().relative_to(root.resolve()).as_posix()
-    except ValueError:
-        return None
-    return str(base_url).rstrip("/") + "/" + "/".join(_quote_url_part(item) for item in relative.split("/"))
-
-
-def _quote_url_part(value: str) -> str:
-    from urllib.parse import quote
-
-    return quote(value, safe="._-()[]~")
-
-
 def _is_atlas_path(path: Path) -> bool:
     lower = path.name.lower()
     return lower.endswith(SPINE_ATLAS_SUFFIXES)
@@ -1186,7 +1014,6 @@ __all__ = [
     "SpineRuntimeUnavailableError",
     "SpineRuntimeUnsupportedError",
     "SpineVersionMismatchError",
-    "build_spine_web_manifest",
     "discover_spine_runtime",
     "export_spine_pose_psd",
     "find_spine_asset",

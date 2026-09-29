@@ -1,10 +1,8 @@
 import json
 import shutil
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 from PIL import Image
@@ -24,7 +22,7 @@ class SpineConverterTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(tempfile.mkdtemp(prefix="spine-converter-test-", dir=Path.cwd()))
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
-        self.converter = self.root / "SpineSkeletonDataConverter.exe"
+        self.converter = self.root / "lpk_spine_converter.dll"
         self.converter.write_bytes(b"test converter placeholder")
 
     def _skeleton_json(self, path: Path, version: str = "4.0.37") -> None:
@@ -70,19 +68,18 @@ class SpineConverterTests(unittest.TestCase):
         return atlas, page
 
     def _fake_converter(self, target: str = "3.8.99", *, binary: bool = False):
-        def run(command, **kwargs):
-            self.assertEqual(command[0], str(self.converter.resolve()))
-            self.assertEqual(command[1].lower().endswith((".json", ".skel")), True)
-            self.assertEqual(command[3:5], ["-v", target])
-            self.assertFalse(kwargs.get("shell"))
-            self.assertIn("timeout", kwargs)
-            output = Path(command[2])
+        def run(converter, source, output, requested_target, remove_curve):
+            self.assertEqual(Path(converter), self.converter.resolve())
+            self.assertTrue(Path(source).suffix.lower() in {".json", ".skel"})
+            self.assertEqual(requested_target, target)
+            self.assertIsInstance(remove_curve, bool)
+            output = Path(output)
             output.parent.mkdir(parents=True, exist_ok=True)
             if binary:
                 output.write_bytes(f"fixture {target}\0".encode("ascii"))
             else:
                 self._skeleton_json(output, target)
-            return SimpleNamespace(returncode=0, stdout="Detected input Spine version", stderr="")
+            return [str(converter), "spine_converter_convert"], "", "", 0
 
         return run
 
@@ -92,7 +89,7 @@ class SpineConverterTests(unittest.TestCase):
         atlas, page = self._atlas(self.root)
         output_root = self.root / "outputs"
 
-        with patch("app.core.spine_converter.subprocess.run", side_effect=self._fake_converter()):
+        with patch("app.core.spine_converter._run_native_converter", side_effect=self._fake_converter()):
             result = convert_spine(
                 skeleton,
                 output_root,
@@ -117,6 +114,8 @@ class SpineConverterTests(unittest.TestCase):
         report = json.loads(result.report_path.read_text(encoding="utf-8"))
         self.assertEqual(report["target_version"], "3.8.99")
         self.assertEqual(report["returncode"], 0)
+        self.assertEqual(report["converter_type"], "in-process native DLL")
+        self.assertEqual(report["converter_abi_version"], "1")
         self.assertTrue(any("pma:true" in warning for warning in result.warnings))
 
     def test_model0_reference_and_explicit_texture_do_not_duplicate_pma_page(self) -> None:
@@ -134,7 +133,7 @@ class SpineConverterTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        with patch("app.core.spine_converter.subprocess.run", side_effect=self._fake_converter()):
+        with patch("app.core.spine_converter._run_native_converter", side_effect=self._fake_converter()):
             result = convert_spine(model, self.root / "out", target_version="3.8.99", converter_path=self.converter)
         self.assertTrue((result.output_dir / atlas.name).is_file())
         self.assertTrue((result.output_dir / page.name).is_file())
@@ -160,7 +159,7 @@ class SpineConverterTests(unittest.TestCase):
         skeleton = self.root / "skeleton.skel"
         skeleton.write_bytes(b"fixture 4.0.37\0")
         self._atlas(self.root, rotate=180)
-        with patch("app.core.spine_converter.subprocess.run", side_effect=self._fake_converter()):
+        with patch("app.core.spine_converter._run_native_converter", side_effect=self._fake_converter()):
             with self.assertRaises(SpineUnsupportedError):
                 convert_spine(skeleton, self.root / "out", target_version="3.8.99", converter_path=self.converter)
 
@@ -168,10 +167,10 @@ class SpineConverterTests(unittest.TestCase):
         skeleton = self.root / "skeleton.skel"
         skeleton.write_bytes(b"fixture 4.0.37\0")
 
-        def failed(command, **kwargs):
-            return SimpleNamespace(returncode=9, stdout="", stderr="bad skeleton")
+        def failed(*_args, **_kwargs):
+            return [], "", "bad skeleton", 9
 
-        with patch("app.core.spine_converter.subprocess.run", side_effect=failed):
+        with patch("app.core.spine_converter._run_native_converter", side_effect=failed):
             with self.assertRaises(SpineConversionProcessError):
                 convert_spine(skeleton, self.root / "out", target_version="3.8.99", converter_path=self.converter)
         reports = list((self.root / "out").rglob("spine_conversion_report.json"))
@@ -180,13 +179,13 @@ class SpineConverterTests(unittest.TestCase):
 
     def test_discover_explicit_path_is_authoritative(self) -> None:
         self.assertEqual(discover_converter(self.converter), self.converter.resolve())
-        self.assertIsNone(discover_converter(self.root / "missing.exe"))
+        self.assertIsNone(discover_converter(self.root / "missing.dll"))
 
     def test_output_format_skel_validates_binary_version(self) -> None:
         source = self.root / "skeleton.json"
         self._skeleton_json(source, "3.8.99")
         with patch(
-            "app.core.spine_converter.subprocess.run",
+            "app.core.spine_converter._run_native_converter",
             side_effect=self._fake_converter("3.8.99", binary=True),
         ):
             result = convert_spine(
@@ -204,7 +203,7 @@ class SpineConverterTests(unittest.TestCase):
         original = b"fixture 4.0.37\0"
         source.write_bytes(original)
         output_root = self.root / "out"
-        with patch("app.core.spine_converter.subprocess.run", side_effect=self._fake_converter()):
+        with patch("app.core.spine_converter._run_native_converter", side_effect=self._fake_converter()):
             first = convert_spine(source, output_root, target_version="3.8.99", converter_path=self.converter)
             first_bytes = first.skeleton_path.read_bytes()
             second = convert_spine(source, output_root, target_version="3.8.99", converter_path=self.converter)
@@ -212,26 +211,26 @@ class SpineConverterTests(unittest.TestCase):
         self.assertEqual(first.skeleton_path.read_bytes(), first_bytes)
         self.assertEqual(source.read_bytes(), original)
 
-    def test_invalid_version_missing_exe_and_timeout_are_explicit(self) -> None:
+    def test_invalid_version_missing_dll_and_native_failure_are_explicit(self) -> None:
         source = self.root / "skeleton.skel"
         source.write_bytes(b"fixture 4.0.37\0")
         with self.assertRaises(SpineSourceError):
             convert_spine(source, self.root / "bad-version", target_version="3.8", converter_path=self.converter)
         with self.assertRaises(SpineConverterNotFoundError):
-            convert_spine(source, self.root / "missing-exe", converter_path=self.root / "missing.exe")
+            convert_spine(source, self.root / "missing-dll", converter_path=self.root / "missing.dll")
 
-        def timed_out(command, **kwargs):
-            raise subprocess.TimeoutExpired(command, kwargs["timeout"], output=b"stdout", stderr=b"stderr")
+        def native_failed(*_args, **_kwargs):
+            return [], "", "native error", 9
 
-        with patch("app.core.spine_converter.subprocess.run", side_effect=timed_out):
+        with patch("app.core.spine_converter._run_native_converter", side_effect=native_failed):
             with self.assertRaises(SpineConversionProcessError):
-                convert_spine(source, self.root / "timed-out", target_version="3.8.99", converter_path=self.converter)
+                convert_spine(source, self.root / "native-failed", target_version="3.8.99", converter_path=self.converter)
 
     def test_scale_resizes_page_and_rejects_zero_sized_region(self) -> None:
         source = self.root / "skeleton.skel"
         source.write_bytes(b"fixture 4.0.37\0")
         self._atlas(self.root, scale=2)
-        with patch("app.core.spine_converter.subprocess.run", side_effect=self._fake_converter()):
+        with patch("app.core.spine_converter._run_native_converter", side_effect=self._fake_converter()):
             result = convert_spine(source, self.root / "scaled", target_version="3.8.99", converter_path=self.converter)
         with Image.open(result.output_dir / "page.png") as scaled_page:
             self.assertEqual(scaled_page.size, (4, 4))
@@ -244,7 +243,7 @@ class SpineConverterTests(unittest.TestCase):
         self._atlas(tiny_root, scale=100)
         tiny_skeleton = tiny_root / "skeleton2.skel"
         tiny_skeleton.write_bytes(b"fixture 4.0.37\0")
-        with patch("app.core.spine_converter.subprocess.run", side_effect=self._fake_converter()):
+        with patch("app.core.spine_converter._run_native_converter", side_effect=self._fake_converter()):
             with self.assertRaises(SpineUnsupportedError):
                 convert_spine(tiny_skeleton, self.root / "tiny-out", target_version="3.8.99", converter_path=self.converter)
 

@@ -1,3 +1,5 @@
+> 历史设计记录：文中的 WebPreviewPage、web_server、assets/live2d 和网页预览方案已移除。当前架构采用 Qt/OpenGL 原生预览，参见 spine-preview.md。
+
 # LpkUnpackerGUI 项目继续规范化建议
 
 本文基于当前仓库结构、主窗口导航、GUI 页面和 core/tooling 代码职责梳理而成，目标是给后续迭代提供边界和分层建议。本文只描述推荐方向，不要求一次性重构。

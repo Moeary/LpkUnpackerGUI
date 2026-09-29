@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ.setdefault("LPK_DISABLE_NATIVE_PREVIEW", "1")
 
 try:
     from PySide6.QtWidgets import QApplication
@@ -17,7 +18,7 @@ try:
 
     import app.gui.PreviewPage as preview_page_module
     from app.gui.PreviewPage import PreviewPage
-    from app.gui.SpinePreviewWidget import SpinePreviewWidget, WEBENGINE_AVAILABLE
+    from app.gui.SpinePreviewWidget import SpinePreviewWidget
 except (ImportError, OSError):  # pragma: no cover - optional desktop dependency
     QApplication = None
     QCoreApplication = None
@@ -27,12 +28,11 @@ except (ImportError, OSError):  # pragma: no cover - optional desktop dependency
     preview_page_module = None
     PreviewPage = None
     SpinePreviewWidget = None
-    WEBENGINE_AVAILABLE = False
 
 
 @unittest.skipIf(
-    QApplication is None or not WEBENGINE_AVAILABLE,
-    "PySide6 QtWebEngine is optional in the lightweight test environment",
+    QApplication is None,
+    "PySide6 is optional in the lightweight test environment",
 )
 class SpinePreviewWidgetTests(unittest.TestCase):
     @classmethod
@@ -46,27 +46,24 @@ class SpinePreviewWidgetTests(unittest.TestCase):
             if predicate():
                 return
             time.sleep(0.01)
-        self.fail("timed out waiting for QtWebEngine")
+        self.fail("timed out waiting for native Spine preview")
 
-    def test_embedded_page_loads_and_clear_stops_navigation(self):
+    def test_native_missing_bridge_reports_error_and_clear_stops_loading(self):
         widget = SpinePreviewWidget()
-        events = []
-        ready = []
         failed = []
-        widget.documentLoaded.connect(lambda url: events.append("document"))
-        widget.previewReady.connect(ready.append)
         widget.previewFailed.connect(failed.append)
         widget.show()
-        widget.open_url(
-            "data:text/html,<html><body data-preview-state='ready'><span id='status'>ready</span>"
-            "<canvas id='canvas'></canvas><div id='atlas' class='hidden'></div>"
-            "<button id='exportPsd' class='hidden'></button></body></html>"
-        )
-        self._wait(lambda: bool(ready) or bool(failed))
-        self.assertFalse(failed, failed)
-        self.assertTrue(ready)
-        self.assertEqual(events, ["document"])
-        self.assertEqual(widget.current_url.split(":", 1)[0], "data")
+        asset = type("Asset", (), {
+            "skeleton_path": Path("missing.skel"),
+            "atlas_paths": (Path("missing.atlas"),),
+            "skeleton_format": "binary",
+            "family": "3.8",
+        })()
+        plan = type("Plan", (), {"asset": asset, "runtime": None, "mode": "runtime"})()
+        widget.open_plan(plan)
+        self.assertTrue(failed)
+        self.assertEqual(widget.last_state.get("previewState"), "error")
+        self.assertNotEqual(widget.last_state.get("previewState"), "loading")
 
         widget.clear_preview()
         self.app.processEvents()
@@ -77,30 +74,26 @@ class SpinePreviewWidgetTests(unittest.TestCase):
         QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
         self.app.processEvents()
 
-    def test_page_state_error_is_forwarded_after_document_load(self):
+    def test_native_controls_are_safe_before_a_plan_is_loaded(self):
         widget = SpinePreviewWidget()
-        failures = []
-        widget.previewFailed.connect(failures.append)
         widget.show()
-        widget.open_url(
-            "data:text/html,<html><body data-preview-state='error' "
-            "data-preview-error='synthetic runtime error'><span id='status' "
-            "class='error'>synthetic runtime error</span><canvas id='canvas'></canvas>"
-            "<div id='atlas' class='hidden'></div><button id='exportPsd' "
-            "class='hidden'></button></body></html>"
-        )
-        self._wait(lambda: bool(failures))
-        self.assertIn("synthetic runtime error", failures[0])
+        widget.set_skin("default")
+        widget.set_animation("idle", True)
+        widget.set_paused(True)
+        widget.set_loop(False)
+        widget.set_time(0.25)
+        widget.reset_pose()
+        self.assertEqual(widget.last_state, {})
         widget.shutdown()
         widget.deleteLater()
         QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
         self.app.processEvents()
 
-    def test_preview_page_surfaces_web_error_without_active_plan(self):
+    def test_preview_page_surfaces_native_error_without_active_plan(self):
         page = PreviewPage()
         try:
-            page._on_spine_preview_web_error("synthetic WebEngine failure")
-            self.assertIn("synthetic WebEngine failure", page.preview_placeholder.text())
+            page._on_spine_preview_error("synthetic native failure")
+            self.assertIn("synthetic native failure", page.preview_placeholder.text())
             self.assertFalse(page.spine_preview.isVisible())
             self.assertFalse(page._spine_mode)
         finally:
