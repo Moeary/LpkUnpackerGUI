@@ -1,6 +1,8 @@
 import os
 import json
 import logging
+import re
+import threading
 from pathlib import Path
 from typing import Dict, Any, Optional
 
@@ -17,6 +19,10 @@ from app.paths import (
 from app.core.toolchain import detect_toolchain_paths
 
 logger = logging.getLogger("SettingsManager")
+
+DEFAULT_SPINE_TARGET_VERSION = "3.8.75"
+_SPINE_TARGET_VERSION_RE = re.compile(r"^(?:3\.(?:5|6|7|8)|4\.(?:0|1|2))\.\d+$")
+_SETTINGS_WRITE_LOCK = threading.RLock()
 
 class SettingsManager:
     """Manages application settings and user preferences"""
@@ -61,6 +67,7 @@ class SettingsManager:
                 "cubism_core_dll_path": "",
                 "photoshop_path": "",
                 "image_viewer_path": "",
+                "spine_converter_path": "",
             },
             "preview": {
                 "image_limit": 48,
@@ -83,6 +90,11 @@ class SettingsManager:
                     "right_sidebar_visible": True,
                     "selected_motion": "",
                 },
+            },
+            "spine_conversion": {
+                "enabled": False,
+                "target_version": DEFAULT_SPINE_TARGET_VERSION,
+                "output_format": "json",
             },
             "psd": {
                 "last_project_file": "",
@@ -136,18 +148,25 @@ class SettingsManager:
         except Exception as e:
             logger.error(f"Failed to load settings: {e}")
             return default_settings
+
+    def reload_settings(self) -> Dict[str, Any]:
+        """Refresh this manager's cache from disk without changing the file."""
+
+        self.settings = self.load_settings()
+        return self.settings
     
     def save_settings(self) -> bool:
         """Save current settings to file"""
-        try:
-            os.makedirs(os.path.dirname(self.settings_file), exist_ok=True)
-            with open(self.settings_file, 'w', encoding='utf-8') as f:
-                json.dump(self.settings, f, indent=2, ensure_ascii=False)
-            logger.debug("Settings saved successfully")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to save settings: {e}")
-            return False
+        with _SETTINGS_WRITE_LOCK:
+            try:
+                os.makedirs(os.path.dirname(self.settings_file), exist_ok=True)
+                with open(self.settings_file, 'w', encoding='utf-8') as f:
+                    json.dump(self.settings, f, indent=2, ensure_ascii=False)
+                logger.debug("Settings saved successfully")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to save settings: {e}")
+                return False
     
     def get(self, key: str, default: Any = None) -> Any:
         """Get a setting value"""
@@ -162,22 +181,86 @@ class SettingsManager:
             return default
     
     def set(self, key: str, value: Any) -> None:
-        """Set a setting value"""
-        keys = key.split('.')
-        setting = self.settings
-        
-        # Navigate to the parent of the target key
-        for k in keys[:-1]:
-            if k not in setting:
-                setting[k] = {}
-            setting = setting[k]
-        
-        # Set the value
-        setting[keys[-1]] = value
-        
-        # Auto-save if remember_paths is enabled
-        if self.get("remember_paths", True):
+        """Set one value while merging it into the newest on-disk settings.
+
+        Individual pages own separate ``SettingsManager`` instances.  A page
+        may therefore hold a stale snapshot while another page has just saved
+        a different setting.  Reload the file under the write lock and apply
+        only this key so unrelated values from the stale snapshot cannot
+        overwrite newer settings.  The in-memory cache is still updated when
+        ``remember_paths`` disables automatic persistence, matching the
+        historical behavior of this method.
+        """
+
+        self._set_nested_value(self.settings, key, value)
+
+        # Preserve the existing opt-out: callers may still update the local
+        # cache without writing user settings when remember_paths is false.
+        if not self.get("remember_paths", True):
+            return
+
+        with _SETTINGS_WRITE_LOCK:
+            latest = self._load_latest_settings_for_update()
+            if latest is None:
+                # Do not replace a usable cache or overwrite a file that could
+                # not be read safely.
+                return
+
+            latest_remember_paths = self._get_nested_value(
+                latest, "remember_paths", True
+            )
+            # A different manager may have disabled persistence after this
+            # manager loaded its cache.  Respect that newer on-disk choice for
+            # ordinary keys.  Setting remember_paths=True remains an explicit
+            # opt-in and is allowed to persist itself.
+            if key != "remember_paths" and not latest_remember_paths:
+                return
+
+            self._set_nested_value(latest, key, value)
+            self.settings = latest
             self.save_settings()
+
+    @staticmethod
+    def _get_nested_value(settings: Dict[str, Any], key: str, default: Any = None) -> Any:
+        value: Any = settings
+        try:
+            for item in key.split("."):
+                value = value[item]
+            return value
+        except (KeyError, TypeError):
+            return default
+
+    @staticmethod
+    def _set_nested_value(settings: Dict[str, Any], key: str, value: Any) -> None:
+        keys = key.split(".")
+        target = settings
+        for item in keys[:-1]:
+            child = target.get(item)
+            if not isinstance(child, dict):
+                child = {}
+                target[item] = child
+            target = child
+        target[keys[-1]] = value
+
+    def _load_latest_settings_for_update(self) -> Optional[Dict[str, Any]]:
+        """Read the current settings file for a single-key update.
+
+        Missing files are initialized from defaults.  A malformed or
+        unreadable existing file is left untouched so a stale page cache cannot
+        destroy it while attempting an automatic save.
+        """
+
+        if not os.path.exists(self.settings_file):
+            return self.get_default_settings()
+        try:
+            with open(self.settings_file, "r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if not isinstance(loaded, dict):
+                raise ValueError("settings root must be a JSON object")
+            return self._merge_defaults(loaded, self.get_default_settings())
+        except Exception as exc:
+            logger.error("Failed to reload settings before update: %s", exc)
+            return None
     
     def update_last_paths(self, lpk_path: str = None, config_path: str = None, output_path: str = None):
         """Update last used paths"""
@@ -281,6 +364,16 @@ class SettingsManager:
         configured = Path(self.get_image_viewer_path()).expanduser()
         return str(configured.resolve()) if configured.is_file() else ""
 
+    def get_spine_converter_path(self) -> str:
+        """Return the configured Spine skeleton converter executable path."""
+
+        return str(self.get("tools.spine_converter_path", "") or "").strip()
+
+    def set_spine_converter_path(self, path: str):
+        """Store the optional Spine skeleton converter executable path."""
+
+        self.set("tools.spine_converter_path", str(path or "").strip())
+
     def get_spine_runtime_dir(self) -> str:
         """Return the configured extracted spine-ts runtime directory."""
 
@@ -291,6 +384,81 @@ class SettingsManager:
 
         self.set("preview.spine_runtime_dir", str(path or "").strip())
 
+    def get_spine_auto_convert(self) -> bool:
+        """Return whether formal Spine unpack/export may create a converted copy."""
+
+        return self.get_spine_conversion_enabled()
+
+    def set_spine_auto_convert(self, enabled: bool):
+        """Store the opt-in formal Spine unpack/export conversion switch."""
+
+        self.set_spine_conversion_enabled(enabled)
+
+    def get_spine_conversion_enabled(self) -> bool:
+        """Return whether automatic Spine conversion is enabled."""
+
+        return bool(self.get("spine_conversion.enabled", False))
+
+    def set_spine_conversion_enabled(self, enabled: bool):
+        """Store the opt-in automatic Spine conversion switch."""
+
+        self.set("spine_conversion.enabled", bool(enabled))
+
+    def get_spine_target_version(self) -> str:
+        """Return the complete Spine version used for automatic conversion."""
+
+        return self.get_spine_conversion_target_version()
+
+    def set_spine_target_version(self, version: str):
+        """Store a complete Spine target version without rewriting its value."""
+
+        self.set_spine_conversion_target_version(version)
+
+    def get_spine_conversion_target_version(self) -> str:
+        """Return the complete Spine version used by automatic conversion."""
+
+        value = self.get("spine_conversion.target_version", None)
+        if value is None:
+            return DEFAULT_SPINE_TARGET_VERSION
+        # Preserve an existing invalid value so the settings page can show it
+        # and the converter can report the actual validation error.  Only an
+        # absent key receives the default.
+        return str(value).strip()
+
+    @staticmethod
+    def validate_spine_conversion_target_version(version: str) -> str:
+        """Validate and normalize a complete supported Spine target version."""
+
+        if not isinstance(version, str):
+            raise ValueError(
+                f"target_version must be a complete supported x.y.z string, got {version!r}"
+            )
+        normalized = version.strip()
+        if not _SPINE_TARGET_VERSION_RE.fullmatch(normalized):
+            raise ValueError(
+                f"Unsupported target_version {version!r}; use a complete supported "
+                "3.5.x/3.6.x/3.7.x/3.8.x/4.0.x/4.1.x/4.2.x version."
+            )
+        return normalized
+
+    def set_spine_conversion_target_version(self, version: str):
+        """Store the complete Spine target version without rewriting it."""
+
+        normalized = self.validate_spine_conversion_target_version(version)
+        self.set("spine_conversion.target_version", normalized)
+
+    def get_spine_conversion_output_format(self) -> str:
+        """Return the automatic conversion output format."""
+
+        value = str(self.get("spine_conversion.output_format", "json") or "").strip().lower()
+        return value if value in {"json", "skel"} else "json"
+
+    def set_spine_conversion_output_format(self, output_format: str):
+        """Store the automatic conversion output format."""
+
+        value = str(output_format or "").strip().lower()
+        self.set("spine_conversion.output_format", value if value in {"json", "skel"} else "json")
+
     def detect_toolchain_paths(self) -> Dict[str, str]:
         """Inspect optional tools without changing user settings."""
 
@@ -299,6 +467,7 @@ class SettingsManager:
             "tools.assetstudio_cli_path": self.get_assetstudio_cli_path(),
             "tools.cubism_core_dll_path": self.get_cubism_core_dll_path(),
             "tools.photoshop_path": self.get_photoshop_path(),
+            "tools.spine_converter_path": self.get_spine_converter_path(),
             "preview.spine_runtime_dir": self.get_spine_runtime_dir(),
         }
         return detect_toolchain_paths(configured)

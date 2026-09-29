@@ -73,6 +73,7 @@ class SpineRuntime:
     version: str | None = None
     source_manifest: Path | None = None
     combined_webgl: bool = False
+    compatible_exact_versions: tuple[str, ...] = ()
     # spine-ts 3.8 exposes WebGL classes under ``spine.webgl`` while 4.0
     # publishes one self-contained IIFE whose WebGL classes are top-level.
     # Keep this in the runtime description so the browser renderer can select
@@ -243,25 +244,35 @@ def find_spine_asset(source: str | Path) -> SpinePreviewAsset | None:
 def discover_spine_runtime(
     root: str | Path,
     requested_family: str | None = None,
+    requested_version: str | None = None,
 ) -> SpineRuntime:
     """Find a user-provided core/webgl runtime pair.
 
     A small ``spine_runtime.json``/``runtime.json`` manifest is preferred when
     present.  Without one, official script names are located recursively and
     the version is inferred from the manifest/path/file name when possible.
+    ``requested_version`` is used for exact-version builds such as the
+    historical 3.8.75 runtime; ordinary 3.8/4.0 requests retain family-level
+    compatibility when a runtime manifest does not declare an exact set.
     """
 
     base = Path(root).expanduser().resolve()
     if not base.is_dir():
         raise SpineRuntimeUnavailableError(f"Spine runtime directory does not exist: {base}")
     requested = str(requested_family or "").strip() or None
+    exact_requested = normalize_spine_version(requested_version) if requested_version else None
 
     explicit_manifest_families: list[str] = []
+    explicit_manifest_versions: list[str] = []
 
     # The configured path may be a unified ``tools/spine`` root.  Check only
     # its own manifest and the requested version directory first, so a large
     # source checkout or a broken dependency link cannot block a valid build.
     prioritized = list(_direct_runtime_manifests(base))
+    if exact_requested:
+        requested_dir = _requested_runtime_version_dir(base, exact_requested)
+        if requested_dir is not None:
+            prioritized.extend(_direct_runtime_manifests(requested_dir))
     if requested:
         requested_dir = _requested_runtime_family_dir(base, requested)
         if requested_dir is not None:
@@ -289,8 +300,19 @@ def discover_spine_runtime(
         )
         if manifest_family:
             explicit_manifest_families.append(manifest_family)
+        manifest_version = (
+            normalize_spine_version(
+                manifest_data.get("version")
+                or manifest_data.get("spineVersion")
+                or manifest_data.get("runtimeVersion")
+            )
+            if isinstance(manifest_data, Mapping)
+            else None
+        )
+        if manifest_version:
+            explicit_manifest_versions.append(manifest_version)
         try:
-            return _runtime_from_manifest(manifest, requested)
+            return _runtime_from_manifest(manifest, requested, exact_requested)
         except (OSError, RuntimeError):
             return None
 
@@ -310,6 +332,10 @@ def discover_spine_runtime(
         runtime = inspect_manifest(manifest)
         if runtime is not None:
             return runtime
+    if exact_requested and explicit_manifest_versions and exact_requested not in explicit_manifest_versions:
+        raise SpineVersionMismatchError(
+            f"Requested Spine runtime {exact_requested}, manifests declare {', '.join(sorted(set(explicit_manifest_versions)))}"
+        )
     if requested and explicit_manifest_families and requested not in explicit_manifest_families:
         raise SpineVersionMismatchError(
             f"Requested Spine runtime {requested}, manifests declare {', '.join(sorted(set(explicit_manifest_families)))}"
@@ -320,7 +346,7 @@ def discover_spine_runtime(
         raise SpineRuntimeUnavailableError(
             f"No official spine-core.js/spine-webgl.js build found under {base}"
         )
-    webgl = _pick_script(scripts, "spine-webgl", requested)
+    webgl = _pick_script(scripts, "spine-webgl", requested, exact_requested)
     if webgl is None:
         if requested:
             found_families = sorted({family for family in (_infer_runtime_family(path) for path in scripts if path.stem.lower().startswith("spine-webgl")) if family})
@@ -330,13 +356,17 @@ def discover_spine_runtime(
                 )
         raise SpineRuntimeUnavailableError(f"No matching spine-webgl.js build found under {base}")
     family = _infer_runtime_family(webgl)
-    core = _pick_script(scripts, "spine-core", requested or family)
+    core = _pick_script(scripts, "spine-core", requested or family, exact_requested)
     combined = core is None
     if requested and family and family != requested:
         raise SpineVersionMismatchError(
             f"Requested Spine runtime {requested}, found {family} at {webgl}"
         )
     version = _infer_runtime_version(webgl) or family or requested
+    if exact_requested == "3.8.75" and version != exact_requested:
+        raise SpineVersionMismatchError(
+            f"Requested exact Spine runtime {exact_requested}, but the selected build reports {version} at {webgl}"
+        )
     return SpineRuntime(
         root_dir=base,
         webgl_script=webgl,
@@ -368,6 +398,18 @@ def _direct_runtime_manifests(root: Path) -> tuple[Path, ...]:
 
 def _requested_runtime_family_dir(base: Path, requested: str) -> Path | None:
     """Resolve a direct requested-family child without allowing parent escape."""
+
+    try:
+        candidate = (base / requested).resolve()
+        if candidate == base or candidate.parent != base or not candidate.is_dir():
+            return None
+    except (OSError, RuntimeError):
+        return None
+    return candidate
+
+
+def _requested_runtime_version_dir(base: Path, requested: str) -> Path | None:
+    """Resolve a direct exact-version child for a precise runtime request."""
 
     try:
         candidate = (base / requested).resolve()
@@ -464,11 +506,27 @@ def make_spine_preview_plan(
             reason="未配置匹配的官方 Spine runtime，已降级为 atlas 页面预览。",
             warnings=asset.warnings + ("请在设置中选择同主次版本的 spine-ts core/webgl。",),
         )
-    runtime = discover_spine_runtime(runtime_root, requested_family=family)
+    runtime = discover_spine_runtime(
+        runtime_root,
+        requested_family=family,
+        requested_version=asset.spine_version,
+    )
     runtime_family = runtime.family
     if runtime_family and runtime_family != family:
         raise SpineVersionMismatchError(
             f"Skeleton Spine {family} 与 runtime {runtime_family} 不匹配。"
+        )
+    requested_version = normalize_spine_version(asset.spine_version)
+    if requested_version and runtime.compatible_exact_versions:
+        if requested_version not in runtime.compatible_exact_versions:
+            raise SpineVersionMismatchError(
+                f"Skeleton Spine {requested_version} is outside the runtime's exact compatibility set "
+                f"{', '.join(runtime.compatible_exact_versions)}."
+            )
+    if requested_version == "3.8.75" and normalize_spine_version(runtime.version) != requested_version:
+        raise SpineVersionMismatchError(
+            f"Skeleton Spine {requested_version} requires the dedicated historical runtime; "
+            f"selected runtime reports {runtime.version or 'unknown'}."
         )
     if runtime_family is None:
         raise SpineRuntimeUnavailableError(
@@ -944,7 +1002,11 @@ def _skeleton_metadata(data: Mapping[str, Any] | None) -> tuple[tuple[str, ...],
     return tuple(skins), animations, tuple(attachments), tuple(dict.fromkeys(unsupported))
 
 
-def _runtime_from_manifest(path: Path, requested: str | None) -> SpineRuntime | None:
+def _runtime_from_manifest(
+    path: Path,
+    requested: str | None,
+    requested_version: str | None = None,
+) -> SpineRuntime | None:
     data = _try_read_json(path)
     if not isinstance(data, Mapping):
         return None
@@ -952,6 +1014,21 @@ def _runtime_from_manifest(path: Path, requested: str | None) -> SpineRuntime | 
     family = spine_version_family(version)
     if requested and family and family != requested:
         return None
+    exact_versions = tuple(
+        dict.fromkeys(
+            normalized
+            for item in (data.get("compatibleExactVersions") or data.get("compatibleVersions") or ())
+            for normalized in [normalize_spine_version(item)]
+            if normalized
+        )
+    )
+    if requested_version:
+        if exact_versions and requested_version not in exact_versions:
+            return None
+        # 3.8.75 is deliberately distributed as a dedicated historical build;
+        # never silently substitute the current 3.8.99 runtime for it.
+        if requested_version == "3.8.75" and version and version != requested_version:
+            return None
     # Official spine-ts 3.8 backend builds are self-contained: the WebGL
     # artifact includes the core classes.  A manifest may still record the
     # separate core artifact for provenance, but callers must not load it a
@@ -961,7 +1038,7 @@ def _runtime_from_manifest(path: Path, requested: str | None) -> SpineRuntime | 
     webgl = _manifest_script(path.parent, data.get("webgl") or data.get("spineWebgl") or data.get("webGL"))
     if webgl is None:
         scripts = list(_iter_runtime_files(path.parent, names=SPINE_SCRIPT_NAMES))
-        webgl = _pick_script(scripts, "spine-webgl", requested or family)
+        webgl = _pick_script(scripts, "spine-webgl", requested or family, requested_version)
     if webgl is None:
         return None
     if core is None and not combined:
@@ -969,6 +1046,7 @@ def _runtime_from_manifest(path: Path, requested: str | None) -> SpineRuntime | 
             [webgl.parent / "spine-core.js", *_iter_runtime_files(webgl.parent, suffixes=(".js",))],
             "spine-core",
             requested or family,
+            requested_version,
         )
     return SpineRuntime(
         root_dir=path.parent.resolve(),
@@ -977,6 +1055,7 @@ def _runtime_from_manifest(path: Path, requested: str | None) -> SpineRuntime | 
         version=version or _infer_runtime_version(webgl) or family or requested,
         source_manifest=path.resolve(),
         combined_webgl=combined or core is None,
+        compatible_exact_versions=exact_versions,
         api_style=_runtime_api_style(
             data.get("api") or data.get("apiStyle") or data.get("namespace"),
             version or _infer_runtime_version(webgl) or family or requested,
@@ -994,7 +1073,12 @@ def _manifest_script(root: Path, raw: Any) -> Path | None:
         return None
 
 
-def _pick_script(scripts: Sequence[Path], stem: str, family: str | None) -> Path | None:
+def _pick_script(
+    scripts: Sequence[Path],
+    stem: str,
+    family: str | None,
+    exact_version: str | None = None,
+) -> Path | None:
     candidates: list[Path] = []
     for path in scripts:
         try:
@@ -1007,6 +1091,12 @@ def _pick_script(scripts: Sequence[Path], stem: str, family: str | None) -> Path
         if matching:
             candidates = matching
         elif candidates and any(_infer_runtime_family(path) for path in candidates):
+            return None
+    if exact_version:
+        exact = [path for path in candidates if _infer_runtime_version(path) == exact_version]
+        if exact:
+            candidates = exact
+        elif exact_version == "3.8.75":
             return None
     return sorted(candidates, key=lambda path: (len(path.parts), str(path).lower()))[0] if candidates else None
 

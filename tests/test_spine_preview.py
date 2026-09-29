@@ -104,6 +104,17 @@ class SpinePreviewTests(unittest.TestCase):
         self.assertIn("atlas.pages.forEach", html)
         self.assertIn("track.getAnimationTime()", html)
 
+    def test_web_preview_initial_animation_prefers_normal_or_idle(self):
+        html = (Path(__file__).parents[1] / "assets" / "spine" / "preview.html").read_text(encoding="utf-8")
+        self.assertIn("function chooseInitialAnimation(animations)", html)
+        self.assertIn('name === "normal" || name === "idle"', html)
+        self.assertIn("Number(item.duration || 0) > 0.01", html)
+        self.assertIn("fillControls(initialAnimationName)", html)
+        self.assertNotIn(
+            "state.setAnimation(0, data.animations[0].name, true)",
+            html,
+        )
+
     def test_without_user_runtime_plan_is_explicit_atlas_fallback(self):
         plan = make_spine_preview_plan(load_spine_asset(self.asset_dir))
         self.assertEqual(plan.mode, "atlas")

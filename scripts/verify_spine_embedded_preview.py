@@ -11,7 +11,9 @@ Examples (run from the repository root with pixi):
 The script is intentionally diagnostic rather than a unit test.  It starts a
 real Qt event loop, reads the embedded page DOM and canvas state through
 ``runJavaScript``, exercises the animation controls, optionally captures the
-embedded WebEngine view, and checks that close/switch clears its URL.
+full three-column PreviewPage (left settings, central canvas, right animation
+controls), and checks that close/switch clears its URL.  Use
+``--webview-screenshot`` when only the central WebEngine is desired.
 """
 
 from __future__ import annotations
@@ -131,6 +133,8 @@ def _dom_state(app: QApplication, widget):
             const status = document.getElementById('status');
             const canvas = document.getElementById('canvas');
             const atlas = document.getElementById('atlas');
+            const host = window.lpkSpineHost && typeof window.lpkSpineHost.state === 'function'
+                ? window.lpkSpineHost.state() : {};
             let canvasPixel = null;
             if (canvas && canvas.width && canvas.height) {
                 try {
@@ -145,6 +149,7 @@ def _dom_state(app: QApplication, widget):
             return {
                 previewState: String(document.body && document.body.dataset.previewState || ''),
                 previewError: String(document.body && document.body.dataset.previewError || ''),
+                hostStateAvailable: !!(window.lpkSpineHost && typeof window.lpkSpineHost.state === 'function'),
                 statusClass: status ? String(status.className || '') : '',
                 status: status ? String(status.textContent || '') : '',
                 canvasVisible: !!canvas && !canvas.classList.contains('hidden'),
@@ -159,11 +164,18 @@ def _dom_state(app: QApplication, widget):
                 animationOptions: Array.from(document.getElementById('animation')?.options || []).map(function (item) {
                     return {value: String(item.value || ''), text: String(item.textContent || ''), disabled: !!item.disabled};
                 }),
-                selectedSkin: document.getElementById('skin') ? String(document.getElementById('skin').value || '') : '',
-                selectedAnimation: document.getElementById('animation') ? String(document.getElementById('animation').value || '') : '',
-                paused: !!(document.getElementById('pause') && document.getElementById('pause').checked),
-                time: document.getElementById('time') ? Number(document.getElementById('time').value || 0) : 0,
-                timeMax: document.getElementById('time') ? Number(document.getElementById('time').max || 0) : 0
+                selectedSkin: String(host.selectedSkin !== undefined
+                    ? host.selectedSkin : (document.getElementById('skin') || {}).value || ''),
+                selectedAnimation: String(host.selectedAnimation !== undefined
+                    ? host.selectedAnimation : (document.getElementById('animation') || {}).value || ''),
+                paused: host.paused !== undefined
+                    ? !!host.paused : !!(document.getElementById('pause') && document.getElementById('pause').checked),
+                loop: host.loop !== undefined
+                    ? !!host.loop : !!(document.getElementById('loop') && document.getElementById('loop').checked),
+                time: Number(host.time !== undefined
+                    ? host.time : (document.getElementById('time') || {}).value || 0),
+                timeMax: Number(host.timeMax !== undefined
+                    ? host.timeMax : (document.getElementById('time') || {}).max || 0)
             };
         })());""",
     )
@@ -237,7 +249,10 @@ def _exercise_runtime_controls(app: QApplication, widget, timeout: float):
         return controls
 
     target_animation = next(
-        (item for item in animation_options if item["value"].lower() == "normal"),
+        (
+            item for item in animation_options
+            if item["value"].lower() in {"normal", "idle"}
+        ),
         animation_options[0],
     )
     selected = _dispatch_control(
@@ -303,6 +318,28 @@ def _exercise_runtime_controls(app: QApplication, widget, timeout: float):
     if position_delta > max(0.03, duration * 0.05):
         raise RuntimeError(f"Spine time seek did not hold ({positioned}, target={target_time})")
 
+    # A non-looping track must remain at its final pose instead of wrapping to
+    # the first frame.  Seeking to the end keeps this check fast even for long
+    # source animations.
+    _dispatch_control(
+        app,
+        widget,
+        """
+        const loop = document.getElementById('loop');
+        loop.checked = false;
+        loop.dispatchEvent(new Event('change', {bubbles: true}));
+        const time = document.getElementById('time');
+        time.value = Number(time.max || 0);
+        time.dispatchEvent(new Event('input', {bubbles: true}));
+        return {loop: !!loop.checked, time: Number(time.value || 0)};
+        """,
+    )
+    _pump(app, 0.25)
+    stopped = _dom_state(app, widget)
+    stopped_time = float(stopped.get("time", 0.0) or 0.0)
+    if stopped.get("loop") or duration > 0 and stopped_time < duration * 0.9:
+        raise RuntimeError(f"Non-looping Spine animation did not stop at its end pose: {stopped}")
+
     _dispatch_control(
         app,
         widget,
@@ -326,19 +363,230 @@ def _exercise_runtime_controls(app: QApplication, widget, timeout: float):
         "pause_delta": pause_delta,
         "seek_target": target_time,
         "seek_delta": position_delta,
+        "loop_stop": {"status": "passed", "state": stopped},
         "state": final_state,
     }
     return controls
 
 
-def _capture_screenshot(widget, path: Path):
-    """Capture the visible embedded QWebEngineView and return metadata."""
+def _native_host_state(app: QApplication, page: PreviewPage):
+    """Return the renderer state after a Qt-side control action."""
 
-    if widget is None or widget.view is None:
-        raise RuntimeError("Cannot capture a Spine screenshot without QWebEngineView")
+    if page is None or page.spine_preview is None:
+        return {}
+    return _dom_state(app, page.spine_preview)
+
+
+def _embedded_chrome_state(app: QApplication, page: PreviewPage):
+    """Read the page chrome and view transform exposed by the real WebEngine."""
+
+    if page is None or page.spine_preview is None or page.spine_preview.view is None:
+        return {}
+    result = _run_js(
+        app,
+        page.spine_preview.view.page(),
+        """JSON.stringify((function () {
+            const canvas = document.getElementById('canvas');
+            const toolbar = document.getElementById('toolbar');
+            const attachments = document.getElementById('attachments');
+            const root = document.documentElement;
+            const body = document.body;
+            const canvasStyle = canvas ? getComputedStyle(canvas) : null;
+            const rootStyle = root ? getComputedStyle(root) : null;
+            const bodyStyle = body ? getComputedStyle(body) : null;
+            return {
+                embeddedHost: !!body && body.classList.contains('lpk-embedded-host'),
+                toolbarDisplay: toolbar ? getComputedStyle(toolbar).display : '',
+                attachmentsDisplay: attachments ? getComputedStyle(attachments).display : '',
+                canvasTransform: canvasStyle ? String(canvasStyle.transform || '') : '',
+                canvasOpacity: canvasStyle ? String(canvasStyle.opacity || '') : '',
+                rootBackground: rootStyle ? String(rootStyle.backgroundColor || '') : '',
+                bodyBackground: bodyStyle ? String(bodyStyle.backgroundColor || '') : ''
+            };
+        })());""",
+    )
+    if isinstance(result, str):
+        try:
+            return json.loads(result)
+        except json.JSONDecodeError:
+            return {"raw": result}
+    return result if isinstance(result, dict) else {}
+
+
+def _exercise_native_controls(app: QApplication, page: PreviewPage, timeout: float):
+    """Exercise the actual Qt right sidebar and left display settings.
+
+    The DOM checks above prove that the page controls work.  This companion
+    check deliberately drives the production Qt widgets so a disconnected
+    signal or stale bridge cannot pass the diagnostic by itself.
+    """
+
+    controls = getattr(page, "spine_controls", None)
+    if controls is None or page.spine_preview is None:
+        raise RuntimeError("PreviewPage has no native Spine controls")
+    _wait_for(
+        app,
+        lambda: bool(controls._ready and controls.animation_combo.count()),
+        timeout,
+        "native Spine animation controls",
+    )
+
+    report = {"status": "passed"}
+    state = _native_host_state(app, page)
+    if not state.get("hostStateAvailable"):
+        raise RuntimeError(f"Embedded Spine host state bridge is unavailable: {state}")
+    if str(state.get("previewState", "")).lower() != "ready":
+        raise RuntimeError(f"Native controls started before renderer ready: {state}")
+
+    skin_values = [controls.skin_combo.itemText(i) for i in range(controls.skin_combo.count())]
+    if skin_values:
+        requested_skin = "default" if "default" in skin_values else skin_values[0]
+        controls.skin_combo.setCurrentText(requested_skin)
+        _pump(app, 0.35)
+        after_skin = _native_host_state(app, page)
+        if after_skin.get("selectedSkin") != requested_skin:
+            raise RuntimeError(f"Native skin selection did not reach the renderer: {after_skin}")
+        report["skin"] = {"requested": requested_skin, "state": after_skin}
+    else:
+        report["skin"] = {"status": "skipped", "reason": "no skin options"}
+
+    animation_values = [
+        controls.animation_combo.itemText(i)
+        for i in range(controls.animation_combo.count())
+        if controls.animation_combo.itemText(i)
+    ]
+    if not animation_values:
+        raise RuntimeError("Native Spine controls exposed no animation options")
+    # Prefer the conventional long-running ``normal`` track.  If a source
+    # has no such name, probe the available Qt options and retain the one with
+    # the longest reported duration so the subsequent time-slider assertion is
+    # meaningful instead of accidentally selecting a 1 ms placeholder track.
+    requested_animation = next(
+        (name for name in animation_values if name.lower() in {"normal", "idle"}),
+        animation_values[0],
+    )
+    controls.animation_combo.setCurrentText(requested_animation)
+    _pump(app, 0.35)
+    after_animation = _native_host_state(app, page)
+    if float(after_animation.get("timeMax") or 0.0) <= 0.001:
+        best = (float(after_animation.get("timeMax") or 0.0), requested_animation, after_animation)
+        for candidate in animation_values:
+            controls.animation_combo.setCurrentText(candidate)
+            _pump(app, 0.22)
+            candidate_state = _native_host_state(app, page)
+            candidate_duration = float(candidate_state.get("timeMax") or 0.0)
+            if candidate_duration > best[0]:
+                best = (candidate_duration, candidate, candidate_state)
+        requested_animation, after_animation = best[1], best[2]
+        controls.animation_combo.setCurrentText(requested_animation)
+        _pump(app, 0.25)
+        after_animation = _native_host_state(app, page)
+    if after_animation.get("selectedAnimation") != requested_animation:
+        raise RuntimeError(f"Native animation selection did not reach the renderer: {after_animation}")
+    report["animation"] = {"requested": requested_animation, "state": after_animation}
+
+    # Click the native pause button and verify the host state, then restore the
+    # running state for the remaining checks.
+    initial_paused = bool(after_animation.get("paused"))
+    controls.play_pause_btn.click()
+    _pump(app, 0.35)
+    paused_state = _native_host_state(app, page)
+    if bool(paused_state.get("paused")) == initial_paused:
+        raise RuntimeError(f"Native play/pause click was not forwarded: {paused_state}")
+    controls.play_pause_btn.click()
+    _pump(app, 0.25)
+    resumed_state = _native_host_state(app, page)
+    report["play_pause"] = {"paused": paused_state, "resumed": resumed_state}
+
+    initial_loop = bool(resumed_state.get("loop"))
+    controls.loop_check.click()
+    _pump(app, 0.35)
+    loop_state = _native_host_state(app, page)
+    if bool(loop_state.get("loop")) == initial_loop:
+        raise RuntimeError(f"Native loop click was not forwarded: {loop_state}")
+    controls.loop_check.click()
+    _pump(app, 0.25)
+    restored_loop_state = _native_host_state(app, page)
+    report["loop"] = {"toggled": loop_state, "restored": restored_loop_state}
+
+    duration = float(restored_loop_state.get("timeMax") or 0.0)
+    if duration <= 0:
+        raise RuntimeError(f"Native time slider has no animation duration: {restored_loop_state}")
+    target_value = max(1, min(999, int(round(0.37 * 1000))))
+    controls.time_slider.setValue(target_value)
+    _pump(app, 0.35)
+    seek_state = _native_host_state(app, page)
+    target_time = duration * target_value / 1000.0
+    if abs(float(seek_state.get("time", 0.0)) - target_time) > max(0.08, duration * 0.08):
+        raise RuntimeError(f"Native time slider was not forwarded: {seek_state}, target={target_time}")
+    report["time"] = {"requested": target_time, "state": seek_state}
+
+    # Reset while paused so a rAF tick cannot make a reset-to-zero assertion
+    # flaky.  Restore the previous play state after reading the reset result.
+    was_paused = bool(seek_state.get("paused"))
+    if not was_paused:
+        controls.play_pause_btn.click()
+        _pump(app, 0.25)
+    controls.reset_btn.click()
+    _pump(app, 0.25)
+    reset_state = _native_host_state(app, page)
+    if reset_state.get("selectedAnimation") != requested_animation:
+        raise RuntimeError(f"Native reset changed the selected animation: {reset_state}")
+    if float(reset_state.get("time", 0.0) or 0.0) > max(0.15, duration * 0.08):
+        raise RuntimeError(f"Native reset did not return to the first pose: {reset_state}")
+    if not was_paused:
+        controls.play_pause_btn.click()
+        _pump(app, 0.25)
+    report["reset"] = reset_state
+
+    settings = page.settings_panel
+    if settings is None:
+        raise RuntimeError("PreviewPage has no display settings panel")
+    original_scale = settings.scale_slider.value()
+    original_opacity = settings.opacity_slider.value()
+    original_transparent = settings.bg_transparent_check.isChecked()
+    try:
+        settings.scale_slider.setValue(max(25, min(300, original_scale + 25)))
+        settings.opacity_slider.setValue(max(10, min(100, original_opacity - 10)))
+        settings.bg_transparent_check.setChecked(False)
+        _pump(app, 0.35)
+        chrome = _embedded_chrome_state(app, page)
+        if not chrome.get("embeddedHost"):
+            raise RuntimeError(f"Embedded host marker is missing: {chrome}")
+        if chrome.get("toolbarDisplay") != "none" or chrome.get("attachmentsDisplay") != "none":
+            raise RuntimeError(f"Embedded Spine webpage chrome is still visible: {chrome}")
+        if not chrome.get("canvasTransform") or chrome.get("canvasTransform") == "none":
+            raise RuntimeError(f"Native scale/offset settings did not reach canvas CSS: {chrome}")
+        if chrome.get("canvasOpacity") in {"", "1"}:
+            raise RuntimeError(f"Native opacity setting did not reach canvas CSS: {chrome}")
+        transparent_values = {"", "rgba(0, 0, 0, 0)", "transparent"}
+        if chrome.get("bodyBackground") in transparent_values or chrome.get("rootBackground") in transparent_values:
+            raise RuntimeError(f"Native background setting did not reach html/body CSS: {chrome}")
+        settings.bg_transparent_check.setChecked(True)
+        _pump(app, 0.35)
+        transparent_chrome = _embedded_chrome_state(app, page)
+        if (
+            transparent_chrome.get("bodyBackground") not in transparent_values
+            or transparent_chrome.get("rootBackground") not in transparent_values
+        ):
+            raise RuntimeError(f"Transparent background did not reach html/body CSS: {transparent_chrome}")
+        report["view_settings"] = {"opaque": chrome, "transparent": transparent_chrome}
+    finally:
+        settings.scale_slider.setValue(original_scale)
+        settings.opacity_slider.setValue(original_opacity)
+        settings.bg_transparent_check.setChecked(original_transparent)
+        _pump(app, 0.15)
+    return report
+
+
+def _capture_screenshot(page, path: Path):
+    """Capture the complete visible PreviewPage and return metadata."""
+
+    if page is None:
+        raise RuntimeError("Cannot capture a Spine screenshot without PreviewPage")
     path = path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
-    pixmap = widget.view.grab()
+    pixmap = page.grab()
     if pixmap.isNull() or not pixmap.save(str(path)):
         raise RuntimeError(f"Could not save Spine screenshot: {path}")
     image = pixmap.toImage().convertToFormat(QImage.Format.Format_RGBA8888)
@@ -356,6 +604,20 @@ def _capture_screenshot(widget, path: Path):
         "sample_count": sample_count,
         "unique_sample_colors": len(sample_colors),
     }
+
+
+def _capture_webview_screenshot(widget, path: Path):
+    """Capture only the central WebEngine for low-level renderer debugging."""
+
+    if widget is None or widget.view is None:
+        raise RuntimeError("Cannot capture a Spine screenshot without QWebEngineView")
+    path = path.resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pixmap = widget.view.grab()
+    if pixmap.isNull() or not pixmap.save(str(path)):
+        raise RuntimeError(f"Could not save Spine WebEngine screenshot: {path}")
+    image = pixmap.toImage().convertToFormat(QImage.Format.Format_RGBA8888)
+    return {"path": str(path), "width": image.width(), "height": image.height()}
 
 
 def _wait_for_case(
@@ -457,9 +719,31 @@ def _wait_for_case(
             raise RuntimeError("Spine runtime reached ready state without a canvas size")
         if not isinstance(state.get("canvasPixel"), list) or len(state["canvasPixel"]) != 4:
             raise RuntimeError("Spine runtime canvas pixel readback was unavailable")
+        animation_values = [
+            str(item.get("value") or "")
+            for item in state.get("animationOptions", [])
+            if isinstance(item, dict) and item.get("value")
+        ]
+        preferred = next(
+            (name for name in animation_values if name.lower() in {"normal", "idle"}),
+            "",
+        )
+        initial_animation = str(state.get("selectedAnimation") or "")
+        if preferred and initial_animation != preferred:
+            raise RuntimeError(
+                "Spine initial animation did not prefer normal/idle "
+                f"({initial_animation!r} != {preferred!r})"
+            )
+        result["initial_animation"] = {
+            "selected": initial_animation,
+            "preferred": preferred,
+            "options": animation_values,
+        }
         result["controls"] = _exercise_runtime_controls(app, page.spine_preview, timeout)
+        result["native_controls"] = _exercise_native_controls(app, page, timeout)
     else:
         result["controls"] = {"status": "skipped", "reason": "atlas mode"}
+        result["native_controls"] = {"status": "skipped", "reason": "atlas mode"}
     if not result["stage_visible"] and not expect_error:
         raise RuntimeError(f"Spine page closed with an error: {result['placeholder']}")
     if expect_error and result["stage_visible"]:
@@ -476,7 +760,10 @@ def main() -> int:
     parser.add_argument("--switch-runtime", type=Path, help="Runtime root for --switch-source")
     parser.add_argument("--expect-mode", choices=("runtime", "atlas"), help="Assert the selected plan mode")
     parser.add_argument("--expect-error", action="store_true", help="Treat a concrete preparation/page error as the expected result")
-    parser.add_argument("--screenshot", type=Path, help="Save a QWebEngineView screenshot of the ready first case")
+    parser.add_argument("--screenshot", type=Path, help="Save a full PreviewPage screenshot of the ready first case")
+    parser.add_argument("--webview-screenshot", type=Path, help="Save only the central QWebEngineView screenshot")
+    parser.add_argument("--width", type=int, default=1280, help="PreviewPage width for the full-page capture")
+    parser.add_argument("--height", type=int, default=800, help="PreviewPage height for the full-page capture")
     parser.add_argument("--report", type=Path, help="Write the structured verification result as JSON")
     parser.add_argument("--timeout", type=float, default=45.0)
     args = parser.parse_args()
@@ -501,7 +788,7 @@ def main() -> int:
     }
     try:
         page = PreviewPage()
-        page.resize(1280, 800)
+        page.resize(max(640, args.width), max(480, args.height))
         page.show()
         first = _wait_for_case(
             app,
@@ -516,7 +803,10 @@ def main() -> int:
             raise RuntimeError(f"Expected mode {args.expect_mode}, got {first['mode']}")
         if args.screenshot and first.get("stage_visible"):
             _pump(app, 0.2)
-            report["screenshot"] = _capture_screenshot(page.spine_preview, args.screenshot)
+            report["screenshot"] = _capture_screenshot(page, args.screenshot)
+        if args.webview_screenshot and first.get("stage_visible"):
+            _pump(app, 0.2)
+            report["webview_screenshot"] = _capture_webview_screenshot(page.spine_preview, args.webview_screenshot)
 
         if args.switch_source:
             if not args.switch_source.exists():
@@ -537,7 +827,12 @@ def main() -> int:
                 switch_path = args.screenshot.with_name(
                     f"{args.screenshot.stem}_switch{args.screenshot.suffix}"
                 )
-                report["switch_screenshot"] = _capture_screenshot(page.spine_preview, switch_path)
+                report["switch_screenshot"] = _capture_screenshot(page, switch_path)
+            if args.webview_screenshot and second.get("stage_visible"):
+                switch_path = args.webview_screenshot.with_name(
+                    f"{args.webview_screenshot.stem}_switch{args.webview_screenshot.suffix}"
+                )
+                report["switch_webview_screenshot"] = _capture_webview_screenshot(page.spine_preview, switch_path)
             print(json.dumps({"switch": second["source"], "old_url_replaced": True}, ensure_ascii=False))
 
         page.close_preview_window()

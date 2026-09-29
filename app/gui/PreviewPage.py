@@ -851,6 +851,9 @@ class Live2DSettingsPanel(QFrame):
         self.advanced_group = None
         self.adv_params_container = None
         self.adv_params_container_layout = None
+        self.window_group = None
+        self.model_group = None
+        self.interaction_group = None
 
         self.window_group_title = None
         self.window_size_label = None
@@ -886,6 +889,9 @@ class Live2DSettingsPanel(QFrame):
         model_group = self.create_model_settings_group()
         interaction_group = self.create_interaction_settings_group()
         advanced_group = self.create_advanced_settings_group()
+        self.window_group = window_group
+        self.model_group = model_group
+        self.interaction_group = interaction_group
         self.advanced_group = advanced_group
         if self.mode == "parameters":
             window_group.hide()
@@ -1216,6 +1222,21 @@ class Live2DSettingsPanel(QFrame):
         if self.reset_adv_btn:
             self.reset_adv_btn.setText(tr("preview.reset_advanced_params"))
 
+    def set_spine_mode(self, active: bool):
+        """Show only display settings that have a meaning for Spine."""
+
+        active = bool(active)
+        if self.mode != "display":
+            return
+        if self.window_group:
+            # Window size controls are already hidden in this card; its
+            # opacity slider remains a valid Spine display setting.
+            self.window_group.setVisible(True)
+        if self.model_group:
+            self.model_group.setVisible(True)
+        if self.interaction_group:
+            self.interaction_group.setVisible(not active)
+
     def _emit_settings(self):
         try:
             self.settingsChanged.emit(self.get_settings())
@@ -1434,6 +1455,194 @@ class Live2DSettingsPanel(QFrame):
         except Exception:
             pass
 
+class SpineAnimationControls(CardWidget):
+    """Native controls for the embedded Spine page.
+
+    Live2D's motion widgets carry model-specific semantics and must not be
+    reused for Spine.  This card talks only to ``SpinePreviewWidget``'s small
+    JavaScript bridge and keeps its own state when the preview is switched.
+    """
+
+    skinChanged = Signal(str)
+    animationChanged = Signal(str)
+    pausedChanged = Signal(bool)
+    loopChanged = Signal(bool)
+    timeChanged = Signal(float)
+    resetRequested = Signal()
+    exportRequested = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("spineAnimationControls")
+        self.setMinimumWidth(250)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        self.title = SubtitleLabel("", self)
+        layout.addWidget(self.title)
+        self.status = CaptionLabel("", self)
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+
+        scroll = SingleDirectionScrollArea(orient=Qt.Vertical)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.enableTransparentBackground()
+        inner = QWidget()
+        inner_layout = QVBoxLayout(inner)
+        inner_layout.setContentsMargins(0, 0, 0, 0)
+        inner_layout.setSpacing(8)
+
+        self.skin_label = BodyLabel("", inner)
+        inner_layout.addWidget(self.skin_label)
+        self.skin_combo = ComboBox(inner)
+        self.skin_combo.currentTextChanged.connect(self.skinChanged.emit)
+        inner_layout.addWidget(self.skin_combo)
+
+        self.animation_label = BodyLabel("", inner)
+        inner_layout.addWidget(self.animation_label)
+        self.animation_combo = ComboBox(inner)
+        self.animation_combo.currentTextChanged.connect(self.animationChanged.emit)
+        inner_layout.addWidget(self.animation_combo)
+
+        action_row = QHBoxLayout()
+        self.play_pause_btn = PushButton("", inner)
+        self.play_pause_btn.setCheckable(True)
+        self.play_pause_btn.toggled.connect(self.pausedChanged.emit)
+        action_row.addWidget(self.play_pause_btn, 1)
+        self.reset_btn = PushButton("", inner)
+        self.reset_btn.clicked.connect(self.resetRequested.emit)
+        action_row.addWidget(self.reset_btn, 1)
+        inner_layout.addLayout(action_row)
+
+        self.export_pose_btn = PushButton("", inner)
+        self.export_pose_btn.clicked.connect(self.exportRequested.emit)
+        inner_layout.addWidget(self.export_pose_btn)
+
+        self.loop_check = CheckBox("", inner)
+        self.loop_check.setChecked(True)
+        self.loop_check.toggled.connect(self.loopChanged.emit)
+        inner_layout.addWidget(self.loop_check)
+
+        time_row = QHBoxLayout()
+        self.time_label = BodyLabel("", inner)
+        time_row.addWidget(self.time_label)
+        self.time_value = CaptionLabel("0.00 / 0.00", inner)
+        time_row.addWidget(self.time_value, 1, Qt.AlignmentFlag.AlignRight)
+        inner_layout.addLayout(time_row)
+        self.time_slider = Slider(Qt.Horizontal, inner)
+        self.time_slider.setRange(0, 1000)
+        self.time_slider.valueChanged.connect(self._emit_time)
+        inner_layout.addWidget(self.time_slider)
+        inner_layout.addStretch(1)
+
+        scroll.setWidget(inner)
+        layout.addWidget(scroll, 1)
+        self._time_max = 0.0
+        self._ready = False
+        self.retranslate_ui()
+        self.clear()
+
+    def retranslate_ui(self):
+        self.title.setText(tr("preview.spine_animation_title"))
+        self.skin_label.setText(tr("preview.spine_skin"))
+        self.animation_label.setText(tr("preview.spine_animation"))
+        self.play_pause_btn.setText(
+            tr("preview.spine_play") if self.play_pause_btn.isChecked()
+            else tr("preview.spine_pause")
+        )
+        self.reset_btn.setText(tr("preview.spine_reset_pose"))
+        self.export_pose_btn.setText(tr("preview.spine_export_pose"))
+        self.loop_check.setText(tr("preview.spine_loop"))
+        self.time_label.setText(tr("preview.spine_time"))
+
+    def _emit_time(self, value: int):
+        if not self._ready or self._time_max <= 0:
+            return
+        self.timeChanged.emit(float(value) / 1000.0 * self._time_max)
+
+    def _set_combo_items(self, combo, values, selected=""):
+        combo.blockSignals(True)
+        combo.clear()
+        for value in values or []:
+            if isinstance(value, dict):
+                value = value.get("value", "")
+            value = str(value or "")
+            if value:
+                combo.addItem(value)
+        if combo.count():
+            index = combo.findText(str(selected or ""))
+            combo.setCurrentIndex(index if index >= 0 else 0)
+        combo.blockSignals(False)
+
+    def set_state(self, state: dict | None):
+        if not isinstance(state, dict):
+            self.clear()
+            return
+        preview_state = str(state.get("previewState") or "").lower()
+        mode = str(state.get("mode") or "").lower()
+        ready = preview_state == "ready"
+        self._ready = ready and mode == "runtime"
+        if mode == "atlas":
+            self.status.setText(tr("preview.spine_atlas_controls_hint"))
+        elif preview_state == "error":
+            self.status.setText(str(state.get("previewError") or state.get("text") or ""))
+        elif ready:
+            self.status.setText(tr("preview.spine_controls_ready"))
+        else:
+            self.status.setText(tr("preview.spine_controls_loading"))
+        self._set_combo_items(self.skin_combo, state.get("skinOptions", []), state.get("selectedSkin", ""))
+        self._set_combo_items(self.animation_combo, state.get("animationOptions", []), state.get("selectedAnimation", ""))
+        self.skin_combo.setEnabled(self._ready and self.skin_combo.count() > 0)
+        self.animation_combo.setEnabled(self._ready and self.animation_combo.count() > 0)
+        self.play_pause_btn.setEnabled(self._ready and self.animation_combo.count() > 0)
+        self.loop_check.setEnabled(self._ready and self.animation_combo.count() > 0)
+        self.reset_btn.setEnabled(self._ready)
+        self.export_pose_btn.setEnabled(self._ready)
+        self.play_pause_btn.blockSignals(True)
+        self.play_pause_btn.setChecked(bool(state.get("paused", False)))
+        self.play_pause_btn.blockSignals(False)
+        self.retranslate_ui()
+        self.loop_check.blockSignals(True)
+        self.loop_check.setChecked(bool(state.get("loop", True)))
+        self.loop_check.blockSignals(False)
+        try:
+            current = max(0.0, float(state.get("time", 0.0) or 0.0))
+            self._time_max = max(0.0, float(state.get("timeMax", 0.0) or 0.0))
+        except (TypeError, ValueError):
+            current, self._time_max = 0.0, 0.0
+        self.time_slider.setEnabled(self._ready and self._time_max > 0)
+        if not self.time_slider.isSliderDown():
+            self.time_slider.blockSignals(True)
+            ratio = current / self._time_max if self._time_max > 0 else 0.0
+            self.time_slider.setValue(max(0, min(1000, int(round(ratio * 1000)))))
+            self.time_slider.blockSignals(False)
+        self.time_value.setText(f"{current:.2f} / {self._time_max:.2f}")
+
+    def clear(self):
+        self._ready = False
+        self._time_max = 0.0
+        self._set_combo_items(self.skin_combo, [])
+        self._set_combo_items(self.animation_combo, [])
+        for widget in (self.skin_combo, self.animation_combo, self.play_pause_btn,
+                       self.loop_check, self.time_slider, self.reset_btn, self.export_pose_btn):
+            widget.setEnabled(False)
+        self.play_pause_btn.blockSignals(True)
+        self.play_pause_btn.setChecked(False)
+        self.play_pause_btn.blockSignals(False)
+        self.loop_check.blockSignals(True)
+        self.loop_check.setChecked(True)
+        self.loop_check.blockSignals(False)
+        self.time_slider.blockSignals(True)
+        self.time_slider.setValue(0)
+        self.time_slider.blockSignals(False)
+        self.time_value.setText("0.00 / 0.00")
+        self.status.setText(tr("preview.spine_controls_loading"))
+        self.retranslate_ui()
+
+
 class PreviewPage(QFrame):
     poseSchemeRequested = Signal(dict)
 
@@ -1455,6 +1664,7 @@ class PreviewPage(QFrame):
         self.preview_dock_layout = None
         self.preview_placeholder = None
         self.spine_preview = None
+        self.spine_controls = None
         self.motion_group_title = None
         self.motion_group = None
         self.motion_combo = None
@@ -1592,7 +1802,7 @@ class PreviewPage(QFrame):
         # 左侧：导入、设置和控制按钮
         left_widget = QWidget()
         self.left_sidebar = left_widget
-        left_widget.setMinimumWidth(320)
+        left_widget.setMinimumWidth(260)
         left_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(0, 10, 12, 0)
@@ -1638,6 +1848,11 @@ class PreviewPage(QFrame):
         spine_runtime_row.addWidget(self.spine_runtime_edit, 1)
         spine_runtime_row.addWidget(self.spine_runtime_btn)
         import_layout.addLayout(spine_runtime_row)
+        # Runtime selection belongs to Settings > Runtime.  Keep the preview
+        # page focused on the source and show only the resolved version/status
+        # in the model information card below.
+        for _widget in (self.spine_runtime_label, self.spine_runtime_edit, self.spine_runtime_btn):
+            _widget.setVisible(False)
 
         image_limit_row = QHBoxLayout()
         image_limit_row.setSpacing(8)
@@ -1694,7 +1909,7 @@ class PreviewPage(QFrame):
 
         # 中间：统一的图片 / Live2D 预览舞台
         right_widget = QWidget()
-        right_widget.setMinimumWidth(520)
+        right_widget.setMinimumWidth(360)
         right_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         right_layout = QVBoxLayout(right_widget)
         right_layout.setContentsMargins(12, 10, 0, 0)
@@ -1778,6 +1993,7 @@ class PreviewPage(QFrame):
         self.spine_preview.documentLoaded.connect(self._on_spine_preview_document_loaded)
         self.spine_preview.previewReady.connect(self._on_spine_preview_ready)
         self.spine_preview.previewFailed.connect(self._on_spine_preview_web_error)
+        self.spine_preview.stateChanged.connect(self._on_spine_preview_state)
         self.preview_dock_layout.addWidget(self.spine_preview, 1)
         self._ensure_embedded_live2d()
         self.preview_stage_layout.addWidget(self.preview_dock_area, 1)
@@ -1787,7 +2003,7 @@ class PreviewPage(QFrame):
         # 右侧：触发动作与高级参数编辑
         action_widget = QWidget()
         self.right_sidebar = action_widget
-        action_widget.setMinimumWidth(300)
+        action_widget.setMinimumWidth(250)
         action_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         action_layout = QVBoxLayout(action_widget)
         action_layout.setContentsMargins(12, 10, 0, 0)
@@ -1835,6 +2051,17 @@ class PreviewPage(QFrame):
         self.motion_hint_label.setWordWrap(True)
         motion_layout.addWidget(self.motion_hint_label)
         action_layout.addWidget(self.motion_group)
+
+        self.spine_controls = SpineAnimationControls(action_widget)
+        self.spine_controls.skinChanged.connect(self._on_spine_skin_changed)
+        self.spine_controls.animationChanged.connect(self._on_spine_animation_changed)
+        self.spine_controls.pausedChanged.connect(self._on_spine_paused_changed)
+        self.spine_controls.loopChanged.connect(self._on_spine_loop_changed)
+        self.spine_controls.timeChanged.connect(self._on_spine_time_changed)
+        self.spine_controls.resetRequested.connect(self._on_spine_reset_requested)
+        self.spine_controls.exportRequested.connect(self._on_spine_export_requested)
+        self.spine_controls.setVisible(False)
+        action_layout.addWidget(self.spine_controls, 1)
 
         self.advanced_panel = Live2DSettingsPanel(action_widget, mode="parameters")
         self.advanced_panel.settingsChanged.connect(self.on_advanced_settings_changed)
@@ -1894,7 +2121,7 @@ class PreviewPage(QFrame):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
-        splitter.setSizes([380, 760, 380])
+        splitter.setSizes([300, 520, 300])
 
         self.main_layout.addWidget(splitter, 1)
         self.main_layout.setStretch(0, 0)
@@ -1979,6 +2206,8 @@ class PreviewPage(QFrame):
             self.settings_panel.retranslate_ui()
         if self.advanced_panel:
             self.advanced_panel.retranslate_ui()
+        if self.spine_controls:
+            self.spine_controls.retranslate_ui()
         self._update_sidebar_button_text()
 
         if not self.current_model_path and not (
@@ -2058,28 +2287,102 @@ class PreviewPage(QFrame):
         selected_motion = ""
         if self.motion_combo and self.motion_combo.currentIndex() >= 0:
             selected_motion = str(self.motion_combo.currentData() or "")
-        self.settings_manager.set(
-            "preview.ui_state",
-            {
-                "opacity": panel.opacity_slider.value(),
-                "rotation": panel.rotation_slider.value(),
-                "scale": panel.scale_slider.value(),
-                "offset_x": panel.position_x_spinbox.value(),
-                "offset_y": panel.position_y_spinbox.value(),
-                "transparent_bg": panel.bg_transparent_check.isChecked(),
-                "mouse_tracking": panel.mouse_tracking_check.isChecked(),
-                "auto_blink": panel.auto_blink_check.isChecked(),
-                "auto_breath": panel.auto_breath_check.isChecked(),
-                "motion_loop": bool(self.loop_motion_check and self.loop_motion_check.isChecked()),
-                "motion_auto_play": bool(
-                    self.auto_play_motion_check and self.auto_play_motion_check.isChecked()
-                ),
-                "freeze_pose": bool(self.freeze_motion_check and self.freeze_motion_check.isChecked()),
-                "left_sidebar_visible": bool(self.left_sidebar and not self.left_sidebar.isHidden()),
-                "right_sidebar_visible": bool(self.right_sidebar and not self.right_sidebar.isHidden()),
-                "selected_motion": selected_motion,
-            },
-        )
+        ui_state = {
+            "opacity": panel.opacity_slider.value(),
+            "rotation": panel.rotation_slider.value(),
+            "scale": panel.scale_slider.value(),
+            "offset_x": panel.position_x_spinbox.value(),
+            "offset_y": panel.position_y_spinbox.value(),
+            "transparent_bg": panel.bg_transparent_check.isChecked(),
+            "mouse_tracking": panel.mouse_tracking_check.isChecked(),
+            "auto_blink": panel.auto_blink_check.isChecked(),
+            "auto_breath": panel.auto_breath_check.isChecked(),
+            "motion_loop": bool(self.loop_motion_check and self.loop_motion_check.isChecked()),
+            "motion_auto_play": bool(
+                self.auto_play_motion_check and self.auto_play_motion_check.isChecked()
+            ),
+            "freeze_pose": bool(self.freeze_motion_check and self.freeze_motion_check.isChecked()),
+            "left_sidebar_visible": bool(self.left_sidebar and not self.left_sidebar.isHidden()),
+            "right_sidebar_visible": bool(self.right_sidebar and not self.right_sidebar.isHidden()),
+            "selected_motion": selected_motion,
+        }
+        # SettingsPage owns the same JSON file through a separate manager.  A
+        # stale PreviewPage manager must not write its old runtime/tool values
+        # back merely because a display slider changed.
+        self._merge_latest_preview_settings(ui_state)
+        self.settings_manager.set("preview.ui_state", ui_state)
+
+    def _load_latest_preview_settings(self):
+        """Read the current settings snapshot without replacing the page cache.
+
+        PreviewPage and SettingsPage each have a SettingsManager instance.  A
+        fresh manager with the same settings file is the safest way to read a
+        runtime selected by SettingsPage without disturbing the live preview
+        UI state.  Lightweight diagnostic/test settings objects may not expose
+        ``settings_file`` or ``load_settings``; those continue to use their
+        in-memory values.
+        """
+
+        manager = self.settings_manager
+        settings_file = getattr(manager, "settings_file", None)
+        if settings_file:
+            try:
+                latest_manager = SettingsManager(settings_file=settings_file)
+                latest = getattr(latest_manager, "settings", None)
+                if isinstance(latest, dict):
+                    return latest
+            except Exception:
+                # A test/sandbox replacement may only support a no-argument
+                # constructor.  Fall through to its own loader/cache.
+                pass
+
+        loader = getattr(manager, "load_settings", None)
+        if callable(loader):
+            try:
+                latest = loader()
+                if isinstance(latest, dict):
+                    return latest
+            except Exception:
+                pass
+        return None
+
+    def _spine_runtime_dir_for_import(self) -> str:
+        """Get the runtime selected in SettingsPage immediately before import."""
+
+        manager = self.settings_manager
+        settings_file = getattr(manager, "settings_file", None)
+        latest = self._load_latest_preview_settings()
+        if isinstance(latest, dict):
+            preview = latest.get("preview")
+            if isinstance(preview, dict) and "spine_runtime_dir" in preview:
+                # Sandbox managers without a settings file are intentionally
+                # kept in memory, so a diagnostic can select a runtime by
+                # editing ``settings`` directly between imports.
+                if not settings_file and callable(getattr(manager, "load_settings", None)):
+                    current_ui = manager.get("preview.ui_state", {})
+                    manager.settings = latest
+                    if isinstance(current_ui, dict) and current_ui:
+                        manager.settings.setdefault("preview", {}).setdefault(
+                            "ui_state", {}
+                        ).update(current_ui)
+                return str(preview.get("spine_runtime_dir") or "").strip()
+        return str(manager.get("preview.spine_runtime_dir", "") or "").strip()
+
+    def _merge_latest_preview_settings(self, ui_state: dict):
+        """Merge the current UI state into the newest persisted settings."""
+
+        latest = self._load_latest_preview_settings()
+        if not isinstance(latest, dict):
+            return
+        preview = latest.setdefault("preview", {})
+        if not isinstance(preview, dict):
+            preview = {}
+            latest["preview"] = preview
+        disk_ui_state = preview.get("ui_state")
+        merged_ui_state = dict(disk_ui_state) if isinstance(disk_ui_state, dict) else {}
+        merged_ui_state.update(ui_state)
+        preview["ui_state"] = merged_ui_state
+        self.settings_manager.settings = latest
 
     def on_preview_image_limit_changed(self, value: int):
         self.settings_manager.set("preview.image_limit", int(value))
@@ -2339,6 +2642,8 @@ class PreviewPage(QFrame):
         preview = self.spine_preview
         self._active_spine_plan = None
         self._active_spine_preview_url = ""
+        if self.spine_controls:
+            self.spine_controls.clear()
         if preview is None:
             self._set_spine_mode(False)
             return
@@ -2349,22 +2654,33 @@ class PreviewPage(QFrame):
         self._set_spine_mode(False)
 
     def _set_spine_mode(self, active: bool):
-        """Keep Live2D-only controls out of the way for a Spine page."""
+        """Keep the three-column host while swapping in Spine controls."""
 
         active = bool(active)
         if active == self._spine_mode:
             return
         if active:
             self._spine_sidebar_state = {
-                "right": bool(self.right_sidebar and self.right_sidebar.isVisible()),
-                "settings": bool(self.settings_panel and self.settings_panel.isVisible()),
+                "right": bool(self.right_sidebar and not self.right_sidebar.isHidden()),
+                "settings": bool(self.settings_panel and not self.settings_panel.isHidden()),
+                "motion": bool(self.motion_group and not self.motion_group.isHidden()),
+                "pose": bool(self.pose_controls_card and not self.pose_controls_card.isHidden()),
+                "advanced": bool(self.advanced_panel and not self.advanced_panel.isHidden()),
             }
-            if self.right_sidebar:
-                self.right_sidebar.setVisible(False)
             if self.right_sidebar_btn:
-                self.right_sidebar_btn.setEnabled(False)
+                self.right_sidebar_btn.setEnabled(True)
             if self.settings_panel:
-                self.settings_panel.setVisible(False)
+                self.settings_panel.setVisible(bool(self._spine_sidebar_state.get("settings", True)))
+                self.settings_panel.set_spine_mode(True)
+            for widget in (self.motion_group, self.pose_controls_card, self.advanced_panel):
+                if widget:
+                    widget.setVisible(False)
+            if self.spine_controls:
+                self.spine_controls.setVisible(True)
+            if self.image_limit_label:
+                self.image_limit_label.setVisible(False)
+            if self.image_limit_spinbox:
+                self.image_limit_spinbox.setVisible(False)
             self._set_motion_debug_visible(False)
             self._spine_mode = True
             self._update_sidebar_button_text()
@@ -2376,7 +2692,22 @@ class PreviewPage(QFrame):
         if self.right_sidebar_btn:
             self.right_sidebar_btn.setEnabled(True)
         if self.settings_panel:
+            self.settings_panel.set_spine_mode(False)
             self.settings_panel.setVisible(bool(state.get("settings", True)))
+        if self.image_limit_label:
+            self.image_limit_label.setVisible(True)
+        if self.image_limit_spinbox:
+            self.image_limit_spinbox.setVisible(True)
+        if self.spine_controls:
+            self.spine_controls.clear()
+            self.spine_controls.setVisible(False)
+        for widget, key in (
+            (self.motion_group, "motion"),
+            (self.pose_controls_card, "pose"),
+            (self.advanced_panel, "advanced"),
+        ):
+            if widget:
+                widget.setVisible(bool(state.get(key, True)))
         self._spine_sidebar_state = None
         self._spine_mode = False
         self._update_sidebar_button_text()
@@ -2954,7 +3285,7 @@ class PreviewPage(QFrame):
         self.model_info_text_box.setMarkdown(
             tr("preview.spine_import_loading", source=source_path)
         )
-        runtime_root = str(self.settings_manager.get("preview.spine_runtime_dir", "") or "").strip()
+        runtime_root = self._spine_runtime_dir_for_import()
         worker = SpinePreviewImportThread(
             source_path,
             self.settings_manager.get_temp_dir(),
@@ -3028,6 +3359,8 @@ class PreviewPage(QFrame):
         url = f"{server_url}/static/spine/preview.html?manifest={manifest_text}"
         self._active_spine_plan = plan
         self._active_spine_preview_url = url
+        if self.spine_controls:
+            self.spine_controls.clear()
         self.spine_preview.open_url(url)
         self.model_info_text_box.setMarkdown(
             tr(
@@ -3045,6 +3378,8 @@ class PreviewPage(QFrame):
         if plan is None:
             return
         self._show_spine_stage()
+        if self.settings_panel:
+            self.spine_preview.set_view_settings(self.settings_panel.get_settings())
         self.model_info_text_box.setMarkdown(
             tr(
                 "preview.spine_preview_loading",
@@ -3069,6 +3404,45 @@ class PreviewPage(QFrame):
                 reason=plan.reason,
             )
         )
+
+    def _on_spine_preview_state(self, state: dict):
+        """Mirror the page's renderer state into the native right sidebar."""
+
+        if not self._spine_mode or self._active_spine_plan is None:
+            return
+        if self.spine_controls:
+            self.spine_controls.set_state(state)
+
+    def _on_spine_skin_changed(self, name: str):
+        if self._spine_mode and self.spine_preview:
+            self.spine_preview.set_skin(name)
+
+    def _on_spine_animation_changed(self, name: str):
+        if self._spine_mode and self.spine_preview:
+            loop = bool(self.spine_controls and self.spine_controls.loop_check.isChecked())
+            self.spine_preview.set_animation(name, loop)
+
+    def _on_spine_paused_changed(self, paused: bool):
+        if self._spine_mode and self.spine_preview:
+            self.spine_preview.set_paused(paused)
+        if self.spine_controls:
+            self.spine_controls.retranslate_ui()
+
+    def _on_spine_loop_changed(self, loop: bool):
+        if self._spine_mode and self.spine_preview:
+            self.spine_preview.set_loop(loop)
+
+    def _on_spine_time_changed(self, value: float):
+        if self._spine_mode and self.spine_preview:
+            self.spine_preview.set_time(value)
+
+    def _on_spine_reset_requested(self):
+        if self._spine_mode and self.spine_preview:
+            self.spine_preview.reset_pose()
+
+    def _on_spine_export_requested(self):
+        if self._spine_mode and self.spine_preview:
+            self.spine_preview.export_pose_psd()
 
     def _on_spine_preview_web_error(self, error: str):
         self._clear_embedded_spine()
@@ -3617,7 +3991,9 @@ class PreviewPage(QFrame):
 
     def on_settings_changed(self, settings: dict):
         """Apply display settings directly to the embedded OpenGL widget."""
-        if self.live2d_preview:
+        if self._spine_mode and self.spine_preview:
+            self.spine_preview.set_view_settings(settings)
+        elif self.live2d_preview:
             self.live2d_preview.apply_settings(settings)
         self._save_preview_ui_state()
 

@@ -21,6 +21,12 @@
     #atlas img { display: block; max-width: 100%; height: auto; image-rendering: auto; }
     #atlas figcaption { padding-top: 4px; color: #b6c5d8; word-break: break-all; }
     #attachments { position: absolute; right: 8px; bottom: 8px; width: min(360px, 42vw); max-height: 34vh; overflow: auto; padding: 8px; margin: 0; background: rgba(16,19,24,.82); border-radius: 5px; color: #c8d6e7; font: 12px ui-monospace, monospace; white-space: pre-wrap; }
+    /* The Qt host supplies the controls in the surrounding three-column page.
+       Keep the standalone page useful, but remove its chrome when embedded. */
+    body.lpk-embedded-host #toolbar,
+    body.lpk-embedded-host #attachments { display: none !important; }
+    body.lpk-embedded-host #stage { min-height: 0; }
+    body.lpk-embedded-host #canvas { transform-origin: center center; }
     .warning { color: #ffd28a; }
     .error { color: #ff9b9b; }
     .hidden { display: none !important; }
@@ -31,6 +37,7 @@
     <label>Skin <select id="skin"></select></label>
     <label>Animation <select id="animation"></select></label>
     <label><input id="pause" type="checkbox"> Pause</label>
+    <label><input id="loop" type="checkbox" checked> Loop</label>
     <label>Time <input id="time" type="range" min="0" max="1" step="0.001" value="0" disabled></label>
     <button id="reset" type="button">Reset pose</button>
     <button id="exportPsd" type="button" class="hidden">Export layered PSD</button>
@@ -59,6 +66,7 @@
   const skinSelect = document.getElementById("skin");
   const animationSelect = document.getElementById("animation");
   const pauseCheck = document.getElementById("pause");
+  const loopCheck = document.getElementById("loop");
   const timeRange = document.getElementById("time");
   const resetButton = document.getElementById("reset");
   const exportPsdButton = document.getElementById("exportPsd");
@@ -69,7 +77,106 @@
   let paused = false;
   let loaded = false;
   let firstFrameRendered = false;
+  let viewSettings = { opacity: 1, rotation: 0, scale: 1, offsetX: 0, offsetY: 0, transparent: true, background: "#20242b" };
   const MAX_POSE_LAYERS = 64;
+
+  function currentTrack() { return state && state.tracks && state.tracks[0] ? state.tracks[0] : null; }
+  function currentAnimationName() {
+    const track = currentTrack();
+    return track && track.animation ? String(track.animation.name || "") : String(animationSelect.value || "");
+  }
+  function hostState() {
+    const track = currentTrack();
+    const animation = track && track.animation;
+    const duration = Number(animation && animation.duration || timeRange.max || 0);
+    let currentTime = Number(track && track.trackTime || 0);
+    if (duration > 0) {
+      currentTime = track && track.loop
+        ? ((currentTime % duration) + duration) % duration
+        : Math.min(Math.max(0, currentTime), duration);
+    }
+    return {
+      mode: String(manifest.mode || ""),
+      runtimeLoaded: !!runtimeApi,
+      skeletonLoaded: !!skeleton,
+      selectedSkin: String(skinSelect.value || ""),
+      selectedAnimation: currentAnimationName(),
+      paused: !!paused,
+      loop: !!(track && track.loop),
+      time: currentTime,
+      timeMax: duration
+    };
+  }
+  function applyViewSettings() {
+    const opacity = Math.max(0.1, Math.min(1, Number(viewSettings.opacity || 1)));
+    const scale = Math.max(0.25, Math.min(3, Number(viewSettings.scale || 1)));
+    const rotate = Number(viewSettings.rotation || 0);
+    const x = Number(viewSettings.offsetX || 0) * 0.5;
+    const y = Number(viewSettings.offsetY || 0) * 0.5;
+    canvas.style.opacity = String(opacity);
+    canvas.style.transform = "translate(" + x + "%," + y + "%) rotate(" + rotate + "deg) scale(" + scale + ")";
+    const background = viewSettings.transparent ? "transparent" : String(viewSettings.background || "#20242b");
+    document.documentElement.style.background = background;
+    document.body.style.background = background;
+  }
+  function setAnimationByName(name, loop) {
+    if (!state || !name) return;
+    if (Array.from(animationSelect.options || []).some(function (option) { return option.value === String(name); })) {
+      animationSelect.value = String(name);
+    }
+    const shouldLoop = loop === undefined ? !!loopCheck.checked : !!loop;
+    state.setAnimation(0, name, shouldLoop);
+    loopCheck.checked = shouldLoop;
+    timeRange.value = 0;
+  }
+  function resetPose() {
+    if (!skeleton) return;
+    skeleton.setToSetupPose(); skeleton.updateWorldTransform();
+    if (state) {
+      state.clearTracks();
+      if (animationSelect.value) setAnimationByName(animationSelect.value, loopCheck.checked);
+    }
+    timeRange.value = 0;
+    updateAttachmentList();
+    try { drawCurrentPose(false); } catch (error) { showError(error); }
+  }
+  // A tiny, intentionally explicit bridge consumed by SpinePreviewWidget.
+  // It is also handy for the standalone diagnostic script without exposing a
+  // Qt object to JavaScript.
+  window.lpkSpineHost = {
+    state: hostState,
+    setSkin: function (name) {
+      if (!skeleton || !name) return;
+      const selected = String(name);
+      skeleton.setSkinByName(selected); skinSelect.value = selected;
+      skeleton.setSlotsToSetupPose(); updateAttachmentList();
+    },
+    setAnimation: function (payload) {
+      if (typeof payload === "string") payload = {name: payload};
+      payload = payload || {};
+      setAnimationByName(String(payload.name || ""), payload.loop);
+    },
+    setPaused: function (value) { paused = !!value; pauseCheck.checked = paused; },
+    setLoop: function (value) {
+      const checked = !!value; loopCheck.checked = checked;
+      const track = currentTrack(); if (track) track.loop = checked;
+    },
+    setTime: function (value) {
+      const track = currentTrack(); if (!track) return;
+      const max = Number(track.animation && track.animation.duration || timeRange.max || 0);
+      track.trackTime = Math.max(0, Math.min(max, Number(value) || 0));
+      state.apply(skeleton); skeleton.updateWorldTransform(); timeRange.value = track.trackTime; drawCurrentPose(false);
+    },
+    resetPose: resetPose,
+    exportPosePsd: function () { return exportPosePsd(); },
+    setViewSettings: function (settings) {
+      if (!settings) return;
+      Object.keys(viewSettings).forEach(function (key) {
+        if (settings[key] !== undefined) viewSettings[key] = settings[key];
+      });
+      applyViewSettings();
+    }
+  };
 
   function showError(message) {
     status.className = "error";
@@ -153,30 +260,56 @@
     attachments.textContent = lines.join("\n");
     attachments.classList.remove("hidden");
   }
+  function chooseInitialAnimation(animations) {
+    const values = (animations || []).filter(function (item) { return item && item.name; });
+    if (!values.length) return "";
+    const preferred = values.find(function (item) {
+      const name = String(item.name).toLowerCase();
+      return name === "normal" || name === "idle";
+    });
+    if (preferred) return String(preferred.name);
+    const substantial = values.find(function (item) {
+      return Number(item.duration || 0) > 0.01;
+    });
+    return String((substantial || values[0]).name);
+  }
   function calculateBounds() {
     skeleton.setToSetupPose(); skeleton.updateWorldTransform();
     const offset = new spine.Vector2(), size = new spine.Vector2();
     skeleton.getBounds(offset, size, []);
     return { offset: offset, size: size };
   }
-  function fillControls() {
+  function fillControls(initialAnimationName) {
     const skins = (skeleton.data.skins || []).map(function (item) { return item.name; });
     const animations = (skeleton.data.animations || []).map(function (item) { return item.name; });
+    const previousAnimation = String(animationSelect.value || "");
     setupSelect(skinSelect, skins, "(no skins)");
     setupSelect(animationSelect, animations, "(no animations)");
     if (skins.length) skinSelect.value = skins.indexOf("default") >= 0 ? "default" : skins[0];
-    if (animations.length) animationSelect.value = animations[0];
+    if (animations.length) {
+      // Preserve an existing user choice if controls are refreshed later;
+      // only the first fill uses the preferred initial track.
+      const requested = String(previousAnimation || initialAnimationName || "");
+      animationSelect.value = animations.indexOf(requested) >= 0
+        ? requested
+        : chooseInitialAnimation(skeleton.data.animations || []);
+    }
     timeRange.disabled = !animations.length;
     updateAttachmentList();
     skinSelect.onchange = function () { skeleton.setSkinByName(skinSelect.value); skeleton.setSlotsToSetupPose(); updateAttachmentList(); };
-    animationSelect.onchange = function () { state.setAnimation(0, animationSelect.value, true); timeRange.value = 0; };
+    loopCheck.checked = true;
+    animationSelect.onchange = function () { setAnimationByName(animationSelect.value, loopCheck.checked); };
     pauseCheck.onchange = function () { paused = pauseCheck.checked; };
+    loopCheck.onchange = function () {
+      const track = currentTrack(); if (track) track.loop = loopCheck.checked;
+    };
     timeRange.oninput = function () {
       const track = state.tracks && state.tracks[0];
       if (track) track.trackTime = Number(timeRange.value);
       state.apply(skeleton); skeleton.updateWorldTransform(); updateAttachmentList();
     };
-    resetButton.onclick = function () { skeleton.setToSetupPose(); skeleton.updateWorldTransform(); state.clearTracks(); updateAttachmentList(); };
+    resetButton.onclick = resetPose;
+    applyViewSettings();
   }
   function renderFrame(now) {
     if (!loaded) return;
@@ -191,7 +324,9 @@
       timeRange.max = Math.max(.001, track.animation.duration || 0.001);
       const animationTime = typeof track.getAnimationTime === "function"
         ? track.getAnimationTime()
-        : (track.trackTime || 0) % Number(timeRange.max);
+        : (track.loop
+          ? (track.trackTime || 0) % Number(timeRange.max)
+          : Math.min(track.trackTime || 0, Number(timeRange.max)));
       timeRange.value = Math.min(Number(timeRange.max), Math.max(0, animationTime || 0));
     }
     shader.bind();
@@ -263,8 +398,9 @@
     }
     skeleton = new spine.Skeleton(data);
     state = new spine.AnimationState(new spine.AnimationStateData(data));
-    if (data.animations && data.animations.length) state.setAnimation(0, data.animations[0].name, true);
-    bounds = calculateBounds(); fillControls(); loaded = true; showWarnings();
+    const initialAnimationName = chooseInitialAnimation(data.animations || []);
+    if (initialAnimationName) state.setAnimation(0, initialAnimationName, true);
+    bounds = calculateBounds(); fillControls(initialAnimationName); loaded = true; showWarnings();
     exportPsdButton.classList.remove("hidden");
     requestAnimationFrame(renderFrame);
   }
@@ -392,7 +528,7 @@
     if (!(manifest.textures || []).length) status.textContent += "\nNo atlas page image was found.";
     await Promise.all(imageLoads);
     setPreviewState("ready");
-    skinSelect.disabled = animationSelect.disabled = pauseCheck.disabled = timeRange.disabled = resetButton.disabled = true;
+    skinSelect.disabled = animationSelect.disabled = pauseCheck.disabled = loopCheck.disabled = timeRange.disabled = resetButton.disabled = true;
   }
   if (manifest.mode === "runtime") startRuntime().catch(showError); else startAtlas().catch(showError);
 }());

@@ -1,4 +1,6 @@
 import os
+import re
+import struct
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,10 +12,104 @@ from app.paths import PROJECT_ROOT
 ASSETSTUDIO_EXE_NAME = "AssetStudioModCLI.exe"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tga"}
 LIVE2D_EXTENSIONS = {".model3.json", ".moc3", ".motion3.json", ".physics3.json", ".png"}
+UNITYFS_SIGNATURE = b"UnityFS\x00"
 
 
 class AssetStudioCLIError(RuntimeError):
     pass
+
+
+def validate_unityfs_bundle(input_path: str | Path) -> str | None:
+    """Reject a truncated UnityFS file before AssetStudio can export garbage.
+
+    AssetStudioModCLI reports a short bundle as a warning and exits with code
+    zero.  Its Live2D exporter may then write a model/MOC from the bytes it was
+    able to read, which is indistinguishable from a successful export to the
+    caller.  The UnityFS file-size field is part of the bundle header and is a
+    reliable preflight check; no source bytes are changed.
+
+    Non-UnityFS inputs are left to AssetStudio (for example serialized
+    ``.assets`` files).  A directory is also left to AssetStudio because it can
+    contain several files and companion resource streams.  A trailing-byte
+    condition is returned as a warning because wrappers may append transport
+    data; it is not treated as a truncated bundle.
+    """
+
+    path = Path(input_path)
+    if not path.is_file():
+        return None
+
+    try:
+        with path.open("rb") as stream:
+            header = stream.read(512)
+            stream.seek(0, os.SEEK_END)
+            actual_size = stream.tell()
+    except OSError as exc:
+        raise AssetStudioCLIError(f"Unable to inspect Unity source {path}: {exc}") from exc
+
+    if not header.startswith(UNITYFS_SIGNATURE):
+        return None
+
+    try:
+        file_size_offset = _unityfs_file_size_offset(header)
+        declared_size = struct.unpack_from(">Q", header, file_size_offset)[0]
+    except (ValueError, struct.error) as exc:
+        raise AssetStudioCLIError(f"Invalid UnityFS header: {path}: {exc}") from exc
+
+    # A file with extra trailing bytes can be a valid wrapper/transport
+    # artifact.  It is safe to leave that case to AssetStudio; only a short
+    # file proves that bytes required by the UnityFS header are missing.
+    if declared_size <= actual_size:
+        if declared_size < actual_size:
+            return (
+                "UnityFS source has "
+                f"{actual_size - declared_size:,} trailing byte(s) beyond its "
+                "declared bundle size; AssetStudio will inspect the wrapper."
+            )
+        return None
+
+    state = "truncated"
+    difference = declared_size - actual_size
+
+    stream_names = sorted(
+        {
+            match.group(1).decode("utf-8", errors="replace")
+            for match in re.finditer(rb"([A-Za-z0-9_.-]+\.resS)\x00", header)
+        }
+    )
+    companion_hint = ""
+    if stream_names:
+        companion_hint = (
+            " Bundle metadata references "
+            + ", ".join(stream_names)
+            + "; obtain the complete UnityFS bundle/resource stream."
+        )
+    raise AssetStudioCLIError(
+        "UnityFS source is "
+        f"{state}: header declares {declared_size:,} bytes, "
+        f"but the file contains {actual_size:,} bytes "
+        f"({difference:,} byte difference).{companion_hint}"
+    )
+
+
+def _unityfs_file_size_offset(header: bytes) -> int:
+    """Return the big-endian file-size field offset in a UnityFS header."""
+
+    if not header.startswith(UNITYFS_SIGNATURE):
+        raise ValueError("not a UnityFS header")
+
+    offset = len(UNITYFS_SIGNATURE)
+    if len(header) < offset + 4:
+        raise ValueError("missing format version")
+    offset += 4  # format version
+    for label in ("Unity version", "Unity revision"):
+        end = header.find(b"\x00", offset)
+        if end < 0:
+            raise ValueError(f"missing {label}")
+        offset = end + 1
+    if len(header) < offset + 8:
+        raise ValueError("missing file size")
+    return offset
 
 
 @dataclass

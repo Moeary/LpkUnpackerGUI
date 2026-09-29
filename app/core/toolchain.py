@@ -39,6 +39,7 @@ ARCHIVE_TOOL_NAMES = (
 )
 ASSETSTUDIO_TOOL_NAMES = ("AssetStudioModCLI.exe", "AssetStudioModCLI")
 CUBISM_CORE_NAMES = ("Live2DCubismCore.dll",)
+SPINE_CONVERTER_NAMES = ("SpineSkeletonDataConverter.exe", "SpineSkeletonDataConverter")
 SPINE_WEBGL_NAMES = {"spine-webgl.js", "spine-webgl.min.js"}
 SPINE_CORE_NAMES = {"spine-core.js", "spine-core.min.js"}
 PHOTOSHOP_NAMES = ("Photoshop.exe", "Photoshop")
@@ -201,6 +202,26 @@ def find_assetstudio_cli(
     if env_path:
         return env_path
     return _first_named_file(ASSETSTUDIO_TOOL_NAMES, roots=tool_roots())
+
+
+def find_spine_converter(
+    explicit: str | os.PathLike[str] | None = None,
+) -> Path | None:
+    """Find the optional Spine skeleton converter executable."""
+
+    configured = _existing_file(explicit)
+    if configured:
+        return configured
+    env_path = _existing_file(os.environ.get("LPK_SPINE_CONVERTER"))
+    if env_path:
+        return env_path
+    for name in SPINE_CONVERTER_NAMES:
+        found = shutil.which(name)
+        if found:
+            path = _existing_file(found)
+            if path:
+                return path
+    return _first_named_file(SPINE_CONVERTER_NAMES, roots=tool_roots())
 
 
 def _steam_library_roots() -> list[Path]:
@@ -500,6 +521,7 @@ def detect_toolchain_paths(
         ("tools.assetstudio_cli_path", find_assetstudio_cli),
         ("tools.cubism_core_dll_path", find_cubism_core),
         ("tools.photoshop_path", find_photoshop),
+        ("tools.spine_converter_path", find_spine_converter),
         ("preview.spine_runtime_dir", find_spine_runtime),
     )
     for key, detector in detectors:
@@ -517,12 +539,14 @@ __all__ = [
     "ASSETSTUDIO_TOOL_NAMES",
     "CUBISM_CORE_NAMES",
     "PHOTOSHOP_NAMES",
+    "SPINE_CONVERTER_NAMES",
     "detect_toolchain_paths",
     "find_archive_extractor",
     "find_assetstudio_cli",
     "find_cubism_core",
     "find_photoshop",
     "find_photoshop_path",
+    "find_spine_converter",
     "find_spine_runtime",
     "tool_roots",
 ]

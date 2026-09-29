@@ -6,6 +6,7 @@ from qfluentwidgets import (
     SubtitleLabel,
     BodyLabel,
     CaptionLabel,
+    CheckBox,
     ComboBox,
     InfoBar,
     InfoBarPosition,
@@ -20,6 +21,7 @@ from app.core.toolchain import (
     find_assetstudio_cli,
     find_cubism_core,
     find_photoshop,
+    find_spine_converter,
     find_spine_runtime,
 )
 from app.i18n import get_i18n, normalize_language_code, tr
@@ -90,6 +92,18 @@ class SettingsPage(QFrame):
         self.spine_runtime_edit = None
         self.spine_runtime_button = None
         self.spine_runtime_auto_button = None
+        self.spine_converter_label = None
+        self.spine_converter_desc = None
+        self.spine_converter_status = None
+        self.spine_converter_edit = None
+        self.spine_converter_button = None
+        self.spine_converter_auto_button = None
+        self.spine_auto_convert_label = None
+        self.spine_auto_convert_desc = None
+        self.spine_auto_convert_checkbox = None
+        self.spine_target_version_label = None
+        self.spine_target_version_desc = None
+        self.spine_target_version_edit = None
         self.texture_viewer_label = None
         self.texture_viewer_desc = None
         self.texture_viewer_combo = None
@@ -333,6 +347,59 @@ class SettingsPage(QFrame):
         spine_runtime_row.addWidget(self.spine_runtime_auto_button)
         runtime_layout.addLayout(spine_runtime_row)
 
+        spine_converter_row = QHBoxLayout()
+        spine_converter_row.setSpacing(12)
+        spine_converter_text_layout = QVBoxLayout()
+        spine_converter_text_layout.setSpacing(4)
+        self.spine_converter_label = BodyLabel("", runtime_card)
+        self.spine_converter_desc = CaptionLabel("", runtime_card)
+        self.spine_converter_desc.setWordWrap(True)
+        self.spine_converter_status = CaptionLabel("", runtime_card)
+        self.spine_converter_status.setWordWrap(True)
+        spine_converter_text_layout.addWidget(self.spine_converter_label)
+        spine_converter_text_layout.addWidget(self.spine_converter_desc)
+        spine_converter_text_layout.addWidget(self.spine_converter_status)
+        self.spine_converter_edit = LineEdit(runtime_card)
+        self.spine_converter_edit.editingFinished.connect(self.on_spine_converter_edit_finished)
+        self.spine_converter_button = PushButton("", runtime_card)
+        self.spine_converter_button.clicked.connect(self.browse_spine_converter)
+        self.spine_converter_auto_button = PushButton("", runtime_card)
+        self.spine_converter_auto_button.clicked.connect(self.auto_detect_spine_converter)
+        spine_converter_row.addLayout(spine_converter_text_layout, 1)
+        spine_converter_row.addWidget(self.spine_converter_edit, 2)
+        spine_converter_row.addWidget(self.spine_converter_button)
+        spine_converter_row.addWidget(self.spine_converter_auto_button)
+        runtime_layout.addLayout(spine_converter_row)
+
+        spine_auto_convert_row = QHBoxLayout()
+        spine_auto_convert_row.setSpacing(12)
+        spine_auto_convert_text_layout = QVBoxLayout()
+        spine_auto_convert_text_layout.setSpacing(4)
+        self.spine_auto_convert_label = BodyLabel("", runtime_card)
+        self.spine_auto_convert_desc = CaptionLabel("", runtime_card)
+        self.spine_auto_convert_desc.setWordWrap(True)
+        spine_auto_convert_text_layout.addWidget(self.spine_auto_convert_label)
+        spine_auto_convert_text_layout.addWidget(self.spine_auto_convert_desc)
+        self.spine_auto_convert_checkbox = CheckBox(runtime_card)
+        spine_auto_convert_row.addLayout(spine_auto_convert_text_layout, 1)
+        spine_auto_convert_row.addWidget(self.spine_auto_convert_checkbox)
+        runtime_layout.addLayout(spine_auto_convert_row)
+
+        spine_target_version_row = QHBoxLayout()
+        spine_target_version_row.setSpacing(12)
+        spine_target_version_text_layout = QVBoxLayout()
+        spine_target_version_text_layout.setSpacing(4)
+        self.spine_target_version_label = BodyLabel("", runtime_card)
+        self.spine_target_version_desc = CaptionLabel("", runtime_card)
+        self.spine_target_version_desc.setWordWrap(True)
+        spine_target_version_text_layout.addWidget(self.spine_target_version_label)
+        spine_target_version_text_layout.addWidget(self.spine_target_version_desc)
+        self.spine_target_version_edit = LineEdit(runtime_card)
+        self.spine_target_version_edit.setMinimumWidth(180)
+        spine_target_version_row.addLayout(spine_target_version_text_layout, 1)
+        spine_target_version_row.addWidget(self.spine_target_version_edit, 2)
+        runtime_layout.addLayout(spine_target_version_row)
+
         texture_viewer_row = QHBoxLayout()
         texture_viewer_row.setSpacing(12)
         texture_viewer_text_layout = QVBoxLayout()
@@ -396,6 +463,16 @@ class SettingsPage(QFrame):
                 self.photoshop_edit.setText(self.settings_manager.get_photoshop_path())
             if self.spine_runtime_edit:
                 self.spine_runtime_edit.setText(self.settings_manager.get_spine_runtime_dir())
+            if self.spine_converter_edit:
+                self.spine_converter_edit.setText(self.settings_manager.get_spine_converter_path())
+            if self.spine_auto_convert_checkbox:
+                self.spine_auto_convert_checkbox.setChecked(
+                    self.settings_manager.get_spine_conversion_enabled()
+                )
+            if self.spine_target_version_edit:
+                self.spine_target_version_edit.setText(
+                    self.settings_manager.get_spine_conversion_target_version()
+                )
             if self.texture_viewer_combo:
                 self._set_combo_by_value(
                     self.texture_viewer_combo,
@@ -480,6 +557,21 @@ class SettingsPage(QFrame):
             )
             self.spine_runtime_button.setText(tr("common.browse"))
             self.spine_runtime_auto_button.setText(tr("settings.tool_auto"))
+            self.spine_converter_label.setText(tr("settings.spine_converter_label"))
+            self.spine_converter_desc.setText(tr("settings.spine_converter_desc"))
+            self.spine_converter_edit.setPlaceholderText(
+                tr("settings.spine_converter_placeholder")
+            )
+            self.spine_converter_button.setText(tr("common.browse"))
+            self.spine_converter_auto_button.setText(tr("settings.tool_auto"))
+            self.spine_auto_convert_label.setText(tr("settings.spine_auto_convert_label"))
+            self.spine_auto_convert_desc.setText(tr("settings.spine_auto_convert_desc"))
+            self.spine_auto_convert_checkbox.setText(tr("settings.spine_auto_convert_checkbox"))
+            self.spine_target_version_label.setText(tr("settings.spine_target_version_label"))
+            self.spine_target_version_desc.setText(tr("settings.spine_target_version_desc"))
+            self.spine_target_version_edit.setPlaceholderText(
+                tr("settings.spine_target_version_placeholder")
+            )
             self.texture_viewer_label.setText(tr("settings.texture_viewer_label"))
             self.texture_viewer_desc.setText(tr("settings.texture_viewer_desc"))
             current_texture_viewer = self._current_combo_value(
@@ -576,6 +668,27 @@ class SettingsPage(QFrame):
         )
 
     def save_runtime_settings(self):
+        target_version = (
+            self.spine_target_version_edit.text().strip()
+            if self.spine_target_version_edit
+            else ""
+        )
+        try:
+            target_version = self.settings_manager.validate_spine_conversion_target_version(
+                target_version
+            )
+        except ValueError as exc:
+            InfoBar.error(
+                title=tr("common.error"),
+                content=tr("settings.spine_target_version_invalid", error=str(exc)),
+                orient=Qt.Horizontal,
+                isClosable=True,
+                position=InfoBarPosition.TOP,
+                duration=4000,
+                parent=self,
+            )
+            return False
+
         output_root = self.output_root_edit.text().strip() if self.output_root_edit else ""
         if output_root:
             self.settings_manager.set_output_root(output_root)
@@ -593,6 +706,17 @@ class SettingsPage(QFrame):
         )
         self.settings_manager.set_spine_runtime_dir(
             self.spine_runtime_edit.text() if self.spine_runtime_edit else ""
+        )
+        self.settings_manager.set_spine_converter_path(
+            self.spine_converter_edit.text() if self.spine_converter_edit else ""
+        )
+        self.settings_manager.set_spine_conversion_enabled(
+            self.spine_auto_convert_checkbox.isChecked()
+            if self.spine_auto_convert_checkbox
+            else False
+        )
+        self.settings_manager.set_spine_conversion_target_version(
+            target_version
         )
         self.settings_manager.set_texture_viewer_mode(
             self._current_combo_value(
@@ -613,6 +737,7 @@ class SettingsPage(QFrame):
             duration=2500,
             parent=self,
         )
+        return True
 
     def browse_archive_tool(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -785,6 +910,34 @@ class SettingsPage(QFrame):
         self.settings_manager.set_spine_runtime_dir(path)
         self.refresh_tool_status_labels()
 
+    def browse_spine_converter(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            tr("settings.spine_converter_select"),
+            self.spine_converter_edit.text() or "",
+            tr("settings.spine_converter_filter"),
+        )
+        if not path:
+            return
+        self.spine_converter_edit.setText(path)
+        self.save_spine_converter(path)
+
+    def on_spine_converter_edit_finished(self):
+        if self._syncing_ui:
+            return
+        self.save_spine_converter(self.spine_converter_edit.text())
+
+    def save_spine_converter(self, path: str):
+        self.settings_manager.set_spine_converter_path(path)
+        self.refresh_tool_status_labels()
+
+    def auto_detect_spine_converter(self):
+        self._auto_detect_single(
+            "tools.spine_converter_path",
+            self.spine_converter_edit,
+            self.save_spine_converter,
+        )
+
     def auto_detect_toolchain(self):
         """Detect available tools and fill only currently empty settings."""
 
@@ -895,6 +1048,13 @@ class SettingsPage(QFrame):
                     directory=True,
                 )
             )
+        if self.spine_converter_status:
+            self.spine_converter_status.setText(
+                self.tool_status_text(
+                    self.settings_manager.get_spine_converter_path(),
+                    self.detect_spine_converter_path,
+                )
+            )
 
     def tool_status_text(self, configured_path: str, detector, directory: bool = False):
         configured_path = str(configured_path or "").strip()
@@ -944,6 +1104,14 @@ class SettingsPage(QFrame):
     def detect_spine_runtime_path() -> str:
         try:
             path = find_spine_runtime()
+            return str(path) if path else ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def detect_spine_converter_path() -> str:
+        try:
+            path = find_spine_converter()
             return str(path) if path else ""
         except Exception:
             return ""

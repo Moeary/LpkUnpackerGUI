@@ -144,6 +144,22 @@ except Exception as e:
 
 
 try:
+    from app.gui.SpineConverterPage import SpineConverterPage
+except Exception as e:
+    import traceback
+    print(f"Error importing SpineConverterPage: {e}")
+    traceback.print_exc()
+
+    class SpineConverterPage(QFrame):
+        previewRequested = None
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setObjectName("spineConverterPage")
+            QHBoxLayout(self).addWidget(QFrame(self))
+
+
+try:
     from app.gui.SettingsPage import SettingsPage
 except Exception as e:
     import traceback
@@ -184,6 +200,7 @@ class MainWindow(FluentWindow):
             PsdReconstructionPage, "psdReconstructionPage"
         )
         self.spineAtlasPage = self._create_page(SpineAtlasPage, "spineAtlasPage")
+        self.spineConverterPage = self._create_page(SpineConverterPage, "spineConverterPage")
         self.settingsPage = self._create_page(SettingsPage, "settingsPage")
 
         unified_preview_requested = getattr(
@@ -212,6 +229,16 @@ class MainWindow(FluentWindow):
             and callable(pose_scheme_handler)
         ):
             pose_scheme_requested.connect(self.save_psd_pose_scheme)
+        converter_preview_requested = getattr(
+            self.spineConverterPage,
+            "previewRequested",
+            None,
+        )
+        if (
+            converter_preview_requested is not None
+            and hasattr(converter_preview_requested, "connect")
+        ):
+            converter_preview_requested.connect(self.open_spine_converter_preview)
 
         language_changed = getattr(self.settingsPage, "languageChanged", None)
         theme_changed = getattr(self.settingsPage, "themeChanged", None)
@@ -249,6 +276,16 @@ class MainWindow(FluentWindow):
         self.setWindowTitle(tr("main.window_title"))
 
     def closeEvent(self, event):
+        converter_page = getattr(self, "spineConverterPage", None)
+        is_conversion_running = getattr(converter_page, "is_conversion_running", None)
+        if callable(is_conversion_running) and is_conversion_running():
+            notify_close = getattr(converter_page, "notify_close_while_running", None)
+            if callable(notify_close):
+                notify_close()
+            # Let the converter finish instead of destroying a running QThread
+            # while the main window is closing.
+            event.ignore()
+            return
         spine_page = getattr(self, "spineAtlasPage", None)
         stop_worker = getattr(spine_page, "stop_worker", None)
         if callable(stop_worker):
@@ -309,6 +346,16 @@ class MainWindow(FluentWindow):
 
         try:
             self.addSubInterface(
+                self.spineConverterPage,
+                FIF.SYNC,
+                tr("main.nav.spine_converter"),
+                NavigationItemPosition.SCROLL,
+            )
+        except Exception as e:
+            print(f"Error adding SpineConverterPage to navigation: {e}")
+
+        try:
+            self.addSubInterface(
                 self.settingsPage,
                 FIF.SETTING,
                 tr("main.nav.settings"),
@@ -351,6 +398,7 @@ class MainWindow(FluentWindow):
             self.live2dModPage,
             self.psdReconstructionPage,
             self.spineAtlasPage,
+            self.spineConverterPage,
             self.settingsPage,
         ]
         for page in filter(None, pages):
@@ -405,6 +453,7 @@ class MainWindow(FluentWindow):
             self.live2dModPage,
             self.psdReconstructionPage,
             self.spineAtlasPage,
+            self.spineConverterPage,
             self.settingsPage,
         ]:
             if page is not None and hasattr(page, "retranslate_ui"):
@@ -433,6 +482,14 @@ class MainWindow(FluentWindow):
         handler = getattr(self.previewPage, "open_model_preview_source", None)
         if callable(handler):
             handler(model_json_path)
+
+    def open_spine_converter_preview(self, skeleton_path: str):
+        """Open converted Spine data in the existing Spine preview stage."""
+
+        self.switchTo(self.previewPage)
+        handler = getattr(self.previewPage, "start_spine_preview_import", None)
+        if callable(handler):
+            handler(skeleton_path)
 
     def save_psd_pose_scheme(self, payload: dict):
         handler = getattr(
