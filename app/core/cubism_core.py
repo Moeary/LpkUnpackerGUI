@@ -652,6 +652,24 @@ def resolve_cubism_core_dll(path: str | Path | None = None) -> Optional[Path]:
         ]
     )
 
+    # Some live2d-py distributions bundle the native runtime inside the
+    # package rather than exposing it through the application directory.  Keep
+    # this as a late fallback so an explicit setting or project-local runtime
+    # always wins, while real Cubism Core export remains available out of the
+    # box when the wheel ships the DLL.
+    try:
+        import live2d
+
+        package_root = Path(live2d.__file__).resolve().parent
+        candidates.extend(
+            sorted(
+                package_root.rglob("Live2DCubismCore.dll"),
+                key=lambda item: len(item.parts),
+            )
+        )
+    except Exception:
+        pass
+
     for candidate in candidates:
         existing = _existing_file(candidate)
         if existing:

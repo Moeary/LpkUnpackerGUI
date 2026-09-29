@@ -6,7 +6,7 @@ import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from PIL import Image, ImageChops
 
@@ -547,6 +547,7 @@ def record_repack(
     output_paths: list[Path],
     scheme_id: str = "",
     display_name: str = "",
+    texture_outputs: Mapping[int, str | Path] | None = None,
 ) -> Live2DPSDProject:
     data = normalize_project_data(project.data, project.project_name)
     entry = {
@@ -558,6 +559,10 @@ def record_repack(
         else "",
         "textures_dir": _relative_to_project(Path(textures_dir), project.project_dir),
         "output_paths": [_relative_to_project(Path(path), project.project_dir) for path in output_paths],
+        "texture_outputs": {
+            str(int(index)): _relative_to_project(Path(path), project.project_dir)
+            for index, path in (texture_outputs or {}).items()
+        },
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "scheme_id": str(scheme_id or ""),
     }
@@ -583,6 +588,7 @@ def record_multi_repack(
     textures_dir: str | Path,
     output_paths: list[Path],
     display_name: str,
+    texture_outputs: Mapping[int, str | Path] | None = None,
 ) -> Live2DPSDProject:
     """Record a multi-PSD output without involving pose-priority composition."""
     data = normalize_project_data(project.data, project.project_name)
@@ -596,6 +602,10 @@ def record_multi_repack(
         ],
         "textures_dir": _relative_to_project(Path(textures_dir), project.project_dir),
         "output_paths": [_relative_to_project(Path(path), project.project_dir) for path in output_paths],
+        "texture_outputs": {
+            str(int(index)): _relative_to_project(Path(path), project.project_dir)
+            for index, path in (texture_outputs or {}).items()
+        },
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "scheme_id": "",
     }
@@ -802,7 +812,12 @@ def prepare_repack_preview_workspace(
     if not outputs:
         raise Live2DPSDProjectError(f"Repack version has no output texture paths: {entry.get('id')}")
 
-    _overlay_preview_textures(outputs, package.texture_paths, log)
+    texture_outputs = {
+        int(index): resolve_project_path(project, value)
+        for index, value in (entry.get("texture_outputs") or {}).items()
+        if str(value or "").strip()
+    }
+    _overlay_preview_textures(outputs, package.texture_paths, log, texture_outputs)
     return package.model_json
 
 
@@ -892,7 +907,21 @@ def _overlay_preview_textures(
     outputs: list[Path],
     target_textures: list[Path],
     log: LogCallback | None,
+    texture_outputs: Mapping[int, Path] | None = None,
 ) -> None:
+    if texture_outputs:
+        for index, target in enumerate(target_textures):
+            output = texture_outputs.get(index)
+            if output is None:
+                continue
+            if not output.is_file():
+                raise Live2DPSDProjectError(f"Repacked texture is missing: {output}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(output, target)
+            if log:
+                log(f"Preview texture replaced: {target}")
+        return
+
     copied_targets: set[Path] = set()
     for output, target in zip(outputs, target_textures):
         if not output.is_file():

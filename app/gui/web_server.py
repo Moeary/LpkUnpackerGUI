@@ -3,13 +3,17 @@ import sys
 import socket
 import threading
 import json
+import base64
+import binascii
 from pathlib import Path
 
-from app.paths import ASSETS_DIR
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import RedirectResponse
+from app.paths import ASSETS_DIR, RUNTIME_TEMP_DIR
+from app.core.spine_preview import SpinePoseLayer, export_spine_pose_psd
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
+from fastapi.responses import RedirectResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
 import uuid
 from typing import Dict, Set
 
@@ -111,6 +115,7 @@ def start_server(host: str = "127.0.0.1", port: int = 0) -> int:
 # ---------------- Dynamic model directory mounting ----------------
 
 _mounted_models: Dict[str, Path] = {}
+_spine_pose_exports: Dict[str, Path] = {}
 
 def mount_model_dir(dir_path: str) -> str:
     """Mount a local directory under a unique URL prefix and return the base path.
@@ -182,3 +187,94 @@ async def http_broadcast(request: Request):
         payload = {"type": "error", "message": "Invalid JSON"}
     await _broadcast_to_clients(payload)
     return {"ok": True, "clients": len(_preview_clients)}
+
+
+@app.post("/api/spine/pose-export")
+async def spine_pose_export(request: Request):
+    """Convert browser-rasterized Spine attachment layers into a PSD.
+
+    The web page sends transparent PNG data URLs for the visible slots at the
+    current animation time.  The server writes those disposable images under
+    ``runtime/temp`` and delegates the actual PSD construction to the core
+    exporter.  Source models and user runtimes are never used as output roots.
+    """
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {exc}") from exc
+    raw_layers = payload.get("layers") if isinstance(payload, dict) else None
+    if not isinstance(raw_layers, list) or not raw_layers:
+        raise HTTPException(status_code=400, detail="layers must be a non-empty list")
+    if len(raw_layers) > 64:
+        raise HTTPException(status_code=413, detail="at most 64 visible attachment layers may be exported")
+    unsupported = [str(value) for value in (payload.get("unsupported") or []) if str(value)]
+    if unsupported:
+        raise HTTPException(
+            status_code=422,
+            detail="Pose export blocked by unsupported Spine features: " + ", ".join(unsupported),
+        )
+
+    export_id = uuid.uuid4().hex
+    output_root = (Path(RUNTIME_TEMP_DIR) / "spine_pose_exports" / export_id).resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    layers: list[SpinePoseLayer] = []
+    total_bytes = 0
+    try:
+        for index, item in enumerate(raw_layers):
+            if not isinstance(item, dict) or not item.get("data"):
+                continue
+            data_url = str(item.get("data"))
+            encoded = data_url.split(",", 1)[1] if "," in data_url else data_url
+            try:
+                raw = base64.b64decode(encoded, validate=True)
+            except (ValueError, binascii.Error) as exc:
+                raise HTTPException(status_code=400, detail=f"invalid layer {index} PNG data") from exc
+            total_bytes += len(raw)
+            if total_bytes > 100 * 1024 * 1024:
+                raise HTTPException(status_code=413, detail="pose layer payload is too large")
+            image_path = output_root / f"layer_{index:03d}.png"
+            image_path.write_bytes(raw)
+            raw_opacity = item.get("opacity", 1.0)
+            opacity = float(1.0 if raw_opacity is None else raw_opacity)
+            layers.append(
+                SpinePoseLayer(
+                    name=str(item.get("name") or f"attachment_{index:03d}"),
+                    image=image_path,
+                    left=int(item.get("left", 0) or 0),
+                    top=int(item.get("top", 0) or 0),
+                    opacity=opacity,
+                    visible=bool(item.get("visible", True)),
+                    attachment=str(item.get("attachment") or ""),
+                )
+            )
+        if not layers:
+            raise HTTPException(status_code=400, detail="No visible PNG layers were supplied")
+        width = int(payload.get("width", 0) or 0)
+        height = int(payload.get("height", 0) or 0)
+        report = await run_in_threadpool(
+            export_spine_pose_psd,
+            layers,
+            output_root / "spine_pose.psd",
+            canvas_size=(width, height) if width > 0 and height > 0 else None,
+            unsupported=unsupported,
+        )
+        _spine_pose_exports[export_id] = report.output_path
+        return {
+            "ok": True,
+            "id": export_id,
+            "download": f"/api/spine/pose-export/{export_id}",
+            "layers": list(report.layer_names),
+            "unsupported": list(report.unsupported),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/spine/pose-export/{export_id}")
+def download_spine_pose_export(export_id: str):
+    path = _spine_pose_exports.get(str(export_id))
+    if not path or not path.is_file():
+        raise HTTPException(status_code=404, detail="pose export no longer exists")
+    return FileResponse(path, media_type="image/vnd.adobe.photoshop", filename="spine_pose.psd")

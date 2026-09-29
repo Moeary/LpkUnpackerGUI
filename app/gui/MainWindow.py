@@ -130,6 +130,20 @@ except Exception as e:
 
 
 try:
+    from app.gui.SpineAtlasPage import SpineAtlasPage
+except Exception as e:
+    import traceback
+    print(f"Error importing SpineAtlasPage: {e}")
+    traceback.print_exc()
+
+    class SpineAtlasPage(QFrame):
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setObjectName("spineAtlasPage")
+            QHBoxLayout(self).addWidget(QFrame(self))
+
+
+try:
     from app.gui.SettingsPage import SettingsPage
 except Exception as e:
     import traceback
@@ -169,6 +183,7 @@ class MainWindow(FluentWindow):
         self.psdReconstructionPage = self._create_page(
             PsdReconstructionPage, "psdReconstructionPage"
         )
+        self.spineAtlasPage = self._create_page(SpineAtlasPage, "spineAtlasPage")
         self.settingsPage = self._create_page(SettingsPage, "settingsPage")
 
         unified_preview_requested = getattr(
@@ -234,6 +249,10 @@ class MainWindow(FluentWindow):
         self.setWindowTitle(tr("main.window_title"))
 
     def closeEvent(self, event):
+        spine_page = getattr(self, "spineAtlasPage", None)
+        stop_worker = getattr(spine_page, "stop_worker", None)
+        if callable(stop_worker):
+            stop_worker()
         rect = self.geometry()
         self.settings_manager.set(
             "window_geometry",
@@ -280,6 +299,16 @@ class MainWindow(FluentWindow):
 
         try:
             self.addSubInterface(
+                self.spineAtlasPage,
+                FIF.IMAGE_EXPORT,
+                tr("main.nav.spine_atlas"),
+                NavigationItemPosition.SCROLL,
+            )
+        except Exception as e:
+            print(f"Error adding SpineAtlasPage to navigation: {e}")
+
+        try:
+            self.addSubInterface(
                 self.settingsPage,
                 FIF.SETTING,
                 tr("main.nav.settings"),
@@ -321,6 +350,7 @@ class MainWindow(FluentWindow):
             self.webPreviewPage,
             self.live2dModPage,
             self.psdReconstructionPage,
+            self.spineAtlasPage,
             self.settingsPage,
         ]
         for page in filter(None, pages):
@@ -374,6 +404,7 @@ class MainWindow(FluentWindow):
             self.webPreviewPage,
             self.live2dModPage,
             self.psdReconstructionPage,
+            self.spineAtlasPage,
             self.settingsPage,
         ]:
             if page is not None and hasattr(page, "retranslate_ui"):

@@ -74,6 +74,7 @@ from app.core.model import prepare_model_json_for_preview, resolve_live2d_packag
 from app.core.model.motions import load_live2d_motions
 from app.core.settings_manager import SettingsManager
 from app.gui.Live2DPreviewWindow import Live2DPreviewWindow
+from app.gui.ArtMeshInspector import ArtMeshInspectorDialog
 from app.gui.PreviewPage import ImagePreviewPanel
 from app.i18n import get_i18n, tr
 
@@ -318,6 +319,7 @@ class PsdReconstructionPage(QFrame):
         self._is_busy = False
         self._motion_items: list[dict] = []
         self.live2d_preview_window: Live2DPreviewWindow | None = None
+        self.artmesh_inspector_dialog: ArtMeshInspectorDialog | None = None
         self.preview_mode = ""
         self.preview_repack_id = ""
         self._last_preview_dock_rect: dict | None = None
@@ -556,6 +558,7 @@ class PsdReconstructionPage(QFrame):
         self.mode_combo = ComboBox(self.mode_frame)
         self.mode_combo.addItem("", userData="mesh")
         self.mode_combo.addItem("", userData="atlas-components")
+        self.mode_combo.addItem(tr("psd.mode.atlas_artmesh"), userData="atlas-artmesh")
         self.mode_combo.currentIndexChanged.connect(self.on_mode_changed)
         self.mode_layout.addWidget(self.mode_label)
         self.mode_layout.addWidget(self.mode_combo, 1)
@@ -692,6 +695,9 @@ class PsdReconstructionPage(QFrame):
         # part of the layout.  Leaving a parented visible widget here caused
         # the stray button at the page's top-left corner.
         self.open_photoshop_button.setVisible(False)
+        self.artmesh_inspector_button = PushButton("", self.left_panel)
+        self.artmesh_inspector_button.clicked.connect(self.open_artmesh_inspector)
+        self.artmesh_inspector_button.setEnabled(False)
         self.multi_repack_button = PushButton("", self.left_panel)
         self.multi_repack_button.clicked.connect(self.start_multi_repack)
         self.multi_repack_button.setVisible(False)
@@ -699,6 +705,7 @@ class PsdReconstructionPage(QFrame):
         self.preview_toggle_button.clicked.connect(self.toggle_preview_panel)
         self.action_layout.addWidget(self.reconstruct_button)
         self.action_layout.addWidget(self.repack_psd_button)
+        self.action_layout.addWidget(self.artmesh_inspector_button)
         self.action_layout.addWidget(self.open_output_button)
         self.action_layout.addWidget(self.preview_toggle_button)
         self.action_layout.addStretch(1)
@@ -872,6 +879,7 @@ class PsdReconstructionPage(QFrame):
         self.mode_label.setText(tr("psd.mode"))
         self.mode_combo.setItemText(0, tr("psd.mode.mesh_pose"))
         self.mode_combo.setItemText(1, tr("psd.mode.editable_atlas"))
+        self.mode_combo.setItemText(2, tr("psd.mode.atlas_artmesh"))
         self.mesh_canvas_label.setText(tr("psd.mesh_canvas.max_dimension"))
         self.mesh_canvas_preset_combo.setItemText(2, tr("psd.mesh_canvas.custom"))
         self.mesh_canvas_spin.setSpecialValueText(tr("psd.mesh_canvas.original"))
@@ -882,6 +890,7 @@ class PsdReconstructionPage(QFrame):
         self.reconstruct_button.setText(tr("psd.reconstruct_button"))
         self.open_output_button.setText(tr("psd.open_output_folder"))
         self.open_photoshop_button.setText(tr("psd.pose.open_photoshop"))
+        self.artmesh_inspector_button.setText(tr("psd.inspector.title"))
         self.preview_toggle_button.setText(
             tr("psd.preview.hide") if not self.preview_frame.isHidden() else tr("psd.preview.show")
         )
@@ -956,12 +965,14 @@ class PsdReconstructionPage(QFrame):
         if path:
             self.selected_metadata = os.path.abspath(path)
             self.metadata_edit.setText(self.selected_metadata)
+            self._update_artmesh_inspector_button()
             self.mark_project_dirty()
             self.append_log(tr("psd.selected_metadata", path=self.selected_metadata))
 
     def clear_metadata_file(self):
         self.selected_metadata = ""
         self.metadata_edit.clear()
+        self._update_artmesh_inspector_button()
         self.mark_project_dirty()
         self.append_log(tr("psd.metadata_default_log"))
 
@@ -1034,6 +1045,50 @@ class PsdReconstructionPage(QFrame):
         folder = self.current_project.project_dir / "psd"
         folder.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder.resolve())))
+
+    def _artmesh_metadata_path(self) -> Path | None:
+        candidates: list[str] = [
+            str(self.selected_metadata or ""),
+            str(self.metadata_edit.text().strip() if hasattr(self, "metadata_edit") else ""),
+        ]
+        source = self.selected_repack_psd_path()
+        if source:
+            candidates.append(str(Path(source).with_suffix(".lpkpsd.json")))
+        latest = self.latest_project_export()
+        if latest:
+            candidates.append(str(latest.get("metadata") or ""))
+        for value in candidates:
+            if not value:
+                continue
+            path = Path(value)
+            if self.current_project and not path.is_absolute():
+                path = resolve_project_path(self.current_project, path)
+            if path.is_file():
+                return path.resolve()
+        return None
+
+    def _update_artmesh_inspector_button(self) -> None:
+        if not hasattr(self, "artmesh_inspector_button"):
+            return
+        self.artmesh_inspector_button.setEnabled(
+            not self._is_busy and self._artmesh_metadata_path() is not None
+        )
+
+    def open_artmesh_inspector(self) -> None:
+        metadata_path = self._artmesh_metadata_path()
+        if metadata_path is None:
+            self.append_log(tr("psd.inspector.choose_first"))
+            return
+        if self.artmesh_inspector_dialog is not None:
+            self.artmesh_inspector_dialog.inspector.load_metadata(metadata_path)
+            self.artmesh_inspector_dialog.show()
+            self.artmesh_inspector_dialog.raise_()
+            self.artmesh_inspector_dialog.activateWindow()
+            return
+        dialog = ArtMeshInspectorDialog(metadata_path, self)
+        self.artmesh_inspector_dialog = dialog
+        dialog.finished.connect(lambda _result: setattr(self, "artmesh_inspector_dialog", None))
+        dialog.show()
 
     def _set_manual_repack_psd(self, path: str):
         self.manual_repack_psd = os.path.abspath(path)
@@ -1395,10 +1450,10 @@ class PsdReconstructionPage(QFrame):
         self.progress_bar.setValue(100)
         self.stage_label.setText(tr("psd.stage.done"))
         self.open_output_button.setEnabled(True)
-        if result.mode in {"mesh", "atlas-components"} and Path(result.psd_path).is_file():
+        if result.mode in {"mesh", "atlas-components", "atlas-artmesh"} and Path(result.psd_path).is_file():
             self.last_psd_path = str(Path(result.psd_path).resolve())
         self.open_photoshop_button.setEnabled(
-            result.mode in {"mesh", "atlas-components"} and Path(result.psd_path).is_file()
+            result.mode in {"mesh", "atlas-components", "atlas-artmesh"} and Path(result.psd_path).is_file()
         )
         self.repack_photoshop_button.setEnabled(bool(self.selected_repack_psd_path()))
 
@@ -1407,8 +1462,20 @@ class PsdReconstructionPage(QFrame):
 
         if result.metadata_path:
             self.append_log(tr("psd.metadata_log", path=str(result.metadata_path)))
+            if Path(result.metadata_path).is_file():
+                self.selected_metadata = str(Path(result.metadata_path).resolve())
+                self.metadata_edit.setText(self.selected_metadata)
         if result.output_paths:
             self.append_log(tr("psd.output_count_log", count=len(result.output_paths)))
+        if result.shared_regions:
+            self.append_log(tr("psd.report.shared_regions", count=len(result.shared_regions)))
+        if result.change_regions:
+            self.append_log(tr("psd.report.change_regions", count=len(result.change_regions)))
+        if result.conflicts:
+            self.append_log(tr("psd.report.conflicts", count=len(result.conflicts)))
+        if result.report_path:
+            self.append_log(tr("psd.report.path", path=result.report_path))
+        self._update_artmesh_inspector_button()
 
         self.update_project_after_result(result)
 
@@ -1448,6 +1515,9 @@ class PsdReconstructionPage(QFrame):
         self.source_folder_button.setEnabled(not busy)
         self.export_name_edit.setEnabled(not busy)
         self.repack_psd_button.setEnabled(not busy)
+        self.artmesh_inspector_button.setEnabled(
+            not busy and self._artmesh_metadata_path() is not None
+        )
         self.repack_photoshop_button.setEnabled(not busy and bool(self.selected_repack_psd_path()))
         self.texture_name_edit.setEnabled(not busy)
         self.new_project_button.setEnabled(not busy)
@@ -1647,6 +1717,8 @@ class PsdReconstructionPage(QFrame):
             self.mode_hint_label.setText("")
         elif mode == "atlas-components":
             self.mode_hint_label.setText(tr("psd.mode_hint.atlas_components"))
+        elif mode == "atlas-artmesh":
+            self.mode_hint_label.setText(tr("psd.mode_hint.atlas_artmesh"))
         else:
             self.mode_hint_label.setText(tr("psd.mode_hint.mesh_pose"))
 
@@ -1655,6 +1727,7 @@ class PsdReconstructionPage(QFrame):
         if not source:
             self.selected_metadata = ""
             self.metadata_edit.clear()
+            self._update_artmesh_inspector_button()
             return
         scheme = self.selected_pose_scheme()
         scheme_metadata = str((scheme or {}).get("metadata") or "")
@@ -1668,6 +1741,7 @@ class PsdReconstructionPage(QFrame):
         else:
             self.selected_metadata = ""
             self.metadata_edit.clear()
+        self._update_artmesh_inspector_button()
 
     def _sync_repack_output_dir(self):
         source = self.selected_repack_psd_path()
@@ -1747,6 +1821,8 @@ class PsdReconstructionPage(QFrame):
             return tr("psd.stage.render_mesh")
         if "split texture" in lower or "editable layer" in lower:
             return tr("psd.stage.atlas_components")
+        if "extracted" in lower or "artmesh" in lower:
+            return "Atlas ArtMesh"
         if "source resolved" in lower or "resolv" in lower:
             return tr("psd.stage.resolve_model")
         return message
@@ -2426,7 +2502,7 @@ class PsdReconstructionPage(QFrame):
         if not self.current_project:
             return
         try:
-            if result.mode in {"mesh", "atlas-components"} and self.pending_pose_scheme_id:
+            if result.mode in {"mesh", "atlas-components", "atlas-artmesh"} and self.pending_pose_scheme_id:
                 self.current_project = record_pose_scheme_export(
                     self.current_project,
                     self.pending_pose_scheme_id,
@@ -2435,7 +2511,7 @@ class PsdReconstructionPage(QFrame):
                     result.mode,
                     result.layer_count,
                 )
-            elif result.mode in {"mesh", "atlas-components"}:
+            elif result.mode in {"mesh", "atlas-components", "atlas-artmesh"}:
                 self.current_project = record_psd_export(
                     self.current_project,
                     result.psd_path,
@@ -2451,6 +2527,7 @@ class PsdReconstructionPage(QFrame):
                     self.pending_repack_dir,
                     result.output_paths,
                     self.pending_repack_name,
+                    texture_outputs=result.texture_outputs,
                 )
             elif result.mode in {"mesh-repack", "atlas-repack"} and self.pending_repack_id:
                 self.current_project = record_repack(
@@ -2462,6 +2539,7 @@ class PsdReconstructionPage(QFrame):
                     result.output_paths,
                     scheme_id=self.pending_pose_scheme_id,
                     display_name=self.pending_repack_name,
+                    texture_outputs=result.texture_outputs,
                 )
             self.refresh_project_ui(self.pending_repack_id or None)
             self.refresh_project_combo(select_project_file=str(self.current_project.project_file))

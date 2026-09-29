@@ -13,7 +13,15 @@ from PIL import Image
 
 ProgressCallback = Callable[[int, str], None]
 METADATA_FORMAT = "LpkUnpacker.Live2DAtlasPSD"
-METADATA_VERSION = 1
+METADATA_VERSION = 2
+
+# The names are deliberately fixed.  Photoshop users can still add semantic
+# sub-groups below these folders, while the importer has one stable anchor when
+# a layer is renamed or duplicated.
+PSD_GROUP_ORIGINAL = "Original"
+PSD_GROUP_PAINT = "Paint"
+PSD_GROUP_AI_EDIT = "AI_Edit"
+PSD_BINDING_GROUPS = (PSD_GROUP_ORIGINAL, PSD_GROUP_PAINT, PSD_GROUP_AI_EDIT)
 
 
 class PsdReconstructionError(RuntimeError):
@@ -86,6 +94,17 @@ class ReconstructionResult:
     # repack uses this as the next PSD's baseline, so untouched pixels survive
     # every pass instead of being recreated from a transparent canvas.
     texture_outputs: dict[int, Path] = field(default_factory=dict)
+    # Regions changed by this operation.  The entries are intentionally plain
+    # dictionaries so the GUI can display them and callers can serialize them
+    # without importing an additional model type.
+    change_regions: list[dict[str, Any]] = field(default_factory=list)
+    conflicts: list[dict[str, Any]] = field(default_factory=list)
+    shared_regions: list[dict[str, Any]] = field(default_factory=list)
+    report: dict[str, Any] = field(default_factory=dict)
+    report_path: Optional[Path] = None
+    # Internal exact masks used to produce conflict reports.  They are kept
+    # out of the serialized report because NumPy arrays are not JSON values.
+    region_masks: list[dict[str, Any]] = field(default_factory=list, repr=False)
 
     @property
     def primary_path(self) -> Path:
@@ -101,6 +120,73 @@ class PsdLayer:
     left: int = 0
     top: int = 0
     group: Optional[str] = None
+    role: str = PSD_GROUP_ORIGINAL
+    unit_id: Optional[str] = None
+
+
+class _BoundPsdLayers:
+    """Composite adapter for legacy flat PSD overlay layers.
+
+    Early PSD exports did not create an edit-unit group.  Photoshop users
+    commonly kept the original layer as ``name`` and added edits as
+    ``name_1``, ``name_2`` and so on.  psd-tools can composite a real Group,
+    but synthesising one would lose the original layer IDs and parent
+    visibility.  This small adapter keeps the actual stack order and exposes
+    the subset of the layer API used by the repacker.
+    """
+
+    def __init__(self, layers: list[Any]) -> None:
+        self.layers = list(layers)
+        boxes = [
+            (
+                int(getattr(layer, "left", 0)),
+                int(getattr(layer, "top", 0)),
+                int(getattr(layer, "left", 0)) + int(getattr(layer, "width", 0)),
+                int(getattr(layer, "top", 0)) + int(getattr(layer, "height", 0)),
+            )
+            for layer in self.layers
+        ]
+        if boxes:
+            left = min(box[0] for box in boxes)
+            top = min(box[1] for box in boxes)
+            right = max(box[2] for box in boxes)
+            bottom = max(box[3] for box in boxes)
+        else:
+            left = top = right = bottom = 0
+        self.left = left
+        self.top = top
+        self.width = max(0, right - left)
+        self.height = max(0, bottom - top)
+        self.name = str(getattr(self.layers[0], "name", "") if self.layers else "")
+        self.visible = True
+        self.parent = None
+        self.layer_id = 0
+
+    def is_group(self) -> bool:
+        return False
+
+    def is_visible(self) -> bool:
+        return any(_layer_effectively_visible(layer) for layer in self.layers)
+
+    def composite(self, force: bool = False, **_: Any) -> Image.Image | None:
+        if self.width <= 0 or self.height <= 0:
+            return None
+        result = Image.new("RGBA", (self.width, self.height), (0, 0, 0, 0))
+        # psd-tools exposes the PSD stack from bottom to top.  Applying the
+        # layers in that order reproduces Photoshop's normal alpha stacking.
+        for layer in self.layers:
+            if not _layer_effectively_visible(layer):
+                continue
+            image = layer.composite(force=force)
+            if image is None:
+                continue
+            _alpha_composite_at(
+                result,
+                image.convert("RGBA"),
+                int(getattr(layer, "left", 0)) - self.left,
+                int(getattr(layer, "top", 0)) - self.top,
+            )
+        return result
 
 
 def _resolve_resource_limits(
@@ -269,13 +355,24 @@ def _validate_psd_layers(
     limits: PsdResourceLimits,
     operation: str,
 ) -> None:
-    if len(psd_layers) > limits.max_layer_count:
+    unique_layers: list[Any] = []
+    seen: set[int] = set()
+    for layer in psd_layers.values():
+        if bool(getattr(layer, "is_group", lambda: False)()):
+            continue
+        marker = id(layer)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        unique_layers.append(layer)
+    if len(unique_layers) > limits.max_layer_count:
         raise PsdReconstructionError(
-            f"{operation} blocked by the safety limit: PSD contains {len(psd_layers):,} indexed layers, "
+            f"{operation} blocked by the safety limit: PSD contains {len(unique_layers):,} indexed layers, "
             f"exceeding {limits.max_layer_count:,}."
         )
     total_pixels = 0
-    for name, layer in psd_layers.items():
+    for layer in unique_layers:
+        name = str(getattr(layer, "name", "?"))
         width = int(getattr(layer, "width", 0) or 0)
         height = int(getattr(layer, "height", 0) or 0)
         if width <= 0 or height <= 0:
@@ -288,7 +385,7 @@ def _validate_psd_layers(
             )
         total_pixels += pixels
     _validate_layer_budget(
-        len(psd_layers), total_pixels, texture_pixels, limits, operation
+        len(unique_layers), total_pixels, texture_pixels, limits, operation
     )
 
 
@@ -302,6 +399,12 @@ def reconstruct_live2d_psd(
     output_name: str | None = None,
     resource_limits: PsdResourceLimits | Mapping[str, Any] | None = None,
 ) -> ReconstructionResult:
+    mode = str(mode or "mesh").strip().lower()
+    if mode not in {"mesh", "atlas-components", "atlas-artmesh"}:
+        raise PsdReconstructionError(
+            f"Unsupported PSD reconstruction mode: {mode}. "
+            "Use mesh, atlas-components, or atlas-artmesh."
+        )
     limits = _resolve_resource_limits(resource_limits)
     cv2 = _require_cv2()
     _configure_opencv(cv2, limits)
@@ -321,7 +424,9 @@ def reconstruct_live2d_psd(
 
     _emit(progress, 20, f"Loaded {len(textures)} texture atlas file(s)")
 
-    if mode == "mesh" and (parameter_values or not source_info.mesh_data):
+    if mode in {"mesh", "atlas-artmesh"} and (
+        not source_info.mesh_data or (mode == "mesh" and parameter_values)
+    ):
         try:
             from app.core.cubism_core import CubismCoreError, export_drawables_sidecar
 
@@ -343,6 +448,21 @@ def reconstruct_live2d_psd(
             cv2, source_info.mesh_data, textures, progress, limits, texture_pixels
         )
         mode = "mesh"
+    elif mode == "atlas-artmesh":
+        if not source_info.mesh_data:
+            raise PsdReconstructionError(
+                "Atlas ArtMesh export requires Cubism drawable metadata."
+            )
+        layers, size, layer_metadata, shared_regions = _build_atlas_artmesh_layers(
+            cv2,
+            source_info.mesh_data,
+            source_info.textures,
+            textures,
+            progress,
+            limits,
+            texture_pixels,
+        )
+        mode = "atlas-artmesh"
     else:
         if mode == "mesh":
             warnings.append(
@@ -354,7 +474,11 @@ def reconstruct_live2d_psd(
         mode = "atlas-components"
 
     model_name = _safe_output_name(output_name or _clean_model_name(source_info.model_json))
-    suffix = "mesh_pose" if mode == "mesh" else "editable_atlas"
+    suffix = {
+        "mesh": "mesh_pose",
+        "atlas-components": "editable_atlas",
+        "atlas-artmesh": "atlas_artmesh",
+    }[mode]
     psd_path = output_path / f"{model_name}_{suffix}.psd"
     metadata_path = output_path / f"{model_name}_{suffix}.lpkpsd.json"
     _emit(progress, 90, f"Preparing PSD with {len(layers)} layer(s)")
@@ -369,18 +493,29 @@ def reconstruct_live2d_psd(
     _save_psd(psd_path, size, layers, progress=progress, resource_limits=limits)
     _emit(progress, 98, "Writing metadata")
     _refresh_pixel_references_from_psd(psd_path, layer_metadata)
-    _write_json(
-        metadata_path,
-        _build_export_metadata(
-            source_info,
-            textures,
-            size,
-            mode,
-            layer_metadata,
-            pose_name=pose_name,
-            parameter_values=parameter_values,
-        ),
+    metadata = _build_export_metadata(
+        source_info,
+        textures,
+        size,
+        mode,
+        layer_metadata,
+        pose_name=pose_name,
+        parameter_values=parameter_values,
     )
+    if mode == "atlas-artmesh":
+        metadata["shared_regions"] = shared_regions
+    _write_layer_baselines(psd_path, metadata_path, layer_metadata)
+    _write_json(metadata_path, metadata)
+    export_report = {
+        "mode": mode,
+        "psd": str(psd_path),
+        "metadata": str(metadata_path),
+        "layer_count": len(layers),
+        "shared_regions": shared_regions if mode == "atlas-artmesh" else [],
+        "conflicts": [],
+    }
+    report_path = output_path / f"{model_name}_{suffix}.report.json"
+    _write_json(report_path, export_report)
 
     _emit(progress, 100, f"PSD written: {psd_path}")
     return ReconstructionResult(
@@ -389,6 +524,9 @@ def reconstruct_live2d_psd(
         mode=mode,
         warnings=warnings,
         metadata_path=metadata_path,
+        shared_regions=shared_regions if mode == "atlas-artmesh" else [],
+        report=export_report,
+        report_path=report_path,
     )
 
 
@@ -402,6 +540,7 @@ def repack_atlas_png_from_psd(
 ) -> ReconstructionResult:
     limits = _resolve_resource_limits(resource_limits)
     _require_psd_tools()
+    cv2 = _require_cv2()
     from psd_tools import PSDImage
 
     psd_file = Path(psd_path).resolve()
@@ -412,18 +551,26 @@ def repack_atlas_png_from_psd(
     metadata = _read_json(metadata_file)
     if metadata.get("format") != METADATA_FORMAT:
         raise PsdReconstructionError(f"Unsupported PSD metadata file: {metadata_file}")
+    _validate_metadata_source_summaries(metadata)
     mode = str(metadata.get("mode") or "")
-    if mode not in {"atlas-components", "mesh"}:
+    if mode not in {"atlas-components", "atlas-artmesh", "mesh"}:
         raise PsdReconstructionError(
-            "Only mesh or editable atlas PSD metadata can be repacked into atlas PNG files."
+            "Only mesh, atlas-components, or atlas-artmesh PSD metadata can be repacked."
         )
+    shared_regions = (
+        [dict(item) for item in (metadata.get("shared_regions") or []) if isinstance(item, Mapping)]
+        if mode == "atlas-artmesh"
+        else []
+    )
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     textures = _metadata_textures(metadata)
     layers_metadata = _metadata_layers(
         metadata,
-        {"drawable-mesh"} if mode == "mesh" else {"atlas-component", "texture-atlas"},
+        {"drawable-mesh"}
+        if mode == "mesh"
+        else {"atlas-component", "texture-atlas", "atlas-artmesh"},
     )
     texture_pixels = _validate_metadata_textures(textures, limits, "PSD repack")
     _validate_metadata_layer_budget(layers_metadata, texture_pixels, limits, "PSD repack")
@@ -437,6 +584,7 @@ def repack_atlas_png_from_psd(
 
     if mode == "mesh":
         return _repack_mesh_psd_layers(
+            psd,
             psd_layers,
             textures,
             layers_metadata,
@@ -448,18 +596,39 @@ def repack_atlas_png_from_psd(
             input_texture_paths,
         )
 
-    canvases, warnings = _load_atlas_repack_canvases(textures, input_texture_paths)
+    canvases, warnings = _load_atlas_repack_canvases(
+        textures,
+        input_texture_paths,
+        output_path=output_path,
+        metadata_file=metadata_file,
+    )
+    baseline_canvases, baseline_warnings = _load_atlas_repack_canvases(
+        textures,
+        None,
+        output_path=None,
+        metadata_file=metadata_file,
+    )
+    warnings.extend(baseline_warnings)
     total = max(1, len(layers_metadata))
+    change_regions: list[dict[str, Any]] = []
+    region_masks: list[dict[str, Any]] = []
 
     for index, layer_info in enumerate(layers_metadata):
         texture_index = int(layer_info["texture_index"])
         canvas = canvases.get(texture_index)
-        if canvas is None:
+        baseline_canvas = baseline_canvases.get(texture_index)
+        if canvas is None or baseline_canvas is None:
             continue
 
-        layer = psd_layers.get(str(layer_info["name"]))
+        layer = _find_bound_psd_layer(psd, psd_layers, layer_info)
         if layer is None:
             warnings.append(f"Layer missing in PSD: {layer_info['name']}")
+            continue
+        if not _layer_effectively_visible(layer):
+            warnings.append(f"Layer or parent group hidden in PSD: {layer_info['name']}")
+            continue
+        if bool(getattr(layer, "is_group", lambda: False)()) and not _has_visible_edit_children(layer):
+            warnings.append(f"No visible Paint or AI_Edit child in PSD: {layer_info['name']}")
             continue
 
         image = layer.composite(force=True)
@@ -469,18 +638,58 @@ def repack_atlas_png_from_psd(
 
         left = int(getattr(layer, "left", layer_info.get("left", 0)))
         top = int(getattr(layer, "top", layer_info.get("top", 0)))
-        _alpha_composite_at(canvas, image.convert("RGBA"), left, top)
+        edited = np.asarray(image.convert("RGBA"), dtype=np.uint8)
+        baseline_layer = _load_layer_baseline(
+            metadata_file,
+            layer_info,
+            baseline_canvas,
+            left,
+            top,
+            edited.shape[:2],
+            baseline_origin=(int(layer_info.get("left", left)), int(layer_info.get("top", top))),
+        )
+        changed = _rgba_difference_mask(edited, baseline_layer)
+        reference_changed = _pixel_reference_changed_mask(edited, layer_info.get("pixel_reference"))
+        if reference_changed is not None and not np.any(reference_changed):
+            changed.fill(False)
+        if changed.shape != edited.shape[:2]:
+            changed = cv2.resize(changed.astype(np.uint8), (edited.shape[1], edited.shape[0]), interpolation=cv2.INTER_NEAREST).astype(bool)
+        if np.any(changed):
+            before = np.asarray(canvas).copy()
+            _replace_rgba_at(canvas, edited, changed, left, top)
+            actual_changed = np.any(np.asarray(canvas) != before, axis=2)
+            region = _mask_region(actual_changed, texture_index, layer_info.get("name"))
+            if region:
+                change_regions.append(region)
+                region_masks.append(
+                    {
+                        "texture_index": texture_index,
+                        "layer": str(layer_info.get("name") or ""),
+                        "mask": actual_changed,
+                    }
+                )
         _emit(progress, 10 + int((index + 1) / total * 75), f"Packed {layer_info['name']}")
 
     outputs: list[Path] = []
     _emit(progress, 95, "Writing atlas PNG")
     for texture in textures:
         canvas = canvases[texture["index"]]
-        output_file = output_path / texture["name"]
+        output_file = output_path / _texture_output_name(texture)
         canvas.save(output_file)
         outputs.append(output_file)
 
     _emit(progress, 100, f"Atlas PNG written: {output_path}")
+    conflicts = _detect_mask_conflicts(region_masks)
+    report = {
+        "mode": "atlas-repack",
+        "metadata": str(metadata_file),
+        "output_paths": [str(path) for path in outputs],
+        "change_regions": change_regions,
+        "conflicts": conflicts,
+        "shared_regions": shared_regions,
+    }
+    report_path = output_path / "repack_report.json"
+    _write_json(report_path, report)
     return ReconstructionResult(
         psd_path=outputs[0] if outputs else output_path,
         layer_count=len(layers_metadata),
@@ -489,10 +698,17 @@ def repack_atlas_png_from_psd(
         metadata_path=metadata_file,
         output_paths=outputs,
         texture_outputs={int(texture["index"]): output for texture, output in zip(textures, outputs)},
+        change_regions=change_regions,
+        conflicts=conflicts,
+        shared_regions=shared_regions,
+        report=report,
+        report_path=report_path,
+        region_masks=region_masks,
     )
 
 
 def _repack_mesh_psd_layers(
+    psd,
     psd_layers: dict[str, Any],
     textures: list[dict[str, Any]],
     layers_metadata: list[dict[str, Any]],
@@ -512,9 +728,22 @@ def _repack_mesh_psd_layers(
         limits,
         "PSD mesh repack",
     )
-    canvases, warnings = _load_mesh_repack_canvases(textures, input_texture_paths)
-    original_canvases = {index: canvas.copy() for index, canvas in canvases.items()}
+    canvases, warnings = _load_mesh_repack_canvases(
+        textures,
+        input_texture_paths,
+        output_path=output_path,
+        metadata_file=metadata_file,
+    )
+    original_canvases, baseline_warnings = _load_mesh_repack_canvases(
+        textures,
+        None,
+        output_path=None,
+        metadata_file=metadata_file,
+    )
+    warnings.extend(baseline_warnings)
     total = max(1, len(layers_metadata))
+    change_regions: list[dict[str, Any]] = []
+    region_masks: list[dict[str, Any]] = []
 
     for index, layer_info in enumerate(layers_metadata):
         texture_index = int(layer_info["texture_index"])
@@ -523,9 +752,15 @@ def _repack_mesh_psd_layers(
         if canvas is None or original_canvas is None:
             continue
 
-        layer = psd_layers.get(str(layer_info["name"]))
+        layer = _find_bound_psd_layer(psd, psd_layers, layer_info)
         if layer is None:
             warnings.append(f"Layer missing in PSD: {layer_info['name']}")
+            continue
+        if not _layer_effectively_visible(layer):
+            warnings.append(f"Layer or parent group hidden in PSD: {layer_info['name']}")
+            continue
+        if bool(getattr(layer, "is_group", lambda: False)()) and not _has_visible_edit_children(layer):
+            warnings.append(f"No visible Paint or AI_Edit child in PSD: {layer_info['name']}")
             continue
 
         image = layer.composite(force=True)
@@ -546,9 +781,24 @@ def _repack_mesh_psd_layers(
             warnings.append(f"Layer metadata has mismatched mesh data: {layer_info['name']}")
             continue
 
-        left = int(getattr(layer, "left", layer_info.get("left", 0)))
-        top = int(getattr(layer, "top", layer_info.get("top", 0)))
-        source = np.asarray(image.convert("RGBA"))
+        if bool(getattr(layer, "is_group", lambda: False)()):
+            group_left = int(getattr(layer, "left", layer_info.get("left", 0)))
+            group_top = int(getattr(layer, "top", layer_info.get("top", 0)))
+            left = int(layer_info.get("left", group_left))
+            top = int(layer_info.get("top", group_top))
+            bbox = layer_info.get("bbox")
+            expected_width = int(bbox[2]) if isinstance(bbox, (list, tuple)) and len(bbox) >= 4 else image.width
+            expected_height = int(bbox[3]) if isinstance(bbox, (list, tuple)) and len(bbox) >= 4 else image.height
+            source = _place_layer_image(
+                np.asarray(image.convert("RGBA"), dtype=np.uint8),
+                (expected_height, expected_width),
+                group_left - left,
+                group_top - top,
+            )
+        else:
+            left = int(getattr(layer, "left", layer_info.get("left", 0)))
+            top = int(getattr(layer, "top", layer_info.get("top", 0)))
+            source = np.asarray(image.convert("RGBA"))
         changed_tiles = _pixel_reference_changed_mask(
             source,
             layer_info.get("pixel_reference"),
@@ -567,6 +817,22 @@ def _repack_mesh_psd_layers(
             indices,
             float(layer_info.get("opacity", 1.0)),
         )
+        baseline_layer = _load_layer_baseline(
+            metadata_file,
+            layer_info,
+            Image.fromarray(original_layer, "RGBA"),
+            0,
+            0,
+            source.shape[:2],
+            baseline_origin=(int(layer_info.get("left", left)), int(layer_info.get("top", top))),
+        )
+        if baseline_layer.shape == source.shape and not np.array_equal(
+            baseline_layer, original_layer
+        ):
+            # The exported PSD decode is the authoritative baseline.  This
+            # avoids treating premultiplied/PNG round-trip bytes as edits when
+            # a mesh was rendered from the source atlas.
+            original_layer = baseline_layer
         edit_mask = _changed_pixel_mask(cv2, source, original_layer)
         if changed_tiles is not None:
             edit_mask = np.where(changed_tiles, edit_mask, 0).astype(np.uint8)
@@ -574,6 +840,7 @@ def _repack_mesh_psd_layers(
             _emit(progress, 10 + int((index + 1) / total * 80), f"Packed {layer_info['name']}")
             continue
 
+        before_canvas = canvas.copy()
         for tri in _iter_triangles(indices):
             if max(tri) >= len(local_vertices) or max(tri) >= len(texture_points):
                 continue
@@ -586,17 +853,39 @@ def _repack_mesh_psd_layers(
                 texture_points[list(tri)],
             )
 
+        actual_changed = np.any(canvas != before_canvas, axis=2)
+        region = _mask_region(actual_changed, texture_index, layer_info.get("name"))
+        if region:
+            change_regions.append(region)
+            region_masks.append(
+                {
+                    "texture_index": texture_index,
+                    "layer": str(layer_info.get("name") or ""),
+                    "mask": actual_changed,
+                }
+            )
+
         _emit(progress, 10 + int((index + 1) / total * 80), f"Packed {layer_info['name']}")
 
     outputs: list[Path] = []
     _emit(progress, 95, "Writing atlas PNG")
     for texture in textures:
         canvas = canvases[texture["index"]]
-        output_file = output_path / texture["name"]
+        output_file = output_path / _texture_output_name(texture)
         Image.fromarray(canvas, "RGBA").save(output_file)
         outputs.append(output_file)
 
     _emit(progress, 100, f"Atlas PNG written: {output_path}")
+    conflicts = _detect_mask_conflicts(region_masks)
+    report = {
+        "mode": "mesh-repack",
+        "metadata": str(metadata_file),
+        "output_paths": [str(path) for path in outputs],
+        "change_regions": change_regions,
+        "conflicts": conflicts,
+    }
+    report_path = output_path / "repack_report.json"
+    _write_json(report_path, report)
     return ReconstructionResult(
         psd_path=outputs[0] if outputs else output_path,
         layer_count=len(layers_metadata),
@@ -605,12 +894,20 @@ def _repack_mesh_psd_layers(
         metadata_path=metadata_file,
         output_paths=outputs,
         texture_outputs={int(texture["index"]): output for texture, output in zip(textures, outputs)},
+        change_regions=change_regions,
+        conflicts=conflicts,
+        report=report,
+        report_path=report_path,
+        region_masks=region_masks,
     )
 
 
 def _load_mesh_repack_canvases(
     textures: list[dict[str, Any]],
     input_texture_paths: Mapping[int, str | Path] | None = None,
+    *,
+    output_path: Path | None = None,
+    metadata_file: Path | None = None,
 ) -> tuple[dict[int, np.ndarray], list[str]]:
     canvases: dict[int, np.ndarray] = {}
     warnings: list[str] = []
@@ -618,19 +915,15 @@ def _load_mesh_repack_canvases(
         width = int(texture["width"])
         height = int(texture["height"])
         source_path = _resolve_repack_texture_path(texture, input_texture_paths)
-        if source_path.is_file():
-            with Image.open(source_path) as source_image:
-                image = source_image.convert("RGBA")
-            if image.size != (width, height):
-                warnings.append(
-                    f"Texture size changed, resizing original atlas for repack: {source_path}"
-                )
-                image = image.resize((width, height), Image.Resampling.LANCZOS)
-        else:
-            warnings.append(
-                f"Original texture missing; unchanged hidden pixels cannot be preserved: {source_path}"
+        _ensure_repack_source(source_path, texture, output_path, metadata_file)
+        with Image.open(source_path) as source_image:
+            image = source_image.convert("RGBA")
+        if image.size != (width, height):
+            raise PsdReconstructionError(
+                f"Texture size changed for {source_path}: expected {width}x{height}, "
+                f"got {image.width}x{image.height}. Repack aborted to preserve the fixed baseline."
             )
-            image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        _validate_texture_digest(source_path, texture, image)
         canvases[int(texture["index"])] = np.asarray(image).copy()
     return canvases, warnings
 
@@ -638,6 +931,9 @@ def _load_mesh_repack_canvases(
 def _load_atlas_repack_canvases(
     textures: list[dict[str, Any]],
     input_texture_paths: Mapping[int, str | Path] | None = None,
+    *,
+    output_path: Path | None = None,
+    metadata_file: Path | None = None,
 ) -> tuple[dict[int, Image.Image], list[str]]:
     """Load the original atlas as the base for component PSD repack too.
 
@@ -651,21 +947,39 @@ def _load_atlas_repack_canvases(
         width = int(texture["width"])
         height = int(texture["height"])
         source_path = _resolve_repack_texture_path(texture, input_texture_paths)
-        if source_path.is_file():
-            with Image.open(source_path) as source_image:
-                image = source_image.convert("RGBA")
-            if image.size != (width, height):
-                warnings.append(
-                    f"Texture size changed, resizing original atlas for repack: {source_path}"
-                )
-                image = image.resize((width, height), Image.Resampling.LANCZOS)
-        else:
-            warnings.append(
-                f"Original texture missing; unchanged hidden pixels cannot be preserved: {source_path}"
+        _ensure_repack_source(source_path, texture, output_path, metadata_file)
+        with Image.open(source_path) as source_image:
+            image = source_image.convert("RGBA")
+        if image.size != (width, height):
+            raise PsdReconstructionError(
+                f"Texture size changed for {source_path}: expected {width}x{height}, "
+                f"got {image.width}x{image.height}. Repack aborted to preserve the fixed baseline."
             )
-            image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        _validate_texture_digest(source_path, texture, image)
         canvases[int(texture["index"])] = image
     return canvases, warnings
+
+
+def _validate_texture_digest(
+    source_path: Path,
+    texture: Mapping[str, Any],
+    image: Image.Image,
+) -> None:
+    expected = str(texture.get("rgba_sha256") or "")
+    fixed_source = str(texture.get("source_path") or "")
+    if not expected or not fixed_source:
+        return
+    # In a multi-PSD pass source_path may be the previous output.  Only the
+    # path recorded in metadata is the immutable baseline whose digest must
+    # still match.
+    if source_path.resolve() != Path(fixed_source).resolve():
+        return
+    actual = _rgba_sha256(image)
+    if actual != expected:
+        raise PsdReconstructionError(
+            f"Original texture digest changed for {texture.get('relative_path') or texture.get('name') or source_path.name}: "
+            f"{source_path}. Repack requires the fixed original baseline."
+        )
 
 
 def _resolve_repack_texture_path(
@@ -674,7 +988,42 @@ def _resolve_repack_texture_path(
 ) -> Path:
     texture_index = int(texture["index"])
     candidate = (input_texture_paths or {}).get(texture_index)
-    return Path(str(candidate or texture.get("source_path") or ""))
+    value = candidate or texture.get("source_path") or ""
+    if not value:
+        raise PsdReconstructionError(
+            f"No source texture path is available for texture index {texture_index} "
+            f"({texture.get('relative_path') or texture.get('name') or '?'})"
+        )
+    return Path(str(value)).resolve()
+
+
+def _ensure_repack_source(
+    source_path: Path,
+    texture: Mapping[str, Any],
+    output_path: Path | None,
+    metadata_file: Path | None,
+) -> None:
+    if not source_path.is_file():
+        relative = texture.get("relative_path") or texture.get("name") or "?"
+        raise PsdReconstructionError(
+            f"Original texture is missing for {relative}: {source_path}. "
+            "Repack requires the fixed original baseline."
+        )
+    if output_path is None:
+        return
+    target = (output_path / _texture_output_name(texture)).resolve()
+    fixed_source_value = str(texture.get("source_path") or "")
+    fixed_source = Path(fixed_source_value).resolve() if fixed_source_value else None
+    # A multi-PSD pass may intentionally feed the preceding pass's output
+    # back into the next pass.  That is safe when the input differs from the
+    # immutable source path.  A direct repack that resolves to the source
+    # atlas itself remains an error even when an explicit input mapping was
+    # supplied.
+    if target == source_path.resolve() and (fixed_source is None or fixed_source == source_path.resolve()):
+        raise PsdReconstructionError(
+            f"Repack output would overwrite the original baseline texture: {source_path}. "
+            "Choose a separate output directory."
+        )
 
 
 def repack_multiple_psds(
@@ -692,10 +1041,35 @@ def repack_multiple_psds(
     if len(ordered_paths) < 2:
         raise PsdReconstructionError("Multi-PSD repack requires at least two PSD files.")
 
+    signatures: list[dict[str, Any]] = []
+    for psd_file in ordered_paths:
+        metadata_file = _default_metadata_path(psd_file)
+        metadata = _read_json(metadata_file)
+        if metadata.get("format") != METADATA_FORMAT:
+            raise PsdReconstructionError(
+                f"Unsupported PSD metadata file for multi-PSD repack: {metadata_file}"
+            )
+        signatures.append(_metadata_model_signature(metadata))
+    baseline_signature = signatures[0]
+    consistency_errors: list[str] = []
+    for index, signature in enumerate(signatures[1:], start=2):
+        differences = _compare_model_signatures(baseline_signature, signature)
+        if differences:
+            consistency_errors.append(f"PSD #{index}: " + "; ".join(differences))
+    if consistency_errors:
+        raise PsdReconstructionError(
+            "Multi-PSD model mismatch; all PSDs must use the same model and texture atlas layout. "
+            + " | ".join(consistency_errors)
+        )
+
     latest: ReconstructionResult | None = None
     texture_paths: dict[int, Path] | None = None
     total = len(ordered_paths)
     warnings: list[str] = []
+    all_regions: list[dict[str, Any]] = []
+    all_conflicts: list[dict[str, Any]] = []
+    all_shared_regions: list[dict[str, Any]] = []
+    all_region_masks: list[dict[str, Any]] = []
     for step, psd_file in enumerate(reversed(ordered_paths)):
         start = int(step / total * 95)
         span = max(1, int(95 / total))
@@ -711,12 +1085,69 @@ def repack_multiple_psds(
             input_texture_paths=texture_paths,
         )
         warnings.extend(result.warnings)
+        for shared in result.shared_regions:
+            enriched_shared = dict(shared)
+            enriched_shared["psd"] = str(psd_file)
+            all_shared_regions.append(enriched_shared)
+        for region in result.change_regions:
+            enriched = dict(region)
+            enriched["psd"] = str(psd_file)
+            all_regions.append(enriched)
+        for region in result.region_masks:
+            enriched_mask = dict(region)
+            enriched_mask["psd"] = str(psd_file)
+            all_region_masks.append(enriched_mask)
+        for conflict in result.conflicts:
+            enriched = dict(conflict)
+            enriched["psd"] = str(psd_file)
+            all_conflicts.append(enriched)
         texture_paths = result.texture_outputs
         latest = result
 
     if latest is None:
         raise PsdReconstructionError("No PSD was available for multi-PSD repack.")
     _emit(progress, 100, f"Atlas PNG written: {Path(output_dir)}")
+    for index, first in enumerate(all_region_masks):
+        first_mask = first.get("mask")
+        if not isinstance(first_mask, np.ndarray):
+            continue
+        for second in all_region_masks[index + 1 :]:
+            if first.get("psd") == second.get("psd"):
+                continue
+            if int(first.get("texture_index", -1)) != int(second.get("texture_index", -2)):
+                continue
+            second_mask = second.get("mask")
+            if not isinstance(second_mask, np.ndarray) or first_mask.shape != second_mask.shape:
+                continue
+            overlap_mask = np.asarray(first_mask, dtype=bool) & np.asarray(second_mask, dtype=bool)
+            region = _mask_region(
+                overlap_mask,
+                int(first.get("texture_index", -1)),
+                f"{first.get('layer', '')}|{second.get('layer', '')}",
+            )
+            if region is not None:
+                all_conflicts.append(
+                    {
+                        "kind": "multi-psd-overlap",
+                        "potential": False,
+                        "texture_index": int(first.get("texture_index", -1)),
+                        "layers": [first.get("layer", ""), second.get("layer", "")],
+                        "psds": [first.get("psd", ""), second.get("psd", "")],
+                        "bbox": region["bbox"],
+                        "pixel_count": region["pixel_count"],
+                    }
+                )
+    report = {
+        "mode": "multi-repack",
+        "psds": [str(path) for path in ordered_paths],
+        "model_signature": baseline_signature,
+        "output_paths": [str(path) for path in latest.output_paths],
+        "change_regions": all_regions,
+        "conflicts": all_conflicts,
+        "shared_regions": all_shared_regions,
+    }
+    report_path = Path(output_dir) / "multi_repack_report.json"
+    _write_json(report_path, report)
     return ReconstructionResult(
         psd_path=latest.psd_path,
         layer_count=sum(1 for _ in ordered_paths),
@@ -725,7 +1156,61 @@ def repack_multiple_psds(
         metadata_path=latest.metadata_path,
         output_paths=latest.output_paths,
         texture_outputs=latest.texture_outputs,
+        change_regions=all_regions,
+        conflicts=all_conflicts,
+        shared_regions=all_shared_regions,
+        report=report,
+        report_path=report_path,
+        region_masks=all_region_masks,
     )
+
+
+def _metadata_model_signature(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    textures = metadata.get("textures") or []
+    normalized_textures: list[dict[str, Any]] = []
+    for item in textures:
+        if not isinstance(item, Mapping):
+            continue
+        normalized_textures.append(
+            {
+                "index": int(item.get("index", len(normalized_textures))),
+                "relative_path": str(item.get("relative_path") or item.get("name") or "").replace("\\", "/"),
+                "name": str(item.get("name") or ""),
+                "width": int(item.get("width", 0)),
+                "height": int(item.get("height", 0)),
+                "rgba_sha256": str(item.get("rgba_sha256") or ""),
+            }
+        )
+    canvas = metadata.get("canvas") if isinstance(metadata.get("canvas"), Mapping) else {}
+    source_model = str(metadata.get("source_model") or "")
+    model_summary = metadata.get("source_model_summary")
+    moc_summary = metadata.get("source_moc_summary")
+    return {
+        "model": Path(source_model).name.casefold() if source_model else "",
+        "model_sha256": str(model_summary.get("sha256") or "") if isinstance(model_summary, Mapping) else "",
+        "moc_sha256": str(moc_summary.get("sha256") or "") if isinstance(moc_summary, Mapping) else "",
+        "canvas": [int(canvas.get("width", 0)), int(canvas.get("height", 0))],
+        "textures": normalized_textures,
+    }
+
+
+def _compare_model_signatures(first: Mapping[str, Any], second: Mapping[str, Any]) -> list[str]:
+    differences: list[str] = []
+    if first.get("model") and second.get("model") and first.get("model") != second.get("model"):
+        differences.append(f"model {first.get('model')} != {second.get('model')}")
+    if first.get("model_sha256") and second.get("model_sha256") and first.get("model_sha256") != second.get("model_sha256"):
+        differences.append("model JSON digest differs")
+    if first.get("moc_sha256") and second.get("moc_sha256") and first.get("moc_sha256") != second.get("moc_sha256"):
+        differences.append("MOC3 digest differs")
+    # Canvas dimensions describe the projection of an individual export.  A
+    # mesh/pose PSD may legitimately use a different projection canvas while
+    # still belonging to the same model and texture layout, so they are not a
+    # model-consistency key for multi-PSD repack.
+    first_textures = list(first.get("textures") or [])
+    second_textures = list(second.get("textures") or [])
+    if first_textures != second_textures:
+        differences.append("texture atlas paths, order, or dimensions differ")
+    return differences
 
 
 def _render_repack_reference_layer(
@@ -754,22 +1239,12 @@ def _changed_pixel_mask(cv2, edited: np.ndarray, reference: np.ndarray) -> np.nd
             interpolation=cv2.INTER_LINEAR,
         )
 
-    delta = np.abs(edited.astype(np.int16) - reference.astype(np.int16))
-    rgb_delta = np.max(delta[:, :, :3], axis=2)
-    # Mesh exports apply Live2D drawable masks.  Those masks make parts of an
-    # otherwise opaque reconstructed reference transparent, even when the
-    # artist did not touch the PSD.  Treating alpha-only differences as edits
-    # therefore erased hair and other masked drawables on writeback.  Only a
-    # visible RGB change in pixels that are visible in both images is safe to
-    # project back onto the original atlas.
-    mutually_visible = (edited[:, :, 3] > 8) & (reference[:, :, 3] > 8)
-    changed = (rgb_delta > 12) & mutually_visible
-    mask = (changed.astype(np.uint8) * 255)
-    if not np.any(mask):
-        return mask
-
-    kernel = np.ones((3, 3), dtype=np.uint8)
-    return cv2.dilate(mask, kernel, iterations=1)
+    # Compare all four channels.  In particular, alpha=0 is a deliberate
+    # erasure and must reach the atlas instead of being filtered as an
+    # ``alpha-only`` difference.  Exported layer baselines are decoded from
+    # the PSD itself, so exact equality is stable across a no-op round trip.
+    changed = np.any(edited.astype(np.uint8) != reference.astype(np.uint8), axis=2)
+    return (changed.astype(np.uint8) * 255)
 
 
 def _build_pixel_reference(image: Image.Image, tile_size: int = 32) -> dict[str, Any]:
@@ -795,6 +1270,72 @@ def _build_pixel_reference(image: Image.Image, tile_size: int = 32) -> dict[str,
     }
 
 
+def _rgba_sha256(value: Image.Image | np.ndarray) -> str:
+    """Return a stable digest of decoded, tightly packed RGBA bytes."""
+    if isinstance(value, Image.Image):
+        rgba = np.ascontiguousarray(np.asarray(value.convert("RGBA"), dtype=np.uint8))
+    else:
+        rgba = np.ascontiguousarray(np.asarray(value, dtype=np.uint8))
+    if rgba.ndim != 3 or rgba.shape[2] != 4:
+        raise PsdReconstructionError("RGBA digest requires an RGBA image.")
+    return hashlib.sha256(rgba.tobytes()).hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise PsdReconstructionError(f"Failed to read source summary file {path}: {exc}") from exc
+    return digest.hexdigest()
+
+
+def _file_summary(path: Path | None) -> dict[str, Any] | None:
+    if path is None:
+        return None
+    path = Path(path).resolve()
+    if not path.is_file():
+        return None
+    return {
+        "path": str(path),
+        "name": path.name,
+        "size": int(path.stat().st_size),
+        "sha256": _file_sha256(path),
+    }
+
+
+def _validate_metadata_source_summaries(metadata: Mapping[str, Any]) -> None:
+    """Reject a model/moc replacement when newer metadata has a summary."""
+    for key, label in (
+        ("source_model_summary", "model JSON"),
+        ("source_moc_summary", "MOC3"),
+    ):
+        summary = metadata.get(key)
+        if not isinstance(summary, Mapping):
+            continue
+        path_value = str(summary.get("path") or "")
+        if not path_value:
+            continue
+        path = Path(path_value).resolve()
+        if not path.is_file():
+            raise PsdReconstructionError(
+                f"Source {label} is missing: {path}. Re-export the PSD from the fixed model baseline."
+            )
+        expected_size = int(summary.get("size", -1))
+        expected_digest = str(summary.get("sha256") or "")
+        actual_size = int(path.stat().st_size)
+        if expected_size >= 0 and actual_size != expected_size:
+            raise PsdReconstructionError(
+                f"Source {label} size changed for {path}: expected {expected_size}, got {actual_size}."
+            )
+        if expected_digest and _file_sha256(path) != expected_digest:
+            raise PsdReconstructionError(
+                f"Source {label} digest changed for {path}. Re-export the PSD from the fixed model baseline."
+            )
+
+
 def _refresh_pixel_references_from_psd(
     psd_path: Path,
     layers_metadata: list[dict[str, Any]],
@@ -803,12 +1344,15 @@ def _refresh_pixel_references_from_psd(
 
     indexed = _index_psd_layers(PSDImage.open(psd_path))
     for layer_info in layers_metadata:
-        layer = indexed.get(str(layer_info.get("name", "")))
+        layer = _find_bound_psd_layer_from_index(indexed, layer_info)
         if layer is None:
             continue
         image = layer.composite(force=True)
         if image is not None:
             layer_info["pixel_reference"] = _build_pixel_reference(image)
+        layer_info["layer_id"] = int(getattr(layer, "layer_id", 0) or 0)
+        layer_info["binding_path"] = _layer_binding_path(layer)
+        layer_info["psd_group"] = _top_level_group_name(layer)
 
 
 def _pixel_reference_changed_mask(
@@ -858,6 +1402,390 @@ def _pixel_reference_changed_mask(
                 ] = True
             offset += 8
     return changed
+
+
+def _rgba_difference_mask(edited: np.ndarray, baseline: np.ndarray) -> np.ndarray:
+    """Return an exact per-pixel RGBA change mask.
+
+    The old repacker compared only visible RGB values.  That made a Photoshop
+    eraser ineffective because an alpha-only change was discarded.  Keeping
+    all four channels here also means transparent RGB edits are handled
+    consistently and untouched pixels are copied byte-for-byte.
+    """
+    edited = np.asarray(edited, dtype=np.uint8)
+    baseline = np.asarray(baseline, dtype=np.uint8)
+    if edited.shape != baseline.shape:
+        return np.ones(edited.shape[:2], dtype=bool)
+    return np.any(edited != baseline, axis=2)
+
+
+def _replace_rgba_at(
+    canvas: Image.Image | np.ndarray,
+    edited: np.ndarray,
+    changed: np.ndarray,
+    left: int,
+    top: int,
+) -> None:
+    """Replace only changed RGBA pixels in a canvas, including erasures."""
+    pil_canvas = canvas if isinstance(canvas, Image.Image) else None
+    target = np.asarray(canvas).copy() if pil_canvas is not None else canvas
+    if target.ndim != 3 or target.shape[2] != 4:
+        raise PsdReconstructionError("RGBA replacement requires an RGBA canvas.")
+    edited = np.asarray(edited, dtype=np.uint8)
+    changed = np.asarray(changed, dtype=bool)
+    if edited.ndim != 3 or edited.shape[2] != 4 or changed.shape != edited.shape[:2]:
+        raise PsdReconstructionError("RGBA replacement layer dimensions are invalid.")
+
+    canvas_h, canvas_w = target.shape[:2]
+    src_h, src_w = edited.shape[:2]
+    dst_left = max(0, int(left))
+    dst_top = max(0, int(top))
+    dst_right = min(canvas_w, int(left) + src_w)
+    dst_bottom = min(canvas_h, int(top) + src_h)
+    if dst_right <= dst_left or dst_bottom <= dst_top:
+        return
+    src_left = dst_left - int(left)
+    src_top = dst_top - int(top)
+    src_right = src_left + dst_right - dst_left
+    src_bottom = src_top + dst_bottom - dst_top
+    mask = changed[src_top:src_bottom, src_left:src_right]
+    roi = target[dst_top:dst_bottom, dst_left:dst_right]
+    roi[mask] = edited[src_top:src_bottom, src_left:src_right][mask]
+    if pil_canvas is not None:
+        pil_canvas.paste(Image.fromarray(target, "RGBA"))
+
+
+def _or_mask_at(
+    target: np.ndarray,
+    source: np.ndarray,
+    left: int,
+    top: int,
+) -> None:
+    canvas_h, canvas_w = target.shape[:2]
+    src_h, src_w = source.shape[:2]
+    dst_left = max(0, int(left))
+    dst_top = max(0, int(top))
+    dst_right = min(canvas_w, int(left) + src_w)
+    dst_bottom = min(canvas_h, int(top) + src_h)
+    if dst_right <= dst_left or dst_bottom <= dst_top:
+        return
+    src_left = dst_left - int(left)
+    src_top = dst_top - int(top)
+    target[dst_top:dst_bottom, dst_left:dst_right] |= source[
+        src_top : src_top + dst_bottom - dst_top,
+        src_left : src_left + dst_right - dst_left,
+    ]
+
+
+def _mask_region(
+    mask: np.ndarray,
+    texture_index: int,
+    layer_name: Any,
+) -> dict[str, Any] | None:
+    coords = np.argwhere(np.asarray(mask, dtype=bool))
+    if coords.size == 0:
+        return None
+    top, left = coords.min(axis=0)
+    bottom, right = coords.max(axis=0)
+    return {
+        "texture_index": int(texture_index),
+        "layer": str(layer_name or ""),
+        "bbox": [int(left), int(top), int(right - left + 1), int(bottom - top + 1)],
+        "pixel_count": int(coords.shape[0]),
+    }
+
+
+def _detect_region_conflicts(regions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    conflicts: list[dict[str, Any]] = []
+    for index, first in enumerate(regions):
+        for second in regions[index + 1 :]:
+            if int(first.get("texture_index", -1)) != int(second.get("texture_index", -2)):
+                continue
+            overlap = _bbox_intersection(first.get("bbox"), second.get("bbox"))
+            if overlap is None:
+                continue
+            conflicts.append(
+                {
+                    "texture_index": int(first.get("texture_index", -1)),
+                    "layers": [str(first.get("layer") or ""), str(second.get("layer") or "")],
+                    "bbox": list(overlap),
+                    # Change regions currently carry bboxes for a compact
+                    # report.  Their bbox intersection is only a candidate;
+                    # do not present it as a proven pixel collision.
+                    "kind": "potential-overlap",
+                    "potential": True,
+                }
+            )
+    return conflicts
+
+
+def _detect_mask_conflicts(regions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Report only proven pixel collisions between changed atlas masks."""
+    conflicts: list[dict[str, Any]] = []
+    for index, first in enumerate(regions):
+        first_mask = first.get("mask")
+        if not isinstance(first_mask, np.ndarray):
+            continue
+        for second in regions[index + 1 :]:
+            if int(first.get("texture_index", -1)) != int(second.get("texture_index", -2)):
+                continue
+            second_mask = second.get("mask")
+            if not isinstance(second_mask, np.ndarray) or first_mask.shape != second_mask.shape:
+                continue
+            overlap = np.asarray(first_mask, dtype=bool) & np.asarray(second_mask, dtype=bool)
+            region = _mask_region(
+                overlap,
+                int(first.get("texture_index", -1)),
+                f"{first.get('layer', '')}|{second.get('layer', '')}",
+            )
+            if region:
+                conflicts.append(
+                    {
+                        "texture_index": int(first.get("texture_index", -1)),
+                        "layers": [str(first.get("layer") or ""), str(second.get("layer") or "")],
+                        "bbox": region["bbox"],
+                        "pixel_count": region["pixel_count"],
+                        "kind": "overlap",
+                        "potential": False,
+                    }
+                )
+    return conflicts
+
+
+def _bbox_intersection(first: Any, second: Any) -> tuple[int, int, int, int] | None:
+    if not isinstance(first, (list, tuple)) or len(first) < 4:
+        return None
+    if not isinstance(second, (list, tuple)) or len(second) < 4:
+        return None
+    left = max(int(first[0]), int(second[0]))
+    top = max(int(first[1]), int(second[1]))
+    right = min(int(first[0]) + int(first[2]), int(second[0]) + int(second[2]))
+    bottom = min(int(first[1]) + int(first[3]), int(second[1]) + int(second[3]))
+    if right <= left or bottom <= top:
+        return None
+    return left, top, right - left, bottom - top
+
+
+def _load_layer_baseline(
+    metadata_file: Path,
+    layer_info: Mapping[str, Any],
+    fallback_canvas: Image.Image | np.ndarray,
+    left: int,
+    top: int,
+    shape: tuple[int, int],
+    baseline_origin: tuple[int, int] | None = None,
+) -> np.ndarray:
+    """Load the immutable exported-layer baseline.
+
+    New exports write a small PNG per layer next to the metadata file.  This is
+    deliberately independent of the evolving multi-PSD target atlas.  Legacy
+    metadata falls back to the corresponding crop from the fixed source atlas,
+    which is still preferable to comparing against a previous pass.
+    """
+    baseline_path = str(layer_info.get("baseline_path") or "")
+    if baseline_path:
+        candidate = (metadata_file.parent / baseline_path).resolve()
+        if not candidate.is_file():
+            raise PsdReconstructionError(
+                f"PSD layer baseline is missing: {candidate}. Re-export the PSD before repacking."
+            )
+        with Image.open(candidate) as image:
+            baseline = np.asarray(image.convert("RGBA"), dtype=np.uint8).copy()
+        expected_digest = str(layer_info.get("baseline_rgba_sha256") or "")
+        if expected_digest and _rgba_sha256(baseline) != expected_digest:
+            raise PsdReconstructionError(
+                f"PSD layer baseline digest changed for {layer_info.get('name', '?')}: {candidate}. "
+                "Re-export the PSD."
+            )
+        expected_size_value = layer_info.get("baseline_size")
+        if isinstance(expected_size_value, (list, tuple)) and len(expected_size_value) >= 2:
+            expected_size = (int(expected_size_value[0]), int(expected_size_value[1]))
+            if (baseline.shape[1], baseline.shape[0]) != expected_size:
+                raise PsdReconstructionError(
+                    f"PSD layer baseline size changed for {layer_info.get('name', '?')}: "
+                    f"expected {expected_size[0]}x{expected_size[1]}, "
+                    f"got {baseline.shape[1]}x{baseline.shape[0]}. Re-export the PSD."
+                )
+        expected_bbox = layer_info.get("bbox")
+        if isinstance(expected_bbox, (list, tuple)) and len(expected_bbox) >= 4:
+            expected_size = (int(expected_bbox[2]), int(expected_bbox[3]))
+            if baseline.shape[:2][::-1] != expected_size:
+                raise PsdReconstructionError(
+                    f"PSD layer baseline size changed for {layer_info.get('name', '?')}: "
+                    f"expected {expected_size[0]}x{expected_size[1]}, "
+                    f"got {baseline.shape[1]}x{baseline.shape[0]}. Re-export the PSD."
+                )
+        return _align_baseline_image(
+            baseline,
+            shape,
+            baseline_origin or (left, top),
+            (left, top),
+            layer_info,
+        )
+
+    source = np.asarray(fallback_canvas.convert("RGBA") if isinstance(fallback_canvas, Image.Image) else fallback_canvas)
+    if source.ndim != 3 or source.shape[2] != 4:
+        raise PsdReconstructionError("Fixed baseline canvas is not RGBA.")
+    height, width = shape
+    source_left, source_top = baseline_origin or (left, top)
+    if source.shape[:2] == (height, width) and (source_left, source_top) == (left, top):
+        return source.astype(np.uint8, copy=False)
+    # Crop a source atlas for legacy atlas metadata.  Out-of-bounds regions are
+    # invalid because silently padding would turn missing baseline bytes into
+    # edits.
+    src_left = int(source_left)
+    src_top = int(source_top)
+    if src_left < 0 or src_top < 0 or src_left + width > source.shape[1] or src_top + height > source.shape[0]:
+        raise PsdReconstructionError(
+            f"PSD layer baseline crop is outside the fixed atlas for {layer_info.get('name', '?')}."
+        )
+    return source[src_top : src_top + height, src_left : src_left + width].astype(np.uint8, copy=False)
+
+
+def _align_baseline_image(
+    baseline: np.ndarray,
+    shape: tuple[int, int],
+    baseline_origin: tuple[int, int],
+    edited_origin: tuple[int, int],
+    layer_info: Mapping[str, Any],
+) -> np.ndarray:
+    """Place a fixed layer baseline into an edited group's expanded bbox."""
+    height, width = shape
+    result = np.zeros((height, width, 4), dtype=np.uint8)
+    offset_x = int(baseline_origin[0]) - int(edited_origin[0])
+    offset_y = int(baseline_origin[1]) - int(edited_origin[1])
+    src_h, src_w = baseline.shape[:2]
+    dst_left = max(0, offset_x)
+    dst_top = max(0, offset_y)
+    dst_right = min(width, offset_x + src_w)
+    dst_bottom = min(height, offset_y + src_h)
+    if dst_right <= dst_left or dst_bottom <= dst_top:
+        return result
+    src_left = dst_left - offset_x
+    src_top = dst_top - offset_y
+    result[dst_top:dst_bottom, dst_left:dst_right] = baseline[
+        src_top : src_top + dst_bottom - dst_top,
+        src_left : src_left + dst_right - dst_left,
+    ]
+    return result
+
+
+def _place_layer_image(
+    image: np.ndarray,
+    shape: tuple[int, int],
+    offset_x: int,
+    offset_y: int,
+) -> np.ndarray:
+    """Clip a group composite into the fixed ArtMesh layer rectangle."""
+    height, width = shape
+    result = np.zeros((height, width, 4), dtype=np.uint8)
+    src_h, src_w = image.shape[:2]
+    dst_left = max(0, int(offset_x))
+    dst_top = max(0, int(offset_y))
+    dst_right = min(width, int(offset_x) + src_w)
+    dst_bottom = min(height, int(offset_y) + src_h)
+    if dst_right <= dst_left or dst_bottom <= dst_top:
+        return result
+    src_left = dst_left - int(offset_x)
+    src_top = dst_top - int(offset_y)
+    result[dst_top:dst_bottom, dst_left:dst_right] = image[
+        src_top : src_top + dst_bottom - dst_top,
+        src_left : src_left + dst_right - dst_left,
+    ]
+    return result
+
+
+def _write_layer_baselines(
+    psd_path: Path,
+    metadata_path: Path,
+    layers_metadata: list[dict[str, Any]],
+) -> None:
+    """Persist decoded PSD layer bytes used as the future immutable baseline."""
+    from psd_tools import PSDImage
+
+    indexed = _index_psd_layers(PSDImage.open(str(psd_path)))
+    baseline_dir = metadata_path.with_suffix("").with_name(
+        metadata_path.stem.replace(".lpkpsd", "") + ".baseline"
+    )
+    baseline_dir.mkdir(parents=True, exist_ok=True)
+    for index, layer_info in enumerate(layers_metadata):
+        layer = _find_bound_psd_layer_from_index(indexed, layer_info)
+        if layer is None:
+            continue
+        unit = _edit_unit_group(layer)
+        baseline_layer = unit if unit is not None else layer
+        image = baseline_layer.composite(force=True)
+        if image is None:
+            continue
+        # Index-based filenames avoid collisions when users intentionally use
+        # duplicate drawable IDs.  The layer_id/path remains the binding key.
+        output = baseline_dir / f"layer_{index:04d}.png"
+        image.convert("RGBA").save(output, format="PNG")
+        try:
+            relative = output.resolve().relative_to(metadata_path.parent.resolve()).as_posix()
+        except ValueError:
+            relative = output.name
+        layer_info["baseline_path"] = relative
+        layer_info["baseline_rgba_sha256"] = _rgba_sha256(image)
+        layer_info["baseline_size"] = [int(image.width), int(image.height)]
+        layer_info["layer_id"] = int(getattr(layer, "layer_id", 0) or 0)
+        layer_info["pixel_layer_id"] = int(getattr(layer, "layer_id", 0) or 0)
+        if unit is not None:
+            layer_info["unit_group_id"] = int(getattr(unit, "layer_id", 0) or 0)
+            layer_info["binding_path"] = _layer_binding_path(unit)
+        else:
+            layer_info["binding_path"] = _layer_binding_path(layer)
+        layer_info["psd_group"] = _top_level_group_name(layer)
+
+
+def _layer_binding_path(layer: Any) -> str:
+    parts: list[str] = []
+    current = layer
+    while current is not None and getattr(current, "parent", None) is not None:
+        parts.append(str(getattr(current, "name", "")))
+        current = getattr(current, "parent", None)
+    parts.reverse()
+    return "/".join(part for part in parts if part)
+
+
+def _top_level_group_name(layer: Any) -> str:
+    current = layer
+    parent = getattr(current, "parent", None)
+    while parent is not None and getattr(parent, "parent", None) is not None:
+        current = parent
+        parent = getattr(current, "parent", None)
+    return str(getattr(current, "name", "")) if current is not layer else ""
+
+
+def _edit_unit_group(layer: Any) -> Any | None:
+    """Return the nearest group that owns Original/Paint/AI_Edit anchors."""
+    current = layer
+    while current is not None:
+        if bool(getattr(current, "is_group", lambda: False)()):
+            names = {
+                str(getattr(child, "name", ""))
+                for child in current
+                if bool(getattr(child, "is_group", lambda: False)())
+            }
+            if set(PSD_BINDING_GROUPS).issubset(names):
+                return current
+        current = getattr(current, "parent", None)
+    return None
+
+
+def _has_visible_edit_children(unit: Any) -> bool:
+    """Whether a bound edit unit has visible Original/Paint/AI_Edit content."""
+    for child in unit:
+        if str(getattr(child, "name", "")) not in set(PSD_BINDING_GROUPS):
+            continue
+        if not _layer_effectively_visible(child):
+            continue
+        if bool(getattr(child, "is_group", lambda: False)()):
+            if any(_layer_effectively_visible(descendant) for descendant in child.descendants()):
+                return True
+        elif _layer_effectively_visible(child):
+            return True
+    return False
 
 
 def resolve_live2d_source(source: Path) -> Live2DSource:
@@ -1227,6 +2155,196 @@ def _build_texture_component_layers(
 
     _emit(progress, 85, f"Split texture atlases into {len(layers)} editable layer(s)")
     return layers, (width, height), layer_metadata
+
+
+def _build_atlas_artmesh_layers(
+    cv2,
+    mesh_data: dict[str, Any],
+    paths: list[Path],
+    textures: list[np.ndarray],
+    progress: Optional[ProgressCallback] = None,
+    limits: PsdResourceLimits | None = None,
+    texture_pixels: int | None = None,
+) -> tuple[list[PsdLayer], tuple[int, int], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Extract every Cubism ArtMesh UV footprint as an editable atlas overlay.
+
+    This mode intentionally does not inspect visibility, dynamic flags, opacity,
+    masks, or current pose.  UV/indices are geometry, so hidden, tiny and
+    transparent fragments remain represented and can be painted back later.
+    """
+    limits = limits or PsdResourceLimits()
+    drawables = mesh_data.get("drawables")
+    if not isinstance(drawables, list) or not drawables:
+        raise PsdReconstructionError("Drawable mesh metadata is empty or invalid.")
+    normalized: list[dict[str, Any]] = []
+    for source_index, item in enumerate(drawables):
+        if not isinstance(item, dict):
+            continue
+        value = _normalize_drawable(item)
+        if value is None:
+            continue
+        value["source_index"] = source_index
+        normalized.append(value)
+    if not normalized:
+        raise PsdReconstructionError("No usable drawable mesh entries were found.")
+
+    texture_pixels = texture_pixels if texture_pixels is not None else sum(
+        texture.shape[0] * texture.shape[1] for texture in textures
+    )
+    width = max(texture.shape[1] for texture in textures)
+    height = max(texture.shape[0] for texture in textures)
+    _validate_canvas_size((width, height), limits, "PSD export")
+
+    # First build coverage masks.  Besides providing exact crop bounds this
+    # gives callers a useful report when several ArtMeshes share atlas texels.
+    footprints: list[dict[str, Any]] = []
+    for drawable in normalized:
+        texture_index = int(drawable.get("texture_index", 0))
+        if texture_index < 0 or texture_index >= len(textures):
+            continue
+        texture = textures[texture_index]
+        points = _uv_to_texture_points(
+            np.asarray(drawable["uvs"], dtype=np.float32), texture
+        )
+        mask = np.zeros(texture.shape[:2], dtype=np.uint8)
+        for tri in _iter_triangles(drawable["indices"]):
+            if max(tri) >= len(points):
+                continue
+            tri_points = points[list(tri)]
+            if not np.all(np.isfinite(tri_points)):
+                continue
+            _fill_mesh_triangle_mask(cv2, mask, tri_points)
+        bbox = _mask_bbox(mask)
+        if bbox is None:
+            # Preserve a valid but sub-pixel/degenerate fragment as a one-pixel
+            # overlay rather than silently dropping it.
+            bbox = _points_pixel_bbox(points, texture.shape[1], texture.shape[0])
+            if bbox is None:
+                continue
+            x, y, w, h = bbox
+            mask[y : y + h, x : x + w] = 255
+        footprints.append(
+            {
+                "drawable": drawable,
+                "texture_index": texture_index,
+                "points": points,
+                "mask": mask,
+                "bbox": bbox,
+            }
+        )
+
+    if not footprints:
+        raise PsdReconstructionError("No valid ArtMesh UV footprints were found.")
+    planned_pixels = sum(int(item["bbox"][2]) * int(item["bbox"][3]) for item in footprints)
+    _validate_layer_budget(
+        len(footprints), planned_pixels, texture_pixels, limits, "PSD export"
+    )
+
+    shared_regions: list[dict[str, Any]] = []
+    for index, first in enumerate(footprints):
+        for second in footprints[index + 1 :]:
+            if first["texture_index"] != second["texture_index"]:
+                continue
+            first_mask = first["mask"]
+            second_mask = second["mask"]
+            overlap = (first_mask > 0) & (second_mask > 0)
+            region = _mask_region(
+                overlap,
+                int(first["texture_index"]),
+                f"{first['drawable']['id']}|{second['drawable']['id']}",
+            )
+            if region:
+                region["kind"] = "shared-atlas-region"
+                region["drawables"] = [
+                    str(first["drawable"]["id"]),
+                    str(second["drawable"]["id"]),
+                ]
+                shared_regions.append(region)
+
+    layers: list[PsdLayer] = []
+    layer_metadata: list[dict[str, Any]] = []
+    used_names: dict[str, int] = {}
+    total = max(1, len(footprints))
+    for index, item in enumerate(footprints):
+        drawable = item["drawable"]
+        texture_index = int(item["texture_index"])
+        texture = textures[texture_index]
+        x, y, w, h = [int(value) for value in item["bbox"]]
+        crop = texture[y : y + h, x : x + w].copy()
+        local_mask = item["mask"][y : y + h, x : x + w] == 0
+        crop[:, :, 3] = np.where(local_mask, 0, crop[:, :, 3]).astype(np.uint8)
+        base_name = _safe_layer_name(
+            f"tex{texture_index:02d}_{drawable['id']}_artmesh"
+        )
+        occurrence = used_names.get(base_name, 0)
+        used_names[base_name] = occurrence + 1
+        layer_name = base_name if occurrence == 0 else f"{base_name}_{occurrence}"
+        layers.append(
+            PsdLayer(layer_name, Image.fromarray(crop, "RGBA"), x, y)
+        )
+        layer_metadata.append(
+            {
+                "kind": "atlas-artmesh",
+                "name": layer_name,
+                "drawable_id": drawable["id"],
+                "source_index": int(drawable.get("source_index", index)),
+                "texture_index": texture_index,
+                "texture_name": paths[texture_index].name,
+                "left": x,
+                "top": y,
+                "bbox": [x, y, w, h],
+                "atlas_uv_bbox": [x, y, w, h],
+                "vertices": drawable["vertices"],
+                "uvs": drawable["uvs"],
+                "indices": drawable["indices"],
+                "opacity": drawable.get("opacity", 1.0),
+                "visible": bool(drawable.get("visible", True)),
+                "dynamic_flags": int(drawable.get("dynamic_flags", 1)),
+                "render_order": drawable.get("render_order", 0),
+                "draw_order": drawable.get("draw_order", 0),
+            }
+        )
+        _emit(progress, 20 + int((index + 1) / total * 70), f"Extracted {drawable['id']}")
+
+    return layers, (width, height), layer_metadata, shared_regions
+
+
+def _fill_mesh_triangle_mask(cv2, mask: np.ndarray, points: np.ndarray) -> None:
+    points = points.astype(np.float32)
+    x0 = max(0, int(math.floor(float(np.min(points[:, 0])))))
+    y0 = max(0, int(math.floor(float(np.min(points[:, 1])))))
+    x1 = min(mask.shape[1], int(math.ceil(float(np.max(points[:, 0])))) + 1)
+    y1 = min(mask.shape[0], int(math.ceil(float(np.max(points[:, 1])))) + 1)
+    if x1 <= x0 or y1 <= y0:
+        return
+    shifted = np.rint(points - np.asarray([x0, y0], dtype=np.float32)).astype(np.int32)
+    cv2.fillConvexPoly(mask[y0:y1, x0:x1], shifted, 255, lineType=cv2.LINE_8)
+
+
+def _mask_bbox(mask: np.ndarray) -> tuple[int, int, int, int] | None:
+    coords = np.argwhere(np.asarray(mask) > 0)
+    if coords.size == 0:
+        return None
+    top, left = coords.min(axis=0)
+    bottom, right = coords.max(axis=0)
+    return int(left), int(top), int(right - left + 1), int(bottom - top + 1)
+
+
+def _points_pixel_bbox(
+    points: np.ndarray,
+    width: int,
+    height: int,
+) -> tuple[int, int, int, int] | None:
+    finite = points[np.all(np.isfinite(points), axis=1)]
+    if len(finite) == 0:
+        return None
+    left = max(0, min(width - 1, int(math.floor(float(np.min(finite[:, 0]))))))
+    top = max(0, min(height - 1, int(math.floor(float(np.min(finite[:, 1]))))))
+    right = max(left + 1, min(width, int(math.ceil(float(np.max(finite[:, 0]))) + 1)))
+    bottom = max(top + 1, min(height, int(math.ceil(float(np.max(finite[:, 1]))) + 1)))
+    if right <= left or bottom <= top:
+        return None
+    return left, top, right - left, bottom - top
 
 
 def _build_texture_atlas_layers(
@@ -1922,19 +3040,63 @@ def _save_psd(
     )
     psd = PSDImage.new("RGBA", size)
     compression = Compression.RAW
+    from psd_tools.api.layers import Group
+    from psd_tools.constants import Tag
+
+    semantic_groups: dict[str, Any] = {}
+    unit_groups: dict[str, Any] = {}
+
+    def make_group(parent: Any, name: str) -> Any:
+        group = Group.new(parent=parent, name=name, open_folder=True)
+        parent.append(group)
+        return group
+
+    def set_layer_id(layer: Any, value: int) -> None:
+        # psd-tools creates layer IDs as -1.  Assigning the standard tagged
+        # block gives us a real persistent PSD layer ID that survives save,
+        # rename, and reopening in Photoshop.
+        try:
+            layer.tagged_blocks.set_data(Tag.LAYER_ID, int(value))
+        except Exception:
+            pass
+
+    # Every edit unit receives its own Original/Paint/AI_Edit anchors.  A
+    # semantic group, when present, is only an outer organization layer and is
+    # never used as the binding identity.
+    for index, layer in enumerate(layers):
+        unit_name = str(layer.unit_id or layer.name)
+        semantic_name = str(layer.group or "").strip()
+        if semantic_name and semantic_name not in semantic_groups:
+            semantic_groups[semantic_name] = make_group(psd, semantic_name)
+        outer = semantic_groups.get(semantic_name, psd)
+        # Duplicate names are legal in PSD, but deterministic suffixes make
+        # fallback binding unambiguous when a layer ID is unavailable.
+        unit_key = f"{unit_name}#{index}"
+        unit = make_group(outer, unit_name)
+        unit_groups[unit_key] = unit
+        set_layer_id(unit, 100000 + index * 10 + 1)
+        anchors: dict[str, Any] = {}
+        for offset, role in enumerate(PSD_BINDING_GROUPS, start=2):
+            anchor = make_group(unit, role)
+            set_layer_id(anchor, 100000 + index * 10 + offset)
+            anchors[role] = anchor
+            anchors[PSD_GROUP_ORIGINAL].visible = True
+        role = str(layer.role or PSD_GROUP_PAINT)
+        if role not in anchors:
+            role = PSD_GROUP_PAINT
+        pixel = PixelLayer.frompil(
+            layer.image,
+            anchors[role],
+            name=layer.name,
+            top=layer.top,
+            left=layer.left,
+            compression=compression,
+        )
+        set_layer_id(pixel, 100000 + index * 10 + 5)
+
     total = max(1, len(layers))
     step = max(1, total // 40)
     for index, layer in enumerate(layers, start=1):
-        psd.append(
-            PixelLayer.frompil(
-                layer.image,
-                psd,
-                name=layer.name,
-                top=layer.top,
-                left=layer.left,
-                compression=compression,
-            )
-        )
         if index == total or index % step == 0:
             _emit(progress, 90 + int(index / total * 6), f"Prepared PSD layer {index}/{total}")
     _emit(progress, 97, "Saving PSD file")
@@ -1964,6 +3126,7 @@ def _build_export_metadata(
                 "relative_path": relative_path,
                 "width": int(w),
                 "height": int(h),
+                "rgba_sha256": _rgba_sha256(texture),
             }
         )
 
@@ -1972,6 +3135,9 @@ def _build_export_metadata(
         "version": METADATA_VERSION,
         "mode": mode,
         "source_model": str(source.model_json),
+        "source_root": str(source.root_dir),
+        "source_model_summary": _file_summary(source.model_json),
+        "source_moc_summary": _file_summary(source.moc3),
         "canvas": {"width": int(canvas_size[0]), "height": int(canvas_size[1])},
         "textures": texture_entries,
         "layers": layers,
@@ -2008,8 +3174,11 @@ def _metadata_textures(metadata: dict[str, Any]) -> list[dict[str, Any]]:
         raise PsdReconstructionError("PSD metadata does not contain texture entries.")
 
     source_root = None
+    source_root_value = metadata.get("source_root")
+    if isinstance(source_root_value, str) and source_root_value:
+        source_root = Path(source_root_value).resolve()
     source_model = metadata.get("source_model")
-    if isinstance(source_model, str) and source_model:
+    if source_root is None and isinstance(source_model, str) and source_model:
         source_root = Path(source_model).resolve().parent
 
     normalized = []
@@ -2028,10 +3197,19 @@ def _metadata_textures(metadata: dict[str, Any]) -> list[dict[str, Any]]:
                 "height": int(item["height"]),
                 "relative_path": relative_path,
                 "source_path": source_path,
+                "rgba_sha256": str(item.get("rgba_sha256") or ""),
             }
         )
     if not normalized:
         raise PsdReconstructionError("PSD metadata texture entries are invalid.")
+    name_counts: dict[str, int] = {}
+    for item in normalized:
+        name_counts[item["name"].casefold()] = name_counts.get(item["name"].casefold(), 0) + 1
+    for item in normalized:
+        if name_counts[item["name"].casefold()] > 1:
+            item["output_name"] = f"texture_{int(item['index']):02d}_{item['name']}"
+        else:
+            item["output_name"] = item["name"]
     return normalized
 
 
@@ -2056,9 +3234,102 @@ def _metadata_layers(metadata: dict[str, Any], allowed_kinds: set[str] | None = 
 def _index_psd_layers(psd) -> dict[str, Any]:
     layers: dict[str, Any] = {}
     for layer in psd.descendants():
-        if not getattr(layer, "is_group", lambda: False)():
-            layers.setdefault(str(layer.name), layer)
+        is_group = bool(getattr(layer, "is_group", lambda: False)())
+        name = str(layer.name)
+        if not is_group:
+            layers.setdefault(name, layer)
+        layer_id = int(getattr(layer, "layer_id", 0) or 0)
+        if layer_id:
+            layers.setdefault(f"@id:{layer_id}", layer)
+        binding_path = _layer_binding_path(layer)
+        if binding_path:
+            layers.setdefault(f"@path:{binding_path}", layer)
     return layers
+
+
+def _find_bound_psd_layer(psd, indexed: Mapping[str, Any], layer_info: Mapping[str, Any]) -> Any | None:
+    """Resolve a PSD layer by durable identity, then strict name fallback."""
+    # A name-only metadata record belongs to the legacy flat format.  The
+    # index maps that name to the first pixel layer, but the strict overlay
+    # convention below may contain several layers which must be composited as
+    # one actual PSD stack.  Durable IDs/paths are safe to resolve directly.
+    durable = bool(
+        int(layer_info.get("unit_group_id", 0) or 0)
+        or int(layer_info.get("layer_id", 0) or 0)
+        or str(layer_info.get("binding_path") or "")
+    )
+    if durable:
+        layer = _find_bound_psd_layer_from_index(indexed, layer_info)
+        if layer is not None:
+            return layer
+
+    expected_name = str(layer_info.get("name") or "")
+    if not expected_name:
+        return None
+    # Photoshop overlay conventions use exactly `originalName_123`.  Collect
+    # the exact original and every numeric overlay in PSD stack order.  Do not
+    # accept arbitrary prefixes/suffixes, which can silently bind a different
+    # artist layer with a similar name.
+    pattern = re.compile(rf"^{re.escape(expected_name)}_([0-9]+)$")
+    candidates = [
+        candidate
+        for candidate in psd.descendants()
+        if not getattr(candidate, "is_group", lambda: False)()
+        and (
+            str(getattr(candidate, "name", "")) == expected_name
+            or pattern.fullmatch(str(getattr(candidate, "name", "")))
+        )
+    ]
+
+    if not candidates:
+        return None
+    # Legacy exports may not carry our persistent group ID.  If the exact
+    # layer or a strict numeric overlay belongs to an edit unit, bind the
+    # unit so all visible Original/Paint/AI_Edit children are composited.
+    for candidate in candidates:
+        unit = _edit_unit_group(candidate)
+        if unit is not None:
+            return unit
+    if len(candidates) > 1:
+        return _BoundPsdLayers(candidates)
+    role = str(layer_info.get("psd_group") or PSD_GROUP_PAINT)
+    role_candidates = [item for item in candidates if _top_level_group_name(item) == role]
+    return (role_candidates or candidates)[-1]
+
+
+def _find_bound_psd_layer_from_index(indexed: Mapping[str, Any], layer_info: Mapping[str, Any]) -> Any | None:
+    unit_group_id = int(layer_info.get("unit_group_id", 0) or 0)
+    if unit_group_id:
+        layer = indexed.get(f"@id:{unit_group_id}")
+        if layer is not None and bool(getattr(layer, "is_group", lambda: False)()):
+            return layer
+    layer_id = int(layer_info.get("layer_id", 0) or 0)
+    if layer_id:
+        layer = indexed.get(f"@id:{layer_id}")
+        if layer is not None:
+            return layer
+    binding_path = str(layer_info.get("binding_path") or "")
+    if binding_path:
+        layer = indexed.get(f"@path:{binding_path}")
+        if layer is not None:
+            return layer
+    name = str(layer_info.get("name") or "")
+    return indexed.get(name)
+
+
+def _layer_effectively_visible(layer: Any) -> bool:
+    checker = getattr(layer, "is_visible", None)
+    if callable(checker):
+        try:
+            return bool(checker())
+        except Exception:
+            pass
+    current = layer
+    while current is not None:
+        if not bool(getattr(current, "visible", True)):
+            return False
+        current = getattr(current, "parent", None)
+    return True
 
 
 def _alpha_composite_at(canvas: Image.Image, image: Image.Image, left: int, top: int) -> None:
@@ -2084,6 +3355,12 @@ def _alpha_composite_at(canvas: Image.Image, image: Image.Image, left: int, top:
 def _safe_output_name(name: str) -> str:
     safe = Path(name).name
     return safe or "texture.png"
+
+
+def _texture_output_name(texture: Mapping[str, Any]) -> str:
+    return _safe_output_name(
+        str(texture.get("output_name") or texture.get("name") or "texture.png")
+    )
 
 
 def _read_json(path: Path) -> dict[str, Any]:

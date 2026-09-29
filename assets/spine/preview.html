@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Spine preview</title>
+  <style>
+    :root { color-scheme: dark; font: 14px system-ui, sans-serif; }
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; background: #20242b; color: #e8edf4; }
+    body { display: flex; flex-direction: column; overflow: hidden; }
+    #toolbar { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; padding: 8px 10px; background: rgba(16,19,24,.94); z-index: 2; }
+    #toolbar label { display: inline-flex; align-items: center; gap: 5px; }
+    select, input, button { color: inherit; background: #303742; border: 1px solid #596474; border-radius: 4px; padding: 3px 6px; }
+    button { cursor: pointer; }
+    #status { flex: 1 1 100%; color: #b6c5d8; white-space: pre-wrap; }
+    #stage { position: relative; flex: 1; min-height: 0; }
+    #canvas { display: block; width: 100%; height: 100%; }
+    #atlas { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-start; justify-content: center; width: 100%; height: 100%; overflow: auto; padding: 16px; }
+    #atlas figure { margin: 0; max-width: min(100%, 1024px); }
+    #atlas img { display: block; max-width: 100%; height: auto; image-rendering: auto; }
+    #atlas figcaption { padding-top: 4px; color: #b6c5d8; word-break: break-all; }
+    #attachments { position: absolute; right: 8px; bottom: 8px; width: min(360px, 42vw); max-height: 34vh; overflow: auto; padding: 8px; margin: 0; background: rgba(16,19,24,.82); border-radius: 5px; color: #c8d6e7; font: 12px ui-monospace, monospace; white-space: pre-wrap; }
+    .warning { color: #ffd28a; }
+    .error { color: #ff9b9b; }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <div id="toolbar">
+    <label>Skin <select id="skin"></select></label>
+    <label>Animation <select id="animation"></select></label>
+    <label><input id="pause" type="checkbox"> Pause</label>
+    <label>Time <input id="time" type="range" min="0" max="1" step="0.001" value="0" disabled></label>
+    <button id="reset" type="button">Reset pose</button>
+    <button id="exportPsd" type="button" class="hidden">Export layered PSD</button>
+    <span id="status"></span>
+  </div>
+  <div id="stage">
+    <canvas id="canvas"></canvas>
+    <div id="atlas" class="hidden"></div>
+    <pre id="attachments" class="hidden"></pre>
+  </div>
+<script>
+(function () {
+  "use strict";
+  const params = new URLSearchParams(window.location.search);
+  let manifest;
+  try { manifest = JSON.parse(params.get("manifest") || "{}"); }
+  catch (error) { showError("Invalid Spine preview manifest: " + error); return; }
+
+  const status = document.getElementById("status");
+  const canvas = document.getElementById("canvas");
+  const atlasView = document.getElementById("atlas");
+  const attachments = document.getElementById("attachments");
+  const skinSelect = document.getElementById("skin");
+  const animationSelect = document.getElementById("animation");
+  const pauseCheck = document.getElementById("pause");
+  const timeRange = document.getElementById("time");
+  const resetButton = document.getElementById("reset");
+  const exportPsdButton = document.getElementById("exportPsd");
+  let gl, shader, batcher, mvp, renderer, assetManager;
+  let skeleton, state, bounds, atlas;
+  let lastFrame = 0;
+  let paused = false;
+  let loaded = false;
+  const MAX_POSE_LAYERS = 64;
+
+  function showError(message) {
+    status.className = "error";
+    status.textContent = String(message);
+  }
+  function showWarnings() {
+    const warnings = (manifest.warnings || []).filter(Boolean);
+    const reason = manifest.reason || "";
+    status.className = warnings.length ? "warning" : "";
+    status.textContent = [reason].concat(warnings).filter(Boolean).join("\n");
+  }
+  function basename(url) {
+    try { return decodeURIComponent(new URL(url, window.location.href).pathname.split("/").pop()); }
+    catch (_) { return String(url).split("/").pop(); }
+  }
+  function loadScript(url) {
+    return new Promise(function (resolve, reject) {
+      if (!url) { resolve(); return; }
+      const script = document.createElement("script");
+      script.src = url;
+      script.onload = resolve;
+      script.onerror = function () { reject(new Error("Failed to load runtime script: " + url)); };
+      document.head.appendChild(script);
+    });
+  }
+  function waitForAssets() {
+    return new Promise(function (resolve, reject) {
+      const started = Date.now();
+      function getAssetErrors() {
+        if (!assetManager) return [];
+        if (typeof assetManager.hasErrors === "function" && assetManager.hasErrors()) {
+          const errors = typeof assetManager.getErrors === "function" ? assetManager.getErrors() : {};
+          return Object.keys(errors || {}).map(function (key) { return String(errors[key]); });
+        }
+        const errors = typeof assetManager.getErrors === "function" ? assetManager.getErrors() : [];
+        return Array.isArray(errors) ? errors : Object.keys(errors || {}).map(function (key) { return String(errors[key]); });
+      }
+      function check() {
+        if (assetManager.isLoadingComplete()) {
+          const errors = getAssetErrors();
+          if (errors.length) {
+            reject(new Error(errors.join("\n")));
+          } else resolve();
+          return;
+        }
+        if (Date.now() - started > 60000) { reject(new Error("Timed out while loading Spine atlas textures.")); return; }
+        requestAnimationFrame(check);
+      }
+      check();
+    });
+  }
+  async function fetchSkeleton() {
+    const response = await fetch(manifest.skeleton);
+    if (!response.ok) throw new Error("Skeleton HTTP " + response.status);
+    if (manifest.skeletonFormat === "binary") return new Uint8Array(await response.arrayBuffer());
+    return await response.text();
+  }
+  function setupSelect(select, values, emptyText) {
+    select.innerHTML = "";
+    (values || []).forEach(function (value) {
+      const option = document.createElement("option");
+      option.value = value; option.textContent = value; select.appendChild(option);
+    });
+    if (!(values || []).length) {
+      const option = document.createElement("option"); option.textContent = emptyText; select.appendChild(option); select.disabled = true;
+    } else select.disabled = false;
+  }
+  function updateAttachmentList() {
+    if (!skeleton || !skeleton.slots) { attachments.classList.add("hidden"); return; }
+    const lines = [];
+    skeleton.slots.forEach(function (slot) {
+      const attachment = slot.getAttachment ? slot.getAttachment() : null;
+      lines.push(slot.data.name + ": " + (attachment ? (attachment.name || "<attachment>") : "<none>"));
+    });
+    attachments.textContent = lines.join("\n");
+    attachments.classList.remove("hidden");
+  }
+  function calculateBounds() {
+    skeleton.setToSetupPose(); skeleton.updateWorldTransform();
+    const offset = new spine.Vector2(), size = new spine.Vector2();
+    skeleton.getBounds(offset, size, []);
+    return { offset: offset, size: size };
+  }
+  function fillControls() {
+    const skins = (skeleton.data.skins || []).map(function (item) { return item.name; });
+    const animations = (skeleton.data.animations || []).map(function (item) { return item.name; });
+    setupSelect(skinSelect, skins, "(no skins)");
+    setupSelect(animationSelect, animations, "(no animations)");
+    if (skins.length) skinSelect.value = skins.indexOf("default") >= 0 ? "default" : skins[0];
+    if (animations.length) animationSelect.value = animations[0];
+    timeRange.disabled = !animations.length;
+    updateAttachmentList();
+    skinSelect.onchange = function () { skeleton.setSkinByName(skinSelect.value); skeleton.setSlotsToSetupPose(); updateAttachmentList(); };
+    animationSelect.onchange = function () { state.setAnimation(0, animationSelect.value, true); timeRange.value = 0; };
+    pauseCheck.onchange = function () { paused = pauseCheck.checked; };
+    timeRange.oninput = function () {
+      const track = state.tracks && state.tracks[0];
+      if (track) track.trackTime = Number(timeRange.value);
+      state.apply(skeleton); skeleton.updateWorldTransform(); updateAttachmentList();
+    };
+    resetButton.onclick = function () { skeleton.setToSetupPose(); skeleton.updateWorldTransform(); state.clearTracks(); updateAttachmentList(); };
+  }
+  function renderFrame(now) {
+    if (!loaded) return;
+    const delta = lastFrame ? Math.min(.1, (now - lastFrame) / 1000) : 0;
+    lastFrame = now;
+    resize();
+    gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+    if (!paused) state.update(delta);
+    state.apply(skeleton); skeleton.updateWorldTransform();
+    const track = state.tracks && state.tracks[0];
+    if (track && track.animation) {
+      timeRange.max = Math.max(.001, track.animation.duration || 0.001);
+      timeRange.value = Math.min(Number(timeRange.max), track.trackTime || 0);
+    }
+    shader.bind();
+    shader.setUniformi(spine.webgl.Shader.SAMPLER, 0);
+    shader.setUniform4x4f(spine.webgl.Shader.MVP_MATRIX, mvp.values);
+    batcher.begin(shader); renderer.draw(batcher, skeleton); batcher.end(); shader.unbind();
+    requestAnimationFrame(renderFrame);
+  }
+  function resize() {
+    const width = Math.max(1, canvas.clientWidth), height = Math.max(1, canvas.clientHeight);
+    if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height; }
+    const centerX = bounds.offset.x + bounds.size.x / 2, centerY = bounds.offset.y + bounds.size.y / 2;
+    const scale = Math.max(bounds.size.x / width, bounds.size.y / height) * 1.2;
+    mvp.ortho2d(centerX - width * scale / 2, centerY - height * scale / 2, width * scale, height * scale);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+  }
+  async function startRuntime() {
+    if (!manifest.runtime || !manifest.runtime.webgl || !manifest.skeleton || !manifest.atlases || !manifest.atlases.length) {
+      throw new Error("Runtime mode requires skeleton, atlas, and matching spine-webgl.js.");
+    }
+    if (!manifest.runtime.combined) await loadScript(manifest.runtime.core);
+    await loadScript(manifest.runtime.webgl);
+    if (!window.spine || !spine.webgl) throw new Error("The supplied runtime did not expose spine.webgl.");
+    gl = canvas.getContext("webgl", { alpha: true, premultipliedAlpha: false }) || canvas.getContext("experimental-webgl", { alpha: true, premultipliedAlpha: false });
+    if (!gl) throw new Error("WebGL is unavailable in this browser.");
+    shader = spine.webgl.Shader.newTwoColoredTextured(gl);
+    batcher = new spine.webgl.PolygonBatcher(gl);
+    mvp = new spine.webgl.Matrix4();
+    renderer = new spine.webgl.SkeletonRenderer(gl);
+    assetManager = new spine.webgl.AssetManager(gl);
+    (manifest.textures || []).forEach(function (url) { assetManager.loadTexture(url); });
+    const atlasTexts = await Promise.all(manifest.atlases.map(async function (url) {
+      const response = await fetch(url); if (!response.ok) throw new Error("Atlas HTTP " + response.status); return await response.text();
+    }));
+    await waitForAssets();
+    const textureByName = {};
+    (manifest.textures || []).forEach(function (url) { textureByName[basename(url)] = assetManager.get(url); });
+    atlas = new spine.TextureAtlas(atlasTexts.join("\n\n"), function (name) {
+      const texture = textureByName[basename(name)] || textureByName[name];
+      if (!texture) throw new Error("Atlas page was not loaded: " + name);
+      return texture;
+    });
+    const skeletonPayload = await fetchSkeleton();
+    const loader = new spine.AtlasAttachmentLoader(atlas);
+    let data;
+    if (manifest.skeletonFormat === "binary") {
+      const binary = new spine.SkeletonBinary(loader); binary.scale = 1; data = binary.readSkeletonData(skeletonPayload);
+    } else {
+      const json = new spine.SkeletonJson(loader); json.scale = 1;
+      try { data = json.readSkeletonData(skeletonPayload); } catch (_) { data = json.readSkeletonData(JSON.parse(skeletonPayload)); }
+    }
+    skeleton = new spine.Skeleton(data);
+    state = new spine.AnimationState(new spine.AnimationStateData(data));
+    if (data.animations && data.animations.length) state.setAnimation(0, data.animations[0].name, true);
+    bounds = calculateBounds(); fillControls(); loaded = true; showWarnings();
+    exportPsdButton.classList.remove("hidden");
+    requestAnimationFrame(renderFrame);
+  }
+  function drawCurrentPose(applyState) {
+    if (!loaded) return;
+    resize(); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+    if (applyState !== false) state.apply(skeleton);
+    skeleton.updateWorldTransform();
+    shader.bind(); shader.setUniformi(spine.webgl.Shader.SAMPLER, 0);
+    shader.setUniform4x4f(spine.webgl.Shader.MVP_MATRIX, mvp.values);
+    batcher.begin(shader); renderer.draw(batcher, skeleton); batcher.end(); shader.unbind();
+  }
+  function attachmentKind(attachment) {
+    const constructor = attachment && attachment.constructor;
+    return String(constructor && (constructor.name || constructor) || "").toLowerCase();
+  }
+  function poseUnsupportedReasons(slot, attachment) {
+    const reasons = [];
+    const kind = attachmentKind(attachment);
+    const unsupportedKinds = ["mesh", "linkedmesh", "clipping", "boundingbox", "path", "point", "skeleton"];
+    if (unsupportedKinds.some(function (value) { return kind.indexOf(value) >= 0; })) {
+      reasons.push((slot.data && slot.data.name ? slot.data.name + ":" : "") + (kind || "unsupported attachment"));
+    } else if (kind.indexOf("region") < 0) {
+      // Unknown attachment classes are rejected rather than silently
+      // rasterized with an inaccurate layer appearance.
+      reasons.push((slot.data && slot.data.name ? slot.data.name + ":" : "") + (kind || "unknown attachment"));
+    }
+    const blendMode = slot && slot.data ? slot.data.blendMode : null;
+    if (blendMode !== null && blendMode !== undefined) {
+      const blendEnum = window.spine && spine.BlendMode;
+      const normalBlend = blendEnum && blendEnum.normal !== undefined ? blendEnum.normal : 0;
+      const normalText = String(blendMode).toLowerCase() === "normal";
+      if (blendMode !== normalBlend && !normalText) {
+        reasons.push((slot.data && slot.data.name ? slot.data.name + ":" : "") + "blend mode " + String(blendMode));
+      }
+    }
+    return reasons;
+  }
+  function visiblePoseSlots() {
+    const drawOrder = Array.from(skeleton.drawOrder || []);
+    const slots = [];
+    const unsupported = [];
+    drawOrder.forEach(function (slot) {
+      const attachment = slot && slot.getAttachment ? slot.getAttachment() : null;
+      if (!attachment || (slot.bone && slot.bone.active === false)) return;
+      if (slot.color && Number.isFinite(Number(slot.color.a)) && Number(slot.color.a) <= 0) return;
+      slots.push({ slot: slot, attachment: attachment });
+      unsupported.push.apply(unsupported, poseUnsupportedReasons(slot, attachment));
+    });
+    return { slots: slots, unsupported: unsupported };
+  }
+  async function exportPosePsd() {
+    if (!loaded || !skeleton) return;
+    exportPsdButton.disabled = true;
+    let saved = null;
+    try {
+      paused = true; pauseCheck.checked = true;
+      const manifestUnsupported = Array.from(new Set((manifest.unsupported || []).filter(Boolean).map(String)));
+      if (manifestUnsupported.length) {
+        throw new Error("Pose export blocked: unsupported asset features " + manifestUnsupported.join(", "));
+      }
+      const candidates = visiblePoseSlots();
+      if (candidates.unsupported.length) {
+        throw new Error("Pose export blocked: " + Array.from(new Set(candidates.unsupported)).join(", "));
+      }
+      if (candidates.slots.length > MAX_POSE_LAYERS) {
+        throw new Error("Pose export blocked: current draw order has " + candidates.slots.length + " visible attachments; maximum is " + MAX_POSE_LAYERS + ".");
+      }
+      if (!candidates.slots.length) throw new Error("Pose export blocked: no visible region attachments at this pose.");
+      saved = skeleton.slots.map(function (slot) { return slot.getAttachment(); });
+      const layers = [];
+      try {
+        // Spine's drawOrder is the current animation order.  Iterating
+        // skeleton.slots here would silently scramble PSD layer stacking when
+        // a draw-order timeline is active.
+        candidates.slots.forEach(function (candidate) {
+          const target = candidate.slot;
+          skeleton.slots.forEach(function (slot) { slot.setAttachment(null); });
+          target.setAttachment(candidate.attachment);
+          // Keep the current world transform while isolating one slot.  Applying
+          // AnimationState here would immediately restore attachment timelines
+          // and make every exported layer contain the full pose again.
+          drawCurrentPose(false);
+          layers.push({
+            name: target.data.name,
+            attachment: candidate.attachment.name || "",
+            data: canvas.toDataURL("image/png"),
+            left: 0, top: 0, opacity: 1, visible: true,
+          });
+        });
+      } finally {
+        // WebGL capture or canvas encoding can throw.  Always restore the
+        // complete slot state before surfacing that error to the user.
+        skeleton.slots.forEach(function (slot, index) { slot.setAttachment(saved[index]); });
+        try { drawCurrentPose(false); } catch (_) { /* keep the original error */ }
+      }
+      const response = await fetch("/api/spine/pose-export", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ width: canvas.width, height: canvas.height, layers: layers, unsupported: manifest.unsupported || [] }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.download) throw new Error(result.detail || "PSD export failed");
+      const download = document.createElement("a"); download.href = result.download; download.download = "spine_pose.psd"; download.click();
+      status.textContent += "\nLayered PSD export is ready (" + layers.length + " layers in current draw order).";
+    } catch (error) {
+      status.className = "error"; status.textContent = "PSD export failed: " + error;
+    } finally { exportPsdButton.disabled = false; }
+  }
+  exportPsdButton.onclick = exportPosePsd;
+  function startAtlas() {
+    canvas.classList.add("hidden"); atlasView.classList.remove("hidden");
+    showWarnings();
+    (manifest.textures || []).forEach(function (url) {
+      const figure = document.createElement("figure");
+      const image = document.createElement("img"); image.src = url; image.alt = basename(url);
+      const caption = document.createElement("figcaption"); caption.textContent = basename(url);
+      figure.appendChild(image); figure.appendChild(caption); atlasView.appendChild(figure);
+    });
+    if (!(manifest.textures || []).length) status.textContent += "\nNo atlas page image was found.";
+    skinSelect.disabled = animationSelect.disabled = pauseCheck.disabled = timeRange.disabled = resetButton.disabled = true;
+  }
+  if (manifest.mode === "runtime") startRuntime().catch(showError); else startAtlas();
+}());
+</script>
+</body>
+</html>

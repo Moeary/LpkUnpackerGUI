@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+from urllib.parse import quote
 
 from PySide6.QtWidgets import (
     QFrame,
@@ -29,8 +30,9 @@ from PySide6.QtCore import (
     QPoint,
     QEvent,
     QStringListModel,
+    QUrl,
 )
-from PySide6.QtGui import QDragEnterEvent, QDropEvent, QColor, QPixmap
+from PySide6.QtGui import QDragEnterEvent, QDropEvent, QColor, QPixmap, QDesktopServices
 from qfluentwidgets import (SubtitleLabel, BodyLabel, CaptionLabel, PushButton, Slider, CheckBox, SpinBox, InfoBar, InfoBarPosition,
                            CardWidget, SingleDirectionScrollArea, TextBrowser, ColorDialog, FluentIcon, IconWidget,
                            ComboBox, EditableComboBox, LineEdit)
@@ -38,7 +40,11 @@ from qfluentwidgets import (SubtitleLabel, BodyLabel, CaptionLabel, PushButton, 
 from app.core.assetstudio_cli import AssetStudioCLI
 from app.core.model import prepare_model_json_for_preview, resolve_live2d_package
 from app.core.model.motions import load_live2d_motions
-from app.core.preview import prepare_preview_import
+from app.core.preview import prepare_preview_import, prepare_spine_preview_import
+from app.core.spine_preview import (
+    SpinePreviewPlan,
+    build_spine_web_manifest,
+)
 from app.core.preview.sources import (
     IMAGE_PREVIEW_EXTENSIONS,
     PACKAGE_PREVIEW_EXTENSIONS,
@@ -525,6 +531,32 @@ class ModelPreviewImportThread(QThread):
                 str(result.temp_dir or ""),
                 self.source_path,
             )
+        except Exception as exc:
+            self.failed.emit(str(exc), self.source_path)
+
+
+class SpinePreviewImportThread(QThread):
+    """Prepare a disposable Spine asset without blocking the Qt event loop."""
+
+    previewReady = Signal(object, str)
+    failed = Signal(str, str)
+
+    def __init__(self, source_path: str, temp_root: str, runtime_root: str = "", parent=None):
+        super().__init__(parent)
+        self.source_path = source_path
+        self.temp_root = temp_root
+        self.runtime_root = runtime_root or None
+        self.result = None
+
+    def run(self):
+        try:
+            result = prepare_spine_preview_import(
+                self.source_path,
+                self.temp_root,
+                self.runtime_root,
+            )
+            self.result = result
+            self.previewReady.emit(result, self.source_path)
         except Exception as exc:
             self.failed.emit(str(exc), self.source_path)
 
@@ -1440,6 +1472,9 @@ class PreviewPage(QFrame):
         self.source_edit = None
         self.source_file_btn = None
         self.source_folder_btn = None
+        self.spine_runtime_label = None
+        self.spine_runtime_edit = None
+        self.spine_runtime_btn = None
         self.image_limit_label = None
         self.image_limit_spinbox = None
         self.title_label = None
@@ -1459,6 +1494,11 @@ class PreviewPage(QFrame):
         self._temp_model_json_path = None
         self._model_preview_thread = None
         self._model_preview_temp_dirs = []
+        self._spine_preview_thread = None
+        self._spine_preview_workers = []
+        self._spine_preview_generation = 0
+        self._spine_preview_temp_dirs = []
+        self._spine_web_server_port = None
         self._image_preview_thread = None
         self._image_preview_temp_dirs = []
         self._archive_preview_thread = None
@@ -1489,6 +1529,7 @@ class PreviewPage(QFrame):
                 app.aboutToQuit.connect(self._destroy_embedded_live2d)
                 app.aboutToQuit.connect(self._cleanup_temp_model_json)
                 app.aboutToQuit.connect(self._cleanup_model_preview_temp_dirs)
+                app.aboutToQuit.connect(self._cleanup_spine_preview_temp_dirs)
                 app.aboutToQuit.connect(self._cleanup_image_preview_temp_dirs)
                 app.aboutToQuit.connect(self._cleanup_archive_preview_temp_dirs)
                 app.aboutToQuit.connect(self._cleanup_folder_preview_temp_dirs)
@@ -1566,6 +1607,19 @@ class PreviewPage(QFrame):
         source_button_row.addWidget(self.source_file_btn)
         source_button_row.addWidget(self.source_folder_btn)
         import_layout.addLayout(source_button_row)
+
+        spine_runtime_row = QHBoxLayout()
+        self.spine_runtime_label = BodyLabel("Spine runtime", import_card)
+        self.spine_runtime_edit = LineEdit(import_card)
+        self.spine_runtime_edit.setReadOnly(True)
+        self.spine_runtime_edit.setPlaceholderText("Official spine-ts core/webgl directory (optional)")
+        self.spine_runtime_btn = PushButton("Choose", import_card)
+        self.spine_runtime_btn.setIcon(FluentIcon.FOLDER)
+        self.spine_runtime_btn.clicked.connect(self.browse_spine_runtime)
+        spine_runtime_row.addWidget(self.spine_runtime_label)
+        spine_runtime_row.addWidget(self.spine_runtime_edit, 1)
+        spine_runtime_row.addWidget(self.spine_runtime_btn)
+        import_layout.addLayout(spine_runtime_row)
 
         image_limit_row = QHBoxLayout()
         image_limit_row.setSpacing(8)
@@ -1852,6 +1906,10 @@ class PreviewPage(QFrame):
             self.source_file_btn.setText(tr("preview.browse_files"))
         if self.source_folder_btn:
             self.source_folder_btn.setText(tr("preview.browse_folder"))
+        if self.spine_runtime_edit:
+            self.spine_runtime_edit.setText(
+                str(self.settings_manager.get("preview.spine_runtime_dir", "") or "")
+            )
         if self.image_limit_label:
             self.image_limit_label.setText(tr("preview.image_limit_label"))
         if self.preview_stage_title:
@@ -2000,6 +2058,27 @@ class PreviewPage(QFrame):
 
     def on_preview_image_limit_changed(self, value: int):
         self.settings_manager.set("preview.image_limit", int(value))
+
+    def browse_spine_runtime(self):
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select official Spine runtime directory",
+            str(self.settings_manager.get("preview.spine_runtime_dir", "") or ""),
+        )
+        if not folder:
+            return
+        self.settings_manager.set("preview.spine_runtime_dir", folder)
+        if self.spine_runtime_edit:
+            self.spine_runtime_edit.setText(folder)
+        current = str(self.source_edit.text() or "") if self.source_edit else ""
+        if current and (
+            _is_spine_preview_source(current)
+            or os.path.splitext(current)[1].lower() in PACKAGE_PREVIEW_EXTENSIONS
+        ):
+            self.start_spine_preview_import(
+                current,
+                package_fallback=os.path.splitext(current)[1].lower() in PACKAGE_PREVIEW_EXTENSIONS,
+            )
 
     def browse_preview_file(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -2571,6 +2650,65 @@ class PreviewPage(QFrame):
         if self._preview_export_kind == "live2d":
             self._clear_preview_export_payload()
 
+    def _cleanup_spine_preview_temp_dirs(self):
+        self._spine_preview_generation += 1
+        running = []
+        for thread in list(self._spine_preview_workers):
+            if thread.isRunning():
+                thread.requestInterruption()
+                running.append(thread)
+            else:
+                thread.deleteLater()
+        self._spine_preview_workers = running
+        if self._spine_preview_thread is not None and not self._spine_preview_thread.isRunning():
+            self._spine_preview_thread.deleteLater()
+            self._spine_preview_thread = None
+        # A worker may still be writing a disposable extraction.  Leave its
+        # directory alone until finished() instead of deleting live files.
+        if running:
+            for thread in running:
+                thread.finished.connect(self._cleanup_finished_spine_thread)
+            return
+        for temp_dir in list(self._spine_preview_temp_dirs):
+            try:
+                if temp_dir and os.path.isdir(temp_dir):
+                    shutil.rmtree(temp_dir)
+            except Exception:
+                pass
+        self._spine_preview_temp_dirs = []
+
+    def _cleanup_finished_spine_thread(self):
+        finished = [thread for thread in self._spine_preview_workers if not thread.isRunning()]
+        self._spine_preview_workers = [thread for thread in self._spine_preview_workers if thread.isRunning()]
+        for thread in finished:
+            result = getattr(thread, "result", None)
+            temp_dir = getattr(result, "temp_dir", None)
+            is_current_result = (
+                thread is self._spine_preview_thread
+                and getattr(thread, "_preview_generation", None) == self._spine_preview_generation
+            )
+            if temp_dir and not is_current_result and str(temp_dir) not in self._spine_preview_temp_dirs:
+                try:
+                    shutil.rmtree(str(temp_dir), ignore_errors=True)
+                except Exception:
+                    pass
+            thread.deleteLater()
+        if self._spine_preview_workers:
+            return
+        if any(
+            thread is self._spine_preview_thread
+            and getattr(thread, "_preview_generation", None) == self._spine_preview_generation
+            for thread in finished
+        ):
+            return
+        for temp_dir in list(self._spine_preview_temp_dirs):
+            try:
+                if temp_dir and os.path.isdir(temp_dir):
+                    shutil.rmtree(temp_dir)
+            except Exception:
+                pass
+        self._spine_preview_temp_dirs = []
+
     def _cleanup_archive_preview_temp_dirs(self):
         for temp_dir in list(self._archive_preview_temp_dirs):
             try:
@@ -2602,10 +2740,7 @@ class PreviewPage(QFrame):
             return
 
         if _is_spine_preview_source(file_path):
-            self.show_error(
-                tr("preview.spine_not_supported_title"),
-                tr("preview.spine_not_supported_content"),
-            )
+            self.start_spine_preview_import(file_path)
             return
 
         if _is_archive_preview_source(file_path):
@@ -2625,7 +2760,15 @@ class PreviewPage(QFrame):
                 pass
 
         suffix = os.path.splitext(file_path)[1].lower()
-        if suffix in PACKAGE_PREVIEW_EXTENSIONS or (
+        if suffix in PACKAGE_PREVIEW_EXTENSIONS:
+            # LPK/WPK may contain a Spine model even though its outer suffix
+            # gives no useful hint.  Probe it off the GUI thread first; a
+            # package without a Spine asset falls back to the existing Live2D
+            # importer in on_spine_preview_failed().
+            self.start_spine_preview_import(file_path, package_fallback=True)
+            return
+
+        if (
             _is_unity_preview_source(file_path) and not os.path.isdir(file_path)
         ):
             self.start_model_preview_import(file_path)
@@ -2644,6 +2787,106 @@ class PreviewPage(QFrame):
         self.show_error(
             tr("preview.invalid_file_type_title"),
             tr("preview.invalid_file_type_content")
+        )
+
+    def start_spine_preview_import(self, source_path: str, package_fallback: bool = False):
+        """Prepare a Spine source and open the local read-only web viewer."""
+        self._spine_preview_generation += 1
+        generation = self._spine_preview_generation
+        previous = self._spine_preview_thread
+        if previous is not None and previous.isRunning():
+            previous.requestInterruption()
+        elif previous is not None:
+            for temp_dir in list(self._spine_preview_temp_dirs):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            self._spine_preview_temp_dirs = []
+            self._spine_preview_thread = None
+        self.close_preview_window()
+        self._cleanup_temp_model_json()
+        self._cleanup_model_preview_temp_dirs()
+        self._cleanup_image_preview_temp_dirs()
+        self._cleanup_archive_preview_temp_dirs()
+        self.current_model_path = None
+        self.preview_btn.setEnabled(False)
+        self._set_motion_debug_visible(False)
+        if self.image_preview_panel:
+            self.image_preview_panel.clear()
+        self._show_stage_placeholder(tr("preview.stage_loading"))
+        self.model_info_text_box.setMarkdown(
+            f"### Preparing Spine preview\n\n**Source:** `{source_path}`\n\n"
+            "The source is read into a disposable workspace; original files are not modified."
+        )
+        runtime_root = str(self.settings_manager.get("preview.spine_runtime_dir", "") or "").strip()
+        worker = SpinePreviewImportThread(
+            source_path,
+            self.settings_manager.get_temp_dir(),
+            runtime_root,
+            self,
+        )
+        worker._package_fallback = bool(package_fallback)
+        worker._preview_generation = generation
+        worker.previewReady.connect(
+            lambda result, source, w=worker, g=generation: self.on_spine_preview_ready(result, source, g, w)
+        )
+        worker.failed.connect(
+            lambda error, source, w=worker, g=generation: self.on_spine_preview_failed(error, source, g, w)
+        )
+        worker.finished.connect(self._cleanup_finished_spine_thread)
+        self._spine_preview_workers.append(worker)
+        self._spine_preview_thread = worker
+        worker.start()
+
+    def on_spine_preview_ready(self, result, source_path: str, generation=None, worker=None):
+        if generation is not None and generation != self._spine_preview_generation:
+            return
+        if worker is not None and worker is not self._spine_preview_thread:
+            return
+        self._spine_preview_thread = worker
+        temp_dir = getattr(result, "temp_dir", None)
+        if temp_dir:
+            self._spine_preview_temp_dirs.append(str(temp_dir))
+        try:
+            self._open_spine_web_preview(result.plan)
+        except Exception as exc:
+            self.show_error(tr("common.error"), f"Spine preview could not start: {exc}")
+
+    def on_spine_preview_failed(self, error: str, source_path: str, generation=None, worker=None):
+        if generation is not None and generation != self._spine_preview_generation:
+            return
+        worker = worker or self._spine_preview_thread
+        package_fallback = bool(getattr(worker, "_package_fallback", False))
+        self._spine_preview_thread = worker
+        if package_fallback and isinstance(error, str) and (
+            "No Spine asset" in error
+            or "Unsupported Spine preview source" in error
+            or "No Spine skeleton" in error
+        ):
+            self.start_model_preview_import(source_path)
+            return
+        self.show_error(tr("common.error"), f"Spine preview preparation failed: {error}")
+
+    def _open_spine_web_preview(self, plan: SpinePreviewPlan):
+        from app.gui.web_server import mount_model_dir, start_server
+
+        if not self._spine_web_server_port:
+            self._spine_web_server_port = start_server(host="127.0.0.1", port=0)
+        server_url = f"http://127.0.0.1:{self._spine_web_server_port}"
+        asset_base = mount_model_dir(str(plan.asset.root_dir))
+        runtime_base = None
+        if plan.runtime:
+            runtime_base = mount_model_dir(str(plan.runtime.root_dir))
+        manifest = build_spine_web_manifest(
+            plan,
+            f"{server_url}{asset_base}",
+            f"{server_url}{runtime_base}" if runtime_base else None,
+        )
+        manifest_text = quote(json.dumps(manifest, ensure_ascii=False, separators=(",", ":")), safe="")
+        url = f"{server_url}/static/spine/preview.html?manifest={manifest_text}"
+        if not QDesktopServices.openUrl(QUrl(url)):
+            raise RuntimeError(f"Could not open the system browser: {url}")
+        self.model_info_text_box.setMarkdown(
+            f"### Spine preview opened\n\n**Version:** `{plan.asset.spine_version or 'unknown'}`\n\n"
+            f"**Mode:** `{plan.mode}`\n\n{plan.reason}"
         )
 
     def start_folder_preview_scan(self, folder_path: str):

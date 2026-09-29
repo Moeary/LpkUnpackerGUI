@@ -14,9 +14,14 @@ from qfluentwidgets import (
     PushButton,
 )
 
-from app.core.assetstudio_cli import AssetStudioCLI, AssetStudioCLIError
-from app.core.cubism_core import resolve_cubism_core_dll
 from app.core.settings_manager import SettingsManager
+from app.core.toolchain import (
+    find_archive_extractor,
+    find_assetstudio_cli,
+    find_cubism_core,
+    find_photoshop,
+    find_spine_runtime,
+)
 from app.i18n import get_i18n, normalize_language_code, tr
 
 
@@ -57,6 +62,7 @@ class SettingsPage(QFrame):
         self.output_root_button = None
         self.archive_tool_label = None
         self.archive_tool_desc = None
+        self.archive_tool_status = None
         self.archive_tool_edit = None
         self.archive_tool_button = None
         self.archive_tool_auto_button = None
@@ -78,6 +84,12 @@ class SettingsPage(QFrame):
         self.photoshop_edit = None
         self.photoshop_button = None
         self.photoshop_clear_button = None
+        self.spine_runtime_label = None
+        self.spine_runtime_desc = None
+        self.spine_runtime_status = None
+        self.spine_runtime_edit = None
+        self.spine_runtime_button = None
+        self.spine_runtime_auto_button = None
         self.texture_viewer_label = None
         self.texture_viewer_desc = None
         self.texture_viewer_combo = None
@@ -85,6 +97,7 @@ class SettingsPage(QFrame):
         self.image_viewer_button = None
         self.image_viewer_clear_button = None
         self.setting_file_note = None
+        self.detect_tools_button = None
         self.save_button = None
 
         self.setup_ui()
@@ -199,15 +212,18 @@ class SettingsPage(QFrame):
         self.archive_tool_label = BodyLabel("", runtime_card)
         self.archive_tool_desc = CaptionLabel("", runtime_card)
         self.archive_tool_desc.setWordWrap(True)
+        self.archive_tool_status = CaptionLabel("", runtime_card)
+        self.archive_tool_status.setWordWrap(True)
         archive_tool_text_layout.addWidget(self.archive_tool_label)
         archive_tool_text_layout.addWidget(self.archive_tool_desc)
+        archive_tool_text_layout.addWidget(self.archive_tool_status)
 
         self.archive_tool_edit = LineEdit(runtime_card)
         self.archive_tool_edit.editingFinished.connect(self.on_archive_tool_edit_finished)
         self.archive_tool_button = PushButton("", runtime_card)
         self.archive_tool_button.clicked.connect(self.browse_archive_tool)
         self.archive_tool_auto_button = PushButton("", runtime_card)
-        self.archive_tool_auto_button.clicked.connect(self.clear_archive_tool)
+        self.archive_tool_auto_button.clicked.connect(self.auto_detect_archive_tool)
 
         archive_tool_row.addLayout(archive_tool_text_layout, 1)
         archive_tool_row.addWidget(self.archive_tool_edit, 2)
@@ -234,7 +250,7 @@ class SettingsPage(QFrame):
         self.assetstudio_tool_button = PushButton("", runtime_card)
         self.assetstudio_tool_button.clicked.connect(self.browse_assetstudio_tool)
         self.assetstudio_tool_auto_button = PushButton("", runtime_card)
-        self.assetstudio_tool_auto_button.clicked.connect(self.clear_assetstudio_tool)
+        self.assetstudio_tool_auto_button.clicked.connect(self.auto_detect_assetstudio_tool)
 
         assetstudio_tool_row.addLayout(assetstudio_tool_text_layout, 1)
         assetstudio_tool_row.addWidget(self.assetstudio_tool_edit, 2)
@@ -261,7 +277,7 @@ class SettingsPage(QFrame):
         self.cubism_core_button = PushButton("", runtime_card)
         self.cubism_core_button.clicked.connect(self.browse_cubism_core)
         self.cubism_core_auto_button = PushButton("", runtime_card)
-        self.cubism_core_auto_button.clicked.connect(self.clear_cubism_core)
+        self.cubism_core_auto_button.clicked.connect(self.auto_detect_cubism_core)
 
         cubism_core_row.addLayout(cubism_core_text_layout, 1)
         cubism_core_row.addWidget(self.cubism_core_edit, 2)
@@ -293,6 +309,30 @@ class SettingsPage(QFrame):
         photoshop_row.addWidget(self.photoshop_clear_button)
         runtime_layout.addLayout(photoshop_row)
 
+        spine_runtime_row = QHBoxLayout()
+        spine_runtime_row.setSpacing(12)
+        spine_runtime_text_layout = QVBoxLayout()
+        spine_runtime_text_layout.setSpacing(4)
+        self.spine_runtime_label = BodyLabel("", runtime_card)
+        self.spine_runtime_desc = CaptionLabel("", runtime_card)
+        self.spine_runtime_desc.setWordWrap(True)
+        self.spine_runtime_status = CaptionLabel("", runtime_card)
+        self.spine_runtime_status.setWordWrap(True)
+        spine_runtime_text_layout.addWidget(self.spine_runtime_label)
+        spine_runtime_text_layout.addWidget(self.spine_runtime_desc)
+        spine_runtime_text_layout.addWidget(self.spine_runtime_status)
+        self.spine_runtime_edit = LineEdit(runtime_card)
+        self.spine_runtime_edit.editingFinished.connect(self.on_spine_runtime_edit_finished)
+        self.spine_runtime_button = PushButton("", runtime_card)
+        self.spine_runtime_button.clicked.connect(self.browse_spine_runtime)
+        self.spine_runtime_auto_button = PushButton("", runtime_card)
+        self.spine_runtime_auto_button.clicked.connect(self.auto_detect_spine_runtime)
+        spine_runtime_row.addLayout(spine_runtime_text_layout, 1)
+        spine_runtime_row.addWidget(self.spine_runtime_edit, 2)
+        spine_runtime_row.addWidget(self.spine_runtime_button)
+        spine_runtime_row.addWidget(self.spine_runtime_auto_button)
+        runtime_layout.addLayout(spine_runtime_row)
+
         texture_viewer_row = QHBoxLayout()
         texture_viewer_row.setSpacing(12)
         texture_viewer_text_layout = QVBoxLayout()
@@ -322,6 +362,9 @@ class SettingsPage(QFrame):
 
         runtime_action_row = QHBoxLayout()
         runtime_action_row.addStretch(1)
+        self.detect_tools_button = PushButton("", runtime_card)
+        self.detect_tools_button.clicked.connect(self.auto_detect_toolchain)
+        runtime_action_row.addWidget(self.detect_tools_button)
         self.save_button = PrimaryPushButton("", runtime_card)
         self.save_button.clicked.connect(self.save_runtime_settings)
         runtime_action_row.addWidget(self.save_button)
@@ -351,6 +394,8 @@ class SettingsPage(QFrame):
                 self.cubism_core_edit.setText(self.settings_manager.get_cubism_core_dll_path())
             if self.photoshop_edit:
                 self.photoshop_edit.setText(self.settings_manager.get_photoshop_path())
+            if self.spine_runtime_edit:
+                self.spine_runtime_edit.setText(self.settings_manager.get_spine_runtime_dir())
             if self.texture_viewer_combo:
                 self._set_combo_by_value(
                     self.texture_viewer_combo,
@@ -428,6 +473,13 @@ class SettingsPage(QFrame):
             self.photoshop_edit.setPlaceholderText(tr("settings.photoshop_placeholder"))
             self.photoshop_button.setText(tr("common.browse"))
             self.photoshop_clear_button.setText(tr("common.clear"))
+            self.spine_runtime_label.setText(tr("settings.spine_runtime_label"))
+            self.spine_runtime_desc.setText(tr("settings.spine_runtime_desc"))
+            self.spine_runtime_edit.setPlaceholderText(
+                tr("settings.spine_runtime_placeholder")
+            )
+            self.spine_runtime_button.setText(tr("common.browse"))
+            self.spine_runtime_auto_button.setText(tr("settings.tool_auto"))
             self.texture_viewer_label.setText(tr("settings.texture_viewer_label"))
             self.texture_viewer_desc.setText(tr("settings.texture_viewer_desc"))
             current_texture_viewer = self._current_combo_value(
@@ -454,6 +506,7 @@ class SettingsPage(QFrame):
                 tr("settings.setting_file_note", path=self.settings_manager.settings_file)
             )
             self.save_button.setText(tr("settings.save_button"))
+            self.detect_tools_button.setText(tr("settings.detect_tools_button"))
         finally:
             self._syncing_ui = False
 
@@ -537,6 +590,9 @@ class SettingsPage(QFrame):
         )
         self.settings_manager.set_photoshop_path(
             self.photoshop_edit.text() if self.photoshop_edit else ""
+        )
+        self.settings_manager.set_spine_runtime_dir(
+            self.spine_runtime_edit.text() if self.spine_runtime_edit else ""
         )
         self.settings_manager.set_texture_viewer_mode(
             self._current_combo_value(
@@ -705,7 +761,99 @@ class SettingsPage(QFrame):
             parent=self,
         )
 
+    def browse_spine_runtime(self):
+        path = QFileDialog.getExistingDirectory(
+            self,
+            tr("settings.spine_runtime_select"),
+            self.spine_runtime_edit.text() or "",
+        )
+        if not path:
+            return
+        self.spine_runtime_edit.setText(path)
+        self.save_spine_runtime(path)
+
+    def clear_spine_runtime(self):
+        self.spine_runtime_edit.clear()
+        self.save_spine_runtime("")
+
+    def on_spine_runtime_edit_finished(self):
+        if self._syncing_ui:
+            return
+        self.save_spine_runtime(self.spine_runtime_edit.text())
+
+    def save_spine_runtime(self, path: str):
+        self.settings_manager.set_spine_runtime_dir(path)
+        self.refresh_tool_status_labels()
+
+    def auto_detect_toolchain(self):
+        """Detect available tools and fill only currently empty settings."""
+
+        changed = self.settings_manager.auto_detect_toolchain()
+        self.load_current_settings()
+        if changed:
+            content = tr("settings.toolchain_detected", count=len(changed))
+        else:
+            content = tr("settings.toolchain_not_found")
+        InfoBar.success(
+            title=tr("common.success"),
+            content=content,
+            orient=Qt.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP,
+            duration=3000,
+            parent=self,
+        )
+
+    def _auto_detect_single(self, key: str, editor, setter):
+        """Populate one editor when it has no configured value."""
+
+        if str(self.settings_manager.get(key, "") or "").strip():
+            self.refresh_tool_status_labels()
+            return
+        found = self.settings_manager.detect_toolchain_paths().get(key, "")
+        if not found:
+            self.refresh_tool_status_labels()
+            return
+        editor.setText(found)
+        setter(found)
+        self.refresh_tool_status_labels()
+
+    def auto_detect_archive_tool(self):
+        self._auto_detect_single(
+            "tools.archive_extractor_path",
+            self.archive_tool_edit,
+            self.save_archive_tool,
+        )
+
+    def auto_detect_assetstudio_tool(self):
+        self._auto_detect_single(
+            "tools.assetstudio_cli_path",
+            self.assetstudio_tool_edit,
+            self.save_assetstudio_tool,
+        )
+
+    def auto_detect_cubism_core(self):
+        self._auto_detect_single(
+            "tools.cubism_core_dll_path",
+            self.cubism_core_edit,
+            self.save_cubism_core,
+        )
+
+    def auto_detect_spine_runtime(self):
+        self._auto_detect_single(
+            "preview.spine_runtime_dir",
+            self.spine_runtime_edit,
+            self.save_spine_runtime,
+        )
+
     def refresh_tool_status_labels(self):
+        if self.archive_tool_status:
+            self.archive_tool_status.setText(
+                self.tool_status_text(
+                    self.settings_manager.get_archive_extractor_path(),
+                    self.detect_archive_tool_path,
+                )
+            )
         if self.assetstudio_tool_status:
             self.assetstudio_tool_status.setText(
                 self.tool_status_text(
@@ -732,13 +880,28 @@ class SettingsPage(QFrame):
                     tr("settings.tool_status.invalid", path=configured)
                 )
             else:
-                self.photoshop_status.setText(tr("settings.tool_status.not_found"))
+                detected = self.detect_photoshop_path()
+                if detected:
+                    self.photoshop_status.setText(
+                        tr("settings.tool_status.auto_found", path=str(detected))
+                    )
+                else:
+                    self.photoshop_status.setText(tr("settings.tool_status.not_found"))
+        if self.spine_runtime_status:
+            self.spine_runtime_status.setText(
+                self.tool_status_text(
+                    self.settings_manager.get_spine_runtime_dir(),
+                    self.detect_spine_runtime_path,
+                    directory=True,
+                )
+            )
 
-    def tool_status_text(self, configured_path: str, detector):
+    def tool_status_text(self, configured_path: str, detector, directory: bool = False):
         configured_path = str(configured_path or "").strip()
         if configured_path:
-            if Path(configured_path).is_file():
-                return tr("settings.tool_status.configured", path=str(Path(configured_path).resolve()))
+            configured = Path(configured_path).expanduser()
+            if (configured.is_dir() if directory else configured.is_file()):
+                return tr("settings.tool_status.configured", path=str(configured.resolve()))
             return tr("settings.tool_status.invalid", path=configured_path)
         detected = detector()
         if detected:
@@ -746,18 +909,41 @@ class SettingsPage(QFrame):
         return tr("settings.tool_status.not_found")
 
     @staticmethod
+    def detect_archive_tool_path() -> str:
+        try:
+            path = find_archive_extractor()
+            return str(path) if path else ""
+        except Exception:
+            return ""
+
+    @staticmethod
     def detect_assetstudio_path() -> str:
         try:
-            return str(AssetStudioCLI.find_executable())
-        except AssetStudioCLIError:
-            return ""
+            path = find_assetstudio_cli()
+            return str(path) if path else ""
         except Exception:
             return ""
 
     @staticmethod
     def detect_cubism_core_path() -> str:
         try:
-            path = resolve_cubism_core_dll(None)
+            path = find_cubism_core()
+            return str(path) if path else ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def detect_photoshop_path() -> str:
+        try:
+            path = find_photoshop()
+            return str(path) if path else ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def detect_spine_runtime_path() -> str:
+        try:
+            path = find_spine_runtime()
             return str(path) if path else ""
         except Exception:
             return ""

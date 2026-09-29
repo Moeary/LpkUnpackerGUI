@@ -9,7 +9,13 @@ from app.core.model import is_model_json_path
 IMAGE_PREVIEW_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tga"}
 PACKAGE_PREVIEW_EXTENSIONS = {".lpk", ".wpk"}
 ARCHIVE_PREVIEW_EXTENSIONS = {".zip", ".7z", ".rar"}
-SPINE_PREVIEW_EXTENSIONS = {".skel", ".atlas"}
+SPINE_PREVIEW_EXTENSIONS = {
+    ".skel",
+    ".skel.bytes",
+    ".atlas",
+    ".atlas.txt",
+    ".atlas.bytes",
+}
 UNITY_PREVIEW_EXTENSIONS = {
     "",
     ".assets",
@@ -42,18 +48,33 @@ def is_unity_preview_source(path: str | os.PathLike[str]) -> bool:
 
 def is_spine_preview_source(path: str | os.PathLike[str]) -> bool:
     path_str = str(path)
+    if os.path.isdir(path_str):
+        try:
+            from app.core.spine_preview import find_spine_asset
+
+            return find_spine_asset(path_str) is not None
+        except Exception:
+            return False
     if not os.path.isfile(path_str):
         return False
+    lower_path = path_str.lower()
     suffix = os.path.splitext(path_str)[1].lower()
-    if suffix in SPINE_PREVIEW_EXTENSIONS:
+    if any(lower_path.endswith(extension) for extension in SPINE_PREVIEW_EXTENSIONS):
         return True
     if suffix == ".json":
         try:
             with open(path_str, "r", encoding="utf-8") as file:
-                head = file.read(4096).lower()
-            return '"skeleton"' in head and '"bones"' in head
+                data = __import__("json").load(file)
+            from app.core.spine_preview import _looks_like_model_config, _looks_like_skeleton_json
+
+            return _looks_like_model_config(data) or _looks_like_skeleton_json(data)
         except Exception:
-            return False
+            try:
+                with open(path_str, "r", encoding="utf-8") as file:
+                    head = file.read(4096).lower()
+                return '"skeleton"' in head and ('"bones"' in head or '"atlases"' in head)
+            except Exception:
+                return False
     return False
 
 

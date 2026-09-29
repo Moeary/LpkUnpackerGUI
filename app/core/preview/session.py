@@ -12,6 +12,12 @@ from app.core.model import (
     prepare_model_json_for_preview,
     resolve_live2d_package,
 )
+from app.core.spine_preview import (
+    SpinePreviewAsset,
+    SpinePreviewPlan,
+    make_spine_preview_plan,
+    prepare_spine_preview_import as _prepare_spine_preview_import,
+)
 
 
 @dataclass
@@ -20,6 +26,13 @@ class PreviewImportResult:
     preview_model_json: Path
     temp_dir: Path | None = None
     warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
+class SpinePreviewImportResult:
+    asset: SpinePreviewAsset
+    plan: SpinePreviewPlan
+    temp_dir: Path | None = None
 
 
 def prepare_preview_import(
@@ -75,3 +88,17 @@ def _try_direct_package(source_path: Path) -> Live2DPackage | None:
         return resolve_live2d_package(source_path)
     except Exception:
         return None
+
+
+def prepare_spine_preview_import(
+    source: str | Path,
+    temp_root: str | Path,
+    runtime_root: str | Path | None = None,
+    log=None,
+) -> SpinePreviewImportResult:
+    result = _prepare_spine_preview_import(source, temp_root, runtime_root, log=log)
+    return SpinePreviewImportResult(
+        asset=result.asset,
+        plan=result.plan,
+        temp_dir=result.temp_dir,
+    )

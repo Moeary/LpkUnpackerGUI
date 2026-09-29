@@ -14,6 +14,7 @@ from app.paths import (
     ensure_runtime_dirs,
     runtime_output_dir,
 )
+from app.core.toolchain import detect_toolchain_paths
 
 logger = logging.getLogger("SettingsManager")
 
@@ -64,6 +65,7 @@ class SettingsManager:
             "preview": {
                 "image_limit": 48,
                 "texture_viewer": "internal",
+                "spine_runtime_dir": "",
                 "ui_state": {
                     "opacity": 100,
                     "rotation": 0,
@@ -278,6 +280,61 @@ class SettingsManager:
     def get_image_viewer_executable(self) -> str:
         configured = Path(self.get_image_viewer_path()).expanduser()
         return str(configured.resolve()) if configured.is_file() else ""
+
+    def get_spine_runtime_dir(self) -> str:
+        """Return the configured extracted spine-ts runtime directory."""
+
+        return str(self.get("preview.spine_runtime_dir", "") or "").strip()
+
+    def set_spine_runtime_dir(self, path: str):
+        """Store the runtime directory used by the Spine preview backend."""
+
+        self.set("preview.spine_runtime_dir", str(path or "").strip())
+
+    def detect_toolchain_paths(self) -> Dict[str, str]:
+        """Inspect optional tools without changing user settings."""
+
+        configured = {
+            "tools.archive_extractor_path": self.get_archive_extractor_path(),
+            "tools.assetstudio_cli_path": self.get_assetstudio_cli_path(),
+            "tools.cubism_core_dll_path": self.get_cubism_core_dll_path(),
+            "tools.photoshop_path": self.get_photoshop_path(),
+            "preview.spine_runtime_dir": self.get_spine_runtime_dir(),
+        }
+        return detect_toolchain_paths(configured)
+
+    def auto_detect_toolchain(
+        self,
+        *,
+        overwrite_invalid: bool = False,
+        save: bool = True,
+    ) -> Dict[str, str]:
+        """Fill only empty tool settings with discovered paths.
+
+        Existing values are retained by default, including an invalid path a
+        user may be repairing later.  ``overwrite_invalid`` is available for
+        an explicit repair action, but the settings page does not use it for
+        its normal one-click detection.  The write is batched so a detection
+        pass creates at most one settings-file update.
+        """
+
+        detected = self.detect_toolchain_paths()
+        changed: Dict[str, str] = {}
+        for key, value in detected.items():
+            current = str(self.get(key, "") or "").strip()
+            if current and not overwrite_invalid:
+                continue
+            if current == value:
+                continue
+            keys = key.split(".")
+            target = self.settings
+            for item in keys[:-1]:
+                target = target.setdefault(item, {})
+            target[keys[-1]] = value
+            changed[key] = value
+        if changed and save:
+            self.save_settings()
+        return changed
 
     def reset_runtime_to_project(self) -> None:
         runtime = self.settings.setdefault("runtime", {})

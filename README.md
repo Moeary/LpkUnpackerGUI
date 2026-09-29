@@ -62,6 +62,7 @@ pixi run check
 | `.lpk` | 识别包内容并解包；需要时自动匹配同目录的 `config.json` |
 | `.wpk` | 先拆出内部 LPK 和配置，再继续处理其中的 LPK |
 | Unity 资源 | 支持 `.assets`、`.sharedassets`、`.bundle`、`.unity3d` 等来源 |
+| Spine 图集 | 选择 `.atlas` 或包含它的目录，进入图集区域提取、PSD 编辑和副本回写 |
 | 文件夹 | 递归扫描其中的 LPK、WPK、Unity 资源和已解包 Live2D 模型 |
 | `.zip` / `.7z` / `.rar` | 在统一预览中临时解压，再查找 Live2D 模型和图片 |
 | 已解包模型 | 支持 `model3.json`、`.moc3`、模型目录和常见贴图文件 |
@@ -101,6 +102,10 @@ LPK 解包演示：
 - 将当前预览资源另行导出。
 - 调整 Live2D 参数并保存为 PSD 工程可使用的姿态参数方案。
 
+### Spine 图集入口
+
+解包或预览 Spine 来源时，可以直接选择 `.atlas` 文件或包含它的文件夹进入 Spine 图集页。页面解析图集页、旋转/裁剪区域和多页贴图，导出区域 PNG（可选 PSD）及元数据；回写时只写入输出目录中的贴图副本，原始 `.atlas`、骨骼文件和源贴图保持不变。该入口处理图集格式，不承担 Spine 原生动画渲染。
+
 软件渲染预览：
 
 ![Live2D 软件渲染预览](assets/readme/Software_Rendering.gif)
@@ -132,29 +137,43 @@ runtime/output/psd_projects/<工程名>/
 
 ### PSD 导出模式
 
-1.  完整人物/场景 PSD
+1. **mesh：完整人物/场景 PSD**
 
 - 优先使用 Cubism Core 读取 ArtMesh 数据。
 - 按模型姿态将 ArtMesh 拼成接近实际显示效果的分层 PSD。
 - 可以限制最大画布尺寸，兼顾编辑性能和细节。
 - 适合查看人物结构、按姿态绘制或制作差分。
 
-2.  贴图图集拆层 PSD
+2. **atlas-components：贴图图集拆层 PSD**
 
 - 按贴图坐标拆分图层。
 - 画面不一定像完整人物，但更适合精确修改图集并回写。
 - 导出时会生成配套的 `.lpkpsd.json`，回写时依靠它恢复图层位置。
+
+3. **atlas-artmesh：ArtMesh UV/indices 图集覆盖层**
+
+- 每个 Cubism ArtMesh 都按 UV 三角形覆盖提取为独立图层，包括隐藏、透明和细碎区域，不依据当前姿态透明度过滤。
+- 元数据记录 `texture_index`、UV、indices 和 atlas 像素区域；重叠覆盖会写入 `shared_regions` 报告。
+- 具备 Cubism Core DLL 时优先读取真实 drawable 数据；没有 Core 时可使用同目录的 `*.drawables.json` 侧车数据。
+
+PSD 工作台中的“ArtMesh 静态检查器”可从导出的 metadata 打开。它把导出姿态三角形、ArtMesh 列表和 atlas UV 区域联动起来：点击姿态或图集三角形会选中实际绘制顺序最上层的部件，列表选择会反向高亮对应区域，并显示持久 `layer_id`、单元绑定和共享区域影响。检查器只读取当前导出快照，不运行动态动画；缺少姿态顶点时会明确退化为图集检查。
+
+PSD 每个编辑单元都包含 `Original`、`Paint`、`AI_Edit` 三个子组。`Original` 默认可见并保存导出时的原图，`Paint` 和 `AI_Edit` 默认为空，便于分别放置手绘和生成式修改。单元组拥有持久 PSD `layer_id`，重命名单元、原图层或外层语义组不会丢失绑定；旧版平铺 PSD 仍支持严格的 `原名_数字` 覆盖层，并按实际图层栈合成。
+
+导出目录中的 `<PSD 名称>.baseline/` 是不可替代的 PSD 图层基准，必须与 `.lpkpsd.json` 一起保留。回写会把 PSD 解码后的 RGBA 与该基准逐像素比较，透明度变为零也会写入擦除；缺失基准、原始贴图缺失、贴图尺寸改变，或输出路径等于原始贴图时会直接报错。输出目录应与源模型贴图目录分开。
 
 ### 贴图回写与版本
 
 - 支持单个 PSD 回写。
 - 支持多个 PSD 按优先级叠加回写；列表越靠上优先级越高。
 - 自动跳过未修改或重复的像素区域。
+- `result.change_regions` 记录实际改变的 atlas 像素框，`result.conflicts` 只把真实 mask 相交报告为 `potential: false`；仅有 bbox 相交的旧报告会标为 `potential: true`。
+- 多 PSD 回写会校验模型名、MOC/模型摘要、贴图相对路径、顺序和尺寸；不同姿态可以使用各自的投影画布。同名贴图通过 `texture_index` 与相对路径绑定，避免误写同名文件。
 - 每次回写都会保留独立版本和 JSON 记录。
 - 可在统一预览中加载回写版本，对比原始模型。
 - 可配置 Photoshop 路径，从工程页直接打开 PSD。
 
-> PSD 功能仍属于实验性工作流。运行时模型的隐藏内容、混合方式和渲染结果未必能被 PSD 完整还原；若目标是可靠回写原始图集，优先使用“贴图图集拆层 PSD”。
+> PSD 功能仍属于实验性工作流。运行时模型的隐藏内容、混合方式和渲染结果未必能被人物姿态 PSD 完整还原；若目标是可靠回写原始图集，优先使用 `atlas-components` 或 `atlas-artmesh`。
 
 ## 三、Live2DViewerEX MOD 工程
 
