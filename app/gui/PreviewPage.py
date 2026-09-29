@@ -204,13 +204,13 @@ class DragDropArea(QFrame):
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.setStyleSheet("""
             DragDropArea {
-                border: 2px dashed #C8CDD6;
+                border: 2px dashed palette(mid);
                 border-radius: 8px;
-                background: #FAFBFD;
+                background: palette(alternate-base);
             }
             DragDropArea:hover {
                 border-color: #00A6B3;
-                background: #F5FBFC;
+                background: palette(base);
             }
         """)
 
@@ -307,11 +307,11 @@ class DragDropArea(QFrame):
             DragDropArea {
                 border: 2px solid #00A6B3;
                 border-radius: 8px;
-                background: #EFFBFC;
+                background: palette(base);
             }
             DragDropArea:hover {
                 border-color: #00A6B3;
-                background: #EFFBFC;
+                background: palette(base);
             }
         """)
 
@@ -319,13 +319,13 @@ class DragDropArea(QFrame):
         """拖拽离开事件"""
         self.setStyleSheet("""
             DragDropArea {
-                border: 2px dashed #C8CDD6;
+                border: 2px dashed palette(mid);
                 border-radius: 8px;
-                background: #FAFBFD;
+                background: palette(alternate-base);
             }
             DragDropArea:hover {
                 border-color: #00A6B3;
-                background: #F5FBFC;
+                background: palette(base);
             }
         """)
 
@@ -1104,7 +1104,7 @@ class Live2DSettingsPanel(QFrame):
         self.bg_color_preview = QFrame(group)
         self.bg_color_preview.setFixedSize(24, 24)
         self.bg_color_preview.setStyleSheet(
-            f"QFrame{{border:1px solid #ccc; border-radius:4px; background:{self.selected_bg_color.name()};}}"
+            f"QFrame{{border:1px solid palette(mid); border-radius:4px; background:{self.selected_bg_color.name()};}}"
         )
         bg_layout.addWidget(self.bg_color_preview)
 
@@ -1470,7 +1470,7 @@ class Live2DSettingsPanel(QFrame):
                 self.selected_bg_color = color
                 try:
                     self.bg_color_preview.setStyleSheet(
-                        f"QFrame{{border:1px solid #ccc; border-radius:4px; background:{color.name()};}}"
+                        f"QFrame{{border:1px solid palette(mid); border-radius:4px; background:{color.name()};}}"
                     )
                 except Exception:
                     pass
@@ -1829,11 +1829,11 @@ class PreviewPage(QFrame):
         splitter.setHandleWidth(8)
         splitter.setStyleSheet("""
             QSplitter::handle {
-                background: #E6EAF0;
+                background: palette(alternate-base);
                 border-radius: 3px;
             }
             QSplitter::handle:hover {
-                background: #BFC7D4;
+                background: palette(mid);
             }
         """)
 
@@ -1912,9 +1912,9 @@ class PreviewPage(QFrame):
         self.model_info_text_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.model_info_text_box.setStyleSheet("""
             TextBrowser {
-                border: 1px solid #E3E6EA;
+                border: 1px solid palette(mid);
                 border-radius: 8px;
-                background: #FFFFFF;
+                background: palette(base);
                 padding: 8px;
             }
         """)
@@ -1961,9 +1961,9 @@ class PreviewPage(QFrame):
         self.preview_stage.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.preview_stage.setStyleSheet("""
             QFrame#previewStage {
-                border: 1px solid #DDE2EA;
+                border: 1px solid palette(mid);
                 border-radius: 8px;
-                background: #FAFBFD;
+                background: palette(alternate-base);
             }
         """)
         self.preview_stage_layout = QVBoxLayout(self.preview_stage)
@@ -1986,16 +1986,16 @@ class PreviewPage(QFrame):
         self.preview_stage_close_btn.setFixedSize(34, 30)
         self.preview_stage_close_btn.setStyleSheet("""
             PushButton {
-                border: 1px solid #D0D7E2;
+                border: 1px solid palette(mid);
                 border-radius: 6px;
-                background: #FFFFFF;
-                color: #31363F;
+                background: palette(base);
+                color: palette(text);
                 font-size: 18px;
                 font-weight: 600;
             }
             PushButton:hover {
                 border-color: #F1A7A7;
-                background: #FDEBEC;
+                background: palette(alternate-base);
                 color: #C42B1C;
             }
         """)
@@ -2018,7 +2018,7 @@ class PreviewPage(QFrame):
 
         self.preview_placeholder = BodyLabel("", self.preview_dock_area)
         self.preview_placeholder.setAlignment(Qt.AlignCenter)
-        self.preview_placeholder.setStyleSheet("color: #68707D;")
+        self.preview_placeholder.setStyleSheet("color: palette(placeholder-text);")
         self.preview_dock_layout.addWidget(self.preview_placeholder, 1)
 
         self.image_preview_panel = ImagePreviewPanel(self.preview_dock_area)

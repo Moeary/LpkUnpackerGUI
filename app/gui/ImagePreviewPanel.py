@@ -78,7 +78,9 @@ class ImagePreviewPanel(QFrame):
 
         self.main_image_label.setMinimumHeight(420)
         self.main_image_label.setAlignment(Qt.AlignCenter)
-        self.main_image_label.setStyleSheet("background: transparent; color: #68707D;")
+        self.main_image_label.setStyleSheet(
+            "background: transparent; color: palette(placeholder-text);"
+        )
         self.image_scroll.setWidget(self.main_image_label)
         self.image_scroll.setWidgetResizable(False)
         self.image_scroll.setAlignment(Qt.AlignCenter)
@@ -86,9 +88,9 @@ class ImagePreviewPanel(QFrame):
         self.image_scroll.zoomRequested.connect(self.zoom_at_position)
         self.image_scroll.setStyleSheet("""
             QScrollArea {
-                border: 1px solid #DDE2EA;
+                border: 1px solid palette(mid);
                 border-radius: 8px;
-                background: #FFFFFF;
+                background: palette(base);
             }
         """)
         preview_layout.addWidget(self.image_scroll, 1)
@@ -128,16 +130,16 @@ class ImagePreviewPanel(QFrame):
         self.side_panel.setMaximumWidth(270)
         self.side_panel.setStyleSheet("""
             QFrame#imagePreviewSidePanel {
-                border: 1px solid #E3E6EA;
+                border: 1px solid palette(mid);
                 border-radius: 8px;
-                background: #FAFBFD;
+                background: palette(alternate-base);
             }
         """)
         side_layout = QVBoxLayout(self.side_panel)
         side_layout.setContentsMargins(10, 10, 10, 10)
         side_layout.setSpacing(8)
         self.limit_label.setWordWrap(True)
-        self.limit_label.setStyleSheet("color: #68707D;")
+        self.limit_label.setStyleSheet("color: palette(placeholder-text);")
         list_scroll = QScrollArea(self.side_panel)
         list_scroll.setWidgetResizable(True)
         list_scroll.setFrameShape(QFrame.NoFrame)
@@ -271,10 +273,10 @@ class ImagePreviewPanel(QFrame):
         thumb.setAlignment(Qt.AlignCenter)
         thumb.setStyleSheet("""
             QLabel {
-                border: 1px solid #E3E6EA;
+                border: 1px solid palette(mid);
                 border-radius: 6px;
-                background: #FFFFFF;
-                color: #68707D;
+                background: palette(base);
+                color: palette(placeholder-text);
                 font-weight: 600;
             }
         """)
@@ -307,7 +309,7 @@ class ImagePreviewPanel(QFrame):
         detail = str(item.get("detail") or "")
         detail_label = BodyLabel(detail, text_box)
         detail_label.setWordWrap(True)
-        detail_label.setStyleSheet("color: #68707D;")
+        detail_label.setStyleSheet("color: palette(placeholder-text);")
         text_layout.addWidget(type_label)
         text_layout.addWidget(name_label)
         if detail:
@@ -512,7 +514,7 @@ class ImagePreviewPanel(QFrame):
                     QFrame#imagePreviewListItem {
                         border: 1px solid #00A6B3;
                         border-radius: 8px;
-                        background: #EFFBFC;
+                        background: palette(highlight);
                     }
                 """)
             else:
@@ -523,8 +525,8 @@ class ImagePreviewPanel(QFrame):
                         background: transparent;
                     }
                     QFrame#imagePreviewListItem:hover {
-                        border-color: #D0D7E2;
-                        background: #FFFFFF;
+                        border-color: palette(mid);
+                        background: palette(base);
                     }
                 """)
 

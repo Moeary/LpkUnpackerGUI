@@ -61,4 +61,6 @@ def _spine_conversion_snapshot() -> SpineConversionOptions:
         target_version=settings.get_spine_conversion_target_version(),
         output_format=settings.get_spine_conversion_output_format(),
         converter_path=settings.get_spine_converter_path() or None,
+        create_project=settings.get_spine_create_project(),
+        editor_path=settings.get_spine_editor_path() or None,
     )

@@ -351,7 +351,7 @@ class PsdReconstructionPage(QFrame):
         self.title_label = SubtitleLabel("", self)
         self.current_project_title_label = BodyLabel("", self)
         self.current_project_title_label.setStyleSheet(
-            "color: #5B6472; font-weight: 600;"
+            "color: palette(text); font-weight: 600;"
         )
         self.unsaved_label = SubtitleLabel("*", self)
         self.unsaved_label.setStyleSheet("color: #D83B01; font-weight: 700;")
@@ -373,9 +373,9 @@ class PsdReconstructionPage(QFrame):
         self.drop_frame.setStyleSheet(
             """
             QFrame#psdDropFrame {
-                border: 1px dashed #8a8a8a;
+                border: 1px dashed palette(mid);
                 border-radius: 6px;
-                background: #fafafa;
+                background: palette(alternate-base);
             }
             """
         )
@@ -1617,8 +1617,8 @@ class PsdReconstructionPage(QFrame):
                     padding: 0 14px;
                 }
                 PushButton#psdWorkflowButton:disabled {
-                    background: #DDE2EA;
-                    color: #8B95A1;
+                    background: palette(alternate-base);
+                    color: palette(placeholder-text);
                 }
                 """
             )
@@ -1629,15 +1629,15 @@ class PsdReconstructionPage(QFrame):
                     border: 0;
                     border-radius: 6px;
                     background: transparent;
-                    color: #30343B;
+                    color: palette(text);
                     padding: 0 14px;
                 }
                 PushButton#psdWorkflowButton:hover {
-                    background: #EEF2F7;
+                    background: palette(alternate-base);
                 }
                 PushButton#psdWorkflowButton:disabled {
                     background: transparent;
-                    color: #A0A7B0;
+                    color: palette(placeholder-text);
                 }
                 """
             )
@@ -1646,63 +1646,63 @@ class PsdReconstructionPage(QFrame):
         self.workflow_segment.setStyleSheet(
             """
             QFrame#psdWorkflowSegment {
-                border: 1px solid #DDE2EA;
+                border: 1px solid palette(mid);
                 border-radius: 9px;
-                background: #F7F9FC;
+                background: palette(alternate-base);
             }
             """
         )
         self.drop_frame.setStyleSheet(
             """
             QFrame#psdDropFrame {
-                border: 1px dashed #B8C1CC;
+                border: 1px dashed palette(mid);
                 border-radius: 8px;
-                background: #FAFBFD;
+                background: palette(alternate-base);
             }
             """
         )
         self.project_frame.setStyleSheet(
             """
             QFrame#psdProjectFrame {
-                border: 1px solid #E3E8EF;
+                border: 1px solid palette(mid);
                 border-radius: 8px;
-                background: #FFFFFF;
+                background: palette(base);
             }
             """
         )
         self.preview_control_frame.setStyleSheet(
             """
             QFrame#psdPreviewControlFrame {
-                border: 1px solid #E3E8EF;
+                border: 1px solid palette(mid);
                 border-radius: 8px;
-                background: #FFFFFF;
+                background: palette(base);
             }
             """
         )
         self.motion_frame.setStyleSheet(
             """
             QFrame#psdMotionFrame {
-                border: 1px solid #E3E8EF;
+                border: 1px solid palette(mid);
                 border-radius: 8px;
-                background: #FFFFFF;
+                background: palette(base);
             }
             """
         )
         self.preview_frame.setStyleSheet(
             """
             QFrame#psdPreviewFrame {
-                border: 1px solid #DDE2EA;
+                border: 1px solid palette(mid);
                 border-radius: 8px;
-                background: #FAFBFD;
+                background: palette(alternate-base);
             }
             """
         )
         self.live2d_preview_host.setStyleSheet(
             """
             QFrame#psdLive2DPreviewHost {
-                border: 1px solid #DDE2EA;
+                border: 1px solid palette(mid);
                 border-radius: 8px;
-                background: #FFFFFF;
+                background: palette(base);
             }
             """
         )

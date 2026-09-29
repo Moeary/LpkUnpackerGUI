@@ -180,6 +180,8 @@ def _normalize_spine_conversion(
             output_format=output_format or "json",
             converter_path=value.get("converter_path"),
             remove_curve=bool(value.get("remove_curve", False)),
+            create_project=bool(value.get("create_project", False)),
+            editor_path=value.get("editor_path"),
         )
     return SpineConversionOptions()
 
@@ -233,6 +235,8 @@ def _maybe_convert_spine_item(
                     output_format=options.output_format,
                     converter_path=options.converter_path,
                     remove_curve=options.remove_curve,
+                    create_project=options.create_project,
+                    editor_path=options.editor_path,
                 )
                 warning_text = ""
                 if converted.warnings:

@@ -1,6 +1,14 @@
 from PySide6.QtCore import QThread, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import QFileDialog, QFrame, QVBoxLayout, QHBoxLayout, QScrollArea, QWidget
+from PySide6.QtWidgets import (
+    QFileDialog,
+    QFrame,
+    QHBoxLayout,
+    QSizePolicy,
+    QScrollArea,
+    QVBoxLayout,
+    QWidget,
+)
 from pathlib import Path
 from qfluentwidgets import (
     CardWidget,
@@ -138,6 +146,15 @@ class SettingsPage(QFrame):
         self.spine_runtime_edit = None
         self.spine_runtime_button = None
         self.spine_runtime_auto_button = None
+        self.spine_editor_label = None
+        self.spine_editor_desc = None
+        self.spine_editor_status = None
+        self.spine_editor_edit = None
+        self.spine_editor_button = None
+        self.spine_editor_clear_button = None
+        self.spine_create_project_label = None
+        self.spine_create_project_desc = None
+        self.spine_create_project_checkbox = None
         self.spine_auto_convert_label = None
         self.spine_auto_convert_desc = None
         self.spine_auto_convert_checkbox = None
@@ -157,12 +174,27 @@ class SettingsPage(QFrame):
         self.texture_viewer_label = None
         self.texture_viewer_desc = None
         self.texture_viewer_combo = None
+        self.image_viewer_label = None
+        self.image_viewer_desc = None
         self.image_viewer_edit = None
         self.image_viewer_button = None
         self.image_viewer_clear_button = None
         self.setting_file_note = None
         self.detect_tools_button = None
         self.save_button = None
+        self.settings_content = None
+        self.settings_columns_layout = None
+        self.settings_left_column = None
+        self.settings_right_column = None
+        self.general_card = None
+        self.runtime_card = None
+        self.archive_card = None
+        self.asset_tools_card = None
+        self.download_card = None
+        self.photoshop_card = None
+        self.spine_card = None
+        self.spine_section_title = None
+        self.texture_card = None
         self._tool_install_worker = None
 
         self.setup_ui()
@@ -170,16 +202,94 @@ class SettingsPage(QFrame):
         self.load_current_settings()
         self.i18n.languageChanged.connect(self.retranslate_ui)
 
+    @staticmethod
+    def _configure_expanding(widget):
+        """Keep settings controls usable in a narrow/high-DPI card."""
+
+        widget.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        # A minimum width derived from a translated button or a 200% DPI font
+        # can force a horizontal scroll bar.  The card columns are the width
+        # constraint; controls should yield to them instead.
+        widget.setMinimumWidth(0)
+        return widget
+
+    def _new_settings_card(self, parent, object_name: str):
+        """Create a theme-aware card with a compact, predictable layout."""
+
+        card = CardWidget(parent)
+        card.setObjectName(object_name)
+        card.setBorderRadius(8)
+        card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+        card.setMinimumWidth(0)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+        return card, layout
+
+    @staticmethod
+    def _add_text_block(layout, label, description, status=None):
+        for text_widget in (label, description, status):
+            if text_widget is None:
+                continue
+            text_widget.setSizePolicy(
+                QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+            )
+            text_widget.setMinimumWidth(0)
+        layout.addWidget(label)
+        layout.addWidget(description)
+        if status is not None:
+            layout.addWidget(status)
+
+    def _add_path_block(self, layout, label, description, editor, buttons, status=None):
+        """Add a path editor whose action buttons can wrap below the field."""
+
+        self._add_text_block(layout, label, description, status)
+        self._configure_expanding(editor)
+        layout.addWidget(editor)
+        button_layout = QHBoxLayout()
+        button_layout.setSpacing(8)
+        for button in buttons:
+            self._configure_expanding(button)
+            button_layout.addWidget(button, 1)
+        layout.addLayout(button_layout)
+
+    def _add_choice_block(self, layout, label, description, control):
+        self._add_text_block(layout, label, description)
+        self._configure_expanding(control)
+        layout.addWidget(control)
+
     def setup_ui(self):
+        """Build a two-column, scrollable settings surface.
+
+        Every field is retained, but path controls are stacked inside their
+        card.  This lets the columns shrink at high DPI without requiring a
+        minimum page width or a second horizontal scrollbar.
+        """
+
         outer_layout = QVBoxLayout(self)
         outer_layout.setContentsMargins(0, 0, 0, 0)
         self.settings_scroll = QScrollArea(self)
+        self.settings_scroll.setObjectName("settingsScroll")
         self.settings_scroll.setWidgetResizable(True)
         self.settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self.settings_scroll.setStyleSheet("QScrollArea { background: transparent; }")
+        self.settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.settings_scroll.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.settings_scroll.setStyleSheet(
+            "QScrollArea#settingsScroll { background: transparent; border: none; }"
+            "QScrollArea#settingsScroll > QWidget { background: transparent; border: none; }"
+            "QWidget#qt_scrollarea_viewport { background: transparent; border: none; }"
+        )
+        self.settings_scroll.viewport().setStyleSheet(
+            "background: transparent; border: none;"
+        )
         content = QWidget()
         content.setObjectName("settingsScrollContent")
-        content.setStyleSheet("#settingsScrollContent { background: transparent; }")
+        self.settings_content = content
+        content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        content.setMinimumWidth(0)
+        content.setStyleSheet(
+            "QWidget#settingsScrollContent { background: transparent; border: none; }"
+        )
         self.settings_scroll.setWidget(content)
         outer_layout.addWidget(self.settings_scroll)
         main_layout = QVBoxLayout(content)
@@ -187,342 +297,403 @@ class SettingsPage(QFrame):
         main_layout.setSpacing(16)
 
         self.title_label = SubtitleLabel("", self)
+        self.title_label.setWordWrap(True)
+        self.title_label.setMinimumWidth(0)
+        self.title_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
         main_layout.addWidget(self.title_label)
 
-        language_card = CardWidget(self)
-        language_layout = QVBoxLayout(language_card)
-        language_layout.setContentsMargins(16, 16, 16, 16)
-        language_layout.setSpacing(10)
+        columns_layout = QHBoxLayout()
+        columns_layout.setSpacing(16)
+        left_column = QVBoxLayout()
+        right_column = QVBoxLayout()
+        left_column.setSpacing(16)
+        right_column.setSpacing(16)
+        columns_layout.addLayout(left_column, 1)
+        columns_layout.addLayout(right_column, 1)
+        self.settings_columns_layout = columns_layout
+        self.settings_left_column = left_column
+        self.settings_right_column = right_column
+        main_layout.addLayout(columns_layout, 1)
 
-        self.language_section_title = SubtitleLabel("", language_card)
-        language_layout.addWidget(self.language_section_title)
+        # General preferences -------------------------------------------------
+        general_card, general_layout = self._new_settings_card(
+            content, "settingsGeneralCard"
+        )
+        self.general_card = general_card
+        left_column.addWidget(general_card)
 
-        language_row = QHBoxLayout()
-        language_row.setSpacing(12)
-
-        language_text_layout = QVBoxLayout()
-        language_text_layout.setSpacing(4)
-        self.language_label = BodyLabel("", language_card)
-        self.language_desc = CaptionLabel("", language_card)
+        self.language_section_title = SubtitleLabel("", general_card)
+        self.language_section_title.setWordWrap(True)
+        self.language_section_title.setMinimumWidth(0)
+        self.language_section_title.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        general_layout.addWidget(self.language_section_title)
+        self.language_label = BodyLabel("", general_card)
+        self.language_desc = CaptionLabel("", general_card)
         self.language_desc.setWordWrap(True)
-        language_text_layout.addWidget(self.language_label)
-        language_text_layout.addWidget(self.language_desc)
-
-        self.language_combo = ComboBox(language_card)
-        self.language_combo.setMinimumWidth(180)
+        self.language_combo = ComboBox(general_card)
         self.language_combo.currentIndexChanged.connect(self.on_language_combo_changed)
-
-        language_row.addLayout(language_text_layout, 1)
-        language_row.addWidget(self.language_combo, 0, Qt.AlignRight)
-        language_layout.addLayout(language_row)
-
-        self.language_note = CaptionLabel("", language_card)
+        self._add_choice_block(
+            general_layout,
+            self.language_label,
+            self.language_desc,
+            self.language_combo,
+        )
+        self.language_note = CaptionLabel("", general_card)
         self.language_note.setWordWrap(True)
-        language_layout.addWidget(self.language_note)
+        general_layout.addWidget(self.language_note)
 
-        main_layout.addWidget(language_card)
-
-        theme_card = CardWidget(self)
-        theme_layout = QVBoxLayout(theme_card)
-        theme_layout.setContentsMargins(16, 16, 16, 16)
-        theme_layout.setSpacing(10)
-
-        self.theme_section_title = SubtitleLabel("", theme_card)
-        theme_layout.addWidget(self.theme_section_title)
-
-        theme_row = QHBoxLayout()
-        theme_row.setSpacing(12)
-
-        theme_text_layout = QVBoxLayout()
-        theme_text_layout.setSpacing(4)
-        self.theme_label = BodyLabel("", theme_card)
-        self.theme_desc = CaptionLabel("", theme_card)
+        self.theme_section_title = SubtitleLabel("", general_card)
+        self.theme_section_title.setWordWrap(True)
+        self.theme_section_title.setMinimumWidth(0)
+        self.theme_section_title.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        general_layout.addWidget(self.theme_section_title)
+        self.theme_label = BodyLabel("", general_card)
+        self.theme_desc = CaptionLabel("", general_card)
         self.theme_desc.setWordWrap(True)
-        theme_text_layout.addWidget(self.theme_label)
-        theme_text_layout.addWidget(self.theme_desc)
-
-        self.theme_combo = ComboBox(theme_card)
-        self.theme_combo.setMinimumWidth(180)
+        self.theme_combo = ComboBox(general_card)
         self.theme_combo.currentIndexChanged.connect(self.on_theme_combo_changed)
+        self._add_choice_block(
+            general_layout,
+            self.theme_label,
+            self.theme_desc,
+            self.theme_combo,
+        )
 
-        theme_row.addLayout(theme_text_layout, 1)
-        theme_row.addWidget(self.theme_combo, 0, Qt.AlignRight)
-        theme_layout.addLayout(theme_row)
-
-        main_layout.addWidget(theme_card)
-
-        runtime_card = CardWidget(self)
-        runtime_layout = QVBoxLayout(runtime_card)
-        runtime_layout.setContentsMargins(16, 16, 16, 16)
-        runtime_layout.setSpacing(10)
-
+        # Output and archive settings ----------------------------------------
+        runtime_card, runtime_layout = self._new_settings_card(
+            content, "settingsRuntimeCard"
+        )
+        self.runtime_card = runtime_card
+        left_column.addWidget(runtime_card)
         self.runtime_section_title = SubtitleLabel("", runtime_card)
+        self.runtime_section_title.setWordWrap(True)
+        self.runtime_section_title.setMinimumWidth(0)
+        self.runtime_section_title.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
         runtime_layout.addWidget(self.runtime_section_title)
-
-        output_row = QHBoxLayout()
-        output_row.setSpacing(12)
-
-        output_text_layout = QVBoxLayout()
-        output_text_layout.setSpacing(4)
         self.output_root_label = BodyLabel("", runtime_card)
         self.output_root_desc = CaptionLabel("", runtime_card)
         self.output_root_desc.setWordWrap(True)
-        output_text_layout.addWidget(self.output_root_label)
-        output_text_layout.addWidget(self.output_root_desc)
-
         self.output_root_edit = LineEdit(runtime_card)
         self.output_root_edit.setReadOnly(True)
         self.output_root_button = PushButton("", runtime_card)
         self.output_root_button.clicked.connect(self.browse_output_root)
+        self._add_path_block(
+            runtime_layout,
+            self.output_root_label,
+            self.output_root_desc,
+            self.output_root_edit,
+            (self.output_root_button,),
+        )
+        self.setting_file_note = CaptionLabel("", runtime_card)
+        self.setting_file_note.setWordWrap(True)
+        self.setting_file_note.setMinimumWidth(0)
+        self.setting_file_note.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        runtime_layout.addWidget(self.setting_file_note)
+        runtime_action_row = QHBoxLayout()
+        runtime_action_row.setSpacing(8)
+        self.detect_tools_button = PushButton("", runtime_card)
+        self.detect_tools_button.clicked.connect(self.auto_detect_toolchain)
+        self.save_button = PrimaryPushButton("", runtime_card)
+        self.save_button.clicked.connect(self.save_runtime_settings)
+        self._configure_expanding(self.detect_tools_button)
+        self._configure_expanding(self.save_button)
+        runtime_action_row.addWidget(self.detect_tools_button, 1)
+        runtime_action_row.addWidget(self.save_button, 1)
+        runtime_layout.addLayout(runtime_action_row)
 
-        output_row.addLayout(output_text_layout, 1)
-        output_row.addWidget(self.output_root_edit, 2)
-        output_row.addWidget(self.output_root_button)
-        runtime_layout.addLayout(output_row)
-
-        archive_tool_row = QHBoxLayout()
-        archive_tool_row.setSpacing(12)
-
-        archive_tool_text_layout = QVBoxLayout()
-        archive_tool_text_layout.setSpacing(4)
-        self.archive_tool_label = BodyLabel("", runtime_card)
-        self.archive_tool_desc = CaptionLabel("", runtime_card)
+        archive_card, archive_layout = self._new_settings_card(
+            content, "settingsArchiveCard"
+        )
+        self.archive_card = archive_card
+        left_column.addWidget(archive_card)
+        self.archive_tool_label = BodyLabel("", archive_card)
+        self.archive_tool_desc = CaptionLabel("", archive_card)
         self.archive_tool_desc.setWordWrap(True)
-        self.archive_tool_status = CaptionLabel("", runtime_card)
+        self.archive_tool_status = CaptionLabel("", archive_card)
         self.archive_tool_status.setWordWrap(True)
-        archive_tool_text_layout.addWidget(self.archive_tool_label)
-        archive_tool_text_layout.addWidget(self.archive_tool_desc)
-        archive_tool_text_layout.addWidget(self.archive_tool_status)
-
-        self.archive_tool_edit = LineEdit(runtime_card)
+        self.archive_tool_edit = LineEdit(archive_card)
         self.archive_tool_edit.editingFinished.connect(self.on_archive_tool_edit_finished)
-        self.archive_tool_button = PushButton("", runtime_card)
+        self.archive_tool_button = PushButton("", archive_card)
         self.archive_tool_button.clicked.connect(self.browse_archive_tool)
-        self.archive_tool_auto_button = PushButton("", runtime_card)
+        self.archive_tool_auto_button = PushButton("", archive_card)
         self.archive_tool_auto_button.clicked.connect(self.auto_detect_archive_tool)
+        self._add_path_block(
+            archive_layout,
+            self.archive_tool_label,
+            self.archive_tool_desc,
+            self.archive_tool_edit,
+            (self.archive_tool_button, self.archive_tool_auto_button),
+            self.archive_tool_status,
+        )
 
-        archive_tool_row.addLayout(archive_tool_text_layout, 1)
-        archive_tool_row.addWidget(self.archive_tool_edit, 2)
-        archive_tool_row.addWidget(self.archive_tool_button)
-        archive_tool_row.addWidget(self.archive_tool_auto_button)
-        runtime_layout.addLayout(archive_tool_row)
-
-        assetstudio_tool_row = QHBoxLayout()
-        assetstudio_tool_row.setSpacing(12)
-
-        assetstudio_tool_text_layout = QVBoxLayout()
-        assetstudio_tool_text_layout.setSpacing(4)
-        self.assetstudio_tool_label = BodyLabel("", runtime_card)
-        self.assetstudio_tool_desc = CaptionLabel("", runtime_card)
+        # Asset and Live2D tools ---------------------------------------------
+        asset_card, asset_layout = self._new_settings_card(
+            content, "settingsAssetToolsCard"
+        )
+        self.asset_tools_card = asset_card
+        left_column.addWidget(asset_card)
+        self.assetstudio_tool_label = BodyLabel("", asset_card)
+        self.assetstudio_tool_desc = CaptionLabel("", asset_card)
         self.assetstudio_tool_desc.setWordWrap(True)
-        self.assetstudio_tool_status = CaptionLabel("", runtime_card)
+        self.assetstudio_tool_status = CaptionLabel("", asset_card)
         self.assetstudio_tool_status.setWordWrap(True)
-        assetstudio_tool_text_layout.addWidget(self.assetstudio_tool_label)
-        assetstudio_tool_text_layout.addWidget(self.assetstudio_tool_desc)
-        assetstudio_tool_text_layout.addWidget(self.assetstudio_tool_status)
-
-        self.assetstudio_tool_edit = LineEdit(runtime_card)
+        self.assetstudio_tool_edit = LineEdit(asset_card)
         self.assetstudio_tool_edit.editingFinished.connect(self.on_assetstudio_tool_edit_finished)
-        self.assetstudio_tool_button = PushButton("", runtime_card)
+        self.assetstudio_tool_button = PushButton("", asset_card)
         self.assetstudio_tool_button.clicked.connect(self.browse_assetstudio_tool)
-        self.assetstudio_tool_auto_button = PushButton("", runtime_card)
+        self.assetstudio_tool_auto_button = PushButton("", asset_card)
         self.assetstudio_tool_auto_button.clicked.connect(self.auto_detect_assetstudio_tool)
-
-        assetstudio_tool_row.addLayout(assetstudio_tool_text_layout, 1)
-        assetstudio_tool_row.addWidget(self.assetstudio_tool_edit, 2)
-        assetstudio_tool_row.addWidget(self.assetstudio_tool_button)
-        assetstudio_tool_row.addWidget(self.assetstudio_tool_auto_button)
-        runtime_layout.addLayout(assetstudio_tool_row)
-
-        cubism_core_row = QHBoxLayout()
-        cubism_core_row.setSpacing(12)
-
-        cubism_core_text_layout = QVBoxLayout()
-        cubism_core_text_layout.setSpacing(4)
-        self.cubism_core_label = BodyLabel("", runtime_card)
-        self.cubism_core_desc = CaptionLabel("", runtime_card)
+        self._add_path_block(
+            asset_layout,
+            self.assetstudio_tool_label,
+            self.assetstudio_tool_desc,
+            self.assetstudio_tool_edit,
+            (self.assetstudio_tool_button, self.assetstudio_tool_auto_button),
+            self.assetstudio_tool_status,
+        )
+        self.cubism_core_label = BodyLabel("", asset_card)
+        self.cubism_core_desc = CaptionLabel("", asset_card)
         self.cubism_core_desc.setWordWrap(True)
-        self.cubism_core_status = CaptionLabel("", runtime_card)
+        self.cubism_core_status = CaptionLabel("", asset_card)
         self.cubism_core_status.setWordWrap(True)
-        cubism_core_text_layout.addWidget(self.cubism_core_label)
-        cubism_core_text_layout.addWidget(self.cubism_core_desc)
-        cubism_core_text_layout.addWidget(self.cubism_core_status)
-
-        self.cubism_core_edit = LineEdit(runtime_card)
+        self.cubism_core_edit = LineEdit(asset_card)
         self.cubism_core_edit.editingFinished.connect(self.on_cubism_core_edit_finished)
-        self.cubism_core_button = PushButton("", runtime_card)
+        self.cubism_core_button = PushButton("", asset_card)
         self.cubism_core_button.clicked.connect(self.browse_cubism_core)
-        self.cubism_core_auto_button = PushButton("", runtime_card)
+        self.cubism_core_auto_button = PushButton("", asset_card)
         self.cubism_core_auto_button.clicked.connect(self.auto_detect_cubism_core)
+        self._add_path_block(
+            asset_layout,
+            self.cubism_core_label,
+            self.cubism_core_desc,
+            self.cubism_core_edit,
+            (self.cubism_core_button, self.cubism_core_auto_button),
+            self.cubism_core_status,
+        )
 
-        cubism_core_row.addLayout(cubism_core_text_layout, 1)
-        cubism_core_row.addWidget(self.cubism_core_edit, 2)
-        cubism_core_row.addWidget(self.cubism_core_button)
-        cubism_core_row.addWidget(self.cubism_core_auto_button)
-        runtime_layout.addLayout(cubism_core_row)
-
-        photoshop_row = QHBoxLayout()
-        photoshop_row.setSpacing(12)
-        photoshop_text_layout = QVBoxLayout()
-        photoshop_text_layout.setSpacing(4)
-        self.photoshop_label = BodyLabel("", runtime_card)
-        self.photoshop_desc = CaptionLabel("", runtime_card)
-        self.photoshop_desc.setWordWrap(True)
-        self.photoshop_status = CaptionLabel("", runtime_card)
-        self.photoshop_status.setWordWrap(True)
-        photoshop_text_layout.addWidget(self.photoshop_label)
-        photoshop_text_layout.addWidget(self.photoshop_desc)
-        photoshop_text_layout.addWidget(self.photoshop_status)
-        self.photoshop_edit = LineEdit(runtime_card)
-        self.photoshop_edit.editingFinished.connect(self.on_photoshop_edit_finished)
-        self.photoshop_button = PushButton("", runtime_card)
-        self.photoshop_button.clicked.connect(self.browse_photoshop)
-        self.photoshop_clear_button = PushButton("", runtime_card)
-        self.photoshop_clear_button.clicked.connect(self.clear_photoshop)
-        photoshop_row.addLayout(photoshop_text_layout, 1)
-        photoshop_row.addWidget(self.photoshop_edit, 2)
-        photoshop_row.addWidget(self.photoshop_button)
-        photoshop_row.addWidget(self.photoshop_clear_button)
-        runtime_layout.addLayout(photoshop_row)
-
-        spine_runtime_row = QHBoxLayout()
-        spine_runtime_row.setSpacing(12)
-        spine_runtime_text_layout = QVBoxLayout()
-        spine_runtime_text_layout.setSpacing(4)
-        self.spine_runtime_label = BodyLabel("", runtime_card)
-        self.spine_runtime_desc = CaptionLabel("", runtime_card)
-        self.spine_runtime_desc.setWordWrap(True)
-        self.spine_runtime_status = CaptionLabel("", runtime_card)
-        self.spine_runtime_status.setWordWrap(True)
-        spine_runtime_text_layout.addWidget(self.spine_runtime_label)
-        spine_runtime_text_layout.addWidget(self.spine_runtime_desc)
-        spine_runtime_text_layout.addWidget(self.spine_runtime_status)
-        self.spine_runtime_edit = LineEdit(runtime_card)
-        self.spine_runtime_edit.editingFinished.connect(self.on_spine_runtime_edit_finished)
-        self.spine_runtime_button = PushButton("", runtime_card)
-        self.spine_runtime_button.clicked.connect(self.browse_spine_runtime)
-        self.spine_runtime_auto_button = PushButton("", runtime_card)
-        self.spine_runtime_auto_button.clicked.connect(self.auto_detect_spine_runtime)
-        spine_runtime_row.addLayout(spine_runtime_text_layout, 1)
-        spine_runtime_row.addWidget(self.spine_runtime_edit, 2)
-        spine_runtime_row.addWidget(self.spine_runtime_button)
-        spine_runtime_row.addWidget(self.spine_runtime_auto_button)
-        runtime_layout.addLayout(spine_runtime_row)
-
-        spine_auto_convert_row = QHBoxLayout()
-        spine_auto_convert_row.setSpacing(12)
-        spine_auto_convert_text_layout = QVBoxLayout()
-        spine_auto_convert_text_layout.setSpacing(4)
-        self.spine_auto_convert_label = BodyLabel("", runtime_card)
-        self.spine_auto_convert_desc = CaptionLabel("", runtime_card)
-        self.spine_auto_convert_desc.setWordWrap(True)
-        spine_auto_convert_text_layout.addWidget(self.spine_auto_convert_label)
-        spine_auto_convert_text_layout.addWidget(self.spine_auto_convert_desc)
-        self.spine_auto_convert_checkbox = CheckBox(runtime_card)
-        spine_auto_convert_row.addLayout(spine_auto_convert_text_layout, 1)
-        spine_auto_convert_row.addWidget(self.spine_auto_convert_checkbox)
-        runtime_layout.addLayout(spine_auto_convert_row)
-
-        spine_target_version_row = QHBoxLayout()
-        spine_target_version_row.setSpacing(12)
-        spine_target_version_text_layout = QVBoxLayout()
-        spine_target_version_text_layout.setSpacing(4)
-        self.spine_target_version_label = BodyLabel("", runtime_card)
-        self.spine_target_version_desc = CaptionLabel("", runtime_card)
-        self.spine_target_version_desc.setWordWrap(True)
-        spine_target_version_text_layout.addWidget(self.spine_target_version_label)
-        spine_target_version_text_layout.addWidget(self.spine_target_version_desc)
-        self.spine_target_version_edit = LineEdit(runtime_card)
-        self.spine_target_version_edit.setMinimumWidth(180)
-        spine_target_version_row.addLayout(spine_target_version_text_layout, 1)
-        spine_target_version_row.addWidget(self.spine_target_version_edit, 2)
-        runtime_layout.addLayout(spine_target_version_row)
-
-        self.tool_download_section_title = SubtitleLabel("", runtime_card)
-        runtime_layout.addWidget(self.tool_download_section_title)
-        self.tool_download_desc = CaptionLabel("", runtime_card)
+        # Optional installation sources --------------------------------------
+        download_card, download_layout = self._new_settings_card(
+            content, "settingsDownloadCard"
+        )
+        self.download_card = download_card
+        left_column.addWidget(download_card)
+        self.tool_download_section_title = SubtitleLabel("", download_card)
+        self.tool_download_section_title.setWordWrap(True)
+        self.tool_download_section_title.setMinimumWidth(0)
+        self.tool_download_section_title.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        download_layout.addWidget(self.tool_download_section_title)
+        self.tool_download_desc = CaptionLabel("", download_card)
         self.tool_download_desc.setWordWrap(True)
-        runtime_layout.addWidget(self.tool_download_desc)
-
-        tool_download_row = QHBoxLayout()
-        tool_download_row.setSpacing(8)
-        self.assetstudio_install_button = PushButton("", runtime_card)
+        self.tool_download_desc.setMinimumWidth(0)
+        self.tool_download_desc.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        download_layout.addWidget(self.tool_download_desc)
+        self.assetstudio_install_button = PushButton("", download_card)
         self.assetstudio_install_button.clicked.connect(
             lambda: self.start_tool_install("assetstudio_cli")
         )
-        self.cubism_official_button = PushButton("", runtime_card)
+        self.cubism_official_button = PushButton("", download_card)
         self.cubism_official_button.clicked.connect(self.open_cubism_download_page)
-        self.cubism_extract_button = PushButton("", runtime_card)
+        self.cubism_extract_button = PushButton("", download_card)
         self.cubism_extract_button.clicked.connect(self.install_cubism_from_live2d_py)
-        tool_download_row.addWidget(self.assetstudio_install_button)
-        tool_download_row.addWidget(self.cubism_official_button)
-        tool_download_row.addWidget(self.cubism_extract_button)
-        runtime_layout.addLayout(tool_download_row)
+        for button in (
+            self.assetstudio_install_button,
+            self.cubism_official_button,
+            self.cubism_extract_button,
+        ):
+            self._configure_expanding(button)
+            download_layout.addWidget(button)
 
         spine_download_row = QHBoxLayout()
         spine_download_row.setSpacing(8)
-        self.spine_native_family_combo = ComboBox(runtime_card)
-        self.spine_native_family_combo.setMinimumWidth(150)
-        spine_download_row.addWidget(self.spine_native_family_combo)
-        self.spine_native_install_button = PushButton("", runtime_card)
+        self.spine_native_family_combo = ComboBox(download_card)
+        self._configure_expanding(self.spine_native_family_combo)
+        spine_download_row.addWidget(self.spine_native_family_combo, 1)
+        self.spine_native_install_button = PushButton("", download_card)
+        self._configure_expanding(self.spine_native_install_button)
         self.spine_native_install_button.clicked.connect(
             lambda: self.start_tool_install("spine_native")
         )
-        spine_download_row.addWidget(self.spine_native_install_button)
-        spine_download_row.addStretch(1)
-        runtime_layout.addLayout(spine_download_row)
+        spine_download_row.addWidget(self.spine_native_install_button, 1)
+        download_layout.addLayout(spine_download_row)
 
-        self.tool_download_progress = ProgressBar(runtime_card)
+        self.tool_download_progress = ProgressBar(download_card)
         self.tool_download_progress.setRange(0, 100)
         self.tool_download_progress.setValue(0)
         self.tool_download_progress.setVisible(False)
-        runtime_layout.addWidget(self.tool_download_progress)
-        self.tool_download_cancel = PushButton("", runtime_card)
+        download_layout.addWidget(self.tool_download_progress)
+        self.tool_download_cancel = PushButton("", download_card)
         self.tool_download_cancel.clicked.connect(self.cancel_tool_install)
         self.tool_download_cancel.setVisible(False)
-        runtime_layout.addWidget(self.tool_download_cancel)
-        self.tool_download_status = CaptionLabel("", runtime_card)
+        self._configure_expanding(self.tool_download_cancel)
+        download_layout.addWidget(self.tool_download_cancel)
+        self.tool_download_status = CaptionLabel("", download_card)
         self.tool_download_status.setWordWrap(True)
-        runtime_layout.addWidget(self.tool_download_status)
+        download_layout.addWidget(self.tool_download_status)
 
-        texture_viewer_row = QHBoxLayout()
-        texture_viewer_row.setSpacing(12)
-        texture_viewer_text_layout = QVBoxLayout()
-        texture_viewer_text_layout.setSpacing(4)
-        self.texture_viewer_label = BodyLabel("", runtime_card)
-        self.texture_viewer_desc = CaptionLabel("", runtime_card)
+        # Photoshop and Spine -------------------------------------------------
+        photoshop_card, photoshop_layout = self._new_settings_card(
+            content, "settingsPhotoshopCard"
+        )
+        self.photoshop_card = photoshop_card
+        right_column.addWidget(photoshop_card)
+        self.photoshop_label = BodyLabel("", photoshop_card)
+        self.photoshop_desc = CaptionLabel("", photoshop_card)
+        self.photoshop_desc.setWordWrap(True)
+        self.photoshop_status = CaptionLabel("", photoshop_card)
+        self.photoshop_status.setWordWrap(True)
+        self.photoshop_edit = LineEdit(photoshop_card)
+        self.photoshop_edit.editingFinished.connect(self.on_photoshop_edit_finished)
+        self.photoshop_button = PushButton("", photoshop_card)
+        self.photoshop_button.clicked.connect(self.browse_photoshop)
+        self.photoshop_clear_button = PushButton("", photoshop_card)
+        self.photoshop_clear_button.clicked.connect(self.clear_photoshop)
+        self._add_path_block(
+            photoshop_layout,
+            self.photoshop_label,
+            self.photoshop_desc,
+            self.photoshop_edit,
+            (self.photoshop_button, self.photoshop_clear_button),
+            self.photoshop_status,
+        )
+
+        spine_card, spine_layout = self._new_settings_card(
+            content, "settingsSpineCard"
+        )
+        self.spine_card = spine_card
+        right_column.addWidget(spine_card)
+        self.spine_section_title = SubtitleLabel(
+            tr("settings.spine_section", "Spine"), spine_card
+        )
+        self.spine_section_title.setWordWrap(True)
+        self.spine_section_title.setMinimumWidth(0)
+        self.spine_section_title.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        spine_layout.addWidget(self.spine_section_title)
+
+        self.spine_runtime_label = BodyLabel("", spine_card)
+        self.spine_runtime_desc = CaptionLabel("", spine_card)
+        self.spine_runtime_desc.setWordWrap(True)
+        self.spine_runtime_status = CaptionLabel("", spine_card)
+        self.spine_runtime_status.setWordWrap(True)
+        self.spine_runtime_edit = LineEdit(spine_card)
+        self.spine_runtime_edit.editingFinished.connect(self.on_spine_runtime_edit_finished)
+        self.spine_runtime_button = PushButton("", spine_card)
+        self.spine_runtime_button.clicked.connect(self.browse_spine_runtime)
+        self.spine_runtime_auto_button = PushButton("", spine_card)
+        self.spine_runtime_auto_button.clicked.connect(self.auto_detect_spine_runtime)
+        self._add_path_block(
+            spine_layout,
+            self.spine_runtime_label,
+            self.spine_runtime_desc,
+            self.spine_runtime_edit,
+            (self.spine_runtime_button, self.spine_runtime_auto_button),
+            self.spine_runtime_status,
+        )
+
+        self.spine_editor_label = BodyLabel("", spine_card)
+        self.spine_editor_desc = CaptionLabel("", spine_card)
+        self.spine_editor_desc.setWordWrap(True)
+        self.spine_editor_status = CaptionLabel("", spine_card)
+        self.spine_editor_status.setWordWrap(True)
+        self.spine_editor_edit = LineEdit(spine_card)
+        self.spine_editor_edit.editingFinished.connect(self.on_spine_editor_edit_finished)
+        self.spine_editor_button = PushButton("", spine_card)
+        self.spine_editor_button.clicked.connect(self.browse_spine_editor)
+        self.spine_editor_clear_button = PushButton("", spine_card)
+        self.spine_editor_clear_button.clicked.connect(self.clear_spine_editor)
+        self._add_path_block(
+            spine_layout,
+            self.spine_editor_label,
+            self.spine_editor_desc,
+            self.spine_editor_edit,
+            (self.spine_editor_button, self.spine_editor_clear_button),
+            self.spine_editor_status,
+        )
+
+        self.spine_create_project_label = BodyLabel("", spine_card)
+        self.spine_create_project_desc = CaptionLabel("", spine_card)
+        self.spine_create_project_desc.setWordWrap(True)
+        self.spine_create_project_checkbox = CheckBox(spine_card)
+        self._add_text_block(
+            spine_layout,
+            self.spine_create_project_label,
+            self.spine_create_project_desc,
+        )
+        self._configure_expanding(self.spine_create_project_checkbox)
+        spine_layout.addWidget(self.spine_create_project_checkbox)
+
+        self.spine_auto_convert_label = BodyLabel("", spine_card)
+        self.spine_auto_convert_desc = CaptionLabel("", spine_card)
+        self.spine_auto_convert_desc.setWordWrap(True)
+        self.spine_auto_convert_checkbox = CheckBox(spine_card)
+        self._add_text_block(
+            spine_layout,
+            self.spine_auto_convert_label,
+            self.spine_auto_convert_desc,
+        )
+        self._configure_expanding(self.spine_auto_convert_checkbox)
+        spine_layout.addWidget(self.spine_auto_convert_checkbox)
+
+        self.spine_target_version_label = BodyLabel("", spine_card)
+        self.spine_target_version_desc = CaptionLabel("", spine_card)
+        self.spine_target_version_desc.setWordWrap(True)
+        self.spine_target_version_edit = LineEdit(spine_card)
+        self._add_choice_block(
+            spine_layout,
+            self.spine_target_version_label,
+            self.spine_target_version_desc,
+            self.spine_target_version_edit,
+        )
+
+        # Texture preview settings -------------------------------------------
+        texture_card, texture_layout = self._new_settings_card(
+            content, "settingsTextureCard"
+        )
+        self.texture_card = texture_card
+        right_column.addWidget(texture_card)
+        self.texture_viewer_label = BodyLabel("", texture_card)
+        self.texture_viewer_desc = CaptionLabel("", texture_card)
         self.texture_viewer_desc.setWordWrap(True)
-        texture_viewer_text_layout.addWidget(self.texture_viewer_label)
-        texture_viewer_text_layout.addWidget(self.texture_viewer_desc)
-        self.texture_viewer_combo = ComboBox(runtime_card)
-        self.texture_viewer_combo.setMinimumWidth(150)
-        self.image_viewer_edit = LineEdit(runtime_card)
-        self.image_viewer_button = PushButton("", runtime_card)
+        self.texture_viewer_combo = ComboBox(texture_card)
+        self._add_choice_block(
+            texture_layout,
+            self.texture_viewer_label,
+            self.texture_viewer_desc,
+            self.texture_viewer_combo,
+        )
+        self.image_viewer_edit = LineEdit(texture_card)
+        self.image_viewer_label = BodyLabel("", texture_card)
+        self.image_viewer_desc = CaptionLabel("", texture_card)
+        self.image_viewer_desc.setWordWrap(True)
+        self.image_viewer_button = PushButton("", texture_card)
         self.image_viewer_button.clicked.connect(self.browse_image_viewer)
-        self.image_viewer_clear_button = PushButton("", runtime_card)
+        self.image_viewer_clear_button = PushButton("", texture_card)
         self.image_viewer_clear_button.clicked.connect(self.clear_image_viewer)
-        texture_viewer_row.addLayout(texture_viewer_text_layout, 1)
-        texture_viewer_row.addWidget(self.texture_viewer_combo)
-        texture_viewer_row.addWidget(self.image_viewer_edit, 2)
-        texture_viewer_row.addWidget(self.image_viewer_button)
-        texture_viewer_row.addWidget(self.image_viewer_clear_button)
-        runtime_layout.addLayout(texture_viewer_row)
+        self._add_path_block(
+            texture_layout,
+            self.image_viewer_label,
+            self.image_viewer_desc,
+            self.image_viewer_edit,
+            (self.image_viewer_button, self.image_viewer_clear_button),
+        )
 
-        self.setting_file_note = CaptionLabel("", runtime_card)
-        self.setting_file_note.setWordWrap(True)
-        runtime_layout.addWidget(self.setting_file_note)
-
-        runtime_action_row = QHBoxLayout()
-        runtime_action_row.addStretch(1)
-        self.detect_tools_button = PushButton("", runtime_card)
-        self.detect_tools_button.clicked.connect(self.auto_detect_toolchain)
-        runtime_action_row.addWidget(self.detect_tools_button)
-        self.save_button = PrimaryPushButton("", runtime_card)
-        self.save_button.clicked.connect(self.save_runtime_settings)
-        runtime_action_row.addWidget(self.save_button)
-        runtime_layout.addLayout(runtime_action_row)
-
-        main_layout.addWidget(runtime_card)
+        left_column.addStretch(1)
+        right_column.addStretch(1)
         main_layout.addStretch(1)
 
     def load_current_settings(self):
@@ -548,6 +719,20 @@ class SettingsPage(QFrame):
                 self.photoshop_edit.setText(self.settings_manager.get_photoshop_path())
             if self.spine_runtime_edit:
                 self.spine_runtime_edit.setText(self.settings_manager.get_spine_runtime_dir())
+            if self.spine_editor_edit:
+                get_editor_path = getattr(
+                    self.settings_manager, "get_spine_editor_path", None
+                )
+                self.spine_editor_edit.setText(
+                    get_editor_path() if callable(get_editor_path) else ""
+                )
+            if self.spine_create_project_checkbox:
+                get_create_project = getattr(
+                    self.settings_manager, "get_spine_create_project", None
+                )
+                self.spine_create_project_checkbox.setChecked(
+                    bool(get_create_project()) if callable(get_create_project) else True
+                )
             if self.spine_auto_convert_checkbox:
                 self.spine_auto_convert_checkbox.setChecked(
                     self.settings_manager.get_spine_conversion_enabled()
@@ -648,6 +833,41 @@ class SettingsPage(QFrame):
             )
             self.spine_runtime_button.setText(tr("common.browse"))
             self.spine_runtime_auto_button.setText(tr("settings.tool_auto"))
+            self.spine_section_title.setText(tr("settings.spine_section", "Spine"))
+            self.spine_editor_label.setText(
+                tr("settings.spine_editor_label", "Spine editor executable")
+            )
+            self.spine_editor_desc.setText(
+                tr(
+                    "settings.spine_editor_desc",
+                    "Select the locally installed Spine.com or Spine.exe used to create .spine projects.",
+                )
+            )
+            self.spine_editor_edit.setPlaceholderText(
+                tr(
+                    "settings.spine_editor_placeholder",
+                    "Example: C:\\Program Files\\Spine\\Spine.com",
+                )
+            )
+            self.spine_editor_button.setText(
+                tr("settings.spine_editor_select", "Select Spine editor")
+            )
+            self.spine_editor_clear_button.setText(tr("common.clear"))
+            self.spine_create_project_label.setText(
+                tr("settings.spine_create_project_label", "Automatic Spine project export")
+            )
+            self.spine_create_project_desc.setText(
+                tr(
+                    "settings.spine_create_project_desc",
+                    "When enabled, export creates an independent .spine project through the selected editor.",
+                )
+            )
+            self.spine_create_project_checkbox.setText(
+                tr(
+                    "settings.spine_create_project_checkbox",
+                    "Create a Spine project during export",
+                )
+            )
             self.spine_auto_convert_label.setText(tr("settings.spine_auto_convert_label"))
             self.spine_auto_convert_desc.setText(tr("settings.spine_auto_convert_desc"))
             self.spine_auto_convert_checkbox.setText(tr("settings.spine_auto_convert_checkbox"))
@@ -699,6 +919,15 @@ class SettingsPage(QFrame):
             )
             self.image_viewer_edit.setPlaceholderText(
                 tr("settings.image_viewer_placeholder")
+            )
+            self.image_viewer_label.setText(
+                tr("settings.image_viewer_label", "Custom image viewer")
+            )
+            self.image_viewer_desc.setText(
+                tr(
+                    "settings.image_viewer_desc",
+                    "Used only when the texture preview mode is set to Custom.",
+                )
             )
             self.image_viewer_button.setText(tr("common.browse"))
             self.image_viewer_clear_button.setText(tr("common.clear"))
@@ -816,6 +1045,22 @@ class SettingsPage(QFrame):
         self.settings_manager.set_spine_runtime_dir(
             self.spine_runtime_edit.text() if self.spine_runtime_edit else ""
         )
+        set_editor_path = getattr(
+            self.settings_manager, "set_spine_editor_path", None
+        )
+        if callable(set_editor_path):
+            set_editor_path(
+                self.spine_editor_edit.text() if self.spine_editor_edit else ""
+            )
+        set_create_project = getattr(
+            self.settings_manager, "set_spine_create_project", None
+        )
+        if callable(set_create_project):
+            set_create_project(
+                self.spine_create_project_checkbox.isChecked()
+                if self.spine_create_project_checkbox
+                else True
+            )
         self.settings_manager.set_spine_conversion_enabled(
             self.spine_auto_convert_checkbox.isChecked()
             if self.spine_auto_convert_checkbox
@@ -1015,6 +1260,45 @@ class SettingsPage(QFrame):
     def save_spine_runtime(self, path: str):
         self.settings_manager.set_spine_runtime_dir(path)
         self.refresh_tool_status_labels()
+
+    def browse_spine_editor(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            tr("settings.spine_editor_select", "Select Spine editor"),
+            self.spine_editor_edit.text() or "",
+            tr(
+                "settings.spine_editor_filter",
+                "Spine editor (Spine.com Spine.exe *.com *.exe);;All files (*.*)",
+            ),
+        )
+        if not path:
+            return
+        self.spine_editor_edit.setText(path)
+        self.save_spine_editor(path)
+
+    def clear_spine_editor(self):
+        self.spine_editor_edit.clear()
+        self.save_spine_editor("")
+
+    def on_spine_editor_edit_finished(self):
+        if self._syncing_ui:
+            return
+        self.save_spine_editor(self.spine_editor_edit.text())
+
+    def save_spine_editor(self, path: str):
+        setter = getattr(self.settings_manager, "set_spine_editor_path", None)
+        if callable(setter):
+            setter(path)
+        self.refresh_tool_status_labels()
+        InfoBar.success(
+            title=tr("common.success"),
+            content=tr("settings.spine_editor_saved", "Spine editor path saved."),
+            orient=Qt.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP,
+            duration=2500,
+            parent=self,
+        )
 
     def open_cubism_download_page(self):
         url = official_download_url("cubism_core")
@@ -1274,6 +1558,35 @@ class SettingsPage(QFrame):
                     directory=True,
                 )
             )
+        if self.spine_editor_status:
+            get_editor_path = getattr(
+                self.settings_manager, "get_spine_editor_path", None
+            )
+            configured_path = (
+                str(get_editor_path() or "").strip()
+                if callable(get_editor_path)
+                else (self.spine_editor_edit.text().strip() if self.spine_editor_edit else "")
+            )
+            if configured_path:
+                configured = Path(configured_path).expanduser()
+                if configured.is_file():
+                    self.spine_editor_status.setText(
+                        tr(
+                            "settings.tool_status.configured",
+                            path=str(configured.resolve()),
+                        )
+                    )
+                else:
+                    self.spine_editor_status.setText(
+                        tr("settings.tool_status.invalid", path=configured_path)
+                    )
+            else:
+                self.spine_editor_status.setText(
+                    tr(
+                        "settings.spine_editor_not_configured",
+                        "Not configured. Select Spine.com or Spine.exe to create .spine projects.",
+                    )
+                )
 
     def tool_status_text(self, configured_path: str, detector, directory: bool = False):
         configured_path = str(configured_path or "").strip()

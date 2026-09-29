@@ -3,9 +3,10 @@ import os
 from PySide6.QtCore import QEvent, Qt
 from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout
 from qfluentwidgets import FluentIcon as FIF
-from qfluentwidgets import FluentWindow, NavigationItemPosition, Theme, setTheme
+from qfluentwidgets import FluentWindow, NavigationItemPosition
 
 from app.core.settings_manager import SettingsManager
+from app.gui.theme import apply_application_theme
 from app.i18n import get_i18n, normalize_language_code, tr
 
 
@@ -116,20 +117,6 @@ except Exception as e:
 
 
 try:
-    from app.gui.SpineAtlasPage import SpineAtlasPage
-except Exception as e:
-    import traceback
-    print(f"Error importing SpineAtlasPage: {e}")
-    traceback.print_exc()
-
-    class SpineAtlasPage(QFrame):
-        def __init__(self, parent=None):
-            super().__init__(parent)
-            self.setObjectName("spineAtlasPage")
-            QHBoxLayout(self).addWidget(QFrame(self))
-
-
-try:
     from app.gui.SpineConverterPage import SpineConverterPage
 except Exception as e:
     import traceback
@@ -184,7 +171,6 @@ class MainWindow(FluentWindow):
         self.psdReconstructionPage = self._create_page(
             PsdReconstructionPage, "psdReconstructionPage"
         )
-        self.spineAtlasPage = self._create_page(SpineAtlasPage, "spineAtlasPage")
         self.spineConverterPage = self._create_page(SpineConverterPage, "spineConverterPage")
         self.settingsPage = self._create_page(SettingsPage, "settingsPage")
 
@@ -279,10 +265,6 @@ class MainWindow(FluentWindow):
             # while the main window is closing.
             event.ignore()
             return
-        spine_page = getattr(self, "spineAtlasPage", None)
-        stop_worker = getattr(spine_page, "stop_worker", None)
-        if callable(stop_worker):
-            stop_worker()
         # Store the restore rectangle, not the maximized monitor rectangle.
         # Otherwise opening the next session looks maximized but its titlebar
         # and Windows restore state disagree.
@@ -331,16 +313,6 @@ class MainWindow(FluentWindow):
             )
         except Exception as e:
             print(f"Error adding Live2DModPage to navigation: {e}")
-
-        try:
-            self.addSubInterface(
-                self.spineAtlasPage,
-                FIF.IMAGE_EXPORT,
-                tr("main.nav.spine_atlas"),
-                NavigationItemPosition.SCROLL,
-            )
-        except Exception as e:
-            print(f"Error adding SpineAtlasPage to navigation: {e}")
 
         try:
             self.addSubInterface(
@@ -394,7 +366,6 @@ class MainWindow(FluentWindow):
             self.steamWorkshopPage,
             self.live2dModPage,
             self.psdReconstructionPage,
-            self.spineAtlasPage,
             self.spineConverterPage,
             self.settingsPage,
         ]
@@ -404,38 +375,12 @@ class MainWindow(FluentWindow):
 
     def apply_theme(self):
         try:
-            theme_setting = self.settings_manager.get("theme", "light").lower()
-
-            if theme_setting == "light":
-                setTheme(Theme.LIGHT)
-            elif theme_setting == "dark":
-                setTheme(Theme.DARK)
-            else:
-                setTheme(Theme.LIGHT)
-
-            self.setStyleSheet("""
-                QWidget {
-                    background-color: white;
-                    color: black;
-                }
-                QFrame {
-                    background-color: white;
-                }
-            """)
-
-            print(f"Applied theme: {theme_setting}")
+            theme_setting = str(self.settings_manager.get("theme", "auto") or "auto").lower()
+            selected = apply_application_theme(theme_setting, self)
+            print(f"Applied theme: {selected.value.lower()}")
         except Exception as e:
             print(f"Error applying theme: {e}")
-            setTheme(Theme.LIGHT)
-            self.setStyleSheet("""
-                QWidget {
-                    background-color: white;
-                    color: black;
-                }
-                QFrame {
-                    background-color: white;
-                }
-            """)
+            apply_application_theme("light", self)
 
     def retranslate_ui(self):
         self.setWindowTitle(tr("main.window_title"))
@@ -448,7 +393,6 @@ class MainWindow(FluentWindow):
             self.steamWorkshopPage,
             self.live2dModPage,
             self.psdReconstructionPage,
-            self.spineAtlasPage,
             self.spineConverterPage,
             self.settingsPage,
         ]:

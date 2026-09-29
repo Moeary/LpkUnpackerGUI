@@ -43,6 +43,11 @@ from app.core.spine_atlas import (
     _unpremultiply,
 )
 from app.core.spine_preview import read_spine_version
+from app.core.spine_editor import (
+    SpineEditorError,
+    SpineEditorProjectResult,
+    create_spine_editor_project,
+)
 from app.paths import PROJECT_ROOT
 
 
@@ -110,6 +115,8 @@ class SpineConversionResult:
     skeleton_path: Path
     report_path: Path
     warnings: tuple[str, ...] = ()
+    editor_project_path: Path | None = None
+    editor_report_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -127,6 +134,10 @@ class SpineConversionOptions:
     # Optional explicit native DLL path; legacy EXE settings are ignored.
     converter_path: str | os.PathLike[str] | None = None
     remove_curve: bool = False
+    # Core API compatibility keeps project generation opt-in.  The GUI and
+    # persisted settings explicitly enable this for editor-ready exports.
+    create_project: bool = False
+    editor_path: str | os.PathLike[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -199,6 +210,8 @@ def convert_spine(
     output_format: str = "json",
     converter_path: str | os.PathLike[str] | None = None,
     remove_curve: bool = False,
+    create_project: bool = False,
+    editor_path: str | os.PathLike[str] | None = None,
 ) -> SpineConversionResult:
     """Convert one Spine skeleton and copy its atlas assets into new output.
 
@@ -210,6 +223,12 @@ def convert_spine(
     is empty, the parent beside the selected file is used. For a selected
     directory, its parent is used so the converted copy is a sibling and
     never becomes source input.
+    When ``create_project`` is true and the output format is JSON, an
+    independent ``editor_project`` package is created below the converted
+    directory.  It unpacks atlas regions, rewrites image references, and runs
+    the official Spine 3.8.75 CLI to create and reopen a real ``.spine`` file.
+    The core API leaves this opt-in for backwards compatibility; the GUI and
+    extraction settings can enable it explicitly.
     """
 
     target = _validate_target_version(target_version)
@@ -289,6 +308,8 @@ def convert_spine(
         "converter_license": UPSTREAM_LICENSE_URL,
         "version_differences": UPSTREAM_VERSION_DIFFERENCES_URL,
         "remove_curve": bool(remove_curve),
+        "create_project": bool(create_project),
+        "editor_path": str(editor_path) if editor_path else None,
         "warnings": warnings,
         "risks": list(warnings),
         "stdout": "",
@@ -340,12 +361,41 @@ def convert_spine(
         report["warnings"] = warnings
         report["risks"] = list(warnings)
         report["asset_policy"] = "converted skeleton plus referenced atlas/page assets; ViewerEX wrapper is not copied"
+        editor_result: SpineEditorProjectResult | None = None
+        if create_project:
+            if format_name != "json":
+                raise SpineConversionError(
+                    "Editor project generation requires JSON output; choose output_format='json' so the official Spine CLI can import it."
+                )
+            converted_atlases = [Path(item["output"]) for item in atlas_warnings if item.get("output")]
+            editor_result = create_spine_editor_project(
+                output_skeleton,
+                converted_atlases,
+                destination,
+                editor_path=editor_path,
+                target_version=target_version,
+                project_name=output_skeleton.stem,
+            )
+            report["editor_project"] = {
+                "project_path": str(editor_result.project_path),
+                "import_json_path": str(editor_result.import_json_path),
+                "images_dir": str(editor_result.images_dir),
+                "report_path": str(editor_result.report_path),
+                "warnings": list(editor_result.warnings),
+            }
+            warnings.extend(editor_result.warnings)
+            # Include editor-side atlas/path diagnostics in the top-level
+            # conversion report as well as the dedicated editor report.
+            report["warnings"] = warnings
+            report["risks"] = list(warnings)
         _write_report(report_path, report)
         return SpineConversionResult(
             output_dir=destination,
             skeleton_path=output_skeleton,
             report_path=report_path,
             warnings=tuple(warnings),
+            editor_project_path=editor_result.project_path if editor_result else None,
+            editor_report_path=editor_result.report_path if editor_result else None,
         )
     except Exception as exc:
         report["error"] = str(exc)
@@ -357,6 +407,8 @@ def convert_spine(
             pass
         if isinstance(exc, SpineConversionError):
             raise
+        if isinstance(exc, SpineEditorError):
+            raise SpineConversionError(f"Spine editor project generation failed: {exc}") from exc
         raise SpineConversionError(f"Spine conversion failed: {exc}") from exc
 
 
@@ -1192,6 +1244,8 @@ __all__ = [
     "SpineConversionProcessError",
     "SpineConversionResult",
     "SpineConversionUnsupportedError",
+    "SpineEditorError",
+    "SpineEditorProjectResult",
     "SpineConverterError",
     "SpineConverterNotFoundError",
     "SpineSourceAmbiguousError",

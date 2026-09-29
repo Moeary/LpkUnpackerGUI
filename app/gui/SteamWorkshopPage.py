@@ -134,9 +134,9 @@ class WorkshopItemCard(CardWidget):
         self.preview_label.setFixedSize(100, 100)
         self.preview_label.setStyleSheet("""
             QLabel {
-                border: 2px solid #E0E0E0;
+                border: 2px solid palette(mid);
                 border-radius: 8px;
-                background-color: #F5F5F5;
+                background-color: palette(alternate-base);
             }
         """)
         self.preview_label.setAlignment(Qt.AlignCenter)
@@ -218,10 +218,10 @@ class WorkshopItemCard(CardWidget):
         self.preview_label.setText(tr("steam.card.no_preview"))
         self.preview_label.setStyleSheet("""
             QLabel {
-                border: 2px solid #E0E0E0;
+                border: 2px solid palette(mid);
                 border-radius: 8px;
-                background-color: #F5F5F5;
-                color: #888888;
+                background-color: palette(alternate-base);
+                color: palette(placeholder-text);
                 font-size: 12px;
             }
         """)

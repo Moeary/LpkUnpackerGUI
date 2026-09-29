@@ -19,6 +19,7 @@ try:
     import app.gui.PreviewPage as preview_page_module
     from app.gui.PreviewPage import PreviewPage
     from app.gui.SpinePreviewWidget import SpinePreviewWidget
+    from app.gui.theme import palette_for_theme
 except (ImportError, OSError):  # pragma: no cover - optional desktop dependency
     QApplication = None
     QCoreApplication = None
@@ -28,6 +29,7 @@ except (ImportError, OSError):  # pragma: no cover - optional desktop dependency
     preview_page_module = None
     PreviewPage = None
     SpinePreviewWidget = None
+    palette_for_theme = None
 
 
 @unittest.skipIf(
@@ -102,6 +104,26 @@ class SpinePreviewWidgetTests(unittest.TestCase):
         widget.deleteLater()
         QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
         self.app.processEvents()
+
+    def test_transparent_stage_follows_current_palette(self):
+        widget = SpinePreviewWidget()
+        original_palette = self.app.palette()
+        try:
+            self.app.setPalette(palette_for_theme("dark"))
+            widget.set_view_settings({"transparent_bg": True, "bg_color": "#ff00ff"})
+            self.assertEqual(widget._background_color().name(), "#272c34")
+
+            self.app.setPalette(palette_for_theme("light"))
+            self.assertEqual(widget._background_color().name(), "#ffffff")
+
+            widget.set_view_settings({"transparent_bg": False, "bg_color": "#ff00ff"})
+            self.assertEqual(widget._background_color().name(), "#ff00ff")
+        finally:
+            self.app.setPalette(original_palette)
+            widget.shutdown()
+            widget.deleteLater()
+            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+            self.app.processEvents()
 
     def test_preview_page_surfaces_native_error_without_active_plan(self):
         page = PreviewPage()

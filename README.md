@@ -62,7 +62,7 @@ pixi run check
 | `.lpk` | 识别包内容并解包；需要时自动匹配同目录的 `config.json` |
 | `.wpk` | 先拆出内部 LPK 和配置，再继续处理其中的 LPK |
 | Unity 资源 | 支持 `.assets`、`.sharedassets`、`.bundle`、`.unity3d` 等来源 |
-| Spine 图集 | 选择 `.atlas` 或包含它的目录，进入图集区域提取、PSD 编辑和副本回写 |
+| Spine 图集 | 统一预览支持 Spine 来源；atlas 解析与副本回写 core 保留供后续编辑器和图像工作流复用 |
 | 文件夹 | 递归扫描其中的 LPK、WPK、Unity 资源和已解包 Live2D 模型 |
 | `.zip` / `.7z` / `.rar` | 在统一预览中临时解压，再查找 Live2D 模型和图片 |
 | 已解包模型 | 支持 `model3.json`、`.moc3`、模型目录和常见贴图文件 |
@@ -102,9 +102,9 @@ LPK 解包演示：
 - 将当前预览资源另行导出。
 - 调整 Live2D 参数并保存为 PSD 工程可使用的姿态参数方案。
 
-### Spine 图集入口
+### Spine 图集能力
 
-解包或预览 Spine 来源时，可以直接选择 `.atlas` 文件或包含它的文件夹进入 Spine 图集页。页面解析图集页、旋转/裁剪区域和多页贴图，导出区域 PNG（可选 PSD）及元数据；回写时只写入输出目录中的贴图副本，原始 `.atlas`、骨骼文件和源贴图保持不变。该入口处理图集格式，不承担 Spine 原生动画渲染。
+应用已移除独立的 Spine 图集工作台入口。统一预览仍可查看支持的 Spine 来源；`app/core/spine_atlas.py` 保留 atlas 解析、区域导出和副本回写能力，供后续编辑器与图像工作流接入，原始 atlas、骨骼文件和源贴图不会被隐式覆盖。
 
 ### Spine 版本转换
 

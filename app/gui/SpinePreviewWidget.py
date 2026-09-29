@@ -15,7 +15,7 @@ import time
 from typing import Any
 
 from PySide6.QtCore import QTimer, Qt, Signal
-from PySide6.QtGui import QColor, QOpenGLContext, QSurfaceFormat
+from PySide6.QtGui import QColor, QGuiApplication, QOpenGLContext, QPalette, QSurfaceFormat
 from PySide6.QtWidgets import QLabel, QFrame, QSizePolicy, QVBoxLayout, QWidget
 
 try:
@@ -479,6 +479,31 @@ class SpinePreviewWidget(QFrame):
         else:
             self.canvas.update()
 
+    def _background_color(self) -> QColor:
+        """Return the stage color for the current preview settings.
+
+        Transparent mode is rendered as an opaque stage for the native child
+        window on Windows.  Its visible color must therefore follow the
+        active Qt palette instead of the color picker default, which may have
+        been created under the light theme before the application switches to
+        dark mode.
+        """
+
+        app = QGuiApplication.instance()
+        if bool(self._settings.get("transparent_bg", True)):
+            if app is not None:
+                return app.palette().color(QPalette.ColorRole.Base)
+            return self.palette().color(QPalette.ColorRole.Base)
+
+        value = self._settings.get("bg_color", "#20242b")
+        color = value if isinstance(value, QColor) else QColor(str(value))
+        if color.isValid():
+            return color
+
+        if app is not None:
+            return app.palette().color(QPalette.ColorRole.Base)
+        return QColor("#20242b")
+
     def _report_error(self, message: str) -> None:
         text = str(message or "Spine native preview failed.")
         if self._reported_error and self._last_state.get("previewError") == text:
@@ -570,13 +595,12 @@ class SpinePreviewWidget(QFrame):
         self._textures_uploaded = True
 
     def _paint_native(self, canvas: _SpineOpenGLWindow) -> None:
+        color = self._background_color()
         if self._model is None:
-            color = QColor(self._settings.get("bg_color", "#20242b"))
             GL.glClearColor(color.redF(), color.greenF(), color.blueF(), 1.0)
             GL.glClear(GL.GL_COLOR_BUFFER_BIT)
             return
         self._upload_native_textures(canvas)
-        color = QColor(self._settings.get("bg_color", "#20242b"))
         transparent = bool(self._settings.get("transparent_bg", True))
         # A QOpenGLWindow inside QWidget.createWindowContainer is a native
         # child window.  Windows cannot alpha-composite that child into the

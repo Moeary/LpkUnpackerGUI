@@ -366,11 +366,11 @@ class ExtractorPage(QFrame):
         self.setStyleSheet(
             """
             QSplitter::handle {
-                background: #eef2f7;
+                background: palette(alternate-base);
                 border-radius: 3px;
             }
             QSplitter::handle:hover {
-                background: #d5dde8;
+                background: palette(mid);
             }
             QProgressBar {
                 min-height: 6px;

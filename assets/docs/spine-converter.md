@@ -47,6 +47,30 @@ spine_converter_convert(input_file, output_file, target_version,
 
 目标为 `3.8.75` 时，内置转换器会写出完整的 `3.8.75` 版本字段。能否预览由所选 runtime 是否接受该精确版本决定；编辑器导入和无损往返均不保证。应用不会通过改写版本字符串来伪装兼容性。
 
+## 生成可编辑的 `.spine` 工程
+
+勾选 GUI 中的“生成 `.spine` 编辑工程”后，转换器会在转换结果下创建独立的
+`editor_project/`。该目录包含重写后的导入 JSON、`images/` 下的每个 atlas region
+PNG、`spine_atlas.json` 元数据、官方 CLI 生成的真实 `.spine` 文件，以及
+`spine_editor_report.json`。源 JSON、atlas 和页面贴图不会被改写。
+
+Spine 编辑器导入的是单张图片路径，而不是运行时 atlas 页面。导出 helper 会使用
+[Atlas format 的 rotation/trim 规则](https://de.esotericsoftware.com/spine-atlas-format#Rendering)
+解包 region，处理 PMA 和裁边；对于 mesh attachment，会原样保留 JSON 中基于原始图片的
+`regionUVs`，因为导出的图片已恢复为原始尺寸且不再旋转。随后调用已安装的 Spine 3.8.75 `Spine.com`：
+
+```text
+Spine.com -i editor_project/skeleton.json \
+  -o editor_project/skeleton.spine -r skeleton
+Spine.com -i editor_project/skeleton.spine
+```
+
+第二次调用用于确认工程能被同一编辑器重新打开，并在报告中记录版本、骨骼名称和
+CLI 输出。官方 CLI 路径可在设置中保存为 `tools.spine_editor_path`；未找到编辑器
+时会保留已经完成的转换目录，并明确提示安装 Spine 3.8.75 或配置 `Spine.com`，
+不会创建伪造的 `.spine` 文件。核心 `convert_spine` API 默认不生成工程，以兼容
+旧调用；GUI 和自动转换设置会显式开启该选项。
+
 ## 支持范围与限制
 
 上游转换逻辑支持 `3.5.x`、`3.6.x`、`3.7.x`、`3.8.x`、`4.0.x`、`4.1.x` 和 `4.2.x`。输入版本由骨骼内容自动检测，目标版本必须写完整的三段式版本号。跨版本转换遵循固定提交中的字段转换规则，曲线、旋转、路径约束、约束顺序和版本特有字段可能发生变化；请在目标 runtime 中检查动画和约束效果。

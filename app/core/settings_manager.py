@@ -95,6 +95,7 @@ class SettingsManager:
                 "enabled": False,
                 "target_version": DEFAULT_SPINE_TARGET_VERSION,
                 "output_format": "json",
+                "create_project": True,
             },
             "psd": {
                 "last_project_file": "",
@@ -368,6 +369,18 @@ class SettingsManager:
         """Return the configured Spine skeleton converter executable path."""
 
         return str(self.get("tools.spine_converter_path", "") or "").strip()
+
+    def get_spine_editor_path(self) -> str:
+        return str(self.get("tools.spine_editor_path", "") or "").strip()
+
+    def set_spine_editor_path(self, path: str):
+        self.set("tools.spine_editor_path", str(path or "").strip())
+
+    def get_spine_create_project(self) -> bool:
+        return bool(self.get("spine_conversion.create_project", True))
+
+    def set_spine_create_project(self, enabled: bool):
+        self.set("spine_conversion.create_project", bool(enabled))
 
     def set_spine_converter_path(self, path: str):
         """Store the optional Spine skeleton converter executable path."""

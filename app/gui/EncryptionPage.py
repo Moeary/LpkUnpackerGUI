@@ -80,7 +80,9 @@ class EncryptionPage(QFrame):
         
         # Feature notice
         self.notice_frame = QFrame(self)
-        self.notice_frame.setStyleSheet("background-color: #f0f0f0; border-radius: 5px;")
+        self.notice_frame.setStyleSheet(
+            "background-color: palette(alternate-base); border-radius: 5px;"
+        )
         notice_layout = QVBoxLayout(self.notice_frame)
         
         self.notice_title = SubtitleLabel("", self.notice_frame)

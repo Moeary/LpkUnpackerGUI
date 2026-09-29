@@ -4,6 +4,7 @@ from typing import Optional, List, Dict, Any
 
 from PySide6.QtOpenGL import QOpenGLWindow
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QGuiApplication, QPalette
 import OpenGL.GL as GL
 from abc import abstractmethod
 
@@ -123,6 +124,10 @@ class ADPOpenGLCanvas(QOpenGLWindow):
         # Background control
         self.__use_background = False
         self.__bg_color = (0.0, 0.0, 0.0, 0.0)
+        self.__background_follows_palette = False
+        app = QGuiApplication.instance()
+        if app is not None and hasattr(app, "paletteChanged"):
+            app.paletteChanged.connect(self._on_palette_changed)
         # High-DPI handling
         self._dpr = 1.0
         self._canvas_framebuffer = None
@@ -396,9 +401,11 @@ class ADPOpenGLCanvas(QOpenGLWindow):
         )
         self.__use_background = not bool(transparent) or embedded_transparent
         if embedded_transparent:
-            self.__bg_color = (0.98, 0.985, 0.992, 1.0)
+            self.__background_follows_palette = True
+            self._set_palette_background()
             self.update()
             return
+        self.__background_follows_palette = False
         if qcolor is not None:
             # QColor -> normalized RGBA
             r, g, b, a = qcolor.redF(), qcolor.greenF(), qcolor.blueF(), 1.0
@@ -406,6 +413,15 @@ class ADPOpenGLCanvas(QOpenGLWindow):
         else:
             self.__bg_color = (0.0, 0.0, 0.0, 1.0)
         self.update()
+
+    def _set_palette_background(self) -> None:
+        color = QGuiApplication.palette().color(QPalette.ColorRole.Base)
+        self.__bg_color = (color.redF(), color.greenF(), color.blueF(), 1.0)
+
+    def _on_palette_changed(self, *_args) -> None:
+        if self.__background_follows_palette:
+            self._set_palette_background()
+            self.update()
 
     @abstractmethod
     def on_init(self):

@@ -137,18 +137,18 @@ class UnifiedPreviewPanel(QFrame):
         self.setStyleSheet(
             f"""
             QFrame#{self.objectName()} {{
-                border: 1px solid #dde2ea;
+                border: 1px solid palette(mid);
                 border-radius: 8px;
-                background: #ffffff;
+                background: palette(base);
             }}
             """
         )
         self.live2d_host.setStyleSheet(
             """
             QFrame {
-                border: 1px solid #dde2ea;
+                border: 1px solid palette(mid);
                 border-radius: 8px;
-                background: #ffffff;
+                background: palette(base);
             }
             """
         )

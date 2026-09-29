@@ -147,6 +147,8 @@ class SpineExtractionConversionTests(unittest.TestCase):
             output_format="json",
             converter_path="converter.exe",
             remove_curve=False,
+            create_project=False,
+            editor_path=None,
         )
 
     def test_disabled_or_texture_only_lpk_does_not_invoke_converter(self) -> None:
@@ -273,6 +275,8 @@ class SpineExtractionConversionTests(unittest.TestCase):
             output_format="json",
             converter_path=None,
             remove_curve=False,
+            create_project=False,
+            editor_path=None,
         )
 
     def test_unity_item_never_enters_spine_conversion(self) -> None:

@@ -44,9 +44,11 @@ except ImportError:  # pragma: no cover - bundled with PySide6 in normal builds
 
 try:
     from app.core.spine_converter import convert_spine, discover_native_converter
+    from app.core.spine_editor import discover_spine_editor
 except ImportError:  # Keep the page importable while the optional backend is absent.
     convert_spine = None
     discover_native_converter = None
+    discover_spine_editor = None
 
 
 def _thread_is_running(thread) -> bool:
@@ -91,8 +93,17 @@ class SpineConverterWorker(QThread):
     resultReady = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, source: str, output_dir: str | None, target_version: str, output_format: str,
-                 converter_path: str | None, remove_curve: bool):
+    def __init__(
+        self,
+        source: str,
+        output_dir: str | None,
+        target_version: str,
+        output_format: str,
+        converter_path: str | None,
+        remove_curve: bool,
+        create_project: bool = False,
+        editor_path: str | None = None,
+    ):
         # The worker is deliberately unparented.  A running QThread must not
         # be destroyed with the page; the page keeps it until its signals have
         # been delivered and its finished state is observed.
@@ -103,6 +114,8 @@ class SpineConverterWorker(QThread):
         self.output_format = output_format
         self.converter_path = converter_path
         self.remove_curve = bool(remove_curve)
+        self.create_project = bool(create_project)
+        self.editor_path = editor_path
 
     def run(self):
         try:
@@ -115,6 +128,8 @@ class SpineConverterWorker(QThread):
                 output_format=self.output_format,
                 converter_path=self.converter_path,
                 remove_curve=self.remove_curve,
+                create_project=self.create_project,
+                editor_path=self.editor_path,
             )
             self.resultReady.emit(result)
         except Exception as exc:
@@ -139,12 +154,14 @@ class SpineConverterPage(_SpineConverterDropFrame):
         self._worker_finished = False
         self._worker_reported = False
         self._converter_info = None
+        self._editor_info = None
         self._status_state = "idle"
         self._status_error = ""
         self._result = None
         self._result_output_dir = ""
         self._result_skeleton_path = ""
         self._result_report_path = ""
+        self._result_editor_project_path = ""
 
         self._build_ui()
         self._load_saved_conversion_settings()
@@ -161,10 +178,15 @@ class SpineConverterPage(_SpineConverterDropFrame):
         output_format = self.settings_manager.get_spine_conversion_output_format()
         if output_format in self.OUTPUT_FORMATS:
             self.output_format_combo.setCurrentText(output_format)
+        self.create_project_checkbox.setChecked(
+            bool(self.settings_manager.get_spine_create_project())
+        )
+        self._editor_info = None
         # The converter is bundled as a native DLL.  The old EXE setting is
         # intentionally not surfaced here; the backend may ignore that legacy
         # value while discovering the installed DLL.
         self._converter_info = None
+        self._update_editor_project_availability()
 
     def _build_ui(self):
         self.main_layout = QVBoxLayout(self)
@@ -219,17 +241,29 @@ class SpineConverterPage(_SpineConverterDropFrame):
         self.output_format_combo.setCurrentIndex(0)
         self.remove_curve_checkbox = CheckBox(self)
         self.remove_curve_checkbox.setChecked(False)
+        self.create_project_checkbox = CheckBox(self)
+        self.create_project_checkbox.setChecked(True)
+        self.target_version_combo.currentTextChanged.connect(
+            self._update_editor_project_availability
+        )
+        self.output_format_combo.currentTextChanged.connect(
+            self._update_editor_project_availability
+        )
         options_row.addWidget(self.target_version_label)
         options_row.addWidget(self.target_version_combo)
         options_row.addWidget(self.output_format_label)
         options_row.addWidget(self.output_format_combo)
         options_row.addWidget(self.remove_curve_checkbox)
+        options_row.addWidget(self.create_project_checkbox)
         options_row.addStretch(1)
         self.main_layout.addLayout(options_row)
 
         self.converter_status_label = CaptionLabel(self)
         self.converter_status_label.setWordWrap(True)
         self.main_layout.addWidget(self.converter_status_label)
+        self.editor_status_label = CaptionLabel(self)
+        self.editor_status_label.setWordWrap(True)
+        self.main_layout.addWidget(self.editor_status_label)
 
         self.warning_label = QLabel(self)
         self.warning_label.setWordWrap(True)
@@ -286,13 +320,16 @@ class SpineConverterPage(_SpineConverterDropFrame):
         self.target_version_label.setText(tr("spine_converter.target_version"))
         self.output_format_label.setText(tr("spine_converter.output_format"))
         self.remove_curve_checkbox.setText(tr("spine_converter.remove_curve"))
+        self.create_project_checkbox.setText(tr("spine_converter.create_project"))
         self.warning_label.setText(tr("spine_converter.warning"))
         self.convert_button.setText(tr("spine_converter.convert"))
         self.open_output_button.setText(tr("spine_converter.open_output"))
         self.preview_button.setText(tr("spine_converter.preview"))
         self._render_status()
         self._render_converter_status()
+        self._render_editor_status()
         self._render_result()
+        self._update_editor_project_availability()
 
     def updateUIScale(self, width: int, height: int):
         del width, height
@@ -309,6 +346,7 @@ class SpineConverterPage(_SpineConverterDropFrame):
         self.settings_manager.reload_settings()
         self._load_saved_conversion_settings()
         self._detect_native_converter()
+        self._detect_editor()
 
     def _accept_dropped_paths(self, paths: list[str]):
         if self._worker is not None:
@@ -360,10 +398,26 @@ class SpineConverterPage(_SpineConverterDropFrame):
         self._render_converter_status()
         return self._converter_info
 
+    def _detect_editor(self):
+        if discover_spine_editor is None:
+            self._editor_info = None
+            self._render_editor_status()
+            return None
+        try:
+            configured = self.settings_manager.get_spine_editor_path()
+            self._editor_info = discover_spine_editor(configured or None, target_version="3.8.75")
+        except Exception as exc:
+            self._editor_info = None
+            self._show_error(str(exc))
+        self._render_editor_status()
+        return self._editor_info
+
     # Kept as a small compatibility hook for callers that used the old
     # auto-detect action; it never accepts or launches an executable.
     def _detect_converter(self):
-        return self._detect_native_converter()
+        native = self._detect_native_converter()
+        self._detect_editor()
+        return native
 
     def _render_converter_status(self):
         path = str(self._converter_info or "").strip()
@@ -371,6 +425,46 @@ class SpineConverterPage(_SpineConverterDropFrame):
             self.converter_status_label.setText(tr("spine_converter.converter_found", path=path))
         else:
             self.converter_status_label.setText(tr("spine_converter.converter_auto"))
+
+    def _render_editor_status(self):
+        if not self._editor_project_target_supported():
+            self.editor_status_label.setText(tr("spine_converter.editor_target_only"))
+            return
+        if not self._editor_project_format_supported():
+            self.editor_status_label.setText(tr("spine_converter.editor_json_only"))
+            return
+        path = str(self._editor_info or "").strip()
+        if path:
+            self.editor_status_label.setText(tr("spine_converter.editor_found", path=path))
+        else:
+            self.editor_status_label.setText(tr("spine_converter.editor_auto"))
+
+    def _editor_project_target_supported(self) -> bool:
+        return str(self.target_version_combo.currentText() or "").strip() == "3.8.75"
+
+    def _editor_project_format_supported(self) -> bool:
+        return str(self.output_format_combo.currentText() or "").strip().lower() == "json"
+
+    def _editor_project_available(self) -> bool:
+        return self._editor_project_target_supported() and self._editor_project_format_supported()
+
+    def _update_editor_project_availability(self, *_args):
+        """Keep the editor-project option explicit about its 3.8.75 scope."""
+
+        supported = self._editor_project_available()
+        if not supported and self.create_project_checkbox.isChecked():
+            self.create_project_checkbox.setChecked(False)
+        self.create_project_checkbox.setEnabled(bool(supported and self._worker is None))
+        self.create_project_checkbox.setToolTip(
+            ""
+            if supported
+            else tr(
+                "spine_converter.editor_target_only"
+                if not self._editor_project_target_supported()
+                else "spine_converter.editor_json_only"
+            )
+        )
+        self._render_editor_status()
 
     def _set_controls_enabled(self, enabled: bool):
         for control in (
@@ -383,8 +477,12 @@ class SpineConverterPage(_SpineConverterDropFrame):
             self.convert_button,
         ):
             control.setEnabled(bool(enabled))
+        self.create_project_checkbox.setEnabled(
+            bool(enabled and self._editor_project_available())
+        )
         if enabled:
             self.convert_button.setEnabled(True)
+        self._render_editor_status()
 
     def _show_error(self, message: str):
         self._status_state = "error"
@@ -430,6 +528,7 @@ class SpineConverterPage(_SpineConverterDropFrame):
         output_dir = self._result_output_dir
         skeleton = self._result_skeleton_path
         report = self._result_report_path
+        editor_project = self._result_editor_project_path
         warnings = _result_value(self._result, "warnings", []) or []
         warning_text = "\n".join(str(item) for item in warnings)
         self.result_text.setPlainText(
@@ -440,6 +539,11 @@ class SpineConverterPage(_SpineConverterDropFrame):
                 report=report or tr("spine_converter.no_report"),
             )
             + (f"\n{warning_text}" if warning_text else "")
+            + (
+                f"\n{tr('spine_converter.editor_project')}: {editor_project}"
+                if editor_project
+                else ""
+            )
         )
 
     def start_conversion(self):
@@ -458,6 +562,12 @@ class SpineConverterPage(_SpineConverterDropFrame):
         if output_format not in self.OUTPUT_FORMATS:
             self._show_error(tr("spine_converter.error_format"))
             return
+        if self.create_project_checkbox.isChecked() and not self._editor_project_target_supported():
+            self._show_error(tr("spine_converter.editor_target_only"))
+            return
+        if self.create_project_checkbox.isChecked() and output_format != "json":
+            self._show_error(tr("spine_converter.editor_json_only"))
+            return
 
         self._conversion_generation += 1
         generation = self._conversion_generation
@@ -468,6 +578,8 @@ class SpineConverterPage(_SpineConverterDropFrame):
             output_format,
             None,
             self.remove_curve_checkbox.isChecked(),
+            self.create_project_checkbox.isChecked(),
+            self.settings_manager.get_spine_editor_path() or None,
         )
         self._worker = worker
         self._worker_finished = False
@@ -476,6 +588,7 @@ class SpineConverterPage(_SpineConverterDropFrame):
         self._result_output_dir = ""
         self._result_skeleton_path = ""
         self._result_report_path = ""
+        self._result_editor_project_path = ""
         self.open_output_button.setEnabled(False)
         self.preview_button.setEnabled(False)
         self._set_controls_enabled(False)
@@ -502,6 +615,9 @@ class SpineConverterPage(_SpineConverterDropFrame):
         self._result_output_dir = str(_result_value(result, "output_dir", "") or "")
         self._result_skeleton_path = str(_result_value(result, "skeleton_path", "") or "")
         self._result_report_path = str(_result_value(result, "report_path", "") or "")
+        self._result_editor_project_path = str(
+            _result_value(result, "editor_project_path", "") or ""
+        )
         self._status_state = "success"
         self._render_status()
         self._render_result()
