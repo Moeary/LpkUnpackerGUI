@@ -194,7 +194,7 @@ def discover_converter(explicit: str | os.PathLike[str] | None = None) -> Path |
 
 def convert_spine(
     source: str | os.PathLike[str],
-    output_dir: str | os.PathLike[str],
+    output_dir: str | os.PathLike[str] | None = None,
     target_version: str = "3.8.75",
     output_format: str = "json",
     converter_path: str | os.PathLike[str] | None = None,
@@ -205,16 +205,34 @@ def convert_spine(
     ``source`` may be a single ``.skel``/``.json`` skeleton, a ViewerEX
     ``model0.json`` that references one, or a directory.  Directory discovery
     is deliberately strict and raises :class:`SpineSourceAmbiguousError` when
-    more than one skeleton is present.  ``output_dir`` is treated as a root;
-    each invocation creates a new uniquely named child below it.
+    more than one skeleton is present.  ``output_dir`` is an optional parent
+    root; each invocation creates a new uniquely named child below it. When it
+    is empty, the parent beside the selected file is used. For a selected
+    directory, its parent is used so the converted copy is a sibling and
+    never becomes source input.
     """
 
     target = _validate_target_version(target_version)
     target_version = ".".join(str(part) for part in target)
     format_name = _validate_output_format(output_format)
-    resolved = _resolve_source(Path(source))
-    output_root = Path(output_dir).expanduser().resolve()
-    if output_root == resolved.source_root or output_root == resolved.source:
+    requested_source = Path(source).expanduser().resolve()
+    resolved = _resolve_source(requested_source)
+    output_text = str(output_dir or "").strip()
+    if output_text:
+        output_root = Path(output_text).expanduser().resolve()
+    else:
+        output_root = _default_output_root(
+            resolved,
+            source_was_directory=requested_source.is_dir(),
+        )
+    output_inside_selected_directory = False
+    if requested_source.is_dir():
+        try:
+            output_root.relative_to(requested_source)
+            output_inside_selected_directory = True
+        except ValueError:
+            pass
+    if output_root == resolved.source or output_inside_selected_directory:
         raise SpineSourceError(
             "output_dir must be independent of the source directory; source files are never overwritten."
         )
@@ -978,6 +996,18 @@ def _resolve_atlas_page(atlas_root: Path, raw_name: str, source_root: Path) -> P
         if alternate.is_file():
             return alternate.resolve()
     raise SpineConversionError(f"Atlas page not found for {raw_name!r} in {atlas_root}")
+
+
+def _default_output_root(
+    resolved: _ResolvedSource,
+    *,
+    source_was_directory: bool = False,
+) -> Path:
+    """Choose a safe adjacent parent when the caller leaves output empty."""
+
+    if source_was_directory or resolved.source.is_dir():
+        return resolved.source_root.parent.resolve()
+    return resolved.source_root.resolve()
 
 
 def _create_output_directory(root: Path, skeleton: Path, target_version: str, output_format: str) -> Path:

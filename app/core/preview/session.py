@@ -13,8 +13,10 @@ from app.core.model import (
     resolve_live2d_package,
 )
 from app.core.spine_preview import (
+    SpineAssetNotFoundError,
     SpinePreviewAsset,
     SpinePreviewPlan,
+    load_spine_asset,
     make_spine_preview_plan,
     prepare_spine_preview_import as _prepare_spine_preview_import,
 )
@@ -33,6 +35,38 @@ class SpinePreviewImportResult:
     asset: SpinePreviewAsset
     plan: SpinePreviewPlan
     temp_dir: Path | None = None
+
+
+def prepare_package_preview_import(source, temp_root, runtime_root=None, *, should_continue=None):
+    """Extract an LPK/WPK once, then select a model from the same workspace.
+
+    Preview extraction deliberately leaves export conversion disabled. Both
+    result types transfer ownership of the temporary directory to the caller.
+    """
+    root = Path(temp_root).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    temp_dir = Path(tempfile.mkdtemp(prefix="package_preview_", dir=root))
+    try:
+        result = run_extraction_batch(
+            [Path(source).resolve()], temp_dir, ExtractMode.FULL,
+            should_continue=should_continue,
+        )
+        if should_continue and not should_continue():
+            raise Live2DPackageError("Preview import cancelled")
+        if result.has_failures:
+            error = result.failed_items[0].error if result.failed_items else None
+            raise Live2DPackageError(error or "Package preview extraction failed")
+        try:
+            asset = load_spine_asset(temp_dir)
+        except SpineAssetNotFoundError:
+            package = resolve_live2d_package(temp_dir)
+            preview_json = prepare_model_json_for_preview(package.model_json)
+            return PreviewImportResult(package, preview_json, temp_dir)
+        return SpinePreviewImportResult(asset, make_spine_preview_plan(asset, runtime_root), temp_dir)
+    except Exception:
+        # Only our newly created disposable workspace is removed on failure.
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
 
 
 def prepare_preview_import(

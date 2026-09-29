@@ -4,6 +4,7 @@ import json
 import shutil
 import re
 import zipfile
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -162,7 +163,10 @@ def _iter_lpk_entry_json(loader: LpkLoader):
     # Costume paths are the reliable entry points.  Follow model-command
     # references too, because a mixed package can keep its second model only
     # behind ``change_model``/``add_submodel``.
-    pending: list[str] = []
+    # Model command references form a small FIFO graph.  ``list.pop(0)``
+    # repeatedly shifts the remaining queue and becomes quadratic for packs
+    # with many submodels; deque keeps traversal order with O(1) pops.
+    pending = deque()
     seen: set[str] = set()
     for chara in loader.mlve_config.get("list", []):
         for costume in chara.get("costume", []):
@@ -171,7 +175,7 @@ def _iter_lpk_entry_json(loader: LpkLoader):
                 pending.append(path)
 
     while pending:
-        path = pending.pop(0)
+        path = pending.popleft()
         if path in seen:
             continue
         seen.add(path)

@@ -107,6 +107,40 @@ class SpineConverterPageTests(unittest.TestCase):
                 finally:
                     self._dispose(page)
 
+    def test_empty_output_is_allowed_and_uses_backend_adjacent_default(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "skeleton.json"
+            source.write_text("{}", encoding="utf-8")
+            output = root / "skeleton_to_3.8.75_json"
+            result = SimpleNamespace(
+                output_dir=output,
+                skeleton_path=output / "skeleton.json",
+                report_path=output / "report.json",
+                warnings=[],
+            )
+            calls = []
+
+            def fake_convert(*args, **kwargs):
+                calls.append((args, kwargs))
+                return result
+
+            with patch.object(
+                converter_page_module,
+                "discover_native_converter",
+                return_value=Path("C:/tools/lpk_spine_converter.dll"),
+            ), patch.object(converter_page_module, "convert_spine", side_effect=fake_convert):
+                page = SpineConverterPage(settings_manager=SettingsManager(root / "settings.json"))
+                try:
+                    page.source_edit.setText(str(source))
+                    page.output_edit.clear()
+                    page.start_conversion()
+                    self._wait(lambda: page._status_state == "success" and page._worker is None)
+                    self.assertEqual(calls[0][0], (str(source), ""))
+                    self.assertTrue(page.open_output_button.isEnabled())
+                finally:
+                    self._dispose(page)
+
     def test_close_does_not_destroy_running_conversion(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import tempfile
 import unittest
 import zipfile
@@ -13,7 +14,7 @@ from app.core.extract.package_classifier import (
     _classify_entry_json,
 )
 from app.core.lpk_loader import LpkDecryptError, LpkLoader
-from app.core.utils import guess_type, is_spine_atlas_data
+from app.core.utils import decrypt, guess_type, is_spine_atlas_data
 
 
 class LpkClassifierTests(unittest.TestCase):
@@ -83,6 +84,17 @@ class LpkClassifierTests(unittest.TestCase):
 
 
 class LpkLoaderTests(unittest.TestCase):
+    def test_decrypt_keeps_lpk_block_reset_compatibility(self):
+        # The LPK stream key resets at every 1024 bytes.  This fixture spans
+        # that boundary so a single-stream optimization cannot pass silently.
+        payload = bytes(range(251)) * 7 + bytes(range(17))
+        decrypted = decrypt(0x12345678, payload)
+        self.assertEqual(len(decrypted), len(payload))
+        self.assertEqual(
+            hashlib.sha256(decrypted).hexdigest(),
+            "46b610f4e177105d1eed77eee7a3eeb3e5463b32d4aaf2aea5d86e5c3685c005",
+        )
+
     def test_guess_type_recognizes_spine_atlas_and_binary_skeleton(self):
         atlas = (
             b"\npage.png\nsize: 16,16\nformat: RGBA8888\n"

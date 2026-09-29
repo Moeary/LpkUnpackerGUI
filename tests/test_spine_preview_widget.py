@@ -48,6 +48,20 @@ class SpinePreviewWidgetTests(unittest.TestCase):
             time.sleep(0.01)
         self.fail("timed out waiting for native Spine preview")
 
+    def test_controls_bound_clock_and_preserve_animation_items(self):
+        controls = preview_page_module.SpineAnimationControls()
+        state = dict(previewState="ready", mode="native", animationOptions=["normal"],
+                     selectedAnimation="normal", time=24.81, timeMax=16.97, loop=True)
+        controls.set_state(state)
+        self.assertEqual(controls.time_value.text(), "7.84 / 16.97")
+        with patch.object(controls.animation_combo, "clear", wraps=controls.animation_combo.clear) as clear:
+            controls.set_state(dict(state, loop=False))
+            clear.assert_not_called()
+        self.assertEqual(controls.time_value.text(), "16.97 / 16.97")
+        controls.set_state(dict(state, time=float("inf")))
+        self.assertEqual(controls.time_value.text(), "0.00 / 0.00")
+        controls.deleteLater()
+
     def test_native_missing_bridge_reports_error_and_clear_stops_loading(self):
         widget = SpinePreviewWidget()
         failed = []

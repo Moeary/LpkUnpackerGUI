@@ -118,6 +118,73 @@ class SpineConverterTests(unittest.TestCase):
         self.assertEqual(report["converter_abi_version"], "1")
         self.assertTrue(any("pma:true" in warning for warning in result.warnings))
 
+    def test_empty_output_uses_adjacent_folder_and_safe_suffix(self) -> None:
+        source_folder = self.root / "source-files"
+        source_folder.mkdir()
+        source = source_folder / "hero.json"
+        self._skeleton_json(source, "4.0.37")
+        original = source.read_bytes()
+
+        with patch("app.core.spine_converter._run_native_converter", side_effect=self._fake_converter("3.8.75")):
+            first = convert_spine(source, "", target_version="3.8.75", converter_path=self.converter)
+            second = convert_spine(source, None, target_version="3.8.75", converter_path=self.converter)
+
+        self.assertEqual(first.output_dir.parent, source_folder.resolve())
+        self.assertEqual(second.output_dir.parent, source_folder.resolve())
+        self.assertNotEqual(first.output_dir, second.output_dir)
+        self.assertTrue(first.output_dir.name.endswith("_json"))
+        self.assertTrue(second.output_dir.name.endswith("_json_2"))
+        self.assertEqual(source.read_bytes(), original)
+
+    def test_empty_output_handles_skel_model_config_and_directory_sources(self) -> None:
+        model_root = self.root / "model"
+        model_root.mkdir()
+        skeleton = model_root / "skeleton.skel"
+        skeleton.write_bytes(b"fixture 4.0.37\0")
+        atlas, page = self._atlas(model_root)
+        model_config = model_root / "model0.json"
+        model_config.write_text(
+            json.dumps(
+                {
+                    "type": 9,
+                    "skeleton": skeleton.name,
+                    "atlases": [{"atlas": atlas.name, "textures": [page.name]}],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch("app.core.spine_converter._run_native_converter", side_effect=self._fake_converter("3.8.75")):
+            skel_result = convert_spine(skeleton, None, target_version="3.8.75", converter_path=self.converter)
+            config_result = convert_spine(model_config, None, target_version="3.8.75", converter_path=self.converter)
+
+        self.assertEqual(skel_result.output_dir.parent, model_root.resolve())
+        self.assertEqual(config_result.output_dir.parent, model_root.resolve())
+        self.assertTrue((config_result.output_dir / atlas.name).is_file())
+        self.assertTrue((config_result.output_dir / page.name).is_file())
+        self.assertEqual(skeleton.read_bytes(), b"fixture 4.0.37\0")
+
+        directory_root = self.root / "directory-source"
+        directory_root.mkdir()
+        directory_skeleton = directory_root / "only.skel"
+        directory_skeleton.write_bytes(b"fixture 4.0.37\0")
+        with patch("app.core.spine_converter._run_native_converter", side_effect=self._fake_converter("3.8.75")):
+            directory_result = convert_spine(
+                directory_root,
+                None,
+                target_version="3.8.75",
+                converter_path=self.converter,
+            )
+        self.assertEqual(directory_result.output_dir.parent, self.root.resolve())
+        self.assertNotEqual(directory_result.output_dir.parent, directory_root.resolve())
+        with self.assertRaises(SpineSourceError):
+            convert_spine(
+                directory_root,
+                directory_root,
+                target_version="3.8.75",
+                converter_path=self.converter,
+            )
+
     def test_model0_reference_and_explicit_texture_do_not_duplicate_pma_page(self) -> None:
         skeleton = self.root / "skeleton_0.skel"
         skeleton.write_bytes(b"fixture 4.0.37\0")

@@ -178,7 +178,7 @@ def main():
             if Path(args.live2d_source).suffix.lower()=='.json':
                 page.open_model_preview_source(args.live2d_source)
             else:
-                page.start_model_preview_import(args.live2d_source)
+                page.on_file_dropped(args.live2d_source)
             wait(app,lambda:(page.live2d_preview is not None and page.current_model_path) or bool(report.get('errors')),args.timeout)
             if report.get('errors'): raise AssertionError(report['errors'])
             pump(app,1)

@@ -8,6 +8,7 @@ native batches directly. No browser, HTML, or local HTTP server is involved.
 
 from __future__ import annotations
 
+import ctypes
 import math
 import os
 import time
@@ -69,6 +70,11 @@ if OPENGL_AVAILABLE:
             self._ebo = 0
             self._textures: dict[int, int] = {}
             self._initialized = False
+            self._vbo_capacity_bytes = 0
+            self._transform_location = -1
+            self._opacity_location = -1
+            self._texture_location = -1
+            self._pma_location = -1
 
         def initializeGL(self):  # noqa: N802
             try:
@@ -79,7 +85,8 @@ if OPENGL_AVAILABLE:
                     out vec2 v_uv;
                     out vec4 v_color;
                     uniform float opacity;
-                    void main() { gl_Position = vec4(a_position, 0.0, 1.0); v_uv = a_uv; v_color = a_color * vec4(1.0, 1.0, 1.0, opacity); }
+                    uniform mat4 model_transform;
+                    void main() { gl_Position = model_transform * vec4(a_position, 0.0, 1.0); v_uv = a_uv; v_color = a_color * vec4(1.0, 1.0, 1.0, opacity); }
                 """
                 fragment = """#version 330 core
                     in vec2 v_uv;
@@ -117,6 +124,24 @@ if OPENGL_AVAILABLE:
                 self._vbo = _gl_id(GL.glGenBuffers(1))
                 self._ebo = _gl_id(GL.glGenBuffers(1))
                 self._vao = _gl_id(GL.glGenVertexArrays(1))
+                # The bridge's POD vertex is always eight contiguous float32
+                # values.  Record the attribute layout once in the VAO; each
+                # frame only updates the VBO contents.
+                GL.glBindVertexArray(self._vao)
+                GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self._vbo)
+                stride = 8 * ctypes.sizeof(ctypes.c_float)
+                for location, count, offset in ((0, 2, 0), (1, 2, 2), (2, 4, 4)):
+                    GL.glEnableVertexAttribArray(location)
+                    GL.glVertexAttribPointer(
+                        location, count, GL.GL_FLOAT, False, stride,
+                        ctypes.c_void_p(offset * ctypes.sizeof(ctypes.c_float)),
+                    )
+                GL.glBindVertexArray(0)
+                GL.glBindBuffer(GL.GL_ARRAY_BUFFER, 0)
+                self._transform_location = GL.glGetUniformLocation(self._program, "model_transform")
+                self._opacity_location = GL.glGetUniformLocation(self._program, "opacity")
+                self._texture_location = GL.glGetUniformLocation(self._program, "page_texture")
+                self._pma_location = GL.glGetUniformLocation(self._program, "premultiplied")
                 self._initialized = True
                 self._owner._upload_native_textures(self)
                 self._owner._native_gl_error = ""
@@ -211,6 +236,11 @@ if OPENGL_AVAILABLE:
                 except Exception:
                     pass
             self._initialized = False
+            self._vbo_capacity_bytes = 0
+            self._transform_location = -1
+            self._opacity_location = -1
+            self._texture_location = -1
+            self._pma_location = -1
 
         def clear_textures(self):
             """Drop atlas textures while keeping the reusable GL program alive."""
@@ -282,7 +312,8 @@ class SpinePreviewWidget(QFrame):
         self._last_tick = time.monotonic()
         self._textures_uploaded = False
         self._status_timer = QTimer(self)
-        self._status_timer.setInterval(50)
+        self._status_timer.setInterval(16)
+        self._status_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._status_timer.timeout.connect(self._tick)
 
         self.canvas = None
@@ -356,8 +387,7 @@ class SpinePreviewWidget(QFrame):
             self._last_state = self._make_state()
             self.documentLoaded.emit(target)
             self.show()
-            if self.canvas is not None:
-                self.canvas.update()
+            self._request_canvas_update()
             self._status_timer.start()
             self._emit_state()
         except (SpineNativeError, OSError, ValueError) as exc:
@@ -437,9 +467,17 @@ class SpinePreviewWidget(QFrame):
         self._refresh_canvas()
 
     def _refresh_canvas(self) -> None:
-        if self.canvas is not None:
-            self.canvas.update()
+        self._request_canvas_update()
         self._emit_state()
+
+    def _request_canvas_update(self) -> None:
+        if self.canvas is None:
+            return
+        request_update = getattr(self.canvas, "requestUpdate", None)
+        if callable(request_update):
+            request_update()
+        else:
+            self.canvas.update()
 
     def _report_error(self, message: str) -> None:
         text = str(message or "Spine native preview failed.")
@@ -484,16 +522,17 @@ class SpinePreviewWidget(QFrame):
             self._status_timer.stop()
             return
         now = time.monotonic()
-        delta = min(0.1, max(0.0, now - self._last_tick))
+        # Keep the real elapsed interval.  A busy window may miss timer ticks,
+        # but the animation clock must not silently lose that elapsed time.
+        delta = max(0.0, now - self._last_tick)
         self._last_tick = now
         if not self._model.paused:
             self._model.update(delta)
-            if self.canvas is not None:
-                self.canvas.update()
+            self._request_canvas_update()
+            self._emit_state()
         if not self._renderer_ready and self._loading_deadline and now > self._loading_deadline:
             self._report_error("Spine native canvas did not render its first frame.")
             return
-        self._emit_state()
 
     def _mark_renderer_ready(self) -> None:
         if self._renderer_ready:
@@ -555,8 +594,9 @@ class SpinePreviewWidget(QFrame):
             GL.glClearColor(color.redF(), color.greenF(), color.blueF(), 1.0)
         GL.glClear(GL.GL_COLOR_BUFFER_BIT)
         GL.glEnable(GL.GL_MULTISAMPLE) if bool(self._settings.get("antialias", True)) else GL.glDisable(GL.GL_MULTISAMPLE)
-        vertices, indices, batches = self._model.render()
-        if not vertices or not indices:
+        render_result = self._model.render_into()
+        vertex_buffer, vertex_count, _index_buffer, index_count, batch_buffer, batch_count = render_result
+        if vertex_buffer is None or vertex_count <= 0 or index_count <= 0 or batch_buffer is None or batch_count <= 0:
             self._mark_renderer_ready()
             return
         width = max(1, int(canvas.width() * float(canvas.devicePixelRatio())))
@@ -569,38 +609,46 @@ class SpinePreviewWidget(QFrame):
         cosine, sine = math.cos(rotation), math.sin(rotation)
         offset_x = float(self._settings.get("model_offset_x", 0.0)) * 2.0
         offset_y = -float(self._settings.get("model_offset_y", 0.0)) * 2.0
-        rows = []
-        for vertex in vertices:
-            dx = (vertex.x - center_x) * model_scale
-            dy = (vertex.y - center_y) * model_scale
-            rx, ry = dx * cosine - dy * sine, dx * sine + dy * cosine
-            rows.append((rx * fit * 2.0 / width + offset_x, ry * fit * 2.0 / height + offset_y,
-                         vertex.u, vertex.v, vertex.r, vertex.g, vertex.b, vertex.a))
-        vertex_array = np.asarray(rows, dtype=np.float32)
+        # Keep skeleton-space positions in the VBO and perform fit/scale/
+        # rotation/offset in the vertex shader.  ``render_into`` exposes the
+        # native POD buffer as a zero-copy float view, so the 32k vertices do
+        # not pass through a Python tuple or per-vertex loop each frame.
+        vertex_array = np.ctypeslib.as_array(vertex_buffer)[:vertex_count].view(np.float32).reshape(vertex_count, 8)
+        transform = np.asarray((
+            fit * 2.0 / width * model_scale * cosine,
+            fit * 2.0 / height * model_scale * sine,
+            0.0, 0.0,
+            -fit * 2.0 / width * model_scale * sine,
+            fit * 2.0 / height * model_scale * cosine,
+            0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            offset_x - fit * 2.0 / width * model_scale * (cosine * center_x - sine * center_y),
+            offset_y - fit * 2.0 / height * model_scale * (sine * center_x + cosine * center_y),
+            0.0, 1.0,
+        ), dtype=np.float32)
         # The bridge expands each triangle index into a contiguous vertex so
         # clipping remains a plain batch operation.  DrawArrays avoids relying
         # on an index-pointer ABI across desktop OpenGL drivers.
-        import ctypes
         GL.glUseProgram(canvas._program)
-        GL.glUniform1f(GL.glGetUniformLocation(canvas._program, "opacity"), max(0.0, min(1.0, float(self._settings.get("opacity", 1.0)))))
-        GL.glUniform1i(GL.glGetUniformLocation(canvas._program, "page_texture"), 0)
-        pma_location = GL.glGetUniformLocation(canvas._program, "premultiplied")
-        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, canvas._vbo)
         if canvas._vao:
             GL.glBindVertexArray(canvas._vao)
-        GL.glBufferData(GL.GL_ARRAY_BUFFER, vertex_array.nbytes, vertex_array, GL.GL_STREAM_DRAW)
-        stride = 8 * vertex_array.itemsize
-        for location, count, offset in ((0, 2, 0), (1, 2, 2), (2, 4, 4)):
-            GL.glEnableVertexAttribArray(location)
-            GL.glVertexAttribPointer(location, count, GL.GL_FLOAT, False, stride, ctypes.c_void_p(offset * vertex_array.itemsize))
+        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, canvas._vbo)
+        if vertex_array.nbytes > canvas._vbo_capacity_bytes:
+            GL.glBufferData(GL.GL_ARRAY_BUFFER, vertex_array.nbytes, None, GL.GL_DYNAMIC_DRAW)
+            canvas._vbo_capacity_bytes = vertex_array.nbytes
+        GL.glBufferSubData(GL.GL_ARRAY_BUFFER, 0, vertex_array.nbytes, vertex_array)
+        GL.glUniformMatrix4fv(canvas._transform_location, 1, False, transform)
+        GL.glUniform1f(canvas._opacity_location, max(0.0, min(1.0, float(self._settings.get("opacity", 1.0)))))
+        GL.glUniform1i(canvas._texture_location, 0)
         GL.glEnable(GL.GL_BLEND)
         GL.glBlendEquation(GL.GL_FUNC_ADD)
-        for batch in batches:
+        for index in range(batch_count):
+            batch = batch_buffer[index]
             texture = canvas._textures.get(int(batch.page))
             if not texture:
                 continue
             pma_page = int(batch.page) < len(self._model.pages) and self._model.pages[int(batch.page)].pma
-            GL.glUniform1f(pma_location, 1.0 if pma_page else 0.0)
+            GL.glUniform1f(canvas._pma_location, 1.0 if pma_page else 0.0)
             if batch.blend == 1:
                 if pma_page:
                     GL.glBlendFunc(GL.GL_ONE, GL.GL_ONE)

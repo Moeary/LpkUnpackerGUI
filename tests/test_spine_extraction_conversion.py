@@ -170,6 +170,28 @@ class SpineExtractionConversionTests(unittest.TestCase):
         discover.assert_not_called()
         convert.assert_not_called()
 
+    def test_disabled_full_lpk_preserves_extraction_without_conversion(self) -> None:
+        source = self.root / "source.lpk"
+        source.write_bytes(b"lpk")
+        extracted_root = self.root / "extracted"
+        options = SpineConversionOptions(enabled=False, target_version="3.8.75")
+
+        with patch.object(batch, "detect_source_type", return_value=ExtractSourceType.LPK), \
+                patch.object(batch, "extract_lpk", side_effect=lambda *_args: self._successful_lpk(extracted_root, source)), \
+                patch.object(batch, "discover_spine_conversion_sources") as discover, \
+                patch.object(batch, "convert_spine") as convert:
+            result = batch.run_extraction_batch(
+                [source],
+                self.root / "batch-output",
+                ExtractMode.FULL,
+                spine_conversion=options,
+            )
+
+        self.assertTrue(result.items[0].success)
+        self.assertEqual(result.items[0].children, [])
+        discover.assert_not_called()
+        convert.assert_not_called()
+
     def test_conversion_failure_marks_parent_and_child_failed_and_logs_error(self) -> None:
         source = self.root / "source.lpk"
         source.write_bytes(b"lpk")

@@ -210,11 +210,15 @@ class LpkLoader():
                         output_path.parent.mkdir(parents=True, exist_ok=True)
                         output_path.write_text(out_s, encoding="utf8")
             else:
-                print("Deprecated/unknown lpk format detected. Attempting with STD_1_0 format...")
-                print("Decryption may not work for some packs, even though this script outputs all files.")
+                logger.warning(
+                    "Deprecated/unknown LPK format detected; attempting STD_1_0 format"
+                )
+                logger.warning(
+                    "Decryption may not work for some packs even though all files are emitted"
+                )
                 self.encrypted = self.mlve_config.get("encrypt", "true")
                 if self.encrypted == "false":
-                    print("lpk is not encrypted, extracting all files...")
+                    logger.info("LPK is not encrypted; extracting all files")
                     self.lpkfile.extractall(outputdir)
                     return [outputdir]
                 # For STD_1_0 and earlier
@@ -225,10 +229,10 @@ class LpkLoader():
                     outputFilePath = os.path.join(subdir, normalize(os.path.basename(file)))
                     safe_mkdir(subdir)
                     if os.path.splitext(file)[-1] in [".json", ".mlve", ".txt"]:
-                        print(f"Extracting {file} -> {outputFilePath}")
+                        logger.debug("Extracting %s -> %s", file, outputFilePath)
                         self.lpkfile.extract(file, outputdir)
                     else:
-                        print(f"Decrypting {file} -> {outputFilePath}")
+                        logger.debug("Decrypting %s -> %s", file, outputFilePath)
                         decryptedData = self.decrypt_file(file)
                         with open(outputFilePath, "wb") as outputFile:
                             outputFile.write(decryptedData)
@@ -511,7 +515,7 @@ class LpkLoader():
     def recovery(self, filename, output) -> Tuple[bytes, str]:
         ret = self.decrypt_file(filename)
         suffix = guess_type(ret)
-        print(f"recovering {filename} -> {output+suffix}")
+        logger.debug("Recovering %s -> %s", filename, output + suffix)
         output_path = Path(output + suffix)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(ret)

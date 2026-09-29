@@ -1,9 +1,13 @@
 from hashlib import md5
 import json
+import logging
 import os
 import re
 import filetype
 from filetype.types import Type
+
+
+logger = logging.getLogger(__name__)
 
 def hashed_filename(s: str) -> str:
     t = md5()
@@ -23,7 +27,10 @@ def safe_mkdir(s: str):
     """
     # Create the directory
     os.makedirs(s, exist_ok=True)
-    print(f"Created directory: {s}")
+    # Directory creation is a routine operation.  Keeping it at DEBUG avoids
+    # flooding the GUI/terminal when a package contains many references while
+    # retaining the detail for an explicitly enabled diagnostic logger.
+    logger.debug("Created directory: %s", s)
 
 def genkey(s: str) -> int:
     ret = 0
@@ -34,12 +41,22 @@ def genkey(s: str) -> int:
     return ret
 
 def decrypt(key: int, data: bytes) -> bytes:
-    ret = []
-    for slice in [data[i:i+1024] for i in range(0, len(data), 1024)]:
+    """Decrypt an LPK payload using its per-block key stream.
+
+    The key intentionally resets at every 1024-byte block; this is part of
+    the LPK format and must not be changed to a single stream.  A bytearray
+    with a locally bound ``append`` avoids the temporary list of slices and
+    the per-byte list growth that made large texture payloads needlessly
+    expensive, while preserving the historical byte-for-byte output.
+    """
+
+    ret = bytearray()
+    append = ret.append
+    for start in range(0, len(data), 1024):
         tmpkey = key
-        for i in slice:
+        for value in data[start:start + 1024]:
             tmpkey = (65535 & 2531011 + 214013 * tmpkey >> 16) & 0xffffffff
-            ret.append((tmpkey & 0xff) ^ i)
+            append((tmpkey & 0xff) ^ value)
     return bytes(ret)
 
 match_rule = re.compile(r"[0-9a-f]{32}\.bin3?", re.IGNORECASE)

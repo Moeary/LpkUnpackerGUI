@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -184,6 +185,9 @@ class SpineNativeModel:
             self.loop = True
             self.paused = False
             self._capacity = (0, 0, 0)
+            self._vertex_buffer = None
+            self._index_buffer = None
+            self._batch_buffer = None
         except Exception:
             self.close()
             raise
@@ -296,7 +300,11 @@ class SpineNativeModel:
 
     @property
     def time(self) -> float:
-        return float(self._lib.spine_native_time(self._handle))
+        value = max(0.0, float(self._lib.spine_native_time(self._handle)))
+        duration = self.duration
+        if duration > 0.0:
+            value = value % duration if self.loop else min(value, duration)
+        return value
 
     def set_skin(self, name: str) -> bool:
         if not name:
@@ -325,7 +333,10 @@ class SpineNativeModel:
         return bool(self._lib.spine_native_set_paused(self._handle, int(self.paused)))
 
     def set_time(self, value: float) -> bool:
-        return bool(self._lib.spine_native_set_time(self._handle, float(value)))
+        value = float(value)
+        if not math.isfinite(value):
+            value = 0.0
+        return bool(self._lib.spine_native_set_time(self._handle, value))
 
     def reset_pose(self) -> bool:
         ok = bool(self._lib.spine_native_reset_pose(self._handle))
@@ -334,20 +345,70 @@ class SpineNativeModel:
         return ok
 
     def update(self, delta: float) -> None:
-        self._lib.spine_native_update(self._handle, max(0.0, float(delta)))
+        delta = float(delta)
+        if not math.isfinite(delta):
+            delta = 0.0
+        self._lib.spine_native_update(self._handle, max(0.0, delta))
+
+    def render_into(self):
+        """Render into reusable ctypes buffers without Python tuple copies.
+
+        The native bridge expands clipping into contiguous triangles, so the
+        Qt renderer needs only the vertex and batch buffers.  The index buffer
+        is retained for the compatibility ``render`` method and reused here,
+        avoiding a 32k-vertex allocation on every timer tick.
+        """
+        for attempt in range(2):
+            vertex_count = ctypes.c_int32()
+            index_count = ctypes.c_int32()
+            batch_count = ctypes.c_int32()
+            if not self._lib.spine_native_required_sizes(
+                self._handle, ctypes.byref(vertex_count), ctypes.byref(index_count), ctypes.byref(batch_count)
+            ):
+                return None, 0, None, 0, None, 0
+
+            required = (max(1, int(vertex_count.value)), max(1, int(index_count.value)), max(1, int(batch_count.value)))
+            old_vertex, old_index, old_batch = self._capacity
+            if self._vertex_buffer is None or required[0] > old_vertex:
+                self._vertex_buffer = (_Vertex * required[0])()
+                old_vertex = required[0]
+            if self._index_buffer is None or required[1] > old_index:
+                self._index_buffer = (ctypes.c_uint32 * required[1])()
+                old_index = required[1]
+            if self._batch_buffer is None or required[2] > old_batch:
+                self._batch_buffer = (_Batch * required[2])()
+                old_batch = required[2]
+            self._capacity = (old_vertex, old_index, old_batch)
+
+            count = self._lib.spine_native_render(
+                self._handle,
+                self._vertex_buffer, old_vertex,
+                self._index_buffer, old_index,
+                self._batch_buffer, old_batch,
+            )
+            if count >= 0:
+                return (
+                    self._vertex_buffer, int(vertex_count.value),
+                    self._index_buffer, int(index_count.value),
+                    self._batch_buffer, int(count),
+                )
+            # A native runtime may grow its clipping output between the size
+            # query and the copy.  Re-query once with fresh capacities rather
+            # than handing the canvas a partial frame.
+            self._capacity = (0, 0, 0)
+            self._vertex_buffer = self._index_buffer = self._batch_buffer = None
+        raise SpineNativeError("Native Spine render buffer changed during capture.")
 
     def render(self) -> tuple[tuple[_Vertex, ...], tuple[int, ...], tuple[_Batch, ...]]:
-        v, i, b = ctypes.c_int32(), ctypes.c_int32(), ctypes.c_int32()
-        if not self._lib.spine_native_required_sizes(self._handle, ctypes.byref(v), ctypes.byref(i), ctypes.byref(b)):
+        result = self.render_into()
+        if result[0] is None:
             return (), (), ()
-        capacity = (max(1, v.value), max(1, i.value), max(1, b.value))
-        vertex_array = (_Vertex * capacity[0])()
-        index_array = (ctypes.c_uint32 * capacity[1])()
-        batch_array = (_Batch * capacity[2])()
-        count = self._lib.spine_native_render(self._handle, vertex_array, capacity[0], index_array, capacity[1], batch_array, capacity[2])
-        if count < 0:
-            raise SpineNativeError("Native Spine render buffer changed during capture.")
-        return tuple(vertex_array[:v.value]), tuple(int(x) for x in index_array[:i.value]), tuple(batch_array[:count])
+        vertex_array, vertex_count, index_array, index_count, batch_array, batch_count = result
+        return (
+            tuple(vertex_array[:vertex_count]),
+            tuple(int(value) for value in index_array[:index_count]),
+            tuple(batch_array[:batch_count]),
+        )
 
     def bounds(self) -> tuple[float, float, float, float]:
         values = [ctypes.c_float() for _ in range(4)]

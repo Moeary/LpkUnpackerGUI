@@ -1,5 +1,6 @@
 import os
 import json
+import math
 import shutil
 import subprocess
 import sys
@@ -38,7 +39,7 @@ from qfluentwidgets import (SubtitleLabel, BodyLabel, CaptionLabel, PushButton, 
 from app.core.assetstudio_cli import AssetStudioCLI
 from app.core.model import prepare_model_json_for_preview, resolve_live2d_package
 from app.core.model.motions import load_live2d_motions
-from app.core.preview import prepare_preview_import, prepare_spine_preview_import
+from app.core.preview import prepare_preview_import, prepare_spine_preview_import, prepare_package_preview_import
 from app.core.spine_preview import (
     SpinePreviewPlan,
 )
@@ -560,11 +561,15 @@ class SpinePreviewImportThread(QThread):
 
     def run(self):
         try:
-            result = prepare_spine_preview_import(
-                self.source_path,
-                self.temp_root,
-                self.runtime_root,
-            )
+            if getattr(self, "_package_fallback", False):
+                result = prepare_package_preview_import(
+                    self.source_path, self.temp_root, self.runtime_root,
+                    should_continue=lambda: not self.isInterruptionRequested(),
+                )
+            else:
+                result = prepare_spine_preview_import(
+                    self.source_path, self.temp_root, self.runtime_root,
+                )
             self.result = result
             self.previewReady.emit(result, self.source_path)
         except Exception as exc:
@@ -1588,14 +1593,15 @@ class SpineAnimationControls(CardWidget):
         self.timeChanged.emit(float(value) / 1000.0 * self._time_max)
 
     def _set_combo_items(self, combo, values, selected=""):
+        names = [str(value.get("value", "") if isinstance(value, dict) else value or "")
+                 for value in values or []]
+        names = [name for name in names if name]
         combo.blockSignals(True)
-        combo.clear()
-        for value in values or []:
-            if isinstance(value, dict):
-                value = value.get("value", "")
-            value = str(value or "")
-            if value:
-                combo.addItem(value)
+        # Animation time updates must not rebuild the skin/animation menus.
+        if names != [combo.itemText(index) for index in range(combo.count())]:
+            combo.clear()
+            for name in names:
+                combo.addItem(name)
         if combo.count():
             index = combo.findText(str(selected or ""))
             combo.setCurrentIndex(index if index >= 0 else 0)
@@ -1640,6 +1646,12 @@ class SpineAnimationControls(CardWidget):
             self._time_max = max(0.0, float(state.get("timeMax", 0.0) or 0.0))
         except (TypeError, ValueError):
             current, self._time_max = 0.0, 0.0
+        if not math.isfinite(current) or not math.isfinite(self._time_max):
+            current, self._time_max = 0.0, 0.0
+        if self._time_max > 0:
+            current = current % self._time_max if state.get("loop", True) else min(current, self._time_max)
+        else:
+            current = 0.0
         self.time_slider.setEnabled(self._ready and self._time_max > 0)
         if not self.time_slider.isSliderDown():
             self.time_slider.blockSignals(True)
@@ -3262,10 +3274,8 @@ class PreviewPage(QFrame):
 
         suffix = os.path.splitext(file_path)[1].lower()
         if suffix in PACKAGE_PREVIEW_EXTENSIONS:
-            # LPK/WPK may contain a Spine model even though its outer suffix
-            # gives no useful hint.  Probe it off the GUI thread first; a
-            # package without a Spine asset falls back to the existing Live2D
-            # importer in on_spine_preview_failed().
+            # Extract once in the worker, then route Spine or Live2D using
+            # that same workspace instead of decrypting a Live2D LPK twice.
             self.start_spine_preview_import(file_path, package_fallback=True)
             return
 
@@ -3340,20 +3350,16 @@ class PreviewPage(QFrame):
         if temp_dir and str(temp_dir) not in self._spine_preview_temp_dirs:
             self._spine_preview_temp_dirs.append(str(temp_dir))
         try:
+            preview_model = getattr(result, "preview_model_json", None)
+            if preview_model:
+                self.load_model_preview(str(preview_model), source_path)
+                return
             self._open_spine_native_preview(result.plan)
         except Exception as exc:
             self._on_spine_preview_error(str(exc))
 
     def on_spine_preview_failed(self, error: str, source_path: str, generation=None, worker=None):
         if generation is not None and generation != self._spine_preview_generation:
-            return
-        package_fallback = bool(getattr(worker, "_package_fallback", False)) if worker is not None else False
-        if package_fallback and isinstance(error, str) and (
-            "No Spine asset" in error
-            or "Unsupported Spine preview source" in error
-            or "No Spine skeleton" in error
-        ):
-            self.start_model_preview_import(source_path)
             return
         self._clear_embedded_spine()
         self._show_stage_placeholder(tr("preview.spine_import_failed_content", error=error))

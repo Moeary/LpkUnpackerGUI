@@ -91,7 +91,7 @@ class SpineConverterWorker(QThread):
     resultReady = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, source: str, output_dir: str, target_version: str, output_format: str,
+    def __init__(self, source: str, output_dir: str | None, target_version: str, output_format: str,
                  converter_path: str | None, remove_curve: bool):
         # The worker is deliberately unparented.  A running QThread must not
         # be destroyed with the page; the page keeps it until its signals have
@@ -198,6 +198,7 @@ class SpineConverterPage(_SpineConverterDropFrame):
         self.output_label = BodyLabel(self)
         self.output_edit = LineEdit(self)
         self.output_edit.setReadOnly(True)
+        self.output_edit.setPlaceholderText(tr("spine_converter.output_default"))
         self.output_browse_button = PushButton(self)
         self.output_browse_button.setIcon(FluentIcon.FOLDER)
         self.output_browse_button.clicked.connect(self.browse_output)
@@ -281,6 +282,7 @@ class SpineConverterPage(_SpineConverterDropFrame):
         self.source_folder_button.setText(tr("spine_converter.browse_folder"))
         self.output_label.setText(tr("spine_converter.output"))
         self.output_browse_button.setText(tr("spine_converter.browse_output"))
+        self.output_edit.setPlaceholderText(tr("spine_converter.output_default"))
         self.target_version_label.setText(tr("spine_converter.target_version"))
         self.output_format_label.setText(tr("spine_converter.output_format"))
         self.remove_curve_checkbox.setText(tr("spine_converter.remove_curve"))
@@ -449,9 +451,6 @@ class SpineConverterPage(_SpineConverterDropFrame):
         output_format = str(self.output_format_combo.currentText() or "json").strip().lower()
         if not source or not Path(source).exists():
             self._show_error(tr("spine_converter.error_source"))
-            return
-        if not output_dir:
-            self._show_error(tr("spine_converter.error_output"))
             return
         if not target_version:
             self._show_error(tr("spine_converter.error_version"))
