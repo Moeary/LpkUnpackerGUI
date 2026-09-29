@@ -46,8 +46,11 @@
   "use strict";
   const params = new URLSearchParams(window.location.search);
   let manifest;
+  let manifestError = null;
   try { manifest = JSON.parse(params.get("manifest") || "{}"); }
-  catch (error) { showError("Invalid Spine preview manifest: " + error); return; }
+  catch (error) { manifest = {}; manifestError = "Invalid Spine preview manifest: " + error; }
+  document.body.dataset.previewState = "loading";
+  document.body.dataset.previewError = "";
 
   const status = document.getElementById("status");
   const canvas = document.getElementById("canvas");
@@ -59,16 +62,24 @@
   const timeRange = document.getElementById("time");
   const resetButton = document.getElementById("reset");
   const exportPsdButton = document.getElementById("exportPsd");
-  let gl, shader, batcher, mvp, renderer, assetManager;
+  if (manifestError) { showError(manifestError); return; }
+  let gl, shader, batcher, mvp, renderer, assetManager, runtimeApi;
   let skeleton, state, bounds, atlas;
   let lastFrame = 0;
   let paused = false;
   let loaded = false;
+  let firstFrameRendered = false;
   const MAX_POSE_LAYERS = 64;
 
   function showError(message) {
     status.className = "error";
     status.textContent = String(message);
+    document.body.dataset.previewState = "error";
+    document.body.dataset.previewError = String(message);
+  }
+  function setPreviewState(value, errorMessage) {
+    document.body.dataset.previewState = value;
+    document.body.dataset.previewError = errorMessage ? String(errorMessage) : "";
   }
   function showWarnings() {
     const warnings = (manifest.warnings || []).filter(Boolean);
@@ -178,12 +189,16 @@
     const track = state.tracks && state.tracks[0];
     if (track && track.animation) {
       timeRange.max = Math.max(.001, track.animation.duration || 0.001);
-      timeRange.value = Math.min(Number(timeRange.max), track.trackTime || 0);
+      const animationTime = typeof track.getAnimationTime === "function"
+        ? track.getAnimationTime()
+        : (track.trackTime || 0) % Number(timeRange.max);
+      timeRange.value = Math.min(Number(timeRange.max), Math.max(0, animationTime || 0));
     }
     shader.bind();
-    shader.setUniformi(spine.webgl.Shader.SAMPLER, 0);
-    shader.setUniform4x4f(spine.webgl.Shader.MVP_MATRIX, mvp.values);
+    shader.setUniformi(runtimeApi.Shader.SAMPLER, 0);
+    shader.setUniform4x4f(runtimeApi.Shader.MVP_MATRIX, mvp.values);
     batcher.begin(shader); renderer.draw(batcher, skeleton); batcher.end(); shader.unbind();
+    if (!firstFrameRendered) { firstFrameRendered = true; setPreviewState("ready"); }
     requestAnimationFrame(renderFrame);
   }
   function resize() {
@@ -200,14 +215,18 @@
     }
     if (!manifest.runtime.combined) await loadScript(manifest.runtime.core);
     await loadScript(manifest.runtime.webgl);
-    if (!window.spine || !spine.webgl) throw new Error("The supplied runtime did not expose spine.webgl.");
+    if (!window.spine) throw new Error("The supplied runtime did not expose window.spine.");
+    runtimeApi = manifest.runtime.api === "flat" ? window.spine : window.spine.webgl;
+    if (!runtimeApi || !runtimeApi.AssetManager || !runtimeApi.SkeletonRenderer) {
+      throw new Error("The supplied runtime did not expose the expected WebGL API.");
+    }
     gl = canvas.getContext("webgl", { alpha: true, premultipliedAlpha: false }) || canvas.getContext("experimental-webgl", { alpha: true, premultipliedAlpha: false });
     if (!gl) throw new Error("WebGL is unavailable in this browser.");
-    shader = spine.webgl.Shader.newTwoColoredTextured(gl);
-    batcher = new spine.webgl.PolygonBatcher(gl);
-    mvp = new spine.webgl.Matrix4();
-    renderer = new spine.webgl.SkeletonRenderer(gl);
-    assetManager = new spine.webgl.AssetManager(gl);
+    shader = runtimeApi.Shader.newTwoColoredTextured(gl);
+    batcher = new runtimeApi.PolygonBatcher(gl);
+    mvp = new runtimeApi.Matrix4();
+    renderer = new runtimeApi.SkeletonRenderer(gl);
+    assetManager = new runtimeApi.AssetManager(gl);
     (manifest.textures || []).forEach(function (url) { assetManager.loadTexture(url); });
     const atlasTexts = await Promise.all(manifest.atlases.map(async function (url) {
       const response = await fetch(url); if (!response.ok) throw new Error("Atlas HTTP " + response.status); return await response.text();
@@ -215,11 +234,24 @@
     await waitForAssets();
     const textureByName = {};
     (manifest.textures || []).forEach(function (url) { textureByName[basename(url)] = assetManager.get(url); });
-    atlas = new spine.TextureAtlas(atlasTexts.join("\n\n"), function (name) {
-      const texture = textureByName[basename(name)] || textureByName[name];
-      if (!texture) throw new Error("Atlas page was not loaded: " + name);
-      return texture;
-    });
+    const atlasText = atlasTexts.join("\n\n");
+    if (manifest.runtime.api === "flat") {
+      // Spine 4.0's TextureAtlas constructor parses pages first and textures
+      // are attached explicitly.  The 3.8 constructor accepts a texture
+      // loader callback, so keep that path for the legacy namespace.
+      atlas = new spine.TextureAtlas(atlasText);
+      atlas.pages.forEach(function (page) {
+        const texture = textureByName[basename(page.name)] || textureByName[page.name];
+        if (!texture) throw new Error("Atlas page was not loaded: " + page.name);
+        page.setTexture(texture);
+      });
+    } else {
+      atlas = new spine.TextureAtlas(atlasText, function (name) {
+        const texture = textureByName[basename(name)] || textureByName[name];
+        if (!texture) throw new Error("Atlas page was not loaded: " + name);
+        return texture;
+      });
+    }
     const skeletonPayload = await fetchSkeleton();
     const loader = new spine.AtlasAttachmentLoader(atlas);
     let data;
@@ -241,8 +273,8 @@
     resize(); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
     if (applyState !== false) state.apply(skeleton);
     skeleton.updateWorldTransform();
-    shader.bind(); shader.setUniformi(spine.webgl.Shader.SAMPLER, 0);
-    shader.setUniform4x4f(spine.webgl.Shader.MVP_MATRIX, mvp.values);
+    shader.bind(); shader.setUniformi(runtimeApi.Shader.SAMPLER, 0);
+    shader.setUniform4x4f(runtimeApi.Shader.MVP_MATRIX, mvp.values);
     batcher.begin(shader); renderer.draw(batcher, skeleton); batcher.end(); shader.unbind();
   }
   function attachmentKind(attachment) {
@@ -342,19 +374,27 @@
     } finally { exportPsdButton.disabled = false; }
   }
   exportPsdButton.onclick = exportPosePsd;
-  function startAtlas() {
+  async function startAtlas() {
     canvas.classList.add("hidden"); atlasView.classList.remove("hidden");
     showWarnings();
-    (manifest.textures || []).forEach(function (url) {
+    const imageLoads = (manifest.textures || []).map(function (url) {
       const figure = document.createElement("figure");
-      const image = document.createElement("img"); image.src = url; image.alt = basename(url);
+      const image = document.createElement("img"); image.alt = basename(url);
       const caption = document.createElement("figcaption"); caption.textContent = basename(url);
       figure.appendChild(image); figure.appendChild(caption); atlasView.appendChild(figure);
+      const load = new Promise(function (resolve, reject) {
+        image.onload = function () { resolve(); };
+        image.onerror = function () { reject(new Error("Atlas image failed to load: " + url)); };
+      });
+      image.src = url;
+      return load;
     });
     if (!(manifest.textures || []).length) status.textContent += "\nNo atlas page image was found.";
+    await Promise.all(imageLoads);
+    setPreviewState("ready");
     skinSelect.disabled = animationSelect.disabled = pauseCheck.disabled = timeRange.disabled = resetButton.disabled = true;
   }
-  if (manifest.mode === "runtime") startRuntime().catch(showError); else startAtlas();
+  if (manifest.mode === "runtime") startRuntime().catch(showError); else startAtlas().catch(showError);
 }());
 </script>
 </body>

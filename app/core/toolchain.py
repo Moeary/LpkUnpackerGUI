@@ -9,6 +9,7 @@ object from recursively importing one of the tool backends.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -321,15 +322,50 @@ def find_photoshop_path(value: str | os.PathLike[str] | None) -> Path | None:
 
 
 def _contains_spine_scripts(root: Path) -> bool:
+    if _manifest_webgl_script(root) is not None:
+        return True
+    pending = [root]
     try:
-        scripts = [
-            path
-            for path in root.rglob("*.js")
-            if path.name.casefold() in SPINE_WEBGL_NAMES
-        ]
-        return bool(scripts)
+        while pending:
+            current = pending.pop()
+            with os.scandir(current) as entries:
+                children = sorted(entries, key=lambda item: item.name.casefold(), reverse=True)
+            for entry in children:
+                try:
+                    name = entry.name.casefold()
+                    if name in {".git", "node_modules"}:
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        pending.append(Path(entry.path))
+                    elif entry.is_file(follow_symlinks=False) and name in SPINE_WEBGL_NAMES:
+                        return True
+                except (OSError, RuntimeError):
+                    continue
     except (OSError, RuntimeError):
-        return False
+        pass
+    return False
+
+
+def _manifest_webgl_script(root: Path) -> Path | None:
+    """Resolve a manifest's WebGL path before walking a runtime tree."""
+
+    for name in ("spine_runtime.json", "runtime.json", "manifest.json"):
+        manifest = root / name
+        try:
+            if not manifest.is_file():
+                continue
+            data = json.loads(manifest.read_text(encoding="utf-8-sig"))
+            if not isinstance(data, dict):
+                continue
+            raw = data.get("webgl") or data.get("spineWebgl") or data.get("webGL")
+            if not isinstance(raw, str) or not raw:
+                continue
+            script = (manifest.parent / raw).resolve()
+            if script.is_file() and script.suffix.casefold() == ".js":
+                return script
+        except (OSError, RuntimeError, UnicodeError, json.JSONDecodeError):
+            continue
+    return None
 
 
 def _has_spine_manifest(root: Path) -> bool:
@@ -338,8 +374,25 @@ def _has_spine_manifest(root: Path) -> bool:
             (root / name).is_file()
             for name in ("spine_runtime.json", "runtime.json", "manifest.json")
         )
-    except OSError:
+    except (OSError, RuntimeError):
         return False
+
+
+def _has_multiple_versioned_spine_runtimes(root: Path) -> bool:
+    """Return whether *root* is a usable common root for versioned builds."""
+
+    matches = 0
+    try:
+        for child in root.iterdir():
+            if not child.is_dir() or not re.fullmatch(r"\d+\.\d+(?:\.\d+)?", child.name):
+                continue
+            if _has_spine_manifest(child) and _contains_spine_scripts(child):
+                matches += 1
+                if matches > 1:
+                    return True
+    except (OSError, RuntimeError):
+        return False
+    return False
 
 
 def find_spine_runtime(
@@ -365,6 +418,16 @@ def find_spine_runtime(
         # lexicographic ``build`` directory would make the settings path
         # fragile and bypass a manifest placed at ``spine/3.8``.
         try:
+            known_spine_roots = [root]
+            if root.name.casefold() != "spine":
+                known_spine_roots.append(root / "spine")
+            common_roots = sorted(
+                (path for path in known_spine_roots if _has_multiple_versioned_spine_runtimes(path)),
+                key=lambda path: (len(path.parts), str(path).casefold()),
+            )
+            if common_roots:
+                return common_roots[0].resolve()
+
             candidates = [root]
             candidates.extend(
                 path
@@ -372,8 +435,15 @@ def find_spine_runtime(
                 if path.is_dir()
                 and path.name.casefold() in {"3.8", "runtime", "spine", "spine-ts"}
             )
+            unique_candidates = _unique_paths(candidates)
+            common_roots = sorted(
+                (path for path in unique_candidates if _has_multiple_versioned_spine_runtimes(path)),
+                key=lambda path: (len(path.parts), str(path).casefold()),
+            )
+            if common_roots:
+                return common_roots[0].resolve()
             candidates = sorted(
-                _unique_paths(candidates),
+                unique_candidates,
                 key=lambda path: (
                     0 if _has_spine_manifest(path) else 1,
                     len(path.parts),

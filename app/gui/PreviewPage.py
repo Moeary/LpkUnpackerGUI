@@ -30,9 +30,8 @@ from PySide6.QtCore import (
     QPoint,
     QEvent,
     QStringListModel,
-    QUrl,
 )
-from PySide6.QtGui import QDragEnterEvent, QDropEvent, QColor, QPixmap, QDesktopServices
+from PySide6.QtGui import QDragEnterEvent, QDropEvent, QColor, QPixmap
 from qfluentwidgets import (SubtitleLabel, BodyLabel, CaptionLabel, PushButton, Slider, CheckBox, SpinBox, InfoBar, InfoBarPosition,
                            CardWidget, SingleDirectionScrollArea, TextBrowser, ColorDialog, FluentIcon, IconWidget,
                            ComboBox, EditableComboBox, LineEdit)
@@ -60,8 +59,21 @@ from app.core.preview.sources import (
 from app.core.settings_manager import SettingsManager
 from app.gui.ImagePreviewPanel import ImagePreviewPanel
 from app.gui.Live2DPreviewWindow import Live2DPreviewWindow
+from app.gui.SpinePreviewWidget import SpinePreviewWidget
 from app.i18n import get_i18n, tr
 from app.paths import PROJECT_ROOT
+
+try:
+    from shiboken6 import isValid as _is_qt_object_valid
+except ImportError:  # pragma: no cover - bundled with PySide6 in normal builds
+    def _is_qt_object_valid(obj) -> bool:
+        return obj is not None
+
+
+def _spine_thread_is_running(thread) -> bool:
+    """Read a worker state only while its wrapped C++ QThread is alive."""
+
+    return bool(thread is not None and _is_qt_object_valid(thread) and thread.isRunning())
 
 
 def _unique_path(path: str) -> str:
@@ -1442,6 +1454,7 @@ class PreviewPage(QFrame):
         self.preview_dock_area = None
         self.preview_dock_layout = None
         self.preview_placeholder = None
+        self.spine_preview = None
         self.motion_group_title = None
         self.motion_group = None
         self.motion_combo = None
@@ -1499,6 +1512,10 @@ class PreviewPage(QFrame):
         self._spine_preview_generation = 0
         self._spine_preview_temp_dirs = []
         self._spine_web_server_port = None
+        self._active_spine_plan = None
+        self._active_spine_preview_url = ""
+        self._spine_mode = False
+        self._spine_sidebar_state = None
         self._image_preview_thread = None
         self._image_preview_temp_dirs = []
         self._archive_preview_thread = None
@@ -1527,6 +1544,7 @@ class PreviewPage(QFrame):
             if app is not None:
                 app.aboutToQuit.connect(self._terminate_preview_process)
                 app.aboutToQuit.connect(self._destroy_embedded_live2d)
+                app.aboutToQuit.connect(self._destroy_embedded_spine)
                 app.aboutToQuit.connect(self._cleanup_temp_model_json)
                 app.aboutToQuit.connect(self._cleanup_model_preview_temp_dirs)
                 app.aboutToQuit.connect(self._cleanup_spine_preview_temp_dirs)
@@ -1754,6 +1772,13 @@ class PreviewPage(QFrame):
         self.image_preview_panel.setVisible(False)
         self.image_preview_panel.itemActivated.connect(self.on_preview_item_activated)
         self.preview_dock_layout.addWidget(self.image_preview_panel, 1)
+
+        self.spine_preview = SpinePreviewWidget(self.preview_dock_area)
+        self.spine_preview.setVisible(False)
+        self.spine_preview.documentLoaded.connect(self._on_spine_preview_document_loaded)
+        self.spine_preview.previewReady.connect(self._on_spine_preview_ready)
+        self.spine_preview.previewFailed.connect(self._on_spine_preview_web_error)
+        self.preview_dock_layout.addWidget(self.spine_preview, 1)
         self._ensure_embedded_live2d()
         self.preview_stage_layout.addWidget(self.preview_dock_area, 1)
 
@@ -2296,6 +2321,66 @@ class PreviewPage(QFrame):
         except Exception:
             pass
 
+    def _destroy_embedded_spine(self):
+        preview = self.spine_preview
+        self.spine_preview = None
+        if preview is None:
+            return
+        try:
+            if self.preview_dock_layout:
+                self.preview_dock_layout.removeWidget(preview)
+            preview.shutdown()
+            preview.close()
+            preview.deleteLater()
+        except Exception:
+            pass
+
+    def _clear_embedded_spine(self):
+        preview = self.spine_preview
+        self._active_spine_plan = None
+        self._active_spine_preview_url = ""
+        if preview is None:
+            self._set_spine_mode(False)
+            return
+        try:
+            preview.clear_preview()
+        except Exception:
+            pass
+        self._set_spine_mode(False)
+
+    def _set_spine_mode(self, active: bool):
+        """Keep Live2D-only controls out of the way for a Spine page."""
+
+        active = bool(active)
+        if active == self._spine_mode:
+            return
+        if active:
+            self._spine_sidebar_state = {
+                "right": bool(self.right_sidebar and self.right_sidebar.isVisible()),
+                "settings": bool(self.settings_panel and self.settings_panel.isVisible()),
+            }
+            if self.right_sidebar:
+                self.right_sidebar.setVisible(False)
+            if self.right_sidebar_btn:
+                self.right_sidebar_btn.setEnabled(False)
+            if self.settings_panel:
+                self.settings_panel.setVisible(False)
+            self._set_motion_debug_visible(False)
+            self._spine_mode = True
+            self._update_sidebar_button_text()
+            return
+
+        state = self._spine_sidebar_state or {}
+        if self.right_sidebar:
+            self.right_sidebar.setVisible(bool(state.get("right", True)))
+        if self.right_sidebar_btn:
+            self.right_sidebar_btn.setEnabled(True)
+        if self.settings_panel:
+            self.settings_panel.setVisible(bool(state.get("settings", True)))
+        self._spine_sidebar_state = None
+        self._spine_mode = False
+        self._update_sidebar_button_text()
+
     def _poll_preview_process(self):
         process = self.preview_process
         if process is None:
@@ -2318,6 +2403,8 @@ class PreviewPage(QFrame):
     def _show_stage_placeholder(self, text: str | None = None):
         if self.live2d_preview:
             self.live2d_preview.setVisible(False)
+        if self.spine_preview:
+            self.spine_preview.setVisible(False)
         if self.image_preview_panel:
             self.image_preview_panel.setVisible(False)
         if self.preview_placeholder:
@@ -2327,10 +2414,23 @@ class PreviewPage(QFrame):
     def _show_image_stage(self):
         if self.live2d_preview:
             self.live2d_preview.setVisible(False)
+        if self.spine_preview:
+            self.spine_preview.setVisible(False)
         if self.preview_placeholder:
             self.preview_placeholder.setVisible(False)
         if self.image_preview_panel:
             self.image_preview_panel.setVisible(True)
+
+    def _show_spine_stage(self):
+        if self.live2d_preview:
+            self.live2d_preview.setVisible(False)
+        if self.image_preview_panel:
+            self.image_preview_panel.setVisible(False)
+        if self.preview_placeholder:
+            self.preview_placeholder.setVisible(False)
+        if self.spine_preview:
+            self.spine_preview.setVisible(True)
+        self._set_spine_mode(True)
 
     def _set_preview_export_payload(
         self,
@@ -2651,23 +2751,56 @@ class PreviewPage(QFrame):
             self._clear_preview_export_payload()
 
     def _cleanup_spine_preview_temp_dirs(self):
+        """Cancel Spine imports and release their disposable workspaces.
+
+        A finished ``QThread`` may already have had its C++ object destroyed
+        while the Python wrapper is still referenced.  Always test validity
+        before touching it and clear the active pointer before scheduling
+        ``deleteLater()`` so a later import cannot call ``isRunning()`` on a
+        dangling wrapper.
+        """
+
         self._spine_preview_generation += 1
         running = []
+        processed = set()
         for thread in list(self._spine_preview_workers):
-            if thread.isRunning():
+            if not _is_qt_object_valid(thread):
+                if thread is self._spine_preview_thread:
+                    self._spine_preview_thread = None
+                continue
+            if _spine_thread_is_running(thread):
                 thread.requestInterruption()
                 running.append(thread)
             else:
+                processed.add(id(thread))
+                result = getattr(thread, "result", None)
+                temp_dir = getattr(result, "temp_dir", None)
+                if temp_dir:
+                    shutil.rmtree(str(temp_dir), ignore_errors=True)
+                if thread is self._spine_preview_thread:
+                    self._spine_preview_thread = None
                 thread.deleteLater()
         self._spine_preview_workers = running
-        if self._spine_preview_thread is not None and not self._spine_preview_thread.isRunning():
-            self._spine_preview_thread.deleteLater()
-            self._spine_preview_thread = None
+        current = self._spine_preview_thread
+        if current is not None and id(current) not in processed:
+            if not _is_qt_object_valid(current):
+                self._spine_preview_thread = None
+            elif _spine_thread_is_running(current):
+                current.requestInterruption()
+                if not any(current is item for item in running):
+                    running.append(current)
+                    self._spine_preview_workers = running
+            else:
+                result = getattr(current, "result", None)
+                temp_dir = getattr(result, "temp_dir", None)
+                if temp_dir:
+                    shutil.rmtree(str(temp_dir), ignore_errors=True)
+                current.deleteLater()
+                self._spine_preview_thread = None
+
         # A worker may still be writing a disposable extraction.  Leave its
         # directory alone until finished() instead of deleting live files.
         if running:
-            for thread in running:
-                thread.finished.connect(self._cleanup_finished_spine_thread)
             return
         for temp_dir in list(self._spine_preview_temp_dirs):
             try:
@@ -2678,36 +2811,45 @@ class PreviewPage(QFrame):
         self._spine_preview_temp_dirs = []
 
     def _cleanup_finished_spine_thread(self):
-        finished = [thread for thread in self._spine_preview_workers if not thread.isRunning()]
-        self._spine_preview_workers = [thread for thread in self._spine_preview_workers if thread.isRunning()]
+        finished = []
+        running = []
+        for thread in list(self._spine_preview_workers):
+            if not _is_qt_object_valid(thread):
+                if thread is self._spine_preview_thread:
+                    self._spine_preview_thread = None
+                continue
+            if _spine_thread_is_running(thread):
+                running.append(thread)
+            else:
+                finished.append(thread)
+        self._spine_preview_workers = running
         for thread in finished:
             result = getattr(thread, "result", None)
             temp_dir = getattr(result, "temp_dir", None)
             is_current_result = (
-                thread is self._spine_preview_thread
-                and getattr(thread, "_preview_generation", None) == self._spine_preview_generation
+                getattr(thread, "_preview_generation", None) == self._spine_preview_generation
             )
-            if temp_dir and not is_current_result and str(temp_dir) not in self._spine_preview_temp_dirs:
-                try:
-                    shutil.rmtree(str(temp_dir), ignore_errors=True)
-                except Exception:
-                    pass
+            if temp_dir:
+                temp_dir = str(temp_dir)
+                if is_current_result:
+                    if temp_dir not in self._spine_preview_temp_dirs:
+                        self._spine_preview_temp_dirs.append(temp_dir)
+                else:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                    try:
+                        self._spine_preview_temp_dirs.remove(temp_dir)
+                    except ValueError:
+                        pass
+            if thread is self._spine_preview_thread:
+                # The active preview owns the result directory; the worker
+                # wrapper must not remain the active handle after finished.
+                self._spine_preview_thread = None
             thread.deleteLater()
         if self._spine_preview_workers:
             return
-        if any(
-            thread is self._spine_preview_thread
-            and getattr(thread, "_preview_generation", None) == self._spine_preview_generation
-            for thread in finished
-        ):
-            return
-        for temp_dir in list(self._spine_preview_temp_dirs):
-            try:
-                if temp_dir and os.path.isdir(temp_dir):
-                    shutil.rmtree(temp_dir)
-            except Exception:
-                pass
-        self._spine_preview_temp_dirs = []
+        # Active result directories belong to the embedded view and are
+        # removed by an explicit close/new import, never by an unrelated
+        # worker's late ``finished`` signal.
 
     def _cleanup_archive_preview_temp_dirs(self):
         for temp_dir in list(self._archive_preview_temp_dirs):
@@ -2790,18 +2932,14 @@ class PreviewPage(QFrame):
         )
 
     def start_spine_preview_import(self, source_path: str, package_fallback: bool = False):
-        """Prepare a Spine source and open the local read-only web viewer."""
+        """Prepare a Spine source and open the local viewer in the stage."""
+        # Closing first invalidates the previous generation and requests
+        # interruption for an import that is still extracting.  A new
+        # generation is assigned only after that cancellation, so a late
+        # ready/failed signal from the old worker cannot reopen the stage.
+        self.close_preview_window()
         self._spine_preview_generation += 1
         generation = self._spine_preview_generation
-        previous = self._spine_preview_thread
-        if previous is not None and previous.isRunning():
-            previous.requestInterruption()
-        elif previous is not None:
-            for temp_dir in list(self._spine_preview_temp_dirs):
-                shutil.rmtree(temp_dir, ignore_errors=True)
-            self._spine_preview_temp_dirs = []
-            self._spine_preview_thread = None
-        self.close_preview_window()
         self._cleanup_temp_model_json()
         self._cleanup_model_preview_temp_dirs()
         self._cleanup_image_preview_temp_dirs()
@@ -2809,12 +2947,12 @@ class PreviewPage(QFrame):
         self.current_model_path = None
         self.preview_btn.setEnabled(False)
         self._set_motion_debug_visible(False)
+        self._set_spine_mode(True)
         if self.image_preview_panel:
             self.image_preview_panel.clear()
         self._show_stage_placeholder(tr("preview.stage_loading"))
         self.model_info_text_box.setMarkdown(
-            f"### Preparing Spine preview\n\n**Source:** `{source_path}`\n\n"
-            "The source is read into a disposable workspace; original files are not modified."
+            tr("preview.spine_import_loading", source=source_path)
         )
         runtime_root = str(self.settings_manager.get("preview.spine_runtime_dir", "") or "").strip()
         worker = SpinePreviewImportThread(
@@ -2839,23 +2977,18 @@ class PreviewPage(QFrame):
     def on_spine_preview_ready(self, result, source_path: str, generation=None, worker=None):
         if generation is not None and generation != self._spine_preview_generation:
             return
-        if worker is not None and worker is not self._spine_preview_thread:
-            return
-        self._spine_preview_thread = worker
         temp_dir = getattr(result, "temp_dir", None)
-        if temp_dir:
+        if temp_dir and str(temp_dir) not in self._spine_preview_temp_dirs:
             self._spine_preview_temp_dirs.append(str(temp_dir))
         try:
             self._open_spine_web_preview(result.plan)
         except Exception as exc:
-            self.show_error(tr("common.error"), f"Spine preview could not start: {exc}")
+            self._on_spine_preview_web_error(str(exc))
 
     def on_spine_preview_failed(self, error: str, source_path: str, generation=None, worker=None):
         if generation is not None and generation != self._spine_preview_generation:
             return
-        worker = worker or self._spine_preview_thread
-        package_fallback = bool(getattr(worker, "_package_fallback", False))
-        self._spine_preview_thread = worker
+        package_fallback = bool(getattr(worker, "_package_fallback", False)) if worker is not None else False
         if package_fallback and isinstance(error, str) and (
             "No Spine asset" in error
             or "Unsupported Spine preview source" in error
@@ -2863,10 +2996,21 @@ class PreviewPage(QFrame):
         ):
             self.start_model_preview_import(source_path)
             return
-        self.show_error(tr("common.error"), f"Spine preview preparation failed: {error}")
+        self._clear_embedded_spine()
+        self._show_stage_placeholder(tr("preview.spine_import_failed_content", error=error))
+        self.model_info_text_box.setMarkdown(
+            tr("preview.spine_import_failed_content", error=error)
+        )
+        self.show_error(
+            tr("preview.spine_import_failed_title"),
+            tr("preview.spine_import_failed_content", error=error),
+        )
 
     def _open_spine_web_preview(self, plan: SpinePreviewPlan):
         from app.gui.web_server import mount_model_dir, start_server
+
+        if self.spine_preview is None:
+            raise RuntimeError("Embedded Spine preview widget is unavailable.")
 
         if not self._spine_web_server_port:
             self._spine_web_server_port = start_server(host="127.0.0.1", port=0)
@@ -2882,12 +3026,56 @@ class PreviewPage(QFrame):
         )
         manifest_text = quote(json.dumps(manifest, ensure_ascii=False, separators=(",", ":")), safe="")
         url = f"{server_url}/static/spine/preview.html?manifest={manifest_text}"
-        if not QDesktopServices.openUrl(QUrl(url)):
-            raise RuntimeError(f"Could not open the system browser: {url}")
+        self._active_spine_plan = plan
+        self._active_spine_preview_url = url
+        self.spine_preview.open_url(url)
         self.model_info_text_box.setMarkdown(
-            f"### Spine preview opened\n\n**Version:** `{plan.asset.spine_version or 'unknown'}`\n\n"
-            f"**Mode:** `{plan.mode}`\n\n{plan.reason}"
+            tr(
+                "preview.spine_preview_loading",
+                version=plan.asset.spine_version or "unknown",
+                mode=plan.mode,
+                reason=plan.reason,
+            )
         )
+
+    def _on_spine_preview_document_loaded(self, url: str):
+        if not self._active_spine_preview_url or str(url) != self._active_spine_preview_url:
+            return
+        plan = self._active_spine_plan
+        if plan is None:
+            return
+        self._show_spine_stage()
+        self.model_info_text_box.setMarkdown(
+            tr(
+                "preview.spine_preview_loading",
+                version=plan.asset.spine_version or "unknown",
+                mode=plan.mode,
+                reason=plan.reason,
+            )
+        )
+
+    def _on_spine_preview_ready(self, url: str):
+        if not self._active_spine_preview_url or str(url) != self._active_spine_preview_url:
+            return
+        plan = self._active_spine_plan
+        if plan is None:
+            return
+        self._show_spine_stage()
+        self.model_info_text_box.setMarkdown(
+            tr(
+                "preview.spine_preview_ready",
+                version=plan.asset.spine_version or "unknown",
+                mode=plan.mode,
+                reason=plan.reason,
+            )
+        )
+
+    def _on_spine_preview_web_error(self, error: str):
+        self._clear_embedded_spine()
+        message = tr("preview.spine_web_error_content", error=str(error))
+        self._show_stage_placeholder(message)
+        self.model_info_text_box.setMarkdown(message)
+        self.show_error(tr("preview.spine_web_error_title"), message)
 
     def start_folder_preview_scan(self, folder_path: str):
         if self._folder_preview_thread is not None and self._folder_preview_thread.isRunning():
@@ -3005,6 +3193,7 @@ class PreviewPage(QFrame):
 
     def activate_image_preview_item(self, item: dict):
         self._terminate_preview_process()
+        self._clear_embedded_spine()
         self.current_model_path = None
         self._set_motion_debug_visible(False)
         self.preview_btn.setEnabled(False)
@@ -3124,6 +3313,7 @@ class PreviewPage(QFrame):
         )
 
     def load_model_preview(self, model_json_path: str, source_path: str | None = None):
+        self._clear_embedded_spine()
         self._psd_project_context = self._pending_psd_project_context
         self._pending_psd_project_context = None
         if self.save_pose_scheme_btn:
@@ -3401,8 +3591,13 @@ class PreviewPage(QFrame):
             self.preview_process = None
 
     def close_preview_window(self):
-        """Close the current image or embedded Live2D preview."""
+        """Close the current image, Spine page, or embedded Live2D preview."""
+        # Invalidate the active import before clearing the page.  Otherwise a
+        # queued worker signal could recreate the Spine page after the user
+        # pressed the close button.
+        self._cleanup_spine_preview_temp_dirs()
         self._terminate_preview_process()
+        self._clear_embedded_spine()
         self._populate_motion_controls([])
         self._set_motion_debug_visible(False)
         self._clear_preview_export_payload()

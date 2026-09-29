@@ -6,14 +6,15 @@ page at an official ``spine-ts`` runtime directory containing a matching
 it never downloads, copies, or mutates runtime or model files.
 
 Spine editor and runtime major/minor versions must match.  Spine 2.1 assets
-are intentionally downgraded to atlas-page preview because the first supported
-dynamic family here is 3.8 JSON.  Newer families remain explicit and are not
-silently loaded by a 3.8 runtime.
+are intentionally downgraded to atlas-page preview.  The validated dynamic
+families are 3.8 and 4.0; newer families remain explicit and are not silently
+loaded by an older runtime.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 from dataclasses import dataclass
@@ -21,8 +22,8 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 
-SPINE_RUNTIME_SUPPORTED_FAMILIES = frozenset({"3.8"})
-SPINE_RUNTIME_KNOWN_FAMILIES = frozenset({"3.8", "4.2"})
+SPINE_RUNTIME_SUPPORTED_FAMILIES = frozenset({"3.8", "4.0"})
+SPINE_RUNTIME_KNOWN_FAMILIES = frozenset({"3.8", "4.0", "4.2"})
 MAX_POSE_CANVAS_PIXELS = 64 * 1024 * 1024
 MAX_POSE_LAYER_PIXELS = 128 * 1024 * 1024
 SPINE_VERSION_RE = re.compile(r"(?<!\d)(\d+)\.(\d+)(?:\.(\d+))?(?!\d)")
@@ -32,6 +33,8 @@ SPINE_SCRIPT_NAMES = {
     "spine-webgl.js",
     "spine-webgl.min.js",
 }
+_SPINE_RUNTIME_MANIFEST_NAMES = frozenset({"spine_runtime.json", "runtime.json", "manifest.json"})
+_SPINE_RUNTIME_SKIP_DIR_NAMES = frozenset({".git", "node_modules"})
 SPINE_ATLAS_SUFFIXES = (".atlas", ".atlas.txt", ".atlas.bytes")
 SPINE_SKEL_SUFFIXES = (".skel", ".skel.bytes")
 
@@ -70,6 +73,11 @@ class SpineRuntime:
     version: str | None = None
     source_manifest: Path | None = None
     combined_webgl: bool = False
+    # spine-ts 3.8 exposes WebGL classes under ``spine.webgl`` while 4.0
+    # publishes one self-contained IIFE whose WebGL classes are top-level.
+    # Keep this in the runtime description so the browser renderer can select
+    # the API from the verified manifest rather than guessing from script text.
+    api_style: str = "legacy"
 
     @property
     def family(self) -> str | None:
@@ -248,20 +256,58 @@ def discover_spine_runtime(
         raise SpineRuntimeUnavailableError(f"Spine runtime directory does not exist: {base}")
     requested = str(requested_family or "").strip() or None
 
-    manifests = [
-        path
-        for path in sorted(base.rglob("*.json"))
-        if path.name.lower() in {"spine_runtime.json", "runtime.json", "manifest.json"}
-    ]
     explicit_manifest_families: list[str] = []
-    for manifest in manifests:
+
+    # The configured path may be a unified ``tools/spine`` root.  Check only
+    # its own manifest and the requested version directory first, so a large
+    # source checkout or a broken dependency link cannot block a valid build.
+    prioritized = list(_direct_runtime_manifests(base))
+    if requested:
+        requested_dir = _requested_runtime_family_dir(base, requested)
+        if requested_dir is not None:
+            prioritized.extend(_direct_runtime_manifests(requested_dir))
+
+    seen_manifests: set[Path] = set()
+
+    def inspect_manifest(manifest: Path) -> SpineRuntime | None:
+        try:
+            identity = manifest.resolve()
+        except (OSError, RuntimeError):
+            identity = manifest
+        if identity in seen_manifests:
+            return None
+        seen_manifests.add(identity)
         manifest_data = _try_read_json(manifest)
-        manifest_family = spine_version_family(
-            manifest_data.get("version") or manifest_data.get("spineVersion") or manifest_data.get("runtimeVersion")
-        ) if isinstance(manifest_data, Mapping) else None
+        manifest_family = (
+            spine_version_family(
+                manifest_data.get("version")
+                or manifest_data.get("spineVersion")
+                or manifest_data.get("runtimeVersion")
+            )
+            if isinstance(manifest_data, Mapping)
+            else None
+        )
         if manifest_family:
             explicit_manifest_families.append(manifest_family)
-        runtime = _runtime_from_manifest(manifest, requested)
+        try:
+            return _runtime_from_manifest(manifest, requested)
+        except (OSError, RuntimeError):
+            return None
+
+    for manifest in prioritized:
+        runtime = inspect_manifest(manifest)
+        if runtime is not None:
+            return runtime
+
+    # Recursive discovery is deliberately a fallback.  The iterator prunes
+    # dependency/source metadata directories and treats disappearing or
+    # inaccessible entries as non-matches rather than aborting discovery.
+    manifests = sorted(
+        _iter_runtime_files(base, names=_SPINE_RUNTIME_MANIFEST_NAMES),
+        key=lambda path: str(path).casefold(),
+    )
+    for manifest in manifests:
+        runtime = inspect_manifest(manifest)
         if runtime is not None:
             return runtime
     if requested and explicit_manifest_families and requested not in explicit_manifest_families:
@@ -269,7 +315,7 @@ def discover_spine_runtime(
             f"Requested Spine runtime {requested}, manifests declare {', '.join(sorted(set(explicit_manifest_families)))}"
         )
 
-    scripts = [path for path in base.rglob("*.js") if path.name.lower() in SPINE_SCRIPT_NAMES]
+    scripts = list(_iter_runtime_files(base, names=SPINE_SCRIPT_NAMES))
     if not scripts:
         raise SpineRuntimeUnavailableError(
             f"No official spine-core.js/spine-webgl.js build found under {base}"
@@ -297,7 +343,76 @@ def discover_spine_runtime(
         core_script=core,
         version=version,
         combined_webgl=combined,
+        api_style=_runtime_api_style(None, version or family or requested),
     )
+
+
+def _direct_runtime_manifests(root: Path) -> tuple[Path, ...]:
+    """Return manifest files directly below *root*, tolerating stale entries."""
+
+    candidates: list[Path] = []
+    try:
+        with os.scandir(root) as entries:
+            for entry in entries:
+                try:
+                    if entry.name.casefold() not in _SPINE_RUNTIME_MANIFEST_NAMES:
+                        continue
+                    if entry.is_file(follow_symlinks=False):
+                        candidates.append(Path(entry.path))
+                except (OSError, RuntimeError):
+                    continue
+    except (OSError, RuntimeError):
+        return ()
+    return tuple(sorted(candidates, key=lambda path: str(path).casefold()))
+
+
+def _requested_runtime_family_dir(base: Path, requested: str) -> Path | None:
+    """Resolve a direct requested-family child without allowing parent escape."""
+
+    try:
+        candidate = (base / requested).resolve()
+        if candidate == base or candidate.parent != base or not candidate.is_dir():
+            return None
+    except (OSError, RuntimeError):
+        return None
+    return candidate
+
+
+def _iter_runtime_files(
+    root: Path,
+    *,
+    names: Iterable[str] = (),
+    suffixes: Iterable[str] = (),
+) -> Iterable[Path]:
+    """Walk below *root* without following links into broken dependencies."""
+
+    wanted_names = {str(name).casefold() for name in names}
+    wanted_suffixes = tuple(str(suffix).casefold() for suffix in suffixes)
+    pending = [Path(root)]
+    while pending:
+        current = pending.pop()
+        try:
+            with os.scandir(current) as entries:
+                children = sorted(entries, key=lambda item: item.name.casefold(), reverse=True)
+        except (OSError, RuntimeError):
+            continue
+        for entry in children:
+            try:
+                entry_name = entry.name.casefold()
+                if entry_name in _SPINE_RUNTIME_SKIP_DIR_NAMES:
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(Path(entry.path))
+                    continue
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                if wanted_names and entry_name not in wanted_names:
+                    continue
+                if wanted_suffixes and not entry_name.endswith(wanted_suffixes):
+                    continue
+                yield Path(entry.path)
+            except (OSError, RuntimeError):
+                continue
 
 
 def make_spine_preview_plan(
@@ -460,6 +575,7 @@ def build_spine_web_manifest(
             "core": _relative_url(plan.runtime.core_script, runtime_root, runtime_base_url),
             "webgl": _relative_url(plan.runtime.webgl_script, runtime_root, runtime_base_url),
             "combined": plan.runtime.combined_webgl,
+            "api": plan.runtime.api_style,
         }
     else:
         manifest["runtime"] = None
@@ -692,11 +808,11 @@ def _asset_from_atlas(path: Path) -> SpinePreviewAsset:
 
 
 def _try_read_json(path: Path | None) -> dict[str, Any] | None:
-    if not path or not path.is_file() or path.stat().st_size > 64 * 1024 * 1024:
-        return None
     try:
+        if not path or not path.is_file() or path.stat().st_size > 64 * 1024 * 1024:
+            return None
         value = json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
+    except (OSError, RuntimeError, UnicodeError, json.JSONDecodeError):
         return None
     return value if isinstance(value, dict) else None
 
@@ -844,12 +960,16 @@ def _runtime_from_manifest(path: Path, requested: str | None) -> SpineRuntime | 
     core = _manifest_script(path.parent, data.get("core") or data.get("spineCore"))
     webgl = _manifest_script(path.parent, data.get("webgl") or data.get("spineWebgl") or data.get("webGL"))
     if webgl is None:
-        scripts = [item for item in path.parent.rglob("*.js") if item.name.lower() in SPINE_SCRIPT_NAMES]
+        scripts = list(_iter_runtime_files(path.parent, names=SPINE_SCRIPT_NAMES))
         webgl = _pick_script(scripts, "spine-webgl", requested or family)
     if webgl is None:
         return None
     if core is None and not combined:
-        core = _pick_script([webgl.parent / "spine-core.js", *webgl.parent.rglob("spine-core*.js")], "spine-core", requested or family)
+        core = _pick_script(
+            [webgl.parent / "spine-core.js", *_iter_runtime_files(webgl.parent, suffixes=(".js",))],
+            "spine-core",
+            requested or family,
+        )
     return SpineRuntime(
         root_dir=path.parent.resolve(),
         webgl_script=webgl,
@@ -857,18 +977,31 @@ def _runtime_from_manifest(path: Path, requested: str | None) -> SpineRuntime | 
         version=version or _infer_runtime_version(webgl) or family or requested,
         source_manifest=path.resolve(),
         combined_webgl=combined or core is None,
+        api_style=_runtime_api_style(
+            data.get("api") or data.get("apiStyle") or data.get("namespace"),
+            version or _infer_runtime_version(webgl) or family or requested,
+        ),
     )
 
 
 def _manifest_script(root: Path, raw: Any) -> Path | None:
     if not isinstance(raw, str) or not raw:
         return None
-    path = (root / raw).resolve()
-    return path if path.is_file() and path.suffix.lower() == ".js" else None
+    try:
+        path = (root / raw).resolve()
+        return path if path.is_file() and path.suffix.lower() == ".js" else None
+    except (OSError, RuntimeError):
+        return None
 
 
 def _pick_script(scripts: Sequence[Path], stem: str, family: str | None) -> Path | None:
-    candidates = [path.resolve() for path in scripts if path.is_file() and path.stem.lower().startswith(stem)]
+    candidates: list[Path] = []
+    for path in scripts:
+        try:
+            if path.is_file() and path.stem.lower().startswith(stem):
+                candidates.append(path.resolve())
+        except (OSError, RuntimeError):
+            continue
     if family:
         matching = [path for path in candidates if _infer_runtime_family(path) == family]
         if matching:
@@ -888,6 +1021,28 @@ def _infer_runtime_version(path: Path) -> str | None:
 
 def _infer_runtime_family(path: Path) -> str | None:
     return spine_version_family(_infer_runtime_version(path))
+
+
+def _runtime_api_style(value: Any, version_or_family: Any) -> str:
+    """Return the browser API layout for a validated spine-ts build.
+
+    The 3.8 repository keeps WebGL classes under ``spine.webgl``.  Starting
+    with the 4.0 runtime, the IIFE build exports those classes directly on
+    ``spine``.  A manifest may state the layout explicitly; otherwise the
+    major/minor family is sufficient for official builds.
+    """
+
+    value_text = str(value or "").strip().casefold().replace("-", "_")
+    if value_text in {"flat", "top_level", "toplevel", "modern"}:
+        return "flat"
+    if value_text in {"legacy", "nested", "webgl_namespace", "webgl"}:
+        return "legacy"
+    family = spine_version_family(version_or_family)
+    if family:
+        major = int(family.split(".", 1)[0])
+        if major >= 4:
+            return "flat"
+    return "legacy"
 
 
 def _relative_url(path: Path | None, root: Path, base_url: str) -> str | None:
