@@ -178,6 +178,25 @@ class SpinePreviewTests(unittest.TestCase):
         self.assertEqual(plan.mode, "atlas")
         self.assertIn("2.1", plan.reason)
 
+    def test_unsupported_family_keeps_runtime_error_for_conversion_choice(self):
+        path = self.asset_dir / "unsupported.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "skeleton": {"spine": "4.1.24"},
+                    "bones": [{"name": "root"}],
+                    "slots": [],
+                    "skins": {},
+                    "animations": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        plan = make_spine_preview_plan(load_spine_asset(path), self.temp / "missing-native")
+        self.assertEqual(plan.mode, "atlas")
+        self.assertTrue(plan.runtime_missing)
+        self.assertIn("3.8.75", plan.runtime_error or "")
+
 
 if __name__ == "__main__":
     unittest.main()

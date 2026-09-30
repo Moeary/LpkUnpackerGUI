@@ -307,6 +307,102 @@ class SpineExtractionConversionTests(unittest.TestCase):
         discover.assert_not_called()
         convert.assert_not_called()
 
+    def test_unity_output_with_spine_is_converted_under_its_own_root(self) -> None:
+        source = self.root / "bundle"
+        source.mkdir()
+        output = self.root / "unity-output"
+        output.mkdir()
+        model = output / "model.json"
+        item = ExtractItemResult(
+            source=source,
+            source_type=ExtractSourceType.UNITY,
+            success=True,
+            output_dir=output,
+            extracted_dirs=[output],
+            message="fake Unity Spine extraction",
+        )
+        converted_dir = output / "spine_converted" / "model"
+        converted = SpineConversionResult(
+            output_dir=converted_dir,
+            skeleton_path=converted_dir / "skeleton.json",
+            report_path=converted_dir / "report.json",
+        )
+        with patch.object(batch, "detect_source_type", return_value=ExtractSourceType.UNITY), \
+                patch.object(batch, "extract_unity", return_value=item), \
+                patch.object(batch, "discover_spine_conversion_sources", return_value=[model]) as discover, \
+                patch.object(batch, "convert_spine", return_value=converted) as convert:
+            result = batch.run_extraction_batch(
+                [source],
+                self.root / "batch-output",
+                ExtractMode.FULL,
+                spine_conversion=SpineConversionOptions(enabled=True),
+            )
+
+        self.assertTrue(result.items[0].success)
+        discover.assert_called_once_with(output.resolve())
+        convert.assert_called_once_with(
+            model,
+            output / "spine_converted",
+            target_version="3.8.75",
+            output_format="json",
+            converter_path=None,
+            remove_curve=False,
+            create_project=False,
+            editor_path=None,
+        )
+
+    def test_wpk_partial_failure_still_converts_successful_child(self) -> None:
+        source = self.root / "source.wpk"
+        source.write_bytes(b"wpk")
+        output = self.root / "wpk-output"
+        output.mkdir()
+        child_root = output / "good"
+        child_root.mkdir()
+        model = child_root / "model.json"
+        successful = ExtractItemResult(
+            source=self.root / "good.lpk",
+            source_type=ExtractSourceType.LPK,
+            success=True,
+            output_dir=child_root,
+            extracted_dirs=[child_root],
+        )
+        failed = ExtractItemResult(
+            source=self.root / "bad.lpk",
+            source_type=ExtractSourceType.LPK,
+            success=False,
+            output_dir=output / "bad",
+            error="bad child",
+        )
+        parent = ExtractItemResult(
+            source=source,
+            source_type=ExtractSourceType.WPK,
+            success=False,
+            output_dir=output,
+            children=[successful, failed],
+            error="1 child failed",
+        )
+        converted_dir = output / "spine_converted" / "model"
+        converted = SpineConversionResult(
+            output_dir=converted_dir,
+            skeleton_path=converted_dir / "skeleton.json",
+            report_path=converted_dir / "report.json",
+        )
+        with patch.object(batch, "detect_source_type", return_value=ExtractSourceType.WPK), \
+                patch.object(batch, "extract_wpk", return_value=parent), \
+                patch.object(batch, "discover_spine_conversion_sources", return_value=[model]) as discover, \
+                patch.object(batch, "convert_spine", return_value=converted) as convert:
+            result = batch.run_extraction_batch(
+                [source],
+                self.root / "batch-output",
+                ExtractMode.FULL,
+                spine_conversion=SpineConversionOptions(enabled=True),
+            )
+
+        self.assertFalse(result.items[0].success)
+        discover.assert_called_once_with(child_root.resolve())
+        convert.assert_called_once()
+        self.assertTrue(any(child.success for child in result.items[0].children))
+
 
 if __name__ == "__main__":
     unittest.main()

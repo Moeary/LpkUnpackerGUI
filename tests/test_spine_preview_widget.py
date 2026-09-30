@@ -7,6 +7,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -337,6 +338,167 @@ class SpinePreviewWidgetTests(unittest.TestCase):
                 QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
                 self.app.processEvents()
                 shutil.rmtree(root, ignore_errors=True)
+
+    def test_missing_runtime_choices_download_convert_and_cancel(self):
+        """Each modal choice has an explicit, testable dispatch path."""
+
+        class FakeButton:
+            def __init__(self, label):
+                self.label = label
+                self.enabled = True
+
+            def setEnabled(self, value):
+                self.enabled = bool(value)
+
+        def message_box_patch(choice):
+            class FakeMessageBox:
+                class ButtonRole:
+                    AcceptRole = object()
+                    ActionRole = object()
+                    RejectRole = object()
+
+                def __init__(self, _parent):
+                    self.buttons = []
+
+                def setWindowTitle(self, _title):
+                    return None
+
+                def setText(self, _text):
+                    return None
+
+                def addButton(self, label, _role):
+                    button = FakeButton(label)
+                    self.buttons.append(button)
+                    return button
+
+                def exec(self):
+                    return 0
+
+                def clickedButton(self):
+                    return self.buttons[{"download": 0, "convert": 1, "cancel": 2}[choice]]
+
+            return patch.object(preview_page_module, "QMessageBox", FakeMessageBox)
+
+        plan = SimpleNamespace(
+            requested_runtime_version="3.8.75",
+            runtime_error="matching runtime is not installed",
+            reason="missing native bridge",
+            asset=SimpleNamespace(spine_version="3.8.75", has_skeleton=True),
+        )
+        page = PreviewPage()
+        try:
+            with patch.object(page, "_spine_compatibility_mode_for_import", return_value=False), \
+                    patch.object(page, "_start_spine_runtime_install", return_value=True) as install, \
+                    message_box_patch("download"):
+                self.assertEqual(
+                    page.handle_missing_spine_runtime(plan, "source.lpk"),
+                    "download",
+                )
+            self.assertEqual(install.call_args.args[0], "spine_native")
+            self.assertFalse(install.call_args.kwargs["retry_compatibility"])
+
+            unsupported_plan = SimpleNamespace(
+                requested_runtime_version="4.1",
+                runtime_error="no verified native runtime",
+                reason="unsupported family",
+                asset=SimpleNamespace(spine_version="4.1", has_skeleton=True),
+            )
+            with patch.object(page, "_spine_conversion_fallback_available", return_value=True), \
+                    patch.object(page, "start_spine_preview_import") as start_import, \
+                    message_box_patch("convert"):
+                self.assertEqual(
+                    page.handle_missing_spine_runtime(
+                        unsupported_plan,
+                        "source.unity3d",
+                        package_fallback=True,
+                    ),
+                    "convert",
+                )
+            self.assertEqual(start_import.call_args.args[0], "source.unity3d")
+            self.assertTrue(start_import.call_args.kwargs["force_compatibility"])
+            self.assertTrue(start_import.call_args.kwargs["package_fallback"])
+            self.assertFalse(start_import.call_args.kwargs["prompt_missing_runtime"])
+
+            with patch.object(page, "_start_spine_runtime_install") as install, \
+                    patch.object(page, "start_spine_preview_import") as start_import, \
+                    message_box_patch("cancel"):
+                self.assertEqual(
+                    page.handle_missing_spine_runtime(plan, "source.lpk"),
+                    "cancel",
+                )
+            install.assert_not_called()
+            start_import.assert_not_called()
+            self.assertEqual(page._spine_runtime_retry_source, "")
+        finally:
+            page.close_preview_window()
+            page._destroy_embedded_spine()
+            page._destroy_embedded_live2d()
+            page.deleteLater()
+            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+            self.app.processEvents()
+
+    def test_late_runtime_worker_signal_is_ignored_after_generation_change(self):
+        """An old installer cannot retry a newer source after cancellation."""
+
+        page = PreviewPage()
+        try:
+            old_worker = SimpleNamespace(
+                _spine_retry_generation=4,
+                _spine_retry_source="old.lpk",
+                isRunning=lambda: False,
+            )
+            page._spine_runtime_install_worker = old_worker
+            page._spine_preview_generation = 5
+            with patch.object(page, "start_spine_preview_import") as start_import, \
+                    patch.object(page.settings_manager, "set_spine_runtime_dir") as set_root:
+                page._on_spine_runtime_install_result(
+                    SimpleNamespace(install_dir="missing"),
+                    old_worker,
+                )
+                page._on_spine_runtime_install_failed("late failure", old_worker)
+            start_import.assert_not_called()
+            set_root.assert_not_called()
+        finally:
+            page.close_preview_window()
+            page._destroy_embedded_spine()
+            page._destroy_embedded_live2d()
+            page.deleteLater()
+            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+            self.app.processEvents()
+
+    def test_main_window_close_waits_for_preview_runtime_installer(self):
+        """MainWindow ignores close while the PreviewPage QThread is active."""
+
+        from app.gui.MainWindow import MainWindow
+
+        class Event:
+            def __init__(self):
+                self.ignored = False
+
+            def ignore(self):
+                self.ignored = True
+
+        class Preview:
+            def __init__(self):
+                self.notified = False
+
+            def is_spine_runtime_install_running(self):
+                return True
+
+            def notify_close_while_spine_runtime_installing(self):
+                self.notified = True
+                return True
+
+        preview = Preview()
+        window = SimpleNamespace(
+            settingsPage=SimpleNamespace(is_tool_install_running=lambda: False),
+            previewPage=preview,
+            spineConverterPage=SimpleNamespace(is_conversion_running=lambda: False),
+        )
+        event = Event()
+        MainWindow.closeEvent(window, event)
+        self.assertTrue(event.ignored)
+        self.assertTrue(preview.notified)
 
 
 if __name__ == "__main__":

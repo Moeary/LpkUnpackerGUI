@@ -183,6 +183,17 @@ def main():
             first_image,first_pixels=pixels(canvas)
             entry={'state':state,'pixels':first_pixels,'window':window_state(window),
                    'device_pixel_ratio':canvas.devicePixelRatio(), 'samples':canvas.format().samples()}
+            from OpenGL.GL import GL_RENDERER, GL_VENDOR, GL_VERSION, glGetString
+            canvas.makeCurrent()
+            try:
+                entry['opengl'] = {
+                    name: (glGetString(token) or b'').decode('utf-8', errors='replace')
+                    for name, token in (
+                        ('renderer', GL_RENDERER), ('vendor', GL_VENDOR), ('version', GL_VERSION)
+                    )
+                }
+            finally:
+                canvas.doneCurrent()
             entry['spine'] = plan_report
             report[label]=entry
             assert entry['window']['hwnd']==baseline['hwnd'],'Preview replaced the top-level HWND'

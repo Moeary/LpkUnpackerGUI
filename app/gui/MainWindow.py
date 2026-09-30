@@ -261,6 +261,23 @@ class MainWindow(FluentWindow):
             settings_page.notify_close_while_installing()
             event.ignore()
             return
+        preview_page = getattr(self, "previewPage", None)
+        spine_installing = getattr(
+            preview_page, "is_spine_runtime_install_running", None
+        )
+        if callable(spine_installing) and spine_installing():
+            notify_close = getattr(
+                preview_page,
+                "notify_close_while_spine_runtime_installing",
+                None,
+            )
+            if callable(notify_close):
+                notify_close()
+            # The preview installer is a QThread child of PreviewPage.  Keep
+            # the window alive until its cancellation reaches ``finished``;
+            # destroying a running QThread would terminate the process.
+            event.ignore()
+            return
         converter_page = getattr(self, "spineConverterPage", None)
         is_conversion_running = getattr(converter_page, "is_conversion_running", None)
         if callable(is_conversion_running) and is_conversion_running():

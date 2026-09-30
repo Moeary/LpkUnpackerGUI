@@ -97,6 +97,10 @@ def build_nuitka_args(compiler: str, *, require_native: bool = False) -> list[st
         "--include-package=qfluentwidgets",
         "--include-package=filetype",
         "--include-package=cv2",
+        # PyOpenGL discovers its optional Cython wrappers at runtime.  Keep
+        # the accelerator package in standalone releases when it is installed
+        # alongside the pinned PyOpenGL version.
+        "--include-package=OpenGL_accelerate",
         "--include-package=psd_tools",
         "--windows-icon-from-ico=assets/app/icon.ico",
         "--nofollow-import-to=matplotlib,scipy,pandas,tkinter",

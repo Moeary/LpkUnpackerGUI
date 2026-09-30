@@ -49,6 +49,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/9a/bd/8adc4d350b3b363f3dfc8fccdcf5bfed25f7e36c2fff30c64e106f4f1572/pyside6_addons-6.11.1-cp310-abi3-win_amd64.whl
       - pypi: https://files.pythonhosted.org/packages/a0/f4/c67b0b3f1b9245e8d266f0f112c500d50e5b4e83cb6f3b71b6528104182a/requests-2.34.2-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/a3/dd/4b822569d6b96c39d1215dbae0582fd99954dcbcf0c1a13c61783feaca3f/numpy-2.2.6-cp310-cp310-win_amd64.whl
+      - pypi: https://files.pythonhosted.org/packages/b5/b7/1dd95f9e1a39c7b845b1198733317e2c31f2b464fdf5477e74e7fe24b981/pyopengl_accelerate-3.1.10-cp310-cp310-win_amd64.whl
       - pypi: https://files.pythonhosted.org/packages/c2/f8/85be809b12670a05132b4b7179cb4df7dfd85d8b4ed954b75288b8ad3fcf/live2d_py-0.7.0-cp310-cp310-win_amd64.whl
       - pypi: https://files.pythonhosted.org/packages/cf/20/1220dacf8f3baf5f5a6200e10fd9dfa3b9adfddaa864185dc55247f03703/psd_tools-1.17.0-cp310-cp310-win_amd64.whl
       - pypi: https://files.pythonhosted.org/packages/d2/23/408243171aa9aaba178d3e2559159c24c1171a641aa83b67bdd3394ead8e/idna-3.15-py3-none-any.whl
@@ -419,6 +420,10 @@ packages:
   version: 2.2.6
   sha256: f0fd6321b839904e15c46e0d257fdd101dd7f530fe03fd6359c1ea63738703f3
   requires_python: '>=3.10'
+- pypi: https://files.pythonhosted.org/packages/b5/b7/1dd95f9e1a39c7b845b1198733317e2c31f2b464fdf5477e74e7fe24b981/pyopengl_accelerate-3.1.10-cp310-cp310-win_amd64.whl
+  name: pyopengl-accelerate
+  version: 3.1.10
+  sha256: d0a6129fe40c32b0ffdaa7386e80e8baae1a3312ac8bc7dc27436146938d5a94
 - pypi: https://files.pythonhosted.org/packages/c2/f8/85be809b12670a05132b4b7179cb4df7dfd85d8b4ed954b75288b8ad3fcf/live2d_py-0.7.0-cp310-cp310-win_amd64.whl
   name: live2d-py
   version: 0.7.0

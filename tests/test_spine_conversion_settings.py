@@ -20,6 +20,38 @@ class SpineConversionSettingsTests(unittest.TestCase):
         self.assertFalse(manager.get_spine_conversion_enabled())
         self.assertEqual(manager.get_spine_conversion_target_version(), "3.8.75")
         self.assertEqual(manager.get_spine_conversion_output_format(), "json")
+        self.assertTrue(manager.get_spine_compatibility_mode())
+        self.assertEqual(manager.get_spine_effective_runtime_version(), "3.8.75")
+        options = manager.get_spine_conversion_options()
+        self.assertTrue(options["enabled"])
+        self.assertEqual(options["target_version"], "3.8.75")
+        self.assertEqual(options["output_format"], "json")
+        self.assertTrue(options["create_project"])
+
+    def test_compatibility_off_does_not_inherit_hidden_legacy_auto_convert(self):
+        manager = SettingsManager(self.settings_path)
+        manager.set_spine_conversion_enabled(True)
+        manager.set_spine_runtime_version("4.0")
+        manager.set_spine_compatibility_mode(False)
+
+        self.assertEqual(manager.get_spine_effective_runtime_version(), "4.0")
+        self.assertFalse(manager.get_spine_conversion_options()["enabled"])
+
+    def test_compatibility_migration_reads_old_preview_switch_once(self):
+        self.settings_path.write_text(
+            json.dumps({"spine_preview": {"unify_version": False}}),
+            encoding="utf-8",
+        )
+        manager = SettingsManager(self.settings_path)
+        self.assertFalse(manager.get_spine_compatibility_mode())
+        manager.set_spine_compatibility_mode(True)
+        reloaded = SettingsManager(self.settings_path)
+        self.assertTrue(reloaded.get_spine_compatibility_mode())
+
+    def test_runtime_choice_normalizes_family_patch(self):
+        manager = SettingsManager(self.settings_path)
+        manager.set_spine_runtime_version("4.0.37")
+        self.assertEqual(manager.get_spine_runtime_version(), "4.0")
 
     def test_spine_conversion_settings_persist_and_reload_from_explicit_file(self):
         manager = SettingsManager(self.settings_path)

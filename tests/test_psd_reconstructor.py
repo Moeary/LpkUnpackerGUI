@@ -9,6 +9,7 @@ from PIL import Image
 from app.core.psd_reconstructor import (
     PsdLayer,
     PsdReconstructionError,
+    _apply_drawable_masks,
     reconstruct_live2d_psd,
     repack_atlas_png_from_psd,
     repack_multiple_psds,
@@ -16,6 +17,47 @@ from app.core.psd_reconstructor import (
 
 
 class PsdReconstructorTests(unittest.TestCase):
+    def _apply_test_mask(self, *, inverted: bool, texture_alpha: int) -> np.ndarray:
+        """Apply one small mask and return the resulting alpha channel."""
+        import cv2
+
+        layer = np.zeros((4, 4, 4), dtype=np.uint8)
+        layer[:, :, 3] = 200
+        texture = np.zeros((4, 4, 4), dtype=np.uint8)
+        texture[:, :, 3] = texture_alpha
+        mask = {
+            "texture_index": 0,
+            "vertices": [[0, 0], [4, 0], [0, 4]],
+            "uvs": [[0, 0], [1, 0], [0, 1]],
+            "indices": [0, 1, 2],
+            "opacity": 1.0,
+        }
+        drawable = {"masks": [1], "inverted_mask": inverted}
+        _apply_drawable_masks(
+            cv2,
+            layer,
+            drawable,
+            {1: mask},
+            [texture],
+            np.zeros(2, dtype=np.float32),
+            np.zeros(2, dtype=np.float32),
+        )
+        return layer[:, :, 3]
+
+    def test_empty_mask_clears_normal_drawable_but_preserves_inverted_drawable(self):
+        normal = self._apply_test_mask(inverted=False, texture_alpha=0)
+        inverted = self._apply_test_mask(inverted=True, texture_alpha=0)
+        self.assertTrue(np.all(normal == 0))
+        self.assertTrue(np.all(inverted == 200))
+
+    def test_partial_inverted_mask_uses_one_minus_mask_alpha(self):
+        alpha = self._apply_test_mask(inverted=True, texture_alpha=128)
+        # The triangle contains this interior pixel and leaves the opposite
+        # corner outside; a 128/255 mask should therefore halve only the
+        # covered alpha.
+        self.assertEqual(int(alpha[1, 0]), int(200 * (1.0 - 128.0 / 255.0)))
+        self.assertEqual(int(alpha[3, 3]), 200)
+
     def _make_source(self, root: Path, *, second_drawable: bool = True) -> tuple[Path, np.ndarray]:
         texture = np.zeros((16, 16, 4), dtype=np.uint8)
         texture[2:12, 2:12] = (20, 40, 80, 255)
@@ -116,6 +158,111 @@ class PsdReconstructorTests(unittest.TestCase):
             )
             output = np.asarray(Image.open(erased.output_paths[0]))
             self.assertEqual(int(output[2, 2, 3]), 0)
+
+    def test_mesh_one_pixel_edit_does_not_reprocess_offset_baseline_region(self):
+        """A one-pixel mesh edit must stay local after baseline alignment."""
+        from psd_tools import PSDImage
+        from psd_tools.api.layers import PixelLayer
+        from psd_tools.constants import Compression
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model, original = self._make_source(root, second_drawable=False)
+            result = reconstruct_live2d_psd(model, root / "export", mode="mesh")
+            metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+            target = metadata["layers"][0]
+            # Keep the fixture's drawable away from the canvas origin so this
+            # regression exercises the local-crop/global-baseline alignment.
+            self.assertNotEqual((int(target["left"]), int(target["top"])), (0, 0))
+
+            psd = PSDImage.open(str(result.psd_path))
+            unit = next(
+                layer
+                for layer in psd.descendants()
+                if int(getattr(layer, "layer_id", 0) or 0) == int(target["unit_group_id"])
+            )
+            original_group = next(child for child in unit if child.name == "Original")
+            paint_group = next(child for child in unit if child.name == "Paint")
+            original_pixel = next(child for child in original_group if child.name == target["name"])
+            baseline = np.asarray(original_pixel.topil().convert("RGBA"), dtype=np.uint8)
+            coords = np.argwhere(baseline[:, :, 3] > 0)
+            self.assertGreaterEqual(len(coords), 3)
+            local_y, local_x = [int(value) for value in coords[len(coords) // 2]]
+
+            PixelLayer.frompil(
+                Image.new("RGBA", (1, 1), (255, 0, 255, 255)),
+                paint_group,
+                name="mesh_one_pixel_probe",
+                top=int(original_pixel.top) + local_y,
+                left=int(original_pixel.left) + local_x,
+                compression=Compression.RAW,
+            )
+            edited_psd = root / "mesh-edited.psd"
+            psd.save(str(edited_psd))
+            repacked = repack_atlas_png_from_psd(
+                edited_psd,
+                root / "repacked",
+                metadata_path=result.metadata_path,
+            )
+            output = np.asarray(Image.open(repacked.output_paths[0]).convert("RGBA"))
+            source_rgba = np.asarray(original, dtype=np.uint8)
+            changed = np.any(source_rgba != output, axis=2)
+            points = np.argwhere(changed)
+            self.assertGreater(int(changed.sum()), 0)
+            self.assertLessEqual(int(changed.sum()), 64)
+            self.assertLessEqual(
+                int((points[:, 1].max() - points[:, 1].min() + 1) * (points[:, 0].max() - points[:, 0].min() + 1)),
+                64,
+            )
+
+    def test_mesh_moved_layer_legacy_baseline_uses_current_origin(self):
+        """Legacy mesh metadata must tolerate moving the PSD unit as a whole."""
+        from psd_tools import PSDImage
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model, original = self._make_source(root, second_drawable=False)
+            result = reconstruct_live2d_psd(model, root / "export", mode="mesh")
+            metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+            target = metadata["layers"][0]
+
+            psd = PSDImage.open(str(result.psd_path))
+            unit = next(
+                layer
+                for layer in psd.descendants()
+                if int(getattr(layer, "layer_id", 0) or 0) == int(target["unit_group_id"])
+            )
+            # Move the drawable content together; psd-tools computes the
+            # enclosing group position from these leaf-layer offsets.
+            for leaf in unit.descendants():
+                if not leaf.is_group():
+                    leaf.offset = (int(leaf.left) + 2, int(leaf.top) + 3)
+            moved_psd = root / "mesh-moved.psd"
+            psd.save(str(moved_psd))
+
+            # Simulate an older export whose metadata has no immutable layer
+            # PNG.  The mesh fallback is a local render and must use the
+            # moved PSD origin directly instead of cropping at the old origin.
+            legacy_metadata = json.loads(json.dumps(metadata))
+            for layer_info in legacy_metadata["layers"]:
+                for key in ("baseline_path", "baseline_rgba_sha256", "baseline_size"):
+                    layer_info.pop(key, None)
+            legacy_metadata_path = root / "legacy.lpkpsd.json"
+            legacy_metadata_path.write_text(
+                json.dumps(legacy_metadata),
+                encoding="utf-8",
+            )
+
+            repacked = repack_atlas_png_from_psd(
+                moved_psd,
+                root / "repacked",
+                metadata_path=legacy_metadata_path,
+            )
+            output = np.asarray(Image.open(repacked.output_paths[0]).convert("RGBA"))
+            changed = np.any(np.asarray(original) != output, axis=2)
+            self.assertGreater(int(changed.sum()), 0)
+            self.assertLess(int(changed.sum()), int(changed.size))
+            self.assertFalse(repacked.warnings)
 
     def test_legacy_numeric_overlays_follow_the_flat_psd_stack(self):
         """Old flat PSDs must combine name/name_1/name_2 in stack order."""

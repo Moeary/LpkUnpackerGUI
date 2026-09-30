@@ -821,10 +821,17 @@ def _repack_mesh_psd_layers(
             metadata_file,
             layer_info,
             Image.fromarray(original_layer, "RGBA"),
-            0,
-            0,
+            left,
+            top,
             source.shape[:2],
-            baseline_origin=(int(layer_info.get("left", left)), int(layer_info.get("top", top))),
+            # New exports store an immutable crop at the metadata origin.  A
+            # legacy mesh export has no crop and its fallback is already the
+            # freshly rendered local layer at the current PSD position.
+            baseline_origin=(
+                (int(layer_info.get("left", left)), int(layer_info.get("top", top)))
+                if layer_info.get("baseline_path")
+                else (left, top)
+            ),
         )
         if baseline_layer.shape == source.shape and not np.array_equal(
             baseline_layer, original_layer
@@ -2794,6 +2801,11 @@ def _apply_drawable_masks(
         mask_alpha = np.maximum(mask_alpha, mask_layer[:, :, 3])
 
     if not np.any(mask_alpha):
+        # An empty ordinary mask hides the drawable.  An empty inverted mask
+        # is the complement of zero coverage, so it must preserve the source
+        # alpha instead of clearing the whole layer.
+        if drawable.get("inverted_mask"):
+            return
         layer[:, :, 3] = 0
         return
 

@@ -21,6 +21,8 @@ from app.core.spine_native import find_native_library
 
 SPINE_RUNTIME_SUPPORTED_FAMILIES = frozenset({"3.8", "4.0"})
 SPINE_RUNTIME_KNOWN_FAMILIES = frozenset({"3.8", "4.0", "4.2"})
+SPINE_COMPATIBILITY_VERSION = "3.8.75"
+SPINE_RUNTIME_SUPPORTED_VERSIONS = ("3.8.75", "4.0")
 MAX_POSE_CANVAS_PIXELS = 64 * 1024 * 1024
 MAX_POSE_LAYER_PIXELS = 128 * 1024 * 1024
 SPINE_VERSION_RE = re.compile(r"(?<!\d)(\d+)\.(\d+)(?:\.(\d+))?(?!\d)")
@@ -50,6 +52,53 @@ class SpineVersionMismatchError(SpinePreviewError):
 
 class SpinePoseExportError(SpinePreviewError):
     """Raised when a constrained pose-to-layer export cannot be completed."""
+
+
+@dataclass(frozen=True)
+class SpineRuntimePolicy:
+    """Explicit runtime decision captured before a preview worker starts.
+
+    Preview/core code accepts this value instead of reaching into
+    ``SettingsManager``.  ``compatibility_mode`` forces the verified
+    3.8.75 bridge, while ``selected_version`` remains the user's preserved
+    choice for the normal mode.  ``prefer_installed`` allows the compatibility
+    path to bypass an obsolete manually selected 4.0 directory and locate the
+    matching verified package installed by the catalog.
+    """
+
+    compatibility_mode: bool = False
+    selected_version: str = SPINE_COMPATIBILITY_VERSION
+    runtime_root: Path | None = None
+    prefer_installed: bool = False
+
+    @property
+    def effective_version(self) -> str:
+        if self.compatibility_mode:
+            return SPINE_COMPATIBILITY_VERSION
+        text = str(self.selected_version or "").strip()
+        if text == SPINE_COMPATIBILITY_VERSION:
+            return text
+        if text == "4.0" or text.startswith("4.0."):
+            return "4.0"
+        # Keep the low-level policy conservative: unknown versions are not
+        # converted into an apparently supported runtime.
+        return text
+
+    @classmethod
+    def from_values(
+        cls,
+        *,
+        compatibility_mode: bool = False,
+        selected_version: str = SPINE_COMPATIBILITY_VERSION,
+        runtime_root: str | Path | None = None,
+        prefer_installed: bool = False,
+    ) -> "SpineRuntimePolicy":
+        return cls(
+            compatibility_mode=bool(compatibility_mode),
+            selected_version=str(selected_version or SPINE_COMPATIBILITY_VERSION).strip(),
+            runtime_root=Path(runtime_root).expanduser().resolve() if runtime_root else None,
+            prefer_installed=bool(prefer_installed),
+        )
 
 
 @dataclass(frozen=True)
@@ -129,6 +178,14 @@ class SpinePreviewPlan:
     runtime: SpineRuntime | None = None
     reason: str = ""
     warnings: tuple[str, ...] = ()
+    requested_runtime_version: str | None = None
+    runtime_error: str | None = None
+
+    @property
+    def runtime_missing(self) -> bool:
+        """Whether animation preview needs an installed runtime decision."""
+
+        return self.runtime_error is not None
 
     @property
     def dynamic(self) -> bool:
@@ -370,6 +427,50 @@ def _default_native_runtime_root() -> Path:
     return Path(__file__).resolve().parents[2] / "runtime" / "tools" / "spine_native"
 
 
+def list_installed_spine_runtimes(
+    root: str | Path | None = None,
+) -> tuple[SpineRuntime, ...]:
+    """List only native runtimes with a verifiable supported manifest.
+
+    The catalog is intentionally local and conservative.  A random folder
+    named ``4.1`` or a bridge without ``spine_native.json`` is not exposed as
+    an installed choice, so the GUI cannot imply support for unverified code.
+    """
+
+    selected = Path(root).expanduser().resolve() if root else None
+    roots = [selected] if selected is not None else [_default_native_runtime_root()]
+    # A configured root may point at one family while the packaged catalog is
+    # installed beside it.  The caller can opt into this helper explicitly;
+    # it never makes this fallback during an ordinary user-selected preview.
+    candidates: list[SpineRuntime] = []
+    seen: set[str] = set()
+    for candidate_root in _native_runtime_dirs([item for item in roots if item is not None]):
+        try:
+            metadata = _native_runtime_metadata(candidate_root)
+        except Exception:
+            metadata = None
+        family = _native_metadata_family(metadata)
+        version = _native_metadata_version(metadata) or _native_version_from_path(candidate_root)
+        if family not in SPINE_RUNTIME_SUPPORTED_FAMILIES or not version:
+            continue
+        normalized_version = normalize_spine_version(version)
+        if family == "3.8" and normalized_version != SPINE_COMPATIBILITY_VERSION:
+            continue
+        if family == "4.0":
+            normalized_version = "4.0"
+        library = find_native_library(candidate_root, family)
+        if library is None or not library.is_file():
+            continue
+        key = str(library.resolve()).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(_runtime_from_native_library(
+            candidate_root.resolve(), library.resolve(), metadata, family
+        ))
+    return tuple(sorted(candidates, key=lambda item: (item.family or "", item.version or "", str(item.root_dir).casefold())))
+
+
 def _native_runtime_dirs(roots: Iterable[Path]) -> tuple[Path, ...]:
     """Return selected roots and their direct versioned children only."""
 
@@ -477,6 +578,8 @@ def make_spine_preview_plan(
     runtime_root: str | Path | None = None,
     *,
     allow_unverified_runtime: bool = False,
+    requested_runtime_version: str | None = None,
+    prefer_installed: bool = False,
 ) -> SpinePreviewPlan:
     """Choose the native bridge or an explicit atlas-only fallback.
 
@@ -493,6 +596,7 @@ def make_spine_preview_plan(
             asset=asset,
             reason="未找到 skeleton，已降级为 Spine atlas 页面预览。",
             warnings=asset.warnings,
+            requested_runtime_version=requested_runtime_version,
         )
     if family == "2.1":
         return SpinePreviewPlan(
@@ -500,6 +604,7 @@ def make_spine_preview_plan(
             asset=asset,
             reason="Spine 2.1 与当前 native bridge 不兼容，已降级为 atlas 页面预览。",
             warnings=asset.warnings + ("Spine 2.1 不进入 native 动画预览。",),
+            requested_runtime_version=requested_runtime_version,
         )
     if not family:
         return SpinePreviewPlan(
@@ -507,27 +612,84 @@ def make_spine_preview_plan(
             asset=asset,
             reason="无法确认 skeleton Spine 版本，已降级为 atlas 页面预览。",
             warnings=asset.warnings + ("缺少 skeleton.spine 或二进制版本标记。",),
+            requested_runtime_version=requested_runtime_version,
         )
     if family not in SPINE_RUNTIME_SUPPORTED_FAMILIES and not allow_unverified_runtime:
+        # Keep the skeleton in the result so the caller can offer the one
+        # verified conversion path (to 3.8.75).  Returning an atlas-only plan
+        # without a structured error made an unsupported 4.1/4.2 asset look
+        # like a harmless atlas and prevented the missing-runtime dialog from
+        # explaining the available fallback.
+        runtime_error = (
+            f"Spine {family} has no verified native runtime in this build; "
+            "a compatible preview requires conversion to 3.8.75."
+        )
         return SpinePreviewPlan(
             mode="atlas",
             asset=asset,
             reason=f"Spine {family} 尚未在本程序中验证，已降级为 atlas 页面预览。",
-            warnings=asset.warnings + (f"未声明支持 Spine {family} 动态 runtime。",),
+            warnings=asset.warnings + (f"未声明支持 Spine {family} 动态 runtime。", runtime_error),
+            requested_runtime_version=requested_runtime_version,
+            runtime_error=runtime_error,
         )
+    requested_exact = normalize_spine_version(requested_runtime_version) if requested_runtime_version else None
+    requested_family = spine_version_family(requested_exact) if requested_exact else None
+    # Compatibility mode supplies an exact target.  Normal mode keeps source
+    # version fidelity and therefore follows the asset family/version first.
+    lookup_family = requested_family if requested_family else family
+    lookup_version = requested_exact if requested_exact else asset.spine_version
+    runtime: SpineRuntime | None = None
     try:
         runtime = discover_spine_runtime(
             runtime_root,
-            requested_family=family,
-            requested_version=asset.spine_version,
+            requested_family=lookup_family,
+            requested_version=lookup_version,
         )
-    except SpineRuntimeUnavailableError as exc:
-        return SpinePreviewPlan(
-            mode="atlas",
-            asset=asset,
-            reason="未找到匹配的 Spine native bridge，已降级为 atlas 页面预览。",
-            warnings=asset.warnings + (str(exc), "请安装匹配的 runtime/tools/spine_native/<version>。"),
-        )
+    except (SpineRuntimeUnavailableError, SpineVersionMismatchError) as exc:
+        # In compatibility mode an obsolete manually selected root (for
+        # example a standalone 4.0 directory) must not mask the verified
+        # 3.8.75 catalog install.  Retry the managed default only when the
+        # caller explicitly opted into that policy.
+        # A configured root can be a single family directory.  If that root
+        # does not contain the source-matching bridge, inspect the managed
+        # catalog root as a source-fidelity fallback.  This does not convert
+        # the asset or silently select a different family; it only allows a
+        # common settings path to discover its sibling installation.
+        selected_root = Path(runtime_root).expanduser() if runtime_root is not None else None
+        catalog_like_root = False
+        if selected_root is not None:
+            try:
+                root_name = normalize_spine_version(selected_root.name) or ""
+                catalog_like_root = spine_version_family(root_name) in SPINE_RUNTIME_SUPPORTED_FAMILIES
+                if selected_root.is_dir():
+                    catalog_like_root = catalog_like_root or any(
+                        spine_version_family(child.name) in SPINE_RUNTIME_SUPPORTED_FAMILIES
+                        for child in selected_root.iterdir()
+                        if child.is_dir()
+                    )
+            except (OSError, RuntimeError):
+                catalog_like_root = False
+        if runtime_root is not None and catalog_like_root:
+            try:
+                runtime = discover_spine_runtime(
+                    None,
+                    requested_family=lookup_family,
+                    requested_version=lookup_version,
+                )
+            except SpinePreviewError:
+                runtime = None
+            if runtime is not None:
+                exc = None
+        if runtime is None:
+            error_text = str(exc)
+            return SpinePreviewPlan(
+                mode="atlas",
+                asset=asset,
+                reason="未找到匹配的 Spine native bridge，已降级为 atlas 页面预览。",
+                warnings=asset.warnings + (error_text, "请安装匹配的 runtime/tools/spine_native/<version>。"),
+                requested_runtime_version=requested_runtime_version,
+                runtime_error=error_text,
+            )
     runtime_family = runtime.family
     if runtime_family and runtime_family != family:
         raise SpineVersionMismatchError(
@@ -555,6 +717,7 @@ def make_spine_preview_plan(
             asset=asset,
             reason=f"Spine native runtime {runtime_family} 尚未完成真实样本验证，已降级为 atlas 页面预览。",
             warnings=asset.warnings + (f"native runtime {runtime_family} 仅记录版本，不宣称动态支持。",),
+            requested_runtime_version=requested_runtime_version,
         )
     return SpinePreviewPlan(
         mode="native",
@@ -562,6 +725,7 @@ def make_spine_preview_plan(
         runtime=runtime,
         reason=f"使用 Spine {runtime_family} native bridge。",
         warnings=asset.warnings,
+        requested_runtime_version=requested_runtime_version,
     )
 
 
@@ -579,10 +743,6 @@ def prepare_spine_preview_import(
         return SpinePreviewImportResult(asset=asset, plan=make_spine_preview_plan(asset, runtime_root))
     except SpineAssetNotFoundError:
         pass
-
-    suffix = source_path.suffix.lower()
-    if suffix not in {".lpk", ".wpk"} and not source_path.is_dir():
-        raise SpineAssetNotFoundError(f"No Spine asset found under {source_path}")
 
     from app.core.extract import ExtractMode, ExtractSourceType, detect_source_type, run_extraction_batch
 
@@ -1002,6 +1162,8 @@ __all__ = [
     "MAX_POSE_LAYER_PIXELS",
     "SPINE_RUNTIME_KNOWN_FAMILIES",
     "SPINE_RUNTIME_SUPPORTED_FAMILIES",
+    "SPINE_COMPATIBILITY_VERSION",
+    "SPINE_RUNTIME_SUPPORTED_VERSIONS",
     "SpineAssetNotFoundError",
     "SpinePoseExportError",
     "SpinePoseExportReport",
@@ -1011,6 +1173,7 @@ __all__ = [
     "SpinePreviewImportResult",
     "SpinePreviewPlan",
     "SpineRuntime",
+    "SpineRuntimePolicy",
     "SpineRuntimeUnavailableError",
     "SpineRuntimeUnsupportedError",
     "SpineVersionMismatchError",
@@ -1018,6 +1181,7 @@ __all__ = [
     "export_spine_pose_psd",
     "find_spine_asset",
     "load_spine_asset",
+    "list_installed_spine_runtimes",
     "make_spine_preview_plan",
     "normalize_spine_version",
     "parse_spine_version",

@@ -135,7 +135,7 @@ def _extract_one(
             return _maybe_convert_spine_item(item, mode, spine_conversion, log)
         if source_type in {ExtractSourceType.UNITY, ExtractSourceType.FOLDER}:
             unity_mode = ExtractMode.LIVE2D if mode == ExtractMode.FULL else mode
-            return extract_unity(
+            item = extract_unity(
                 source,
                 _target_dir(
                     output_dir,
@@ -147,7 +147,17 @@ def _extract_one(
                 ),
                 unity_mode,
                 log=log,
+                # A compatibility-enabled formal export must inspect Unity
+                # TextAssets for Spine even though AssetStudio's user-facing
+                # mode is named LIVE2D.  With the policy off, keep the fast
+                # Live2D-only route unless a caller explicitly enables the
+                # conversion options.
+                include_spine=(
+                    mode in {ExtractMode.FULL, ExtractMode.LIVE2D}
+                    and spine_conversion.enabled
+                ),
             )
+            return _maybe_convert_spine_item(item, mode, spine_conversion, log)
 
         return ExtractItemResult(
             source=source,
@@ -192,13 +202,27 @@ def _maybe_convert_spine_item(
     options: SpineConversionOptions,
     log: LogCallback | None,
 ) -> ExtractItemResult:
-    """Append opt-in Spine conversions to one completed LPK/WPK item."""
+    """Append formal Spine conversion results to one extracted item.
+
+    The same hook is used for LPK/WPK/Unity/folder outputs.  Discovery is
+    scoped to directories explicitly created by the current extraction item,
+    so a shared output root or a nested previous ``spine_converted`` directory
+    cannot be converted again.
+    """
 
     if not options.enabled or mode not in {ExtractMode.FULL, ExtractMode.LIVE2D}:
         return item
-    if item.source_type not in {ExtractSourceType.LPK, ExtractSourceType.WPK}:
+    if item.source_type not in {
+        ExtractSourceType.LPK,
+        ExtractSourceType.WPK,
+        ExtractSourceType.UNITY,
+        ExtractSourceType.FOLDER,
+    }:
         return item
-    if item.source_type == ExtractSourceType.LPK and not item.success:
+    # WPK is a container result: one child may fail while another child has
+    # already produced a valid extraction.  Keep visiting successful children
+    # so a partial package cannot discard the usable Spine conversions.
+    if not item.success and item.source_type != ExtractSourceType.WPK:
         return item
     if not item.output_dir or not item.output_dir.is_dir():
         return item
@@ -252,6 +276,12 @@ def _maybe_convert_spine_item(
                             f"Converted Spine model {source.name} to "
                             f"{converted.skeleton_path.name} under {converted.output_dir}."
                             + warning_text
+                            + (
+                                " .spine editor project was not generated: "
+                                f"{converted.editor_project_error}"
+                                if converted.editor_project_error
+                                else ""
+                            )
                         ),
                     )
                 )
@@ -302,9 +332,14 @@ def _spine_conversion_roots(item: ExtractItemResult) -> list[Path]:
 
     if item.source_type == ExtractSourceType.LPK:
         visit(item)
-    else:
+    elif item.source_type == ExtractSourceType.WPK:
         for child in item.children:
             visit(child)
+    else:
+        # Unity/folder extraction must record the directory created by this
+        # invocation.  Falling back to the shared output directory would scan
+        # models from older runs and convert them again.
+        visit(item)
 
     result: list[Path] = []
     seen: set[str] = set()

@@ -7,10 +7,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from app.core.assetstudio_cli import AssetStudioCLIError, validate_unityfs_bundle
+from app.core.assetstudio_cli import AssetStudioCLIError, AssetStudioResult, validate_unityfs_bundle
 from app.core.cubism_core import CubismCoreError
 from app.core.extract.models import ExtractMode
-from app.core.extract.unity import extract_unity, validate_live2d_export
+from app.core.extract.unity import (
+    extract_unity, validate_live2d_export, _materialize_spine_text_assets,
+)
 
 
 def _write_unityfs(path: Path, declared_size: int, payload: bytes = b"") -> None:
@@ -71,6 +73,80 @@ class UnityExtractionTests(unittest.TestCase):
 
         self.assertIsNotNone(warning)
         self.assertIn("trailing byte", warning or "")
+
+    def test_full_unity_export_can_resolve_spine_text_asset(self):
+        source = self.root / "spine_bundle"
+        source.mkdir()
+        output = self.root / "output"
+
+        class FakeCLI:
+            executable = self.root / "AssetStudioModCLI.exe"
+
+            def export_live2d(self, _source, target):
+                target = Path(target)
+                target.mkdir(parents=True, exist_ok=True)
+                return AssetStudioResult(
+                    command=[], output_dir=target, exported_files=[],
+                    stdout="", stderr="", returncode=0,
+                )
+
+            def export_spine(self, _source, target):
+                target = Path(target)
+                target.mkdir(parents=True, exist_ok=True)
+                skeleton = target / "hero.txt"
+                skeleton.write_text(
+                    json.dumps(
+                        {
+                            "skeleton": {"spine": "4.0.37"},
+                            "bones": [{"name": "root"}],
+                            "slots": [],
+                            "skins": {},
+                            "animations": {"idle": {}},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                atlas = target / "hero_atlas.txt"
+                atlas.write_text(
+                    "page.png\nsize: 1,1\nformat: RGBA8888\nregion\n  xy: 0,0\n  size: 1,1\n",
+                    encoding="utf-8",
+                )
+                (target / "page.png").write_bytes(b"png")
+                return AssetStudioResult(
+                    command=[], output_dir=target,
+                    exported_files=[skeleton, atlas, target / "page.png"],
+                    stdout="", stderr="", returncode=0,
+                )
+
+        with patch("app.core.extract.unity.AssetStudioCLI", return_value=FakeCLI()):
+            result = extract_unity(
+                source,
+                output,
+                ExtractMode.LIVE2D,
+                include_spine=True,
+            )
+
+        self.assertTrue(result.success)
+        self.assertIn("Spine", result.message)
+        self.assertEqual(len(result.extracted_dirs), 1)
+        self.assertTrue((result.extracted_dirs[0] / "hero.json").is_file())
+        self.assertTrue(result.extracted_dirs[0].is_relative_to(output))
+
+    def test_binary_text_asset_is_copied_without_utf8_roundtrip(self):
+        raw = b"\x91\xff\x004.0.37\x00\xfe\x80"
+        source = self.root / "hero.bytes"
+        source.write_bytes(raw)
+        restored = _materialize_spine_text_assets(self.root, [source])
+        self.assertEqual(restored, [self.root / "hero.skel"])
+        self.assertEqual(restored[0].read_bytes(), raw)
+        self.assertEqual(source.read_bytes(), raw)
+
+    def test_text_asset_does_not_scan_old_files_when_export_is_empty(self):
+        (self.root / "old.txt").write_text(json.dumps({
+            "skeleton": {"spine": "3.8.75"}, "bones": [], "slots": [],
+        }), encoding="utf-8")
+        self.assertEqual(_materialize_spine_text_assets(self.root, []), [])
+        self.assertFalse((self.root / "old.json").exists())
 
     def test_extract_unity_rejects_truncated_source_before_cli(self):
         source = self.root / "chaijun_6"

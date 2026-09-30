@@ -1,7 +1,7 @@
 """Prepare Spine assets for the unified native preview.
 
-The formal extraction/export conversion setting deliberately does not control
-this module.  Preview conversion is a separate, disposable-cache operation:
+Preview conversion is a separate, disposable-cache operation even though the
+application-wide compatibility policy also controls formal extraction:
 the source files are hashed, a converted copy is built with the bundled native
 converter, and the resulting cache is reused only after every recorded output
 file has passed an integrity check.
@@ -27,6 +27,8 @@ from app.core.spine_converter import (
 from app.core.spine_preview import (
     SpinePreviewAsset,
     SpinePreviewPlan,
+    SpineRuntimePolicy,
+    SPINE_COMPATIBILITY_VERSION,
     load_spine_asset,
     make_spine_preview_plan,
     normalize_spine_version,
@@ -71,6 +73,7 @@ def prepare_spine_preview(
     runtime_root: str | Path | None = None,
     *,
     unify_version: bool = False,
+    runtime_policy: SpineRuntimePolicy | None = None,
 ) -> PreparedSpinePreview:
     """Prepare *asset* and build a native preview plan.
 
@@ -82,6 +85,12 @@ def prepare_spine_preview(
     """
 
     source_version = normalize_spine_version(asset.spine_version)
+    policy = runtime_policy
+    if policy is not None:
+        unify_version = bool(policy.compatibility_mode)
+    runtime_version = policy.effective_version if policy is not None else None
+    selected_root = policy.runtime_root if policy is not None else runtime_root
+    prefer_installed = bool(policy and policy.prefer_installed)
     if not unify_version or not asset.has_skeleton:
         target = source_version or asset.spine_version
         info = SpinePreviewConversionInfo(
@@ -90,7 +99,12 @@ def prepare_spine_preview(
         )
         return PreparedSpinePreview(
             asset=asset,
-            plan=make_spine_preview_plan(asset, runtime_root),
+            plan=make_spine_preview_plan(
+                asset,
+                selected_root,
+                requested_runtime_version=None,
+                prefer_installed=False,
+            ),
             conversion=info,
         )
 
@@ -101,7 +115,12 @@ def prepare_spine_preview(
         )
         return PreparedSpinePreview(
             asset=asset,
-            plan=make_spine_preview_plan(asset, runtime_root),
+            plan=make_spine_preview_plan(
+                asset,
+                selected_root,
+                requested_runtime_version=runtime_version,
+                prefer_installed=prefer_installed,
+            ),
             conversion=info,
         )
 
@@ -148,7 +167,12 @@ def prepare_spine_preview(
             report_path=report_path,
             warnings=(warning,),
         )
-        plan = make_spine_preview_plan(converted_asset, runtime_root)
+        plan = make_spine_preview_plan(
+            converted_asset,
+            selected_root,
+            requested_runtime_version=runtime_version or SPINE_COMPATIBILITY_VERSION,
+            prefer_installed=prefer_installed,
+        )
         if warning not in plan.warnings:
             plan = _plan_with_warning(plan, warning)
         return PreparedSpinePreview(
@@ -173,6 +197,8 @@ def _plan_with_warning(plan: SpinePreviewPlan, warning: str) -> SpinePreviewPlan
         runtime=plan.runtime,
         reason=plan.reason,
         warnings=tuple(plan.warnings) + (warning,),
+        requested_runtime_version=plan.requested_runtime_version,
+        runtime_error=plan.runtime_error,
     )
 
 

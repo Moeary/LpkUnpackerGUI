@@ -12,6 +12,22 @@ from app.paths import PROJECT_ROOT
 ASSETSTUDIO_EXE_NAME = "AssetStudioModCLI.exe"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tga"}
 LIVE2D_EXTENSIONS = {".model3.json", ".moc3", ".motion3.json", ".physics3.json", ".png"}
+# AssetStudio has no built-in Spine mode.  Unity Spine packages are stored as
+# TextAsset skeleton/atlas files plus Texture2D/Sprite pages, so extraction
+# asks for those two verified asset kinds and lets the Spine resolver validate
+# their contents afterwards.
+SPINE_EXPORT_EXTENSIONS = {
+    ".json",
+    ".skel",
+    ".bytes",
+    ".atlas",
+    ".txt",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".bmp",
+}
 UNITYFS_SIGNATURE = b"UnityFS\x00"
 
 
@@ -221,6 +237,42 @@ class AssetStudioCLI:
 
         return self._run(args, output_dir, LIVE2D_EXTENSIONS)
 
+    def export_spine(
+        self,
+        input_path: str | Path,
+        output_dir: str | Path,
+        filter_text: str = "",
+    ) -> AssetStudioResult:
+        """Export Unity TextAsset/texture inputs for a Spine resolver.
+
+        AssetStudioModCLI does not parse Spine itself.  This deliberately
+        requests only the documented ``textAsset``, ``tex2d`` and ``sprite``
+        types; :mod:`app.core.extract.unity` recognizes a Spine skeleton or
+        atlas from the resulting bytes before reporting success.  Arbitrary
+        Unity assets are never presented as Spine merely because this export
+        command exited successfully.
+        """
+
+        args = [
+            str(self.executable),
+            str(Path(input_path)),
+            "-m",
+            "export",
+            "-o",
+            str(Path(output_dir)),
+            "-t",
+            "textAsset,tex2d,sprite",
+            "-g",
+            "container",
+            "-r",
+            "--image-format",
+            "png",
+            "--decompress-to-disk",
+        ]
+        if filter_text:
+            args.extend(["--filter-by-text", filter_text])
+        return self._run(args, output_dir, SPINE_EXPORT_EXTENSIONS)
+
     def info(self, input_path: str | Path) -> AssetStudioResult:
         args = [str(self.executable), str(Path(input_path)), "-m", "info", "--load-all"]
         return self._run(args, self.executable.parent, set())
@@ -250,7 +302,9 @@ class AssetStudioCLI:
         )
 
         after = _snapshot_files(output_path)
-        exported_files = sorted(after - before)
+        exported_files = sorted(
+            path for path, stamp in after.items() if before.get(path) != stamp
+        )
         ext_set = {ext.lower() for ext in extensions}
         if ext_set:
             exported_files = [
@@ -273,7 +327,12 @@ class AssetStudioCLI:
         )
 
 
-def _snapshot_files(root: Path) -> set[Path]:
+def _snapshot_files(root: Path) -> dict[Path, tuple[int, int]]:
     if not root.exists():
-        return set()
-    return {path.resolve() for path in root.rglob("*") if path.is_file()}
+        return {}
+    result = {}
+    for path in root.rglob("*"):
+        if path.is_file():
+            stat = path.stat()
+            result[path.resolve()] = (stat.st_size, stat.st_mtime_ns)
+    return result

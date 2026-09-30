@@ -21,6 +21,8 @@ from app.core.toolchain import detect_toolchain_paths
 logger = logging.getLogger("SettingsManager")
 
 DEFAULT_SPINE_TARGET_VERSION = "3.8.75"
+SPINE_COMPATIBILITY_VERSION = DEFAULT_SPINE_TARGET_VERSION
+SPINE_RUNTIME_VERSION_CHOICES = ("3.8.75", "4.0")
 DEFAULT_FONT_FAMILY = ""
 DEFAULT_FONT_SIZE = 10
 MIN_FONT_SIZE = 8
@@ -110,6 +112,15 @@ class SettingsManager:
                 # conversion.  The GUI captures this explicit switch before a
                 # worker starts so a settings-page edit cannot race an import.
                 "unify_version": True,
+            },
+            # One user-facing switch controls both the disposable preview
+            # cache and formal Spine extraction.  The migration marker keeps
+            # old ``spine_preview.unify_version`` preferences from being
+            # copied over a later explicit choice on every reload.
+            "spine": {
+                "compatibility_mode": True,
+                "runtime_version": SPINE_COMPATIBILITY_VERSION,
+                "compatibility_mode_migrated": True,
             },
             "spine_conversion": {
                 "enabled": False,
@@ -498,6 +509,97 @@ class SettingsManager:
 
         self.set("spine_preview.unify_version", bool(enabled))
 
+    def get_spine_compatibility_mode(self) -> bool:
+        """Return the explicit application-wide Spine compatibility policy.
+
+        In compatibility mode all preview and formal extraction callers must
+        target the verified 3.8.75 bridge.  The selected runtime version is
+        kept separately so disabling the mode restores the user's previous
+        choice without rewriting it.
+        """
+
+        return bool(self.get("spine.compatibility_mode", True))
+
+    def set_spine_compatibility_mode(self, enabled: bool):
+        self.set("spine.compatibility_mode", bool(enabled))
+        # The marker is intentionally written with the explicit user change;
+        # old migration code must never override it later.
+        self.set("spine.compatibility_mode_migrated", True)
+
+    @staticmethod
+    def normalize_spine_runtime_version(value: Any) -> str:
+        """Normalize one of the runtime versions validated by this app.
+
+        ``4.0`` is a family-only native bridge in the shipped manifest.  A
+        patch version such as ``4.0.37`` is accepted as an alias for that
+        family, while unverified versions are rejected instead of being
+        presented as downloadable or playable.
+        """
+
+        text = str(value or "").strip()
+        if text == "4.0" or text.startswith("4.0."):
+            return "4.0"
+        if text == SPINE_COMPATIBILITY_VERSION:
+            return SPINE_COMPATIBILITY_VERSION
+        raise ValueError(
+            f"Unsupported Spine runtime version {value!r}; supported choices are "
+            "3.8.75 and 4.0."
+        )
+
+    def get_spine_runtime_version(self) -> str:
+        """Return the installed runtime selection used when compatibility is off."""
+
+        value = self.get("spine.runtime_version", SPINE_COMPATIBILITY_VERSION)
+        try:
+            return self.normalize_spine_runtime_version(value)
+        except ValueError:
+            return SPINE_COMPATIBILITY_VERSION
+
+    def set_spine_runtime_version(self, version: str):
+        self.set("spine.runtime_version", self.normalize_spine_runtime_version(version))
+
+    def get_spine_effective_runtime_version(self) -> str:
+        """Return the runtime version captured by the current policy."""
+
+        return (
+            SPINE_COMPATIBILITY_VERSION
+            if self.get_spine_compatibility_mode()
+            else self.get_spine_runtime_version()
+        )
+
+    def get_spine_conversion_options(self) -> Dict[str, Any]:
+        """Return an explicit conversion snapshot for extraction workers.
+
+        The compatibility branch deliberately produces JSON and requests the
+        official CLI project independently of cached preview conversion.  In
+        compatibility-off mode the legacy formal conversion fields remain
+        available for callers that still use the manual extraction setting.
+        """
+
+        if self.get_spine_compatibility_mode():
+            return {
+                "enabled": True,
+                "target_version": SPINE_COMPATIBILITY_VERSION,
+                "output_format": "json",
+                "converter_path": self.get_spine_converter_path() or None,
+                "remove_curve": False,
+                "create_project": True,
+                "editor_path": self.get_spine_editor_path() or None,
+            }
+        return {
+            # The consolidated switch owns automatic extraction.  Keep the
+            # legacy fields readable for the standalone converter page, but
+            # a user who turns compatibility off must not inherit an unseen
+            # old auto-convert checkbox and receive a surprise formal copy.
+            "enabled": False,
+            "target_version": self.get_spine_conversion_target_version(),
+            "output_format": self.get_spine_conversion_output_format(),
+            "converter_path": self.get_spine_converter_path() or None,
+            "remove_curve": False,
+            "create_project": self.get_spine_create_project(),
+            "editor_path": self.get_spine_editor_path() or None,
+        }
+
     def get_spine_auto_convert(self) -> bool:
         """Return whether formal Spine unpack/export may create a converted copy."""
 
@@ -753,4 +855,28 @@ class SettingsManager:
                 merged[key] = self._merge_defaults(value, merged[key])
             else:
                 merged[key] = value
+
+        # Migrate the old preview-only switch once.  The marker is persisted
+        # by ``__init__`` after this merge, so a later explicit toggle is not
+        # overwritten by the legacy key that may remain for compatibility.
+        loaded_spine = loaded.get("spine")
+        if not isinstance(loaded_spine, dict):
+            loaded_spine = {}
+        if "compatibility_mode" not in loaded_spine and not bool(
+            loaded_spine.get("compatibility_mode_migrated", False)
+        ):
+            legacy_preview = loaded.get("spine_preview")
+            if isinstance(legacy_preview, dict) and "unify_version" in legacy_preview:
+                merged.setdefault("spine", {})["compatibility_mode"] = bool(
+                    legacy_preview.get("unify_version")
+                )
+                merged["spine"]["compatibility_mode_migrated"] = True
+            elif "spine_conversion" in loaded:
+                # A legacy formal-conversion opt-in is the closest available
+                # intent when the preview key was absent.  The compatibility
+                # target is still fixed to the verified 3.8.75 runtime.
+                merged.setdefault("spine", {})["compatibility_mode"] = bool(
+                    (loaded.get("spine_conversion") or {}).get("enabled", False)
+                )
+                merged["spine"]["compatibility_mode_migrated"] = True
         return merged

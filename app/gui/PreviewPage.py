@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+from pathlib import Path
 
 from PySide6.QtWidgets import (
     QFrame,
@@ -13,6 +14,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QFileDialog,
     QWidget,
+    QMessageBox,
     QSplitter,
     QGridLayout,
     QLabel,
@@ -42,7 +44,12 @@ from app.core.model.motions import load_live2d_motions
 from app.core.preview import prepare_preview_import, prepare_spine_preview_import, prepare_package_preview_import
 from app.core.spine_preview import (
     SpinePreviewPlan,
+    SpineRuntimePolicy,
+    SPINE_COMPATIBILITY_VERSION,
+    SPINE_RUNTIME_SUPPORTED_VERSIONS,
+    discover_spine_runtime,
 )
+from app.core.spine_converter import discover_native_converter
 from app.core.preview.sources import (
     IMAGE_PREVIEW_EXTENSIONS,
     PACKAGE_PREVIEW_EXTENSIONS,
@@ -56,6 +63,7 @@ from app.core.preview.sources import (
     safe_export_name as _safe_export_name,
 )
 from app.core.settings_manager import SettingsManager
+from app.gui.SettingsPage import ToolchainInstallWorker
 from app.gui.ImagePreviewPanel import ImagePreviewPanel
 from app.gui.Live2DPreviewWindow import Live2DPreviewWindow
 from app.gui.SpinePreviewWidget import SpinePreviewWidget
@@ -561,6 +569,7 @@ class SpinePreviewImportThread(QThread):
         # this value on the worker avoids observing a settings-page edit while
         # an import is already in progress.
         self._unify_version = False
+        self._runtime_policy = None
         self.result = None
 
     def run(self):
@@ -570,11 +579,13 @@ class SpinePreviewImportThread(QThread):
                     self.source_path, self.temp_root, self.runtime_root,
                     should_continue=lambda: not self.isInterruptionRequested(),
                     unify_version=self._unify_version,
+                    runtime_policy=self._runtime_policy,
                 )
             else:
                 result = prepare_spine_preview_import(
                     self.source_path, self.temp_root, self.runtime_root,
                     unify_version=self._unify_version,
+                    runtime_policy=self._runtime_policy,
                 )
             self.result = result
             self.previewReady.emit(result, self.source_path)
@@ -1766,6 +1777,12 @@ class PreviewPage(QFrame):
         self._spine_preview_workers = []
         self._spine_preview_generation = 0
         self._spine_preview_temp_dirs = []
+        self._spine_runtime_install_worker = None
+        self._spine_runtime_retry_source = ""
+        self._spine_runtime_retry_package_fallback = False
+        self._spine_runtime_retry_compatibility = False
+        self._spine_runtime_retry_generation = 0
+        self._spine_runtime_prompt_enabled = True
         self._active_spine_plan = None
         self._active_spine_preview_key = ""
         self._spine_mode = False
@@ -1802,6 +1819,7 @@ class PreviewPage(QFrame):
                 app.aboutToQuit.connect(self._cleanup_temp_model_json)
                 app.aboutToQuit.connect(self._cleanup_model_preview_temp_dirs)
                 app.aboutToQuit.connect(self._cleanup_spine_preview_temp_dirs)
+                app.aboutToQuit.connect(self._cancel_spine_runtime_install)
                 app.aboutToQuit.connect(self._cleanup_image_preview_temp_dirs)
                 app.aboutToQuit.connect(self._cleanup_archive_preview_temp_dirs)
                 app.aboutToQuit.connect(self._cleanup_folder_preview_temp_dirs)
@@ -2415,18 +2433,59 @@ class PreviewPage(QFrame):
         return str(manager.get("preview.spine_runtime_dir", "") or "").strip()
 
     def _spine_preview_unify_for_import(self) -> bool:
-        """Capture the independent unified-preview switch on the GUI thread."""
+        """Compatibility alias for older integrations and tests."""
+
+        return self._spine_compatibility_mode_for_import()
+
+    def _spine_compatibility_mode_for_import(self) -> bool:
+        """Capture the unified Spine policy on the GUI thread."""
 
         manager = self.settings_manager
         latest = self._load_latest_preview_settings()
         if isinstance(latest, dict):
-            section = latest.get("spine_preview")
-            if isinstance(section, dict) and "unify_version" in section:
-                return bool(section.get("unify_version"))
-        getter = getattr(manager, "get_spine_preview_unify_version", None)
+            section = latest.get("spine")
+            if isinstance(section, dict) and "compatibility_mode" in section:
+                return bool(section.get("compatibility_mode"))
+        getter = getattr(manager, "get_spine_compatibility_mode", None)
         if callable(getter):
             return bool(getter())
-        return bool(manager.get("spine_preview.unify_version", True))
+        # A small compatibility fallback for test doubles created before the
+        # consolidated setting existed.
+        legacy = getattr(manager, "get_spine_preview_unify_version", None)
+        if callable(legacy):
+            return bool(legacy())
+        return bool(manager.get("spine.compatibility_mode", manager.get("spine_preview.unify_version", True)))
+
+    def _spine_selected_runtime_version_for_import(self) -> str:
+        """Capture the preserved off-mode runtime choice on the GUI thread."""
+
+        manager = self.settings_manager
+        latest = self._load_latest_preview_settings()
+        if isinstance(latest, dict):
+            section = latest.get("spine")
+            if isinstance(section, dict) and "runtime_version" in section:
+                value = str(section.get("runtime_version") or SPINE_COMPATIBILITY_VERSION).strip()
+                if value.startswith("4.0."):
+                    return "4.0"
+                return value
+        getter = getattr(manager, "get_spine_runtime_version", None)
+        if callable(getter):
+            return str(getter() or SPINE_COMPATIBILITY_VERSION)
+        value = str(manager.get("spine.runtime_version", SPINE_COMPATIBILITY_VERSION) or SPINE_COMPATIBILITY_VERSION)
+        return "4.0" if value.startswith("4.0.") else value
+
+    def _spine_runtime_policy_for_import(self, force_compatibility: bool | None = None) -> SpineRuntimePolicy:
+        compatibility = (
+            self._spine_compatibility_mode_for_import()
+            if force_compatibility is None
+            else bool(force_compatibility)
+        )
+        return SpineRuntimePolicy.from_values(
+            compatibility_mode=compatibility,
+            selected_version=self._spine_selected_runtime_version_for_import(),
+            runtime_root=self._spine_runtime_dir_for_import() or None,
+            prefer_installed=compatibility,
+        )
 
     def _merge_latest_preview_settings(self, ui_state: dict):
         """Merge the current UI state into the newest persisted settings."""
@@ -3302,7 +3361,7 @@ class PreviewPage(QFrame):
         if (
             _is_unity_preview_source(file_path) and not os.path.isdir(file_path)
         ):
-            self.start_model_preview_import(file_path)
+            self.start_spine_preview_import(file_path, package_fallback=True)
             return
 
         if _is_image_file(file_path):
@@ -3312,7 +3371,7 @@ class PreviewPage(QFrame):
                 return
 
         if _is_unity_preview_source(file_path) and not _is_model_json(file_path):
-            self.start_unity_image_preview(file_path)
+            self.start_spine_preview_import(file_path, package_fallback=True)
             return
 
         self.show_error(
@@ -3320,7 +3379,14 @@ class PreviewPage(QFrame):
             tr("preview.invalid_file_type_content")
         )
 
-    def start_spine_preview_import(self, source_path: str, package_fallback: bool = False):
+    def start_spine_preview_import(
+        self,
+        source_path: str,
+        package_fallback: bool = False,
+        *,
+        force_compatibility: bool | None = None,
+        prompt_missing_runtime: bool = True,
+    ):
         """Prepare a Spine source and open the local viewer in the stage."""
         # Closing first invalidates the previous generation and requests
         # interruption for an import that is still extracting.  A new
@@ -3344,7 +3410,9 @@ class PreviewPage(QFrame):
             tr("preview.spine_import_loading", source=source_path)
         )
         runtime_root = self._spine_runtime_dir_for_import()
-        unify_version = self._spine_preview_unify_for_import()
+        runtime_policy = self._spine_runtime_policy_for_import(force_compatibility)
+        unify_version = bool(runtime_policy.compatibility_mode)
+        self._spine_runtime_prompt_enabled = bool(prompt_missing_runtime)
         worker = SpinePreviewImportThread(
             source_path,
             self.settings_manager.get_temp_dir(),
@@ -3353,6 +3421,7 @@ class PreviewPage(QFrame):
         )
         worker._package_fallback = bool(package_fallback)
         worker._unify_version = bool(unify_version)
+        worker._runtime_policy = runtime_policy
         worker._preview_generation = generation
         worker.previewReady.connect(
             lambda result, source, w=worker, g=generation: self.on_spine_preview_ready(result, source, g, w)
@@ -3372,6 +3441,21 @@ class PreviewPage(QFrame):
         if temp_dir and str(temp_dir) not in self._spine_preview_temp_dirs:
             self._spine_preview_temp_dirs.append(str(temp_dir))
         try:
+            plan = getattr(result, "plan", None)
+            if (
+                isinstance(plan, SpinePreviewPlan)
+                and plan.runtime_missing
+                and bool(getattr(plan.asset, "has_skeleton", False))
+            ):
+                if self._spine_runtime_prompt_enabled:
+                    self.handle_missing_spine_runtime(
+                        plan,
+                        source_path,
+                        package_fallback=bool(getattr(worker, "_package_fallback", False)),
+                    )
+                else:
+                    self._on_spine_preview_error(plan.runtime_error or plan.reason)
+                return
             preview_model = getattr(result, "preview_model_json", None)
             if preview_model:
                 self.load_model_preview(str(preview_model), source_path)
@@ -3379,6 +3463,335 @@ class PreviewPage(QFrame):
             self._open_spine_native_preview(result.plan)
         except Exception as exc:
             self._on_spine_preview_error(str(exc))
+
+    def _spine_runtime_choice_version(self, plan: SpinePreviewPlan) -> str:
+        requested = str(
+            plan.requested_runtime_version
+            or getattr(plan.asset, "spine_version", "")
+            or ""
+        ).strip()
+        if requested.startswith("3.8."):
+            return SPINE_COMPATIBILITY_VERSION if requested == SPINE_COMPATIBILITY_VERSION else requested
+        if requested == "4.0" or requested.startswith("4.0."):
+            return "4.0"
+        return requested
+
+    def _has_verified_spine_runtime(self, version: str) -> bool:
+        """Return whether the requested verified bridge is usable locally."""
+
+        family = "3.8" if version.startswith("3.8.") else "4.0" if version == "4.0" else ""
+        if not family:
+            return False
+        requested = version if family == "3.8" else "4.0"
+        roots = []
+        configured = self._spine_runtime_dir_for_import()
+        if configured:
+            roots.append(configured)
+        # ``discover_spine_runtime(None, ...)`` scans the managed catalog root
+        # and is also the fallback used by the core planner for a single
+        # family directory selected in Settings.
+        roots.append(None)
+        for root in roots:
+            try:
+                discover_spine_runtime(
+                    root,
+                    requested_family=family,
+                    requested_version=requested,
+                )
+            except Exception:
+                continue
+            return True
+        return False
+
+    def _spine_conversion_fallback_available(self, plan: SpinePreviewPlan) -> bool:
+        """Check the verified converter and target bridge before offering Convert."""
+
+        if not bool(getattr(plan.asset, "has_skeleton", False)):
+            return False
+        source_version = str(
+            getattr(plan.asset, "spine_version", "") or plan.requested_runtime_version or ""
+        ).strip()
+        source_family = source_version.rsplit(".", 1)[0] if source_version.count(".") >= 2 else ""
+        if source_family not in {"3.5", "3.6", "3.7", "3.8", "4.0", "4.1", "4.2"}:
+            return False
+        if source_version == SPINE_COMPATIBILITY_VERSION:
+            return False
+        try:
+            converter = discover_native_converter()
+        except Exception:
+            converter = None
+        return bool(converter and self._has_verified_spine_runtime(SPINE_COMPATIBILITY_VERSION))
+
+    def handle_missing_spine_runtime(
+        self,
+        plan: SpinePreviewPlan,
+        source_path: str,
+        *,
+        package_fallback: bool = False,
+    ) -> str:
+        """Show the explicit missing-runtime choices and dispatch one branch.
+
+        Return values are stable for tests and callers: ``download``,
+        ``convert`` or ``cancel``.  Download/build work is delegated to the
+        same QThread worker used by SettingsPage, so the modal decision never
+        performs network or CMake work on the GUI thread.
+        """
+
+        version = self._spine_runtime_choice_version(plan)
+        download_id = {
+            "3.8.75": "spine_native",
+            "4.0": "spine_native_4_0",
+        }.get(version)
+
+        box = QMessageBox(self)
+        box.setWindowTitle(tr("preview.spine_runtime_missing_title"))
+        box.setText(
+            tr(
+                "preview.spine_runtime_missing_content",
+                version=version,
+                error=plan.runtime_error or plan.reason,
+            )
+        )
+        download_button = box.addButton(
+            tr("preview.spine_runtime_download"), QMessageBox.ButtonRole.AcceptRole
+        )
+        convert_button = box.addButton(
+            tr("preview.spine_runtime_convert"), QMessageBox.ButtonRole.ActionRole
+        )
+        cancel_button = box.addButton(
+            tr("common.cancel"), QMessageBox.ButtonRole.RejectRole
+        )
+        # An unsupported family (for example 4.1) has no catalog download,
+        # but can still use the verified converter when its 3.8.75 bridge is
+        # already installed.  Conversely, a 3.8.75 source cannot be made
+        # playable by converting it again when that same bridge is missing.
+        download_button.setEnabled(download_id is not None)
+        convert_button.setEnabled(self._spine_conversion_fallback_available(plan))
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is download_button:
+            started = self._start_spine_runtime_install(
+                download_id,
+                retry_source=str(source_path),
+                retry_package_fallback=bool(package_fallback),
+                retry_compatibility=self._spine_compatibility_mode_for_import(),
+                retry_generation=self._spine_preview_generation,
+            )
+            return "download" if started else "cancel"
+        if clicked is convert_button:
+            self._spine_runtime_retry_source = str(source_path)
+            self._spine_runtime_retry_package_fallback = bool(package_fallback)
+            self._spine_runtime_retry_compatibility = True
+            self._spine_runtime_retry_generation = self._spine_preview_generation
+            # This is a one-import override and does not mutate the global
+            # compatibility toggle in SettingsManager.
+            self.start_spine_preview_import(
+                source_path,
+                package_fallback=package_fallback,
+                force_compatibility=True,
+                prompt_missing_runtime=False,
+            )
+            return "convert"
+
+        self._spine_runtime_retry_source = ""
+        self._spine_runtime_retry_package_fallback = False
+        self._spine_runtime_retry_compatibility = False
+        self._spine_runtime_retry_generation = 0
+        self._show_stage_placeholder(tr("preview.spine_runtime_cancelled"))
+        self.model_info_text_box.setMarkdown(tr("preview.spine_runtime_cancelled"))
+        return "cancel"
+
+    def _start_spine_runtime_install(
+        self,
+        package_id: str,
+        *,
+        retry_source: str | None = None,
+        retry_package_fallback: bool | None = None,
+        retry_compatibility: bool | None = None,
+        retry_generation: int | None = None,
+    ) -> bool:
+        worker = self._spine_runtime_install_worker
+        if worker is not None and _spine_thread_is_running(worker):
+            InfoBar.warning(
+                title=tr("settings.tool_download_busy_title"),
+                content=tr("settings.tool_download_busy"),
+                orient=Qt.Horizontal,
+                isClosable=True,
+                position=InfoBarPosition.TOP,
+                duration=4000,
+                parent=self,
+            )
+            return False
+        # Capture retry context on this worker.  The page-level fields are
+        # convenient for diagnostics, but late signals must be checked against
+        # the immutable worker context so a new source cannot be paired with an
+        # older download that happened to finish later.
+        retry_generation = (
+            self._spine_preview_generation
+            if retry_generation is None
+            else int(retry_generation)
+        )
+        retry_source = (
+            self._spine_runtime_retry_source
+            if retry_source is None
+            else str(retry_source)
+        )
+        retry_package_fallback = (
+            self._spine_runtime_retry_package_fallback
+            if retry_package_fallback is None
+            else bool(retry_package_fallback)
+        )
+        retry_compatibility = (
+            self._spine_runtime_retry_compatibility
+            if retry_compatibility is None
+            else bool(retry_compatibility)
+        )
+        worker = ToolchainInstallWorker(package_id, self)
+        worker._spine_retry_generation = retry_generation
+        worker._spine_retry_source = retry_source
+        worker._spine_retry_package_fallback = retry_package_fallback
+        worker._spine_retry_compatibility = retry_compatibility
+        self._spine_runtime_retry_source = retry_source
+        self._spine_runtime_retry_package_fallback = retry_package_fallback
+        self._spine_runtime_retry_compatibility = retry_compatibility
+        self._spine_runtime_retry_generation = retry_generation
+        self._spine_runtime_install_worker = worker
+        worker.progressChanged.connect(
+            lambda progress, w=worker: self._on_spine_runtime_install_progress(progress, w)
+        )
+        worker.resultReady.connect(
+            lambda result, w=worker: self._on_spine_runtime_install_result(result, w)
+        )
+        worker.failed.connect(
+            lambda message, w=worker: self._on_spine_runtime_install_failed(message, w)
+        )
+        worker.finished.connect(self._on_spine_runtime_install_finished)
+        self._show_stage_placeholder(tr("preview.spine_runtime_installing", version=package_id))
+        worker.start()
+        return True
+
+    def _on_spine_runtime_install_progress(self, progress, worker=None) -> None:
+        if worker is not None and worker is not self._spine_runtime_install_worker:
+            return
+        if worker is not None and getattr(worker, "_spine_retry_generation", None) != self._spine_preview_generation:
+            return
+        message = str(getattr(progress, "message", "") or getattr(progress, "phase", ""))
+        if message:
+            self.model_info_text_box.setMarkdown(message)
+
+    def _on_spine_runtime_install_result(self, result, worker=None) -> None:
+        if worker is not None and worker is not self._spine_runtime_install_worker:
+            return
+        retry_generation = getattr(
+            worker, "_spine_retry_generation", self._spine_runtime_retry_generation
+        )
+        if retry_generation != self._spine_preview_generation:
+            return
+        install_dir = Path(str(getattr(result, "install_dir", ""))).expanduser().resolve()
+        if not install_dir.is_dir():
+            self._on_spine_runtime_install_failed(
+                "Installed runtime directory is missing.", worker
+            )
+            return
+        # The preview resolver accepts either a family directory or the
+        # common parent.  Persist the common parent so both verified families
+        # remain discoverable after installing either package.
+        common_root = install_dir.parent if install_dir.name in {"3.8.75", "4.0"} else install_dir
+        setter = getattr(self.settings_manager, "set_spine_runtime_dir", None)
+        if callable(setter):
+            setter(str(common_root))
+        else:
+            self.settings_manager.set("preview.spine_runtime_dir", str(common_root))
+        if self.spine_runtime_edit:
+            self.spine_runtime_edit.setText(str(common_root))
+        source = getattr(worker, "_spine_retry_source", self._spine_runtime_retry_source)
+        if source:
+            self.start_spine_preview_import(
+                source,
+                package_fallback=getattr(
+                    worker,
+                    "_spine_retry_package_fallback",
+                    self._spine_runtime_retry_package_fallback,
+                ),
+                force_compatibility=getattr(
+                    worker,
+                    "_spine_retry_compatibility",
+                    self._spine_runtime_retry_compatibility,
+                ),
+                prompt_missing_runtime=False,
+            )
+
+    def _on_spine_runtime_install_failed(self, message: str, worker=None) -> None:
+        if worker is not None and worker is not self._spine_runtime_install_worker:
+            return
+        retry_generation = getattr(
+            worker, "_spine_retry_generation", self._spine_runtime_retry_generation
+        )
+        if retry_generation != self._spine_preview_generation:
+            return
+        self._show_stage_placeholder(
+            tr("preview.spine_runtime_install_failed", error=str(message))
+        )
+        self.model_info_text_box.setMarkdown(
+            tr("preview.spine_runtime_install_failed", error=str(message))
+        )
+        self.show_error(
+            tr("preview.spine_runtime_install_failed_title"),
+            tr("preview.spine_runtime_install_failed", error=str(message)),
+        )
+        self._spine_runtime_retry_source = ""
+        self._spine_runtime_retry_package_fallback = False
+        self._spine_runtime_retry_compatibility = False
+        self._spine_runtime_retry_generation = 0
+
+    def _on_spine_runtime_install_finished(self) -> None:
+        worker = self.sender()
+        if worker is self._spine_runtime_install_worker:
+            self._spine_runtime_install_worker = None
+        if worker is not None:
+            worker.deleteLater()
+
+    def is_spine_runtime_install_running(self) -> bool:
+        worker = self._spine_runtime_install_worker
+        if worker is None:
+            return False
+        try:
+            return bool(worker.isRunning())
+        except RuntimeError:
+            return False
+
+    def notify_close_while_spine_runtime_installing(self) -> bool:
+        if not self.is_spine_runtime_install_running():
+            return False
+        self._cancel_spine_runtime_install()
+        InfoBar.warning(
+            title=tr("settings.tool_download_busy_title"),
+            content=tr("settings.tool_download_busy"),
+            orient=Qt.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP,
+            duration=5000,
+            parent=self,
+        )
+        return True
+
+    def _cancel_spine_runtime_install(self) -> None:
+        # Invalidate both pending import results and a pending installer
+        # retry.  A late result from the worker must never reopen a preview
+        # after the user closed it or the application began to quit.
+        self._spine_preview_generation += 1
+        self._spine_runtime_retry_source = ""
+        self._spine_runtime_retry_package_fallback = False
+        self._spine_runtime_retry_compatibility = False
+        self._spine_runtime_retry_generation = 0
+        worker = self._spine_runtime_install_worker
+        if worker is None:
+            return
+        try:
+            if worker.isRunning():
+                worker.requestInterruption()
+        except RuntimeError:
+            pass
 
     def on_spine_preview_failed(self, error: str, source_path: str, generation=None, worker=None):
         if generation is not None and generation != self._spine_preview_generation:
@@ -3606,11 +4019,17 @@ class PreviewPage(QFrame):
             self.activate_image_preview_item(item)
 
     def activate_model_preview_item(self, item: dict):
+        source_path = str(item.get("source_path") or item.get("path") or "")
+        # Folder scans may have prepared a Live2D candidate before the user
+        # activates it. Unity sources still go through the unified importer so
+        # a Spine TextAsset is not hidden behind the old Cubism-only path.
+        if source_path and _is_unity_preview_source(source_path) and not os.path.isdir(source_path):
+            self.start_spine_preview_import(source_path, package_fallback=True)
+            return
         prepared = item.get("prepared_model_json")
         if prepared and os.path.isfile(str(prepared)):
-            self.load_model_preview(str(prepared), str(item.get("source_path") or prepared))
+            self.load_model_preview(str(prepared), source_path or str(prepared))
             return
-        source_path = str(item.get("source_path") or item.get("path") or "")
         if source_path:
             self.start_model_preview_import(source_path)
 
@@ -4019,6 +4438,7 @@ class PreviewPage(QFrame):
         # queued worker signal could recreate the Spine page after the user
         # pressed the close button.
         self._cleanup_spine_preview_temp_dirs()
+        self._cancel_spine_runtime_install()
         self._terminate_preview_process()
         self._clear_embedded_spine()
         self._populate_motion_controls([])

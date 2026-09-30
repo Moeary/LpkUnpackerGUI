@@ -4,6 +4,11 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
     QHBoxLayout,
+    QDialog,
+    QDialogButtonBox,
+    QListWidget,
+    QListWidgetItem,
+    QToolButton,
     QSizePolicy,
     QScrollArea,
     QVBoxLayout,
@@ -17,6 +22,7 @@ from qfluentwidgets import (
     CaptionLabel,
     CheckBox,
     ComboBox,
+    EditableComboBox,
     InfoBar,
     InfoBarPosition,
     LineEdit,
@@ -47,6 +53,12 @@ from app.core.toolchain_download import (
     extract_cubism_core_from_live2d_py,
     official_download_url,
     download_tool_package,
+    list_tool_package_manifests,
+)
+from app.core.spine_preview import (
+    SPINE_COMPATIBILITY_VERSION,
+    SPINE_RUNTIME_SUPPORTED_VERSIONS,
+    list_installed_spine_runtimes,
 )
 from app.i18n import get_i18n, normalize_language_code, tr
 
@@ -107,6 +119,10 @@ class SettingsPage(QFrame):
         self._texture_viewer_values = ["internal", "system", "custom"]
         self._spine_native_family_values = ["3.8.75", "4.0"]
         self._syncing_ui = False
+        # The combo is deliberately forced to 3.8.75 while compatibility is
+        # enabled.  Keep the user's off-mode choice separately so toggling
+        # the switch back does not turn a remembered 4.0 preference into 3.8.
+        self._spine_runtime_version_before_compatibility = SPINE_COMPATIBILITY_VERSION
 
         self.title_label = None
         self.language_section_title = None
@@ -182,6 +198,14 @@ class SettingsPage(QFrame):
         self.spine_preview_unify_label = None
         self.spine_preview_unify_desc = None
         self.spine_preview_unify_checkbox = None
+        self.spine_compatibility_label = None
+        self.spine_compatibility_desc = None
+        self.spine_compatibility_checkbox = None
+        self.spine_runtime_version_label = None
+        self.spine_runtime_version_desc = None
+        self.spine_runtime_version_combo = None
+        self.spine_runtime_download_button = None
+        self.spine_runtime_advanced_toggle = None
         self.tool_download_section_title = None
         self.tool_download_desc = None
         self.assetstudio_install_button = None
@@ -647,6 +671,59 @@ class SettingsPage(QFrame):
         )
         spine_layout.addWidget(self.spine_section_title)
 
+        # One compatibility switch owns both formal extraction and preview.
+        # The old independent controls remain available to the settings
+        # migration layer but are hidden from this consolidated surface.
+        self.spine_compatibility_label = BodyLabel("", spine_card)
+        self.spine_compatibility_desc = CaptionLabel("", spine_card)
+        self.spine_compatibility_desc.setWordWrap(True)
+        self.spine_compatibility_checkbox = CheckBox(spine_card)
+        self._add_text_block(
+            spine_layout,
+            self.spine_compatibility_label,
+            self.spine_compatibility_desc,
+        )
+        self._configure_expanding(self.spine_compatibility_checkbox)
+        self.spine_compatibility_checkbox.toggled.connect(
+            self._on_spine_compatibility_toggled
+        )
+        spine_layout.addWidget(self.spine_compatibility_checkbox)
+
+        self.spine_runtime_version_label = BodyLabel("", spine_card)
+        self.spine_runtime_version_desc = CaptionLabel("", spine_card)
+        self.spine_runtime_version_desc.setWordWrap(True)
+        self.spine_runtime_version_combo = EditableComboBox(spine_card)
+        self.spine_runtime_version_combo.setPlaceholderText("3.8.75 / 4.0")
+        self.spine_runtime_version_combo.currentTextChanged.connect(
+            self._on_spine_runtime_version_changed
+        )
+        self.spine_runtime_download_button = QToolButton(spine_card)
+        self.spine_runtime_download_button.setText("↓")
+        self.spine_runtime_download_button.setToolTip("Download verified runtime")
+        self.spine_runtime_download_button.clicked.connect(
+            self.open_spine_runtime_catalog
+        )
+        self._add_text_block(
+            spine_layout,
+            self.spine_runtime_version_label,
+            self.spine_runtime_version_desc,
+        )
+        runtime_version_row = QHBoxLayout()
+        runtime_version_row.setSpacing(8)
+        self._configure_expanding(self.spine_runtime_version_combo)
+        runtime_version_row.addWidget(self.spine_runtime_version_combo, 1)
+        runtime_version_row.addWidget(self.spine_runtime_download_button)
+        spine_layout.addLayout(runtime_version_row)
+
+        self.spine_runtime_advanced_toggle = PushButton(spine_card)
+        self.spine_runtime_advanced_toggle.setCheckable(True)
+        self.spine_runtime_advanced_toggle.setChecked(False)
+        self.spine_runtime_advanced_toggle.toggled.connect(
+            self._toggle_spine_runtime_advanced
+        )
+        self._configure_expanding(self.spine_runtime_advanced_toggle)
+        spine_layout.addWidget(self.spine_runtime_advanced_toggle)
+
         self.spine_runtime_label = BodyLabel("", spine_card)
         self.spine_runtime_desc = CaptionLabel("", spine_card)
         self.spine_runtime_desc.setWordWrap(True)
@@ -666,6 +743,7 @@ class SettingsPage(QFrame):
             (self.spine_runtime_button, self.spine_runtime_auto_button),
             self.spine_runtime_status,
         )
+        self._set_spine_runtime_advanced_visible(False)
 
         self.spine_editor_label = BodyLabel("", spine_card)
         self.spine_editor_desc = CaptionLabel("", spine_card)
@@ -733,6 +811,21 @@ class SettingsPage(QFrame):
         )
         self._configure_expanding(self.spine_preview_unify_checkbox)
         spine_layout.addWidget(self.spine_preview_unify_checkbox)
+        for legacy_widget in (
+            self.spine_create_project_label,
+            self.spine_create_project_desc,
+            self.spine_create_project_checkbox,
+            self.spine_auto_convert_label,
+            self.spine_auto_convert_desc,
+            self.spine_auto_convert_checkbox,
+            self.spine_target_version_label,
+            self.spine_target_version_desc,
+            self.spine_target_version_edit,
+            self.spine_preview_unify_label,
+            self.spine_preview_unify_desc,
+            self.spine_preview_unify_checkbox,
+        ):
+            legacy_widget.setVisible(False)
 
         # Texture preview settings -------------------------------------------
         texture_card, texture_layout = self._new_settings_card(
@@ -800,6 +893,14 @@ class SettingsPage(QFrame):
                 self.photoshop_edit.setText(self.settings_manager.get_photoshop_path())
             if self.spine_runtime_edit:
                 self.spine_runtime_edit.setText(self.settings_manager.get_spine_runtime_dir())
+            if self.spine_compatibility_checkbox:
+                get_mode = getattr(
+                    self.settings_manager, "get_spine_compatibility_mode", None
+                )
+                self.spine_compatibility_checkbox.setChecked(
+                    bool(get_mode()) if callable(get_mode) else True
+                )
+            self._refresh_spine_runtime_version_combo()
             if self.spine_editor_edit:
                 get_editor_path = getattr(
                     self.settings_manager, "get_spine_editor_path", None
@@ -840,8 +941,197 @@ class SettingsPage(QFrame):
                     self.settings_manager.get_image_viewer_path()
                 )
             self.refresh_tool_status_labels()
+            self._update_spine_runtime_selection_ui()
         finally:
             self._syncing_ui = False
+
+    def _set_spine_runtime_advanced_visible(self, visible: bool) -> None:
+        for widget in (
+            getattr(self, "spine_runtime_label", None),
+            getattr(self, "spine_runtime_desc", None),
+            getattr(self, "spine_runtime_status", None),
+            getattr(self, "spine_runtime_edit", None),
+            getattr(self, "spine_runtime_button", None),
+            getattr(self, "spine_runtime_auto_button", None),
+        ):
+            if widget is not None:
+                widget.setVisible(bool(visible))
+
+    def _toggle_spine_runtime_advanced(self, visible: bool) -> None:
+        self._set_spine_runtime_advanced_visible(bool(visible))
+
+    def _on_spine_compatibility_toggled(self, _checked: bool) -> None:
+        if self._syncing_ui:
+            return
+        if self.spine_runtime_version_combo is not None:
+            if _checked:
+                # Capture the persisted off-mode choice before the display is
+                # forced to the compatibility target.
+                selected = self._normalize_spine_runtime_choice(
+                    self.spine_runtime_version_combo.currentText()
+                )
+                if selected:
+                    self._spine_runtime_version_before_compatibility = selected
+            else:
+                selected = self._normalize_spine_runtime_choice(
+                    self._spine_runtime_version_before_compatibility
+                )
+                if selected:
+                    combo = self.spine_runtime_version_combo
+                    if combo.findText(selected) < 0:
+                        combo.addItem(selected)
+                    combo.blockSignals(True)
+                    combo.setCurrentText(selected)
+                    combo.blockSignals(False)
+        self._update_spine_runtime_selection_ui()
+
+    @staticmethod
+    def _normalize_spine_runtime_choice(value: str) -> str | None:
+        text = str(value or "").strip()
+        if text == SPINE_COMPATIBILITY_VERSION:
+            return SPINE_COMPATIBILITY_VERSION
+        if text == "4.0" or text.startswith("4.0."):
+            return "4.0"
+        return None
+
+    def _on_spine_runtime_version_changed(self, _value: str) -> None:
+        if self._syncing_ui:
+            return
+        # EditableComboBox is searchable, but the value remains constrained to
+        # verified native families when the user leaves the field.
+        if self.spine_runtime_version_combo is None:
+            return
+        text = self.spine_runtime_version_combo.currentText().strip()
+        if text.startswith("4.0."):
+            text = "4.0"
+        if text not in SPINE_RUNTIME_SUPPORTED_VERSIONS:
+            return
+        self.settings_manager.set_spine_runtime_version(text)
+
+    def _refresh_spine_runtime_version_combo(self) -> None:
+        combo = self.spine_runtime_version_combo
+        if combo is None:
+            return
+        selected = SPINE_COMPATIBILITY_VERSION
+        getter = getattr(self.settings_manager, "get_spine_runtime_version", None)
+        if callable(getter):
+            selected = str(getter() or selected)
+        selected = self._normalize_spine_runtime_choice(selected) or SPINE_COMPATIBILITY_VERSION
+        self._spine_runtime_version_before_compatibility = selected
+        root = self.settings_manager.get_spine_runtime_dir()
+        try:
+            installed = list_installed_spine_runtimes(root or None)
+        except Exception:
+            installed = ()
+        values = [
+            self._normalize_spine_runtime_choice(str(item.version))
+            for item in installed
+        ]
+        values = [value for value in values if value]
+        if selected not in values:
+            values.append(selected)
+        if not values:
+            values = [selected]
+        values = list(dict.fromkeys(values))
+        combo.blockSignals(True)
+        combo.clear()
+        for value in values:
+            combo.addItem(value)
+        if selected in values:
+            combo.setCurrentText(selected)
+        combo.blockSignals(False)
+        self._update_spine_runtime_selection_ui()
+
+    def _update_spine_runtime_selection_ui(self) -> None:
+        compatibility = bool(
+            self.spine_compatibility_checkbox
+            and self.spine_compatibility_checkbox.isChecked()
+        )
+        combo = self.spine_runtime_version_combo
+        if combo is not None:
+            combo.blockSignals(True)
+            if compatibility:
+                combo.setCurrentText(SPINE_COMPATIBILITY_VERSION)
+            else:
+                selected = self._normalize_spine_runtime_choice(
+                    self._spine_runtime_version_before_compatibility
+                )
+                if selected:
+                    if combo.findText(selected) < 0:
+                        combo.addItem(selected)
+                    combo.setCurrentText(selected)
+            combo.setEnabled(not compatibility)
+            combo.blockSignals(False)
+        if self.spine_runtime_download_button:
+            self.spine_runtime_download_button.setEnabled(True)
+
+    def open_spine_runtime_catalog(self) -> None:
+        """Show the verified Spine source-build catalog.
+
+        The arrow intentionally lists only the two pinned native packages.
+        They are official source archives built by the local bridge builder;
+        this dialog never invents a pre-built DLL URL for an arbitrary Spine
+        version.
+        """
+
+        manifests = tuple(
+            manifest
+            for manifest in list_tool_package_manifests()
+            if manifest.package_id in {"spine_native", "spine_native_4_0"}
+            and manifest.runtime_family in {"3.8", "4.0"}
+            and (manifest.is_pinned_archive or manifest.requires_builder)
+        )
+        dialog = QDialog(self)
+        dialog.setWindowTitle(
+            tr("settings.spine_runtime_catalog_title", "Verified Spine runtimes")
+        )
+        dialog.setMinimumSize(500, 300)
+        layout = QVBoxLayout(dialog)
+        filter_edit = LineEdit(dialog)
+        filter_edit.setPlaceholderText(
+            tr("settings.spine_runtime_catalog_filter", "Filter versions")
+        )
+        layout.addWidget(filter_edit)
+        entries = QListWidget(dialog)
+        layout.addWidget(entries, 1)
+        note = CaptionLabel(
+            tr(
+                "settings.spine_runtime_catalog_note",
+                "Packages are pinned official source archives and require the local CMake/compiler builder.",
+            ),
+            dialog,
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel,
+            parent=dialog,
+        )
+        layout.addWidget(buttons)
+
+        def populate(query: str = "") -> None:
+            needle = str(query or "").strip().casefold()
+            entries.clear()
+            for manifest in manifests:
+                label = f"Spine {manifest.version} ({manifest.runtime_family})"
+                if needle and needle not in label.casefold() and needle not in manifest.notes.casefold():
+                    continue
+                item = QListWidgetItem(label, entries)
+                item.setData(Qt.ItemDataRole.UserRole, manifest.package_id)
+                item.setToolTip(manifest.notes)
+            entries.setCurrentRow(0 if entries.count() else -1)
+
+        filter_edit.textChanged.connect(populate)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        populate()
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        item = entries.currentItem()
+        package_id = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if package_id:
+            self.start_tool_install(str(package_id))
 
     def retranslate_ui(self):
         self._syncing_ui = True
@@ -936,6 +1226,38 @@ class SettingsPage(QFrame):
             self.spine_runtime_button.setText(tr("common.browse"))
             self.spine_runtime_auto_button.setText(tr("settings.tool_auto"))
             self.spine_section_title.setText(tr("settings.spine_section", "Spine"))
+            self.spine_compatibility_label.setText(
+                tr("settings.spine_compatibility_label", "Spine compatibility mode")
+            )
+            self.spine_compatibility_desc.setText(
+                tr(
+                    "settings.spine_compatibility_desc",
+                    "Use verified Spine 3.8.75 for preview and formal extraction. "
+                    "Formal extraction also creates an independent .spine project when the official CLI is available.",
+                )
+            )
+            self.spine_compatibility_checkbox.setText(
+                tr(
+                    "settings.spine_compatibility_checkbox",
+                    "Always use compatible Spine 3.8.75",
+                )
+            )
+            self.spine_runtime_version_label.setText(
+                tr("settings.spine_runtime_version_label", "Installed Spine runtime")
+            )
+            self.spine_runtime_version_desc.setText(
+                tr(
+                    "settings.spine_runtime_version_desc",
+                    "When compatibility mode is off, prefer an installed verified runtime. "
+                    "The download arrow lists only supported catalog packages.",
+                )
+            )
+            self.spine_runtime_download_button.setToolTip(
+                tr("settings.spine_runtime_download_tooltip", "Find or build a verified runtime")
+            )
+            self.spine_runtime_advanced_toggle.setText(
+                tr("settings.spine_runtime_advanced", "Advanced runtime root")
+            )
             self.spine_editor_label.setText(
                 tr("settings.spine_editor_label", "Spine editor executable")
             )
@@ -1197,26 +1519,29 @@ class SettingsPage(QFrame):
         )
 
     def save_runtime_settings(self):
-        target_version = (
-            self.spine_target_version_edit.text().strip()
-            if self.spine_target_version_edit
-            else ""
+        compatibility = bool(
+            self.spine_compatibility_checkbox
+            and self.spine_compatibility_checkbox.isChecked()
         )
-        try:
-            target_version = self.settings_manager.validate_spine_conversion_target_version(
-                target_version
+        set_compatibility = getattr(
+            self.settings_manager, "set_spine_compatibility_mode", None
+        )
+        if callable(set_compatibility):
+            set_compatibility(compatibility)
+        # While compatibility is on the visible combo is intentionally forced
+        # to 3.8.75.  Do not write that display value over the preserved
+        # off-mode selection; the toggle handler captured it separately.
+        if not compatibility:
+            set_runtime_version = getattr(
+                self.settings_manager, "set_spine_runtime_version", None
             )
-        except ValueError as exc:
-            InfoBar.error(
-                title=tr("common.error"),
-                content=tr("settings.spine_target_version_invalid", error=str(exc)),
-                orient=Qt.Horizontal,
-                isClosable=True,
-                position=InfoBarPosition.TOP,
-                duration=4000,
-                parent=self,
+            selected = self._normalize_spine_runtime_choice(
+                self.spine_runtime_version_combo.currentText()
+                if self.spine_runtime_version_combo
+                else ""
             )
-            return False
+            if callable(set_runtime_version) and selected:
+                set_runtime_version(selected)
 
         output_root = self.output_root_edit.text().strip() if self.output_root_edit else ""
         if output_root:
@@ -1236,39 +1561,14 @@ class SettingsPage(QFrame):
         self.settings_manager.set_spine_runtime_dir(
             self.spine_runtime_edit.text() if self.spine_runtime_edit else ""
         )
-        set_editor_path = getattr(
-            self.settings_manager, "set_spine_editor_path", None
-        )
+        set_editor_path = getattr(self.settings_manager, "set_spine_editor_path", None)
         if callable(set_editor_path):
-            set_editor_path(
-                self.spine_editor_edit.text() if self.spine_editor_edit else ""
-            )
-        set_create_project = getattr(
-            self.settings_manager, "set_spine_create_project", None
-        )
-        if callable(set_create_project):
-            set_create_project(
-                self.spine_create_project_checkbox.isChecked()
-                if self.spine_create_project_checkbox
-                else True
-            )
-        self.settings_manager.set_spine_conversion_enabled(
-            self.spine_auto_convert_checkbox.isChecked()
-            if self.spine_auto_convert_checkbox
-            else False
-        )
-        self.settings_manager.set_spine_conversion_target_version(
-            target_version
-        )
-        set_unify_preview = getattr(
-            self.settings_manager, "set_spine_preview_unify_version", None
-        )
-        if callable(set_unify_preview):
-            set_unify_preview(
-                self.spine_preview_unify_checkbox.isChecked()
-                if self.spine_preview_unify_checkbox
-                else True
-            )
+            set_editor_path(self.spine_editor_edit.text() if self.spine_editor_edit else "")
+        # The old create-project, automatic-conversion, target-version and
+        # preview-unify controls remain only for migration/backward-compatible
+        # converter pages.  They are hidden here and must not override the
+        # consolidated policy when the user saves Runtime settings.  The
+        # manual converter page can still validate and write its own target.
         self.settings_manager.set_texture_viewer_mode(
             self._current_combo_value(
                 self.texture_viewer_combo,

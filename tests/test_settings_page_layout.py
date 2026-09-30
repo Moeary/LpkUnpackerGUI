@@ -84,7 +84,11 @@ class SettingsPageLayoutTests(unittest.TestCase):
                 self.assertTrue(page.save_runtime_settings())
                 manager = SettingsManager(settings_path)
                 self.assertEqual(manager.get_spine_editor_path(), r"D:\\Tools\\Spine.com")
-                self.assertFalse(manager.get_spine_create_project())
+                # The legacy project checkbox is hidden by the consolidated
+                # compatibility setting.  Compatibility mode always requests
+                # an independent .spine project; a hidden stale checkbox must
+                # not override that policy when Runtime settings are saved.
+                self.assertTrue(manager.get_spine_conversion_options()["create_project"])
             finally:
                 page.close()
                 page.deleteLater()

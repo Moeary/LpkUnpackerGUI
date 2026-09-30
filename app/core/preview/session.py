@@ -17,6 +17,7 @@ from app.core.spine_preview import (
     SpinePreviewAsset,
     SpinePreviewPlan,
     load_spine_asset,
+    SpineRuntimePolicy,
     prepare_spine_preview_import as _prepare_spine_preview_import,
 )
 from app.core.spine_preview_conversion import (
@@ -52,6 +53,7 @@ def prepare_package_preview_import(
     *,
     should_continue=None,
     unify_version: bool = False,
+    runtime_policy: SpineRuntimePolicy | None = None,
 ):
     """Extract an LPK/WPK once, then select a model from the same workspace.
 
@@ -83,6 +85,7 @@ def prepare_package_preview_import(
             temp_root,
             runtime_root,
             unify_version=unify_version,
+            runtime_policy=runtime_policy,
         )
     except Exception:
         # Only our newly created disposable workspace is removed on failure.
@@ -152,6 +155,7 @@ def prepare_spine_preview_import(
     log=None,
     *,
     unify_version: bool = False,
+    runtime_policy: SpineRuntimePolicy | None = None,
 ) -> SpinePreviewImportResult:
     result = _prepare_spine_preview_import(source, temp_root, runtime_root, log=log)
     try:
@@ -161,6 +165,7 @@ def prepare_spine_preview_import(
             temp_root,
             runtime_root,
             unify_version=unify_version,
+            runtime_policy=runtime_policy,
         )
     except Exception:
         # The lower-level importer has already transferred ownership of its
@@ -179,6 +184,7 @@ def _finish_spine_preview_import(
     runtime_root: str | Path | None,
     *,
     unify_version: bool,
+    runtime_policy: SpineRuntimePolicy | None = None,
 ) -> SpinePreviewImportResult:
     """Apply the explicit preview conversion policy after source preparation."""
 
@@ -191,6 +197,7 @@ def _finish_spine_preview_import(
         cache_root,
         runtime_root,
         unify_version=bool(unify_version),
+        runtime_policy=runtime_policy,
     )
     conversion = prepared.conversion
     warnings = tuple(prepared.plan.warnings) + tuple(conversion.warnings)

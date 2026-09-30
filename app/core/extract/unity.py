@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from pathlib import Path
 
 from app.core.assetstudio_cli import (
@@ -10,6 +11,7 @@ from app.core.assetstudio_cli import (
 )
 from app.core.cubism_core import CubismCore, CubismCoreError
 from app.core.extract.models import ExtractItemResult, ExtractMode, ExtractSourceType
+from app.core.spine_preview import read_spine_version
 
 
 def extract_unity(
@@ -17,6 +19,8 @@ def extract_unity(
     output_dir: str | Path,
     mode: ExtractMode,
     log=None,
+    *,
+    include_spine: bool = False,
 ) -> ExtractItemResult:
     source = Path(input_path)
     target = Path(output_dir)
@@ -32,8 +36,53 @@ def extract_unity(
         if log:
             log("INFO", f"AssetStudio CLI: {cli.executable}")
 
+        spine_export = False
+        live2d_export = False
+        spine_roots: list[Path] = []
         if mode == ExtractMode.LIVE2D:
             result = cli.export_live2d(source, target)
+            live2d_export = _has_live2d_model(result.exported_files)
+            # AssetStudio's Live2D mode intentionally rejects Spine Unity
+            # packages.  When no Cubism model was exported, ask the same CLI
+            # for TextAsset + texture data and validate it as Spine before
+            # treating the extraction as successful.  This keeps ordinary
+            # non-Live2D sources as explicit failures.
+            if include_spine:
+                export_spine = getattr(cli, "export_spine", None)
+                if callable(export_spine):
+                    try:
+                        # AssetStudio's output root can contain older models.
+                        # A fresh workspace scopes recognition and conversion
+                        # to this invocation, including repeated bundle imports.
+                        spine_parent = target / "SpineOutput"
+                        spine_parent.mkdir(parents=True, exist_ok=True)
+                        spine_target = Path(tempfile.mkdtemp(
+                            prefix=f"{source.stem}_", dir=spine_parent
+                        ))
+                        spine_result = export_spine(source, spine_target)
+                        spine_files = _materialize_spine_text_assets(
+                            spine_result.output_dir,
+                            spine_result.exported_files,
+                        )
+                        if _has_spine_asset(
+                            spine_result.output_dir,
+                            list(spine_result.exported_files) + spine_files,
+                        ):
+                            if live2d_export:
+                                # Keep both exports below the current item
+                                # root so formal batch conversion can discover
+                                # the Spine child without discarding Cubism.
+                                result.exported_files.extend(
+                                    list(spine_result.exported_files) + spine_files
+                                )
+                            else:
+                                result = spine_result
+                                result.exported_files.extend(spine_files)
+                            spine_export = True
+                            spine_roots.append(Path(spine_result.output_dir).resolve())
+                    except AssetStudioCLIError as exc:
+                        if log:
+                            log("WARNING", f"AssetStudio Spine export was not available: {exc}")
         elif mode == ExtractMode.TEXTURES:
             result = cli.export_textures(source, target)
         else:
@@ -51,7 +100,8 @@ def extract_unity(
 
         validation_warnings: list[str] = []
         if mode == ExtractMode.LIVE2D:
-            if not _has_live2d_model(result.exported_files):
+            live2d_export = live2d_export or _has_live2d_model(result.exported_files)
+            if not live2d_export and not spine_export:
                 return ExtractItemResult(
                     source=source,
                     source_type=ExtractSourceType.UNITY if source.is_file() else ExtractSourceType.FOLDER,
@@ -63,15 +113,22 @@ def extract_unity(
                         "package, so export was rejected."
                     ),
                 )
-            validation_warnings = validate_live2d_export(
-                result.output_dir,
-                result.exported_files,
-            )
-            for warning in validation_warnings:
-                if log:
-                    log("WARNING", warning)
+            if live2d_export:
+                validation_warnings = validate_live2d_export(
+                    target,
+                    result.exported_files,
+                )
+                for warning in validation_warnings:
+                    if log:
+                        log("WARNING", warning)
 
-        message = f"AssetStudio exported {result.exported_count} file(s) from {source.name}"
+        export_kind = (
+            "Live2D + Spine" if live2d_export and spine_export
+            else "Spine" if spine_export
+            else "Live2D" if mode == ExtractMode.LIVE2D
+            else "texture"
+        )
+        message = f"AssetStudio exported {result.exported_count} {export_kind} file(s) from {source.name}"
         if input_warning:
             message += " " + input_warning
         if validation_warnings:
@@ -84,6 +141,7 @@ def extract_unity(
             output_dir=result.output_dir,
             exported_count=result.exported_count,
             message=message,
+            extracted_dirs=spine_roots,
         )
     except AssetStudioCLIError as exc:
         return ExtractItemResult(
@@ -118,6 +176,124 @@ def _has_live2d_model(paths: list[Path]) -> bool:
             return True
         if suffix in {".moc", ".moc3"}:
             return True
+    return False
+
+
+def _materialize_spine_text_assets(
+    output_dir: str | Path,
+    exported_files: list[Path] | None,
+) -> list[Path]:
+    """Give JSON/atlas TextAssets resolver-friendly suffixes.
+
+    AssetStudio commonly writes a Unity ``TextAsset`` as ``.txt`` (or
+    ``.bytes``), even when its contents are a Spine JSON skeleton or atlas.
+    Keep the exported file untouched and create a sibling with the semantic
+    suffix expected by the Spine loader.  Only content that passes a strict
+    JSON/atlas shape check is copied.
+    """
+
+    root = Path(output_dir).resolve()
+    candidates = list(exported_files or [])
+    materialized: list[Path] = []
+    for raw_path in candidates:
+        path = Path(raw_path).resolve()
+        if not path.is_file() or path.suffix.lower() not in {".txt", ".bytes"}:
+            continue
+        try:
+            if path.stat().st_size > 64 * 1024 * 1024:
+                continue
+            raw = path.read_bytes()
+        except OSError:
+            continue
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = None
+        stripped = text.lstrip() if text is not None else ""
+        target: Path | None = None
+        if text is not None and stripped.startswith("{"):
+            try:
+                value = json.loads(stripped)
+            except (TypeError, ValueError):
+                value = None
+            if _looks_like_spine_skeleton_json(value):
+                target = path.with_suffix(".json")
+        elif text is not None and _looks_like_spine_atlas_text(text):
+            target = path.with_suffix(".atlas")
+        else:
+            # Spine binary TextAssets are often exported as ``.bytes`` and
+            # cannot be decoded as UTF-8.  The loader's version marker is the
+            # conservative probe available at this boundary; only a known
+            # converter family is materialized as ``.skel``.
+            version = read_spine_version(path)
+            family = version.rsplit(".", 1)[0] if version and version.count(".") >= 2 else ""
+            if family in {"3.5", "3.6", "3.7", "3.8", "4.0", "4.1", "4.2"}:
+                target = path.with_suffix(".skel")
+        if target is None or target == path:
+            continue
+        # Unity commonly preserves the semantic suffix before .txt/.bytes.
+        if path.with_suffix("").suffix.casefold() == target.suffix.casefold():
+            target = path.with_suffix("")
+        try:
+            target.relative_to(root)
+        except ValueError:
+            continue
+        if target.exists():
+            continue
+        try:
+            if target.suffix.casefold() == ".skel":
+                target.write_bytes(raw)
+            else:
+                target.write_text(text or "", encoding="utf-8")
+        except OSError:
+            continue
+        materialized.append(target)
+    return materialized
+
+
+def _looks_like_spine_skeleton_json(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    skeleton = value.get("skeleton")
+    return (
+        isinstance(skeleton, dict)
+        and isinstance(skeleton.get("spine"), str)
+        and isinstance(value.get("bones"), list)
+        and ("slots" in value or "skins" in value or "animations" in value)
+    )
+
+
+def _looks_like_spine_atlas_text(text: str) -> bool:
+    lines = [line.strip().casefold() for line in str(text or "").splitlines()]
+    if not lines:
+        return False
+    # Atlas pages have a size declaration and at least one region/property;
+    # requiring both avoids treating arbitrary Unity text as an atlas.
+    return any(line.startswith("size:") for line in lines) and any(
+        line.startswith(prefix)
+        for line in lines
+        for prefix in ("format:", "filter:", "repeat:", "xy:", "bounds:")
+    )
+
+
+def _has_spine_asset(output_dir: str | Path, exported_files: list[Path] | None) -> bool:
+    """Return true only for exported skeleton data, never old output files."""
+
+    candidates = [Path(path).resolve() for path in (exported_files or [])]
+    for path in candidates:
+        if not path.is_file():
+            continue
+        name = path.name.casefold()
+        if name.endswith(".skel") or name.endswith(".skel.bytes"):
+            if read_spine_version(path):
+                return True
+        if path.suffix.casefold() == ".json":
+            try:
+                value = json.loads(path.read_text(encoding="utf-8-sig"))
+            except (OSError, UnicodeError, ValueError):
+                continue
+            if _looks_like_spine_skeleton_json(value):
+                return True
     return False
 
 
