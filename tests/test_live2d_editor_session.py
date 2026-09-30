@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from PIL import Image
 
-from app.core.animation_editing import AnimationEditingError, INVENTORY_FORMAT
+from app.core.animation_editing import AnimationEditingError, INVENTORY_FORMAT, _motion_meta, create_animation_project
 from app.core.live2d_editor_session import Live2DEditorSession, decode_curve, encode_curve
 
 
@@ -210,6 +210,174 @@ class Live2DEditorSessionTests(unittest.TestCase):
         with patch("app.core.live2d_editor_session.os.name", "nt"), patch("app.core.live2d_editor_session.time.sleep"), patch.object(Path, "replace", intermittent):
             self.assertTrue(self.session.replace_texture(0, replacement))
         self.assertEqual(len(attempts), 3)
+
+    def _shared_motion_model(self):
+        motion = {"Version": 3, "Meta": {"Duration": 2, "Fps": 30, "Loop": False},
+                  "Curves": [{"Target": "Parameter", "Id": "ParamAngleY", "Segments": [0, 0, 0, 2, 1]}]}
+        _motion_meta(motion)
+        motion_path = self.model.parent / "motion.json"
+        motion_path.write_text(json.dumps(motion, separators=(",", ":")), encoding="utf-8")
+        document = json.loads(self.model.read_text())
+        document["FileReferences"]["Motions"] = {"Idle": [
+            {"Name": "Menu", "Command": "start_mtn Idle#1"},
+            {"File": "motion.json", "Name": "First", "PostCommand": "parameters lock drag 0"},
+            {"Name": "Switch", "Command": "change_model model0.json"},
+            {"File": "motion.json", "Name": "Shared", "FadeInTime": .3},
+            {"File": "motion.json", "Name": "Last"},
+        ]}
+        self.model.write_text(json.dumps(document), encoding="utf-8")
+        return document, motion_path
+
+    def test_open_validates_shared_motion_once_without_rewriting_or_sharing_edits(self):
+        _, path = self._shared_motion_model()
+        raw = path.read_bytes()
+        from app.core import animation_editing
+        import shutil
+        with patch("app.core.animation_editing._motion_meta", wraps=animation_editing._motion_meta) as validate, patch("app.core.live2d_editor_session.shutil.copy2", wraps=shutil.copy2) as copy_asset:
+            other = Live2DEditorSession(self.model)
+            self.addCleanup(other.close)
+        self.assertEqual(validate.call_count, 1)
+        self.assertEqual((other.root / "motion.json").read_bytes(), raw)
+        copied = [str(call.args[0]) for call in copy_asset.call_args_list]
+        self.assertEqual(copied.count(str(path.resolve())), 1)
+        self.assertEqual(copied.count(str((self.model.parent / "model.moc3").resolve())), 1)
+        other.set_keyframes("Idle[0]", "ParamAngleY", [{"time": 0, "value": -20}])
+        self.assertEqual(other.keyframes("Idle[1]", "ParamAngleY")[0]["value"], 0)
+        self.assertEqual(path.read_bytes(), raw)
+        # The public factory still validates unknown callers' file data, and
+        # its two bindings must also own independent editable curves.
+        native = create_animation_project(other.model_path)
+        native.set_keyframes("Idle[0]", "ParamAngleY", "value", [{"time": 0, "value": 10}])
+        self.assertEqual(native.get_keyframes("Idle[1]", "ParamAngleY", "value")["keyframes"][0]["value"], 0)
+        invalid = json.loads(raw)
+        invalid["Curves"][0]["Segments"] = [0, 0, 4, 2, 1]
+        (other.root / "motion.json").write_text(json.dumps(invalid))
+        with self.assertRaises(AnimationEditingError):
+            create_animation_project(other.model_path)
+
+    def test_dirty_cache_tracks_nested_edits_attribute_replacement_and_repeated_polling(self):
+        self.session.create_motion("Move", 2)
+        self.session.set_keyframes("Move", "ParamAngleY", [{"time": 0, "value": 0}, {"time": 2, "value": 1}])
+        self.session.save_copy(self.root / "cache_baseline")
+        with patch("app.core.live2d_editor_session.json.dumps", side_effect=AssertionError("unchanged dirty poll recomputed its digest")):
+            for _ in range(20):
+                self.assertFalse(self.session.dirty)
+        segments = self.session.project.motions["Move"]["Curves"][0]["Segments"]
+        baseline_segments = list(segments)
+        segments[1] = 10
+        self.assertTrue(self.session.dirty)
+        segments[1] = baseline_segments[1]
+        self.assertFalse(self.session.dirty)
+        segments[2:] = [2, 2, 1]
+        self.assertTrue(self.session.dirty)
+        segments[2:] = baseline_segments[2:]
+        self.assertFalse(self.session.dirty)
+        metadata = self.session.project.motions["Move"]["Meta"]
+        metadata.update(Loop=False)
+        self.assertTrue(self.session.dirty)
+        metadata.update(Loop=True)
+        self.assertFalse(self.session.dirty)
+        curves = self.session.project.motions["Move"]["Curves"]
+        curves.append({"Target": "PartOpacity", "Id": "Face", "Segments": [0, 1]})
+        self.assertTrue(self.session.dirty)
+        curves.pop()
+        self.assertFalse(self.session.dirty)
+        self.session.parameter_overrides = {"ParamAngleY": 10}
+        self.assertTrue(self.session.dirty)
+        self.session.parameter_overrides = {}
+        self.assertFalse(self.session.dirty)
+        self.session.project.document = copy.deepcopy(self.session.project.document)
+        self.assertFalse(self.session.dirty)
+        self.session.project.document["Groups"] = [{"Target": "Parameter", "Name": "Test", "Ids": []}]
+        self.assertTrue(self.session.dirty)
+
+    def test_each_edit_kind_undo_redo_and_save_reset_dirty(self):
+        replacement = self.root / "dirty_texture.png"
+        Image.new("RGBA", (32, 32), "red").save(replacement)
+        actions = [lambda: self.session.create_motion("DirtyMotion", 2),
+                   lambda: self.session.set_keyframes("DirtyMotion", "ParamAngleY", [{"time": 0, "value": 3}]),
+                   lambda: self.session.set_parameter("ParamAngleY", 5),
+                   lambda: self.session.set_part_opacity("PartFace", .5),
+                   lambda: self.session.replace_texture(0, replacement)]
+        for index, action in enumerate(actions):
+            with self.subTest(index=index):
+                action()
+                self.assertTrue(self.session.dirty)
+                self.assertTrue(self.session.undo())
+                self.assertFalse(self.session.dirty)
+                self.assertTrue(self.session.redo())
+                self.assertTrue(self.session.dirty)
+                self.session.save_copy(self.root / f"dirty_saved_{index}")
+                self.assertFalse(self.session.dirty)
+        self.session.ensure_psd_project()
+        self.assertTrue(self.session.dirty)
+        self.session.save_copy(self.root / "dirty_psd_saved")
+        self.assertFalse(self.session.dirty)
+        self.session.ensure_mod_project()
+        self.assertTrue(self.session.dirty)
+        self.session.save_copy(self.root / "dirty_mod_saved")
+        self.assertFalse(self.session.dirty)
+        self.session.mark_project_changed()
+        self.assertTrue(self.session.dirty)
+
+    def test_delete_shared_motion_preserves_commands_reindexes_bindings_and_reopens(self):
+        document, path = self._shared_motion_model()
+        before = self.hashes()
+        other = Live2DEditorSession(self.model)
+        self.addCleanup(other.close)
+        self.assertEqual(len(other.motion_catalog()), 5)
+        command = other.motion_catalog()[0]
+        self.assertFalse(command["editable"])
+        self.assertEqual(command["kind"], "command")
+        with self.assertRaises(AnimationEditingError):
+            other.delete_motion(command["name"])
+        self.assertFalse(other.can_undo)
+        self.assertTrue(other.delete_motion("Idle[0]"))
+        self.assertEqual(other.original_bindings, {("Idle", 0): 3, ("Idle", 1): 4})
+        self.assertEqual(other.project.bindings["Idle[1]"], ("Idle", 0))
+        self.assertTrue(other.dirty)
+        other.undo()
+        self.assertEqual(other.original_bindings, {("Idle", 0): 1, ("Idle", 1): 3, ("Idle", 2): 4})
+        self.assertFalse(other.dirty)
+        other.redo()
+        other.set_keyframes("Idle[1]", "ParamAngleY", [{"time": 0, "value": -20}])
+        other.delete_motion("Idle[2]")
+        saved = other.save_copy(self.root / "deleted-copy")
+        output = json.loads(Path(saved["model_path"]).read_text())
+        entries = output["FileReferences"]["Motions"]["Idle"]
+        self.assertEqual(entries[:2], [document["FileReferences"]["Motions"]["Idle"][0], document["FileReferences"]["Motions"]["Idle"][2]])
+        self.assertEqual(entries[2]["Name"], "Shared")
+        self.assertEqual(entries[2]["FadeInTime"], .3)
+        self.assertEqual(len(entries), 3)
+        self.assertTrue(path.is_file())
+        self.assertTrue((Path(saved["model_path"]).parent / "motion.json").is_file())
+        reopened = Live2DEditorSession(saved["model_path"])
+        self.addCleanup(reopened.close)
+        self.assertEqual(list(reopened.project.motions), ["Idle[0]"])
+        self.assertEqual(reopened.keyframes("Idle[0]", "ParamAngleY")[0]["value"], -20)
+        self.assertEqual(len(reopened.motion_catalog()), 3)
+        self.assertEqual(before, self.hashes())
+        self.assertFalse(other.dirty)
+        self.assertFalse(reopened.dirty)
+
+    def test_delete_new_motion_roundtrip_and_unknown_name_do_not_consume_history(self):
+        self.session.create_motion("Temporary", 2)
+        self.session.clone_motion("Temporary", "Kept")
+        self.session.delete_motion("Temporary")
+        self.session.undo()
+        self.assertIn("Temporary", self.session.project.motions)
+        self.session.redo()
+        self.assertNotIn("Temporary", self.session.project.motions)
+        previous = self.session._snapshot()
+        undo_count = len(self.session._undo)
+        with self.assertRaises(AnimationEditingError):
+            self.session.delete_motion("unknown")
+        self.assertEqual(self.session._snapshot(), previous)
+        self.assertEqual(len(self.session._undo), undo_count)
+        saved = self.session.save_copy(self.root / "new-deleted-copy")
+        reopened = Live2DEditorSession(saved["model_path"])
+        self.addCleanup(reopened.close)
+        self.assertEqual(list(reopened.project.motions), ["Kept[0]"])
 
 
 if __name__ == "__main__":

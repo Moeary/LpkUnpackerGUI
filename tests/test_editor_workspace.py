@@ -7,7 +7,8 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QCoreApplication, QEvent, QPoint
+from PySide6.QtCore import QCoreApplication, QEvent, QPoint, Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QVBoxLayout, QWidget
 from app.core.settings_manager import SettingsManager
 from app.gui.editor_timeline import AnimationTimelineEditor
@@ -150,6 +151,27 @@ class EditorWorkspaceTests(unittest.TestCase):
         self.assertLessEqual(right, tabs.tab_scroll.viewport().width() + 8)
         tabs.setTabText(3, "MOD 管理")
         self.assertEqual(tabs.tabText(3), "MOD 管理")
+
+    def test_mouse_clicks_switch_every_tab_and_return_from_artmesh(self):
+        tabs = EditorTabs()
+        self.widgets.append(tabs)
+        for label in ("Animation", "Display", "ArtMesh", "PSD", "MOD"):
+            tabs.addTab(QWidget(), label)
+        tabs.resize(260, 350)
+        tabs.show()
+        self.app.processEvents()
+        changes = []
+        tabs.currentChanged.connect(changes.append)
+        for index in (2, 0, 1, 2, 4, 3, 0):
+            item = tabs.pivot.widget(tabs._keys[index])
+            tabs.tab_scroll.ensureWidgetVisible(item, 8, 0)
+            self.app.processEvents()
+            QTest.mouseClick(item, Qt.LeftButton)
+            self.app.processEvents()
+            self.assertEqual(tabs.currentIndex(), index)
+            self.assertIs(tabs.currentWidget(), tabs.widget(index))
+            self.assertEqual(tabs.pivot.currentRouteKey(), tabs._keys[index])
+        self.assertEqual(changes, [2, 0, 1, 2, 4, 3, 0])
 
 
 if __name__ == "__main__":

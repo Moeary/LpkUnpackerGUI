@@ -13,8 +13,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("LPK_DISABLE_NATIVE_PREVIEW", "1")
 
 try:
-    from PySide6.QtCore import QCoreApplication, QEvent
-    from PySide6.QtWidgets import QApplication, QMessageBox
+    from PySide6.QtCore import QCoreApplication, QEvent, QTimer, Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
     from app.gui.SpineEditorPage import SpineEditorPage
     from app.core.editor_session import SpineEditorSession
 except (ImportError, OSError):
@@ -144,10 +145,14 @@ class SpineEditorPageTests(unittest.TestCase):
             loaded_names.update(self.page.session.animation_names)
 
         plan = SimpleNamespace(dynamic=True, asset=SimpleNamespace(atlas_paths=("model.atlas",)))
+        from app.gui.editor_actions import ActionNameDialog
+        dialog = ActionNameDialog("New", self.page)
+        dialog.name_edit.setText("Reach")
         with patch.object(self.page.preview, "set_animation", side_effect=native_set_animation), \
              patch.object(self.page.preview, "open_plan", side_effect=native_open), \
              patch.object(self.page.preview, "set_time") as set_time, \
-             patch("app.gui.SpineEditorPage.QInputDialog.getText", return_value=("Reach", True)):
+             patch("app.gui.SpineEditorPage.ActionNameDialog", return_value=dialog), \
+             patch.object(dialog, "exec", return_value=QDialog.Accepted):
             self.page.new_button.click()
             self.assertEqual(self.page.animation_name, "Reach")
             self.assertTrue(self.page._pending_preview)
@@ -175,6 +180,52 @@ class SpineEditorPageTests(unittest.TestCase):
                 self.page._load_preview(plan)
             self.assertEqual(errors, ["Spine animation is unavailable: Reach"])
             self.assertIn("Reach", self.page.status_label.text())
+
+    def test_action_mouse_create_copy_confirm_delete_and_undo_persist(self):
+        self.open()
+        original = self.model.read_bytes()
+        failures = []
+        def run_dialog(button, name=None, accepted=True):
+            def answer():
+                try:
+                    dialog = self.page._action_dialog
+                    self.assertIs(self.app.activeModalWidget(), dialog)
+                    self.assertTrue(dialog.isWindow())
+                    self.page._new_animation()
+                    self.assertIs(self.page._action_dialog, dialog)
+                    if name is not None:
+                        dialog.name_edit.setText(name)
+                    QTest.mouseClick(dialog.yesButton if accepted else dialog.cancelButton, Qt.LeftButton)
+                except BaseException as exc:
+                    failures.append(exc)
+                    if self.page._action_dialog:
+                        self.page._action_dialog.reject()
+            QTimer.singleShot(0, answer)
+            QTest.mouseClick(button, Qt.LeftButton)
+            self.app.processEvents()
+            self.assertFalse(failures, failures)
+        run_dialog(self.page.new_button, accepted=False)
+        self.assertFalse(self.page.session.dirty)
+        run_dialog(self.page.new_button, "Reach")
+        self.assertEqual(self.page.animation_name, "Reach")
+        run_dialog(self.page.clone_button, "ReachCopy")
+        self.assertEqual(self.page.animation_name, "ReachCopy")
+        run_dialog(self.page.delete_animation_button, accepted=False)
+        self.assertIn("ReachCopy", self.page.session.animation_names)
+        run_dialog(self.page.delete_animation_button)
+        self.assertNotIn("ReachCopy", self.page.session.animation_names)
+        self.page.undo_button.click()
+        self.assertIn("ReachCopy", self.page.session.animation_names)
+        self.page.redo_button.click()
+        self.assertNotIn("ReachCopy", self.page.session.animation_names)
+        output = self.root / "saved-actions"
+        with patch("app.gui.SpineEditorPage.QFileDialog.getSaveFileName", return_value=(str(output), "")):
+            self.assertTrue(self.page.export_copy())
+        self.page.open_source(str(output / "model.json"))
+        self.wait(lambda: self.page.session.original_source == output / "model.json" and not self.page.loading)
+        self.assertIn("Reach", self.page.session.animation_names)
+        self.assertNotIn("ReachCopy", self.page.session.animation_names)
+        self.assertEqual(self.model.read_bytes(), original)
 
     def test_discard_save_cancellation_keeps_document_and_source(self):
         self.open()

@@ -25,6 +25,7 @@ from qfluentwidgets import (
 
 from app.i18n import tr
 from app.gui.editor_workspace import EditorComboBox, EditorViewportLayout
+from app.gui.editor_actions import action_text
 
 
 TIMELINE_TEXT = {
@@ -622,7 +623,8 @@ class AnimationTimelineEditor(QWidget):
 
     def retranslate_ui(self):
         self.play_button.setToolTip(_text("editor.timeline.pause" if self.is_playing else "editor.timeline.play"))
-        self.add_button.setToolTip(_text("editor.timeline.add"))
+        self.add_button.setToolTip(action_text("editor.actions.keyframe"))
+        self.add_button.setAccessibleName(_text("editor.timeline.add"))
         self.delete_button.setToolTip(_text("editor.timeline.delete"))
         self.loop_check.setToolTip(_text("editor.timeline.loop"))
         self.loop_check.setAccessibleName(_text("editor.timeline.loop"))

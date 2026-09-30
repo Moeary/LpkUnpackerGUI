@@ -13,7 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PIL import Image
 from PySide6.QtCore import QCoreApplication, QEvent
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
-from qfluentwidgets import ComboBox, DoubleSpinBox, Pivot, TableWidget
+from qfluentwidgets import EditableComboBox, DoubleSpinBox, Pivot, TableWidget
 
 from app.core.live2d_editor_mod_preview import mapped_mod_skin_preview
 from app.core.live2dviewer_mod_project import (
@@ -95,7 +95,7 @@ class Live2DEditorModTests(unittest.TestCase):
         self.assertIsInstance(self.page.tabs.pivot, Pivot)
         self.assertIsInstance(self.page.parameter_table, TableWidget)
         self.assertIsInstance(self.page.parameter_spin, DoubleSpinBox)
-        self.assertIsInstance(self.page.motion_combo, ComboBox)
+        self.assertIsInstance(self.page.motion_combo, EditableComboBox)
         self.assertIsInstance(self.mod.workflow_tabs.pivot, Pivot)
         self.assertEqual(self.mod.workflow_tabs.count(), 3)
         self.assertIs(self.mod.project_combo.parent(), self.mod)

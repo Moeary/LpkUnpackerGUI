@@ -22,7 +22,7 @@ from PIL import Image, ImageDraw
 
 from app.core.animation_editing import (
     AnimationEditingError, _motion_meta, _number, _read_json, _relative, _rename_directory,
-    create_animation_project,
+    _create_live2d_project, _read_validated_cubism_motion,
 )
 from app.core.model.motions import _evaluate_segments
 from app.core.psd_reconstructor import resolve_live2d_source
@@ -31,6 +31,137 @@ from app.core.live2d_editor_project import Live2DEditorProjects
 
 
 EDITOR_MANIFEST = "lpk_live2d_editor.json"
+
+
+def _track_mutable(value, changed):
+    """Observe nested edits without scanning every motion on each UI poll."""
+    if isinstance(value, (_DirtyDict, _DirtyList)) and value._changed is changed:
+        return value
+    if isinstance(value, dict):
+        return _DirtyDict(value, changed)
+    if isinstance(value, list):
+        return _DirtyList(value, changed)
+    if isinstance(value, tuple):
+        return tuple(_track_mutable(item, changed) for item in value)
+    return value
+
+
+class _DirtyDict(dict):
+    def __init__(self, value, changed):
+        self._changed = changed
+        dict.__init__(self, ((key, _track_mutable(item, changed)) for key, item in value.items()))
+
+    def __deepcopy__(self, memo):
+        result = {}
+        memo[id(self)] = result
+        result.update((copy.deepcopy(key, memo), copy.deepcopy(value, memo)) for key, value in self.items())
+        return result
+
+    def __setitem__(self, key, value):
+        dict.__setitem__(self, key, _track_mutable(value, self._changed))
+        self._changed()
+
+    def __delitem__(self, key):
+        dict.__delitem__(self, key)
+        self._changed()
+
+    def clear(self):
+        if self:
+            dict.clear(self)
+            self._changed()
+
+    def pop(self, key, *default):
+        existed = key in self
+        result = dict.pop(self, key, *default)
+        if existed:
+            self._changed()
+        return result
+
+    def popitem(self):
+        result = dict.popitem(self)
+        self._changed()
+        return result
+
+    def setdefault(self, key, default=None):
+        if key not in self:
+            self[key] = default
+        return self[key]
+
+    def update(self, *args, **kwargs):
+        incoming = dict(*args, **kwargs)
+        if incoming:
+            dict.update(self, ((key, _track_mutable(value, self._changed)) for key, value in incoming.items()))
+            self._changed()
+
+    def __ior__(self, value):
+        self.update(value)
+        return self
+
+
+class _DirtyList(list):
+    def __init__(self, value, changed):
+        self._changed = changed
+        list.__init__(self, (_track_mutable(item, changed) for item in value))
+
+    def __deepcopy__(self, memo):
+        result = []
+        memo[id(self)] = result
+        result.extend(copy.deepcopy(item, memo) for item in self)
+        return result
+
+    def __setitem__(self, index, value):
+        value = [_track_mutable(item, self._changed) for item in value] if isinstance(index, slice) else _track_mutable(value, self._changed)
+        list.__setitem__(self, index, value)
+        self._changed()
+
+    def __delitem__(self, index):
+        list.__delitem__(self, index)
+        self._changed()
+
+    def append(self, value):
+        list.append(self, _track_mutable(value, self._changed))
+        self._changed()
+
+    def extend(self, values):
+        incoming = [_track_mutable(value, self._changed) for value in values]
+        if incoming:
+            list.extend(self, incoming)
+            self._changed()
+
+    def insert(self, index, value):
+        list.insert(self, index, _track_mutable(value, self._changed))
+        self._changed()
+
+    def pop(self, index=-1):
+        result = list.pop(self, index)
+        self._changed()
+        return result
+
+    def remove(self, value):
+        list.remove(self, value)
+        self._changed()
+
+    def clear(self):
+        if self:
+            list.clear(self)
+            self._changed()
+
+    def reverse(self):
+        list.reverse(self)
+        self._changed()
+
+    def sort(self, *args, **kwargs):
+        list.sort(self, *args, **kwargs)
+        self._changed()
+
+    def __iadd__(self, values):
+        self.extend(values)
+        return self
+
+    def __imul__(self, count):
+        list.__imul__(self, count)
+        self._changed()
+        return self
 
 
 def decode_curve(segments: list[Any]) -> list[dict[str, Any]]:
@@ -121,8 +252,12 @@ class Live2DEditorSession:
         self.root.mkdir()
         self.model_path = self.root / "model.json"
         self._project_revision = 0
+        self._signature_revision = 0
+        self._signature_cache = None
+        self._signature_changed = self._invalidate_signature
         self._projects = Live2DEditorProjects(self)
         self.original_bindings: dict[tuple[str, int], int] = {}
+        self._deleted_original_bindings: set[tuple[str, int]] = set()
         self._copied: set[str] = set()
         self.warnings: list[str] = []
         try:
@@ -134,6 +269,7 @@ class Live2DEditorSession:
             if not isinstance(groups, dict):
                 raise AnimationEditingError("Live2D motion groups must be an object.")
             playable = {}
+            validated_motions = {}
             for group, entries in groups.items():
                 valid = []
                 for original_index, item in enumerate(entries if isinstance(entries, list) else []):
@@ -144,9 +280,12 @@ class Live2DEditorSession:
                         self.warnings.append(f"Unplayable motion preserved in export: {group}[{original_index}]")
                         continue
                     try:
-                        motion = _read_json(self.root / relative)
-                        _motion_meta(motion)
-                        self._write_json(self.root / relative, motion)
+                        validated = validated_motions.get(relative)
+                        if validated is None:
+                            validated = _read_validated_cubism_motion(self.root / relative)
+                            validated_motions[relative] = validated
+                            if validated.metadata_changed:
+                                self._write_json(self.root / relative, validated.data)
                     except AnimationEditingError as exc:
                         self.warnings.append(f"Uneditable motion preserved in export: {group}[{original_index}]: {exc}")
                         continue
@@ -160,7 +299,7 @@ class Live2DEditorSession:
             inventory = self.source_root / "live2d_parameter_inventory.json"
             if inventory.is_file():
                 shutil.copy2(inventory, self.root / inventory.name)
-            self.project = create_animation_project(self.model_path)
+            self.project = _create_live2d_project(self.model_path, document, validated_motions=validated_motions)
             self.project.references.update({rel: self.root / rel for rel in self._copied})
             self.warnings.extend(self.project.warnings)
             self.texture_paths = [self.root / _relative(rel) for rel in document["FileReferences"].get("Textures", [])]
@@ -215,6 +354,8 @@ class Live2DEditorSession:
                 raise AnimationEditingError(f"Missing or escaping Live2D asset: {value}")
             return False
         target = self.root / relative
+        if relative in self._copied:
+            return True
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(path, target)
         self._copied.add(relative)
@@ -224,12 +365,17 @@ class Live2DEditorSession:
         for relative in iter_live2d_asset_references(value, key):
             self._copy_asset(relative)
 
-    def _snapshot(self) -> dict:
+    def _snapshot_values(self) -> dict:
         project = self.project
-        return copy.deepcopy({"motions": project.motions, "document": project.document,
-                              "bindings": project.bindings, "settings": project.settings,
-                              "modified": project.modified, "parameters": self.parameter_overrides,
-                              "parts": self.part_overrides, "textures": self._texture_data})
+        return {"motions": project.motions, "document": project.document,
+                "bindings": project.bindings, "settings": project.settings,
+                "modified": project.modified, "parameters": self.parameter_overrides,
+                "parts": self.part_overrides, "textures": self._texture_data,
+                "original_bindings": self.original_bindings,
+                "deleted_original_bindings": self._deleted_original_bindings}
+
+    def _snapshot(self) -> dict:
+        return copy.deepcopy(self._snapshot_values())
 
     def _restore(self, state: dict) -> None:
         state = copy.deepcopy(state)
@@ -249,13 +395,46 @@ class Live2DEditorSession:
         self.parameter_overrides = state["parameters"]
         self.part_overrides = state["parts"]
         self._texture_data = state["textures"]
+        self.original_bindings = state["original_bindings"]
+        self._deleted_original_bindings = state["deleted_original_bindings"]
+        self._invalidate_signature()
+
+    def _invalidate_signature(self):
+        self._signature_revision += 1
+        self._signature_cache = None
+
+    def _observe_signature_values(self):
+        # Also recognize direct attribute replacement by advanced editor code.
+        # Dict/list wrappers recursively observe direct curve/pose changes;
+        # small set fields are compared by value below.
+        for name in ("motions", "document", "bindings", "settings"):
+            value = getattr(self.project, name)
+            tracked = _track_mutable(value, self._signature_changed)
+            if tracked is not value:
+                setattr(self.project, name, tracked)
+                self._invalidate_signature()
+        for name in ("parameter_overrides", "part_overrides", "_texture_data", "original_bindings"):
+            value = getattr(self, name)
+            tracked = _track_mutable(value, self._signature_changed)
+            if tracked is not value:
+                setattr(self, name, tracked)
+                self._invalidate_signature()
 
     def _signature(self) -> str:
-        snapshot = self._snapshot()
+        self._observe_signature_values()
+        token = (self._signature_revision, self._project_revision,
+                 frozenset(self.project.modified), frozenset(self._deleted_original_bindings))
+        if self._signature_cache is not None and self._signature_cache[0] == token:
+            return self._signature_cache[1]
+        snapshot = self._snapshot_values()
         snapshot["modified"] = sorted(snapshot["modified"])
         snapshot["textures"] = [hashlib.sha256(data).hexdigest() for data in snapshot["textures"]]
+        snapshot["original_bindings"] = sorted((group, index, original) for (group, index), original in self.original_bindings.items())
+        snapshot["deleted_original_bindings"] = sorted(self._deleted_original_bindings)
         snapshot["project_revision"] = self._project_revision
-        return hashlib.sha256(json.dumps(snapshot, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        signature = hashlib.sha256(json.dumps(snapshot, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        self._signature_cache = token, signature
+        return signature
 
     def _record(self, action) -> Any:
         previous = self._snapshot()
@@ -264,7 +443,8 @@ class Live2DEditorSession:
         except Exception:
             self._restore(previous)
             raise
-        if previous != self._snapshot():
+        if previous != self._snapshot_values():
+            self._invalidate_signature()
             self._undo.append(previous)
             del self._undo[:-32]
             self._redo.clear()
@@ -288,6 +468,7 @@ class Live2DEditorSession:
 
     def mark_project_changed(self):
         self._project_revision += 1
+        self._invalidate_signature()
 
     mark_workspace_dirty = mark_project_changed
 
@@ -355,6 +536,59 @@ class Live2DEditorSession:
 
     def clone_motion(self, source: str, name: str) -> dict:
         return self._record(lambda: self.project.clone_animation(source, name))
+
+    def motion_catalog(self) -> list[dict[str, Any]]:
+        """List editable motions alongside preserved, read-only Viewer entries."""
+        by_original = {(group, original): name
+                       for name, (group, index) in self.project.bindings.items()
+                       if (original := self.original_bindings.get((group, index))) is not None}
+        result = []
+        registered = set()
+        for group, entries in self.original_document["FileReferences"].get("Motions", {}).items():
+            for index, entry in enumerate(entries if isinstance(entries, list) else []):
+                if (group, index) in self._deleted_original_bindings:
+                    continue
+                name = by_original.get((group, index))
+                editable = name is not None
+                display_name = str(entry.get("Name", "")) if isinstance(entry, dict) else ""
+                key = name if editable else f"command:{group}[{index}]"
+                result.append({"name": key, "label": name or f"{group}[{index}]" + (f" · {display_name}" if display_name else ""),
+                               "group": group, "index": self.project.bindings[name][1] if editable else index,
+                               "original_index": index, "editable": editable,
+                               "kind": "motion" if editable else "uneditable_motion" if isinstance(entry, dict) and entry.get("File") else "command",
+                               "entry": copy.deepcopy(entry)})
+                if editable:
+                    registered.add(name)
+        for name, (group, index) in self.project.bindings.items():
+            if name not in registered:
+                result.append({"name": name, "label": name, "group": group, "index": index,
+                               "original_index": None, "editable": True, "kind": "motion", "entry": {}})
+        return result
+
+    def delete_motion(self, name: str) -> bool:
+        """Delete one playable entry, preserving commands and shared assets."""
+        self.project._animation(name)
+        group, index = self.project.bindings[name]
+
+        def apply():
+            original_index = self.original_bindings.pop((group, index), None)
+            if original_index is not None:
+                self._deleted_original_bindings.add((group, original_index))
+            del self.project.motions[name]
+            del self.project.bindings[name]
+            self.project.settings.pop(name, None)
+            self.project.modified.discard(name)
+            entries = self.project.document["FileReferences"].get("Motions", {}).get(group, [])
+            if index < len(entries):
+                entries.pop(index)
+            for other, (other_group, other_index) in list(self.project.bindings.items()):
+                if other_group == group and other_index > index:
+                    self.project.bindings[other] = group, other_index - 1
+            self.original_bindings = {(entry_group, entry_index - 1 if entry_group == group and entry_index > index else entry_index): original
+                                      for (entry_group, entry_index), original in self.original_bindings.items()}
+            return True
+
+        return self._record(apply)
 
     def keyframes(self, motion: str, parameter: str) -> list[dict]:
         animation = self.project._animation(motion)
@@ -583,6 +817,10 @@ class Live2DEditorSession:
                     originals.append(item)
                 else:
                     originals[original_index] = dict(originals[original_index], File=item["File"])
+            for group, original_index in sorted(self._deleted_original_bindings, reverse=True):
+                entries = groups.get(group, [])
+                if original_index < len(entries):
+                    entries.pop(original_index)
             self._write_json(Path(result["model_path"]), document)
             projects = self._projects.export(stage) if include_projects else {}
             self._write_json(stage / "model.drawables.json", self.snapshot_mesh(self.parameter_overrides))

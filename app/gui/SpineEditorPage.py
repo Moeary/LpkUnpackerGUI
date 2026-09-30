@@ -10,7 +10,7 @@ from pathlib import Path
 from PySide6.QtCore import QPoint, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
-    QFileDialog, QFormLayout, QGridLayout, QHBoxLayout, QInputDialog, QListWidgetItem,
+    QDialog, QFileDialog, QFormLayout, QGridLayout, QHBoxLayout, QInputDialog, QListWidgetItem,
     QMessageBox, QFrame, QSplitter, QStackedWidget, QTreeWidgetItem, QVBoxLayout, QWidget, QSizePolicy,
 )
 from qfluentwidgets import (
@@ -24,6 +24,7 @@ from app.core.animation_editing import AnimationEditingError
 from app.core.editor_session import BONE_FIELDS, SpineEditorSession
 from app.gui.SpinePreviewWidget import SpinePreviewWidget
 from app.gui.editor_timeline import AnimationTimelineEditor
+from app.gui.editor_actions import ActionComboBox, ActionDeleteDialog, ActionNameDialog, close_editor_popup
 from app.gui.editor_workspace import EditorComboBox as QComboBox, EditorTabs, EditorViewportLayout, EditorWorkspace
 from app.i18n import get_i18n, tr
 
@@ -348,6 +349,7 @@ class SpineEditorPage(QWidget):
         self._pending_preview = False
         self._updating = False
         self._closing = False
+        self._action_dialog = None
         self._selection = None
         self._track = None
         self._preview_timer = QTimer(self)
@@ -379,9 +381,7 @@ class SpineEditorPage(QWidget):
             header.addWidget(button)
         layout.addLayout(header)
         self.animation_label, self.skin_label, self.duration_label = CaptionLabel(self), CaptionLabel(self), CaptionLabel(self)
-        self.animation_combo, self.skin_combo = QComboBox(self), QComboBox(self)
-        self.animation_combo.setMinimumWidth(80)
-        self.animation_combo.setMaximumWidth(125)
+        self.animation_combo, self.skin_combo = ActionComboBox(self), QComboBox(self)
         self.animation_combo.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self.animation_label.hide()
         self.skin_combo.setFixedWidth(160)
@@ -393,7 +393,7 @@ class SpineEditorPage(QWidget):
         self.duration_spin.setSuffix(" s")
         self.new_button = TransparentToolButton(FluentIcon.ADD, self)
         self.clone_button = TransparentToolButton(FluentIcon.COPY, self)
-        self.delete_animation_button = TransparentToolButton(FluentIcon.DELETE, self)
+        self.delete_animation_button = TransparentToolButton(FluentIcon.REMOVE, self)
         for button in (self.new_button, self.clone_button, self.delete_animation_button):
             button.setFixedSize(28, 28)
         self.tabs = EditorTabs(self)
@@ -471,6 +471,8 @@ class SpineEditorPage(QWidget):
         self.track_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.channel_combo.setMinimumWidth(90)
         track_bar.addWidget(self.animation_combo)
+        for button in (self.new_button, self.delete_animation_button, self.clone_button):
+            track_bar.addWidget(button)
         track_bar.addWidget(self.track_combo, 1)
         self.animation_options_button = TransparentToolButton(FluentIcon.MORE, self)
         self.animation_options_button.setFixedSize(26, 28)
@@ -478,15 +480,9 @@ class SpineEditorPage(QWidget):
         track_bar.addSpacing(28)
         self.animation_options_menu = RoundMenu(parent=self)
         options = QWidget(self.animation_options_menu)
-        options.setFixedSize(280, 82)
+        options.setFixedSize(280, 42)
         options_layout = QVBoxLayout(options)
         options_layout.setContentsMargins(7, 3, 7, 3)
-        commands = QHBoxLayout()
-        commands.addWidget(self.new_button)
-        commands.addWidget(self.clone_button)
-        commands.addWidget(self.delete_animation_button)
-        commands.addStretch(1)
-        options_layout.addLayout(commands)
         channel_row = QHBoxLayout()
         channel_row.addWidget(self.channel_combo, 1)
         channel_row.addWidget(self.duration_spin)
@@ -921,18 +917,33 @@ class SpineEditorPage(QWidget):
         self._edit(lambda: self.session.set_draw_order(order, animation=animation, seconds=self.timeline.current_time), refresh_tree=not animation)
 
     def _new_animation(self, checked=False, clone: bool = False):
-        if not self.session or (clone and not self.animation_name):
+        if not self.session or (clone and not self.animation_name) or self._action_dialog is not None:
             return
-        name, accepted = QInputDialog.getText(self, _text("spine_editor.clone_animation" if clone else "spine_editor.new_animation"), _text("spine_editor.animation_name"))
-        if not accepted:
+        dialog = ActionNameDialog(_text("spine_editor.clone_animation" if clone else "spine_editor.new_animation"),
+                                  self.window(), duration=not clone, existing_names=self.session.animation_names)
+        dialog.duration_spin.setValue(max(2, self.timeline.duration))
+        if self._exec_action_dialog(dialog) != QDialog.Accepted:
             return
+        name = dialog.name_edit.text().strip()
         previous = self.animation_name
-        if self._edit(lambda: self.session.clone_animation(previous, name) if clone else self.session.create_animation(name, max(2, self.timeline.duration)), refresh_tree=True):
+        if self._edit(lambda: self.session.clone_animation(previous, name) if clone else self.session.create_animation(name, dialog.duration_spin.value()), refresh_tree=True):
             self.animation_combo.setCurrentIndex(self.animation_combo.findData(name))
 
     def _delete_animation(self):
-        if self.session and self.animation_name:
-            self._edit(lambda: self.session.delete_animation(self.animation_name), refresh_tree=True)
+        if self.session and self.animation_name and self._action_dialog is None:
+            name = self.animation_name
+            if self._exec_action_dialog(ActionDeleteDialog(name, self.window())) == QDialog.Accepted:
+                self._edit(lambda: self.session.delete_animation(name), refresh_tree=True)
+
+    def _exec_action_dialog(self, dialog):
+        close_editor_popup()
+        self.pause_playback()
+        self._action_dialog = dialog
+        try:
+            return dialog.exec()
+        finally:
+            self._action_dialog = None
+            dialog.deleteLater()
 
     def _duration_changed(self):
         if not self._updating and self.session and self.animation_name:
@@ -1092,6 +1103,7 @@ class SpineEditorPage(QWidget):
                             (self.duration_spin, "duration"), (self.track_combo, "track"), (self.channel_combo, "track")):
             widget.setToolTip(_text(f"spine_editor.{key}"))
         self.search_edit.setPlaceholderText(_text("spine_editor.search"))
+        self.animation_combo.retranslate_ui()
         self.animation_options_button.setToolTip(_text("spine_editor.animation") + " · " + _text("spine_editor.duration"))
         self.workspace.retranslate_ui()
         for index, key in enumerate(("skeleton", "layers", "atlas")):

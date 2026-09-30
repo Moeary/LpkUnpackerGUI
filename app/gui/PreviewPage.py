@@ -83,6 +83,9 @@ PREVIEW_LAYOUT_TEXT = {
     "preview.layout.display": "显示",
     "preview.layout.artmesh": "ArtMesh 部件",
     "preview.layout.empty": "载入资源后显示对应的预览控制。",
+    "preview.motion_freeze_hint": "冻结保留当前动画时刻；拖动时间修改姿态后，取消冻结将从头重新播放该动作。",
+    "preview.motion_playback_position": "{motion} · {current:.2f} / {total:.2f} 秒",
+    "preview.motion_not_playing_position": "未播放 · {current:.2f} / {total:.2f} 秒",
 }
 
 
@@ -924,6 +927,7 @@ class Live2DSettingsPanel(QFrame):
 
         # 创建滚动区域
         scroll = SingleDirectionScrollArea(orient=Qt.Vertical)
+        self.parameter_scroll = scroll
         scroll_widget = QWidget()
         scroll_layout = QVBoxLayout(scroll_widget)
         scroll_layout.setContentsMargins(0, 0, 0, 0)
@@ -1771,12 +1775,15 @@ class PreviewPage(QFrame):
         self.motion_time_label = None
         self._timeline_sync = False
         self._freeze_syncing = False
+        self._frozen_parameter_values = {}
+        self._pose_slider_values = {}
         self.left_sidebar_btn = None
         self.right_sidebar_btn = None
         self.preview_splitter = None
         self.left_sidebar = None
         self.right_sidebar = None
         self._motion_items = []
+        self._motion_parameter_ids_cache = {}
         self.drag_drop_area = None
         self.source_label = None
         self.source_edit = None
@@ -2250,6 +2257,8 @@ class PreviewPage(QFrame):
         self._display_layouts["live2d"].addWidget(self.settings_panel, 1)
         self.artmesh_panel = PreviewArtMeshPanel(self.live2d_details)
         self.artmesh_panel.overridesChanged.connect(self._preview_parts_changed)
+        self.artmesh_panel.parameterRequested.connect(self._show_artmesh_parameter)
+        self.artmesh_panel.freezeRequested.connect(self.freeze_motion_check.setChecked)
         self.live2d_details.addTab(self.artmesh_panel, "")
         self.live2d_details.currentChanged.connect(self._on_preview_tab_changed)
 
@@ -2339,6 +2348,7 @@ class PreviewPage(QFrame):
             self.pose_controls_title.setText(tr("preview.advanced_settings"))
         if self.freeze_motion_check:
             self.freeze_motion_check.setText(tr("preview.enable_advanced_overrides"))
+            self.freeze_motion_check.setToolTip(_layout_text("preview.motion_freeze_hint"))
         if self.refresh_pose_params_btn:
             self.refresh_pose_params_btn.setText(tr("preview.refresh_current_model"))
         if self.reset_pose_params_btn:
@@ -2400,6 +2410,9 @@ class PreviewPage(QFrame):
         if self._parameter_sync_timer:
             self._parameter_sync_timer.stop()
         self._artmesh_loaded_for = None
+        self._motion_parameter_ids_cache.clear()
+        self._frozen_parameter_values.clear()
+        self._pose_slider_values.clear()
         if hasattr(self, "artmesh_panel"):
             self.artmesh_panel.clear()
         if self.advanced_panel:
@@ -2451,6 +2464,37 @@ class PreviewPage(QFrame):
     def _on_preview_tab_changed(self, index):
         if index == 2 and self._ensure_artmesh_loaded():
             self.artmesh_panel.refresh(self._preview_parameters())
+            self._sync_live_parameter_controls(force=True)
+
+    def _show_artmesh_parameter(self, parameter_id):
+        controls = self.advanced_panel.advanced_param_sliders.get(str(parameter_id))
+        if controls:
+            self.live2d_details.setCurrentIndex(0)
+            self.advanced_panel.parameter_scroll.ensureWidgetVisible(controls[0], 0, 30)
+            controls[0].setFocus()
+
+    def _motion_parameter_ids(self, motion):
+        path = str((motion or {}).get("file") or "")
+        if path not in self._motion_parameter_ids_cache:
+            try:
+                data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+            except (OSError, ValueError):
+                data = {}
+            self._motion_parameter_ids_cache[path] = {
+                str(curve["Id"]) for curve in data.get("Curves", [])
+                if isinstance(curve, dict) and curve.get("Target") == "Parameter" and curve.get("Id")
+            }
+        return self._motion_parameter_ids_cache[path]
+
+    def _motion_playback_context(self):
+        getter = getattr(self.live2d_preview, "get_motion_playback_state", None)
+        state = getter() if callable(getter) else None
+        if state:
+            motion = next((item for item in self._motion_items
+                           if (str(item.get("group", "")), int(item.get("index", -1)))
+                           == (str(state.get("group", "")), int(state.get("index", -2)))), None)
+            return motion or state, state
+        return self._selected_motion_item(), None
 
     def _preview_parts_changed(self, values, defaults):
         setter = getattr(self.live2d_preview, "set_part_opacity_overrides", None)
@@ -3352,29 +3396,29 @@ class PreviewPage(QFrame):
         return self._motion_items[index] if 0 <= index < len(self._motion_items) else None
 
     def _update_motion_timeline_visibility(self):
-        motion = self._selected_motion_item()
+        motion, state = self._motion_playback_context()
         duration = float((motion or {}).get("duration") or 0.0)
-        visible = bool(
-            self.freeze_motion_check
-            and self.freeze_motion_check.isChecked()
-            and motion
-            and duration > 0.0
-        )
+        visible = bool(self._resource_mode == "live2d" and motion and duration > 0.0)
         if not self.motion_timeline_frame:
             return
         self.motion_timeline_frame.setVisible(visible)
         if not visible:
             return
         maximum_ms = max(1, int(round(duration * 1000)))
+        frozen = bool(self.freeze_motion_check and self.freeze_motion_check.isChecked())
+        self.motion_time_spin.setEnabled(frozen)
+        self.motion_timeline.setEnabled(frozen)
         self._timeline_sync = True
         try:
             self.motion_time_spin.setRange(0, maximum_ms)
-            current_ms = min(self.motion_time_spin.value(), maximum_ms)
+            current_ms = min(max(0, int(round(float((state or {}).get("time", 0)) * 1000))), maximum_ms)
             self.motion_time_spin.setValue(current_ms)
             self.motion_timeline.setValue(int(round(current_ms / maximum_ms * 1000)))
-            self.motion_time_label.setText(
-                tr("preview.motion_timeline_position", current=current_ms / 1000, total=duration)
-            )
+            key = "preview.motion_playback_position" if state else "preview.motion_not_playing_position"
+            self.motion_time_label.setText(tr(key, PREVIEW_LAYOUT_TEXT[key],
+                                            motion=f"{motion.get('group', '')}[{motion.get('index', 0)}]",
+                                            current=current_ms / 1000, total=duration))
+            self.motion_time_label.setToolTip(str(motion.get("display") or motion.get("group") or ""))
         finally:
             self._timeline_sync = False
 
@@ -3390,10 +3434,12 @@ class PreviewPage(QFrame):
         self._set_motion_timeline_ms(int(value))
 
     def _set_motion_timeline_ms(self, milliseconds: int):
-        motion = self._selected_motion_item()
+        # The combo may be a queued choice with auto-play off. Scrub the motion
+        # whose native clock is displayed, not a different selected item.
+        motion, _state = self._motion_playback_context()
         if not motion or not self.live2d_preview or not self.motion_time_spin:
             return
-        maximum = max(1, self.motion_time_spin.maximum())
+        maximum = max(1, int(round(float(motion.get("duration") or 0) * 1000)))
         target = min(max(0, int(milliseconds)), maximum)
         self._timeline_sync = True
         try:
@@ -3409,16 +3455,34 @@ class PreviewPage(QFrame):
         finally:
             self._timeline_sync = False
         values = self.live2d_preview.set_motion_time(motion, target / 1000)
-        if values and self.advanced_panel:
-            self.advanced_panel.set_advanced_param_values(values)
+        self._sync_live_parameter_controls(force=True)
+        if values and self.freeze_motion_check.isChecked():
+            self._capture_frozen_parameters()
+            self.live2d_preview.apply_settings({"advanced_enabled": True, "advanced_params": dict(self._frozen_parameter_values)})
 
     def on_motion_freeze_changed(self, frozen: bool):
         if not self.live2d_preview:
             return
+        canvas_frozen = getattr(self.live2d_preview, "live2d_canvas", None)
+        checker = getattr(canvas_frozen, "isMotionFrozen", None)
+        was_frozen = bool(checker()) if callable(checker) else bool(self._frozen_parameter_values)
         self.live2d_preview.set_motion_frozen(bool(frozen))
         if frozen:
-            self._sync_live_parameter_controls(force=True)
+            if not was_frozen:
+                self._sync_live_parameter_controls(force=True)
+                self._capture_frozen_parameters()
+            if self.live2d_details.currentIndex() == 2 and self._ensure_artmesh_loaded():
+                self.artmesh_panel.refresh(self._preview_parameters())
+        else:
+            self._frozen_parameter_values.clear()
+            self._pose_slider_values.clear()
         self._update_motion_timeline_visibility()
+
+    def _capture_frozen_parameters(self):
+        self._frozen_parameter_values = self._preview_parameters()
+        self._pose_slider_values = {parameter_id: slider.value() / float(scale)
+                                   for parameter_id, (slider, _label, scale)
+                                   in self.advanced_panel.advanced_param_sliders.items()}
 
     def on_motion_loop_changed(self, enabled: bool):
         if self.live2d_preview:
@@ -3433,23 +3497,33 @@ class PreviewPage(QFrame):
                 self.freeze_motion_check.setChecked(editing_pose)
                 self.freeze_motion_check.blockSignals(False)
             self.on_motion_freeze_changed(editing_pose)
-            self.live2d_preview.apply_settings(
-                self.advanced_panel.get_advanced_settings()
-            )
+            values = self.advanced_panel.get_advanced_settings()
+            if editing_pose:
+                for parameter_id, value in values.get("advanced_params", {}).items():
+                    if value != self._pose_slider_values.get(parameter_id):
+                        self._frozen_parameter_values[parameter_id] = float(value)
+                self._pose_slider_values = dict(values.get("advanced_params", {}))
+                values["advanced_params"] = dict(self._frozen_parameter_values)
+            self.live2d_preview.apply_settings(values)
 
     def _sync_live_parameter_controls(self, force: bool = False):
+        self._update_motion_timeline_visibility()
         if (
             self.live2d_preview is None
             or self.advanced_panel is None
-            or (self.freeze_motion_check and self.freeze_motion_check.isChecked() and not force)
         ):
             return
         meta = self.live2d_preview.get_parameter_meta_list()
         if not meta:
             return
-        if not self.advanced_panel.advanced_param_sliders:
-            self.advanced_panel.rebuild_advanced_params(meta)
-        self.advanced_panel.sync_advanced_param_values(meta)
+        frozen = bool(self.freeze_motion_check and self.freeze_motion_check.isChecked())
+        if force or not frozen:
+            if not self.advanced_panel.advanced_param_sliders:
+                self.advanced_panel.rebuild_advanced_params(meta)
+            self.advanced_panel.sync_advanced_param_values(meta)
+        if self.live2d_details.currentIndex() == 2:
+            motion, _state = self._motion_playback_context()
+            self.artmesh_panel.set_parameter_context(meta, self._motion_parameter_ids(motion), frozen)
 
     def _cleanup_temp_model_json(self):
         """Forget the model reference; owned temporary directories clean it up."""

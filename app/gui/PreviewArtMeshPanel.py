@@ -6,8 +6,8 @@ from pathlib import Path
 
 from PySide6.QtCore import QSignalBlocker, Qt, Signal
 from PySide6.QtGui import QPixmap
-from PySide6.QtWidgets import QHBoxLayout, QSizePolicy, QWidget
-from qfluentwidgets import CaptionLabel, CheckBox, DoubleSpinBox, FluentIcon, PushButton
+from PySide6.QtWidgets import QAbstractItemView, QHBoxLayout, QHeaderView, QSizePolicy, QTableWidgetItem, QWidget
+from qfluentwidgets import CaptionLabel, CheckBox, DoubleSpinBox, FluentIcon, PushButton, SearchLineEdit, TableWidget, TransparentToggleToolButton
 
 from app.core.cubism_core import CubismCore, resolve_live2d_source
 from app.gui.ArtMeshInspector import ArtMeshInspector, _point_in_triangle
@@ -22,6 +22,12 @@ PREVIEW_ARTMESH_TEXT = {
     "preview.artmesh.selection": "{drawable} → Part {part}（{count} 个 ArtMesh）",
     "preview.artmesh.no_part": "{drawable} 未关联可调整的 Part。",
     "preview.artmesh.unavailable": "部件信息不可用：{error}",
+    "preview.artmesh.pose_parameters": "当前姿态参数",
+    "preview.artmesh.all_parameters": "全部",
+    "preview.artmesh.parameter_search": "搜索参数 ID",
+    "preview.artmesh.parameter_scope": "默认显示当前动作的 Parameter 曲线；搜索可查看全部参数。这不是 ArtMesh 的绑定关系表。双击参数可前往调整。",
+    "preview.artmesh.parameter_id": "参数 ID",
+    "preview.artmesh.parameter_value": "当前值",
 }
 
 
@@ -33,6 +39,8 @@ class PreviewArtMeshPanel(QWidget):
     """Inspect native drawable geometry; opacity changes affect preview only."""
 
     overridesChanged = Signal(dict, dict)
+    parameterRequested = Signal(str)
+    freezeRequested = Signal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -42,6 +50,9 @@ class PreviewArtMeshPanel(QWidget):
         self.mesh_data = {}
         self.part_overrides = {}
         self.part_defaults = {}
+        self._parameter_meta = {}
+        self._motion_parameter_ids = set()
+        self._parameter_rows = []
         layout = EditorViewportLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
@@ -81,6 +92,32 @@ class PreviewArtMeshPanel(QWidget):
         self.reset_button = PushButton(FluentIcon.RETURN, "", self)
         self.reset_button.clicked.connect(self.reset_parts)
         layout.addWidget(self.reset_button)
+        parameter_row = QHBoxLayout()
+        self.parameter_title = CaptionLabel(self)
+        self.freeze_pose = TransparentToggleToolButton(FluentIcon.PAUSE, self)
+        self.freeze_pose.setFixedSize(28, 28)
+        self.freeze_pose.toggled.connect(self.freezeRequested)
+        self.all_parameters = CheckBox(self)
+        parameter_row.addWidget(self.parameter_title, 1)
+        parameter_row.addWidget(self.freeze_pose)
+        parameter_row.addWidget(self.all_parameters)
+        layout.addLayout(parameter_row)
+        self.parameter_search = SearchLineEdit(self)
+        self.parameter_search.textChanged.connect(self._filter_parameters)
+        self.all_parameters.toggled.connect(self._filter_parameters)
+        layout.addWidget(self.parameter_search)
+        self.parameter_table = TableWidget(self)
+        self.parameter_table.setColumnCount(2)
+        self.parameter_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.parameter_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.parameter_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.parameter_table.verticalHeader().hide()
+        self.parameter_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.parameter_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.parameter_table.setMinimumHeight(80)
+        self.parameter_table.setMaximumHeight(140)
+        self.parameter_table.cellDoubleClicked.connect(self._parameter_requested)
+        layout.addWidget(self.parameter_table)
         get_i18n().languageChanged.connect(self.retranslate_ui)
         self.clear()
         self.retranslate_ui()
@@ -126,6 +163,14 @@ class PreviewArtMeshPanel(QWidget):
         self.mesh_data = {}
         self.part_overrides = {}
         self.part_defaults = {}
+        self._parameter_meta = {}
+        self._motion_parameter_ids = set()
+        self._parameter_rows = []
+        self.parameter_table.setRowCount(0)
+        with QSignalBlocker(self.parameter_search), QSignalBlocker(self.all_parameters), QSignalBlocker(self.freeze_pose):
+            self.parameter_search.clear()
+            self.all_parameters.setChecked(False)
+            self.freeze_pose.setChecked(False)
         inspector = self.inspector
         inspector.entries = []
         inspector.selected_index = -1
@@ -144,6 +189,42 @@ class PreviewArtMeshPanel(QWidget):
         self.reset_button.setEnabled(False)
         self.selection_label.setText(_text("preview.artmesh.empty"))
         self.overridesChanged.emit({}, {})
+
+    def set_parameter_context(self, meta, motion_parameter_ids=(), frozen=False):
+        """Current native values filtered by proven motion-curve IDs only.
+
+        Core exposes no drawable-to-parameter binding table. Preserve the
+        selected ArtMesh while updating this independent pose inspection.
+        """
+        self._parameter_meta = {str(item["id"]): item for item in meta if item.get("id")}
+        self._motion_parameter_ids = set(map(str, motion_parameter_ids or ()))
+        with QSignalBlocker(self.freeze_pose):
+            self.freeze_pose.setChecked(bool(frozen))
+        self._filter_parameters()
+
+    def _filter_parameters(self, *_args):
+        query = self.parameter_search.text().strip().casefold()
+        rows = [parameter_id for parameter_id in self._parameter_meta
+                if ((query in parameter_id.casefold()) if query else
+                    (self.all_parameters.isChecked() or parameter_id in self._motion_parameter_ids))]
+        if rows != self._parameter_rows:
+            self._parameter_rows = rows
+            self.parameter_table.setRowCount(len(rows))
+            for row, parameter_id in enumerate(rows):
+                item = QTableWidgetItem(parameter_id)
+                item.setToolTip(parameter_id)
+                self.parameter_table.setItem(row, 0, item)
+                self.parameter_table.setItem(row, 1, QTableWidgetItem())
+        for row, parameter_id in enumerate(rows):
+            value = float(self._parameter_meta[parameter_id].get("value", 0))
+            item = self.parameter_table.item(row, 1)
+            text = f"{value:.6g}"
+            if item.text() != text:
+                item.setText(text)
+
+    def _parameter_requested(self, row, _column):
+        if 0 <= row < len(self._parameter_rows):
+            self.parameterRequested.emit(self._parameter_rows[row])
 
     def _selection_changed(self, entry):
         if entry is None:
@@ -202,6 +283,13 @@ class PreviewArtMeshPanel(QWidget):
         self.inspector.retranslate_ui()
         self.part_visible.setText(_text("preview.artmesh.visible"))
         self.reset_button.setText(_text("preview.artmesh.reset"))
+        self.parameter_title.setText(_text("preview.artmesh.pose_parameters"))
+        self.parameter_title.setToolTip(_text("preview.artmesh.parameter_scope"))
+        self.parameter_table.setToolTip(_text("preview.artmesh.parameter_scope"))
+        self.freeze_pose.setToolTip(tr("preview.enable_advanced_overrides"))
+        self.all_parameters.setText(_text("preview.artmesh.all_parameters"))
+        self.parameter_search.setPlaceholderText(_text("preview.artmesh.parameter_search"))
+        self.parameter_table.setHorizontalHeaderLabels([_text("preview.artmesh.parameter_id"), _text("preview.artmesh.parameter_value")])
         entry = self.inspector.current_entry()
         if entry:
             self._selection_changed(entry)

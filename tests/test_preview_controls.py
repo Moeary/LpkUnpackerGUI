@@ -31,7 +31,9 @@ class FakeNativePreview(QWidget):
         self.settings = {}
         self.part_calls = []
         self.motion_times = []
+        self.motion_seek_items = []
         self.failure = None
+        self.playback = None
 
     def load_model(self, path):
         if self.failure:
@@ -58,8 +60,13 @@ class FakeNativePreview(QWidget):
 
     def set_motion_time(self, motion, time):
         self.motion_times.append(time)
+        self.motion_seek_items.append(copy.deepcopy(motion))
         self.meta[0]["value"] = 12.5
+        self.playback = dict(motion, time=time, frozen=True, scrubbed=True)
         return {"ParamAngleX": 12.5}
+
+    def get_motion_playback_state(self):
+        return copy.deepcopy(self.playback)
 
     def set_part_opacity_overrides(self, values, defaults):
         self.part_calls.append((dict(values), dict(defaults)))
@@ -113,6 +120,12 @@ class PreviewControlsTests(unittest.TestCase):
         (self.root / "character.moc3").write_bytes(b"fake-moc")
         Image.new("RGBA", (32, 32), (40, 80, 120, 255)).save(self.root / "texture.png")
         self.motion = {"group": "Idle", "index": 0, "display": "Idle / 0", "duration": 2}
+        motion_path = self.root / "idle.motion3.json"
+        motion_path.write_text(json.dumps({"Meta": {"Duration": 2}, "Curves": [
+            {"Target": "Parameter", "Id": "ParamAngleX", "Segments": [0, 0, 0, 2, 20]},
+            {"Target": "Model", "Id": "ParamOther", "Segments": [0, 0, 0, 2, 1]},
+        ]}), encoding="utf-8")
+        self.motion["file"] = str(motion_path)
 
     def dispose(self):
         self.page.shutdown()
@@ -151,6 +164,84 @@ class PreviewControlsTests(unittest.TestCase):
         self.assertFalse(page._parameter_sync_timer.isActive())
         page.set_active(True)
         self.assertTrue(page._parameter_sync_timer.isActive())
+
+    def test_clock_is_visible_while_playing_and_tracks_native_identity(self):
+        self.load_live()
+        page = self.page
+        self.assertTrue(page.motion_timeline_frame.isVisible())
+        self.assertFalse(page.motion_time_spin.isEnabled())
+        other = dict(self.motion, group="TapBody", index=1, duration=4)
+        page._motion_items.append(other)
+        self.native.playback = dict(other, time=1.25, playing=True)
+        page._sync_live_parameter_controls()
+        self.assertEqual(page.motion_combo.currentIndex(), 0)  # selection is not proof of playback
+        self.assertEqual(page.motion_time_spin.value(), 1250)
+        self.assertEqual(page.motion_time_spin.maximum(), 4000)
+        self.assertIn("TapBody[1]", page.motion_time_label.text())
+        page.freeze_motion_check.click()
+        self.assertEqual(page.motion_time_spin.value(), 1250)
+        self.assertTrue(page.motion_time_spin.isEnabled())
+        page._sync_live_parameter_controls()
+        self.assertEqual(page.motion_time_spin.value(), 1250)
+        page.freeze_motion_check.click()
+        self.assertEqual(page.motion_time_spin.value(), 1250)
+
+    def test_freeze_preserves_exact_native_values_until_that_parameter_is_edited(self):
+        self.load_live()
+        self.native.meta[0]["value"] = 3.14159265
+        self.native.meta.append({"id": "ParamOther", "min": -30, "max": 30, "default": 0, "value": 2.71828183})
+        self.page._refresh_parameter_controls()
+        self.page.freeze_motion_check.click()
+        self.assertEqual(self.native.settings["advanced_params"], {"ParamAngleX": 3.14159265, "ParamOther": 2.71828183})
+        slider, _, scale = self.page.advanced_panel.advanced_param_sliders["ParamAngleX"]
+        slider.setValue(int(12.5 * scale))
+        self.assertEqual(self.native.settings["advanced_params"], {"ParamAngleX": 12.5, "ParamOther": 2.71828183})
+
+    def test_selected_motion_without_autoplay_does_not_change_displayed_seek_identity(self):
+        self.load_live()
+        page = self.page
+        other = dict(self.motion, group="TapBody", index=1, duration=4)
+        page.auto_play_motion_check.setChecked(False)
+        page._populate_motion_controls([self.motion, other])
+        self.native.playback = dict(self.motion, time=.75, playing=True)
+        page.motion_combo.setCurrentIndex(1)
+        page._sync_live_parameter_controls()
+        self.assertIn("Idle[0]", page.motion_time_label.text())
+        page.freeze_motion_check.click()
+        page.motion_timeline.setValue(625)
+        self.assertEqual(self.native.motion_times[-1], 1.25)
+        self.assertEqual(self.native.motion_seek_items[-1]["group"], "Idle")
+        self.assertIn("Idle[0]", page.motion_time_label.text())
+
+    def test_mouse_tabs_return_from_artmesh_and_inspect_current_pose_parameters(self):
+        self.load_live()
+        self.native.meta[0]["value"] = 3.14159265
+        self.native.meta.append({"id": "ParamOther", "min": 0, "max": 1, "value": .125})
+        self.page._refresh_parameter_controls()
+        with patch.object(self.mesh_module, "CubismCore") as core:
+            core.return_value.load_moc.return_value = FakeCoreModel()
+            page = self.page
+            for index in (2, 0, 1, 2):
+                item = page.live2d_details.pivot.widget(page.live2d_details._keys[index])
+                page.live2d_details.tab_scroll.ensureWidgetVisible(item, 8, 0)
+                self.app.processEvents()
+                QTest.mouseClick(item, Qt.LeftButton)
+                self.app.processEvents()
+                self.assertEqual(page.live2d_details.currentIndex(), index)
+            panel = page.artmesh_panel
+            panel.select_drawable("HairMesh2")
+            self.assertEqual(panel._parameter_rows, ["ParamAngleX"])
+            self.assertEqual(float(panel.parameter_table.item(0, 1).text()), 3.14159)
+            panel.freeze_pose.click()
+            self.assertTrue(page.freeze_motion_check.isChecked())
+            self.assertEqual(panel.inspector.current_entry().drawable_id, "HairMesh2")
+            panel.parameter_search.setText("Other")
+            self.assertEqual(panel._parameter_rows, ["ParamOther"])
+            self.assertEqual(panel.parameter_table.item(0, 1).text(), "0.125")
+            self.assertEqual(panel.inspector.current_entry().drawable_id, "HairMesh2")
+            panel.parameter_table.cellDoubleClicked.emit(0, 0)
+            self.assertEqual(page.live2d_details.currentIndex(), 0)
+            self.assertEqual(panel.inspector.current_entry().drawable_id, "HairMesh2")
 
     def test_artmesh_controls_use_part_id_and_leave_source_unchanged(self):
         self.load_live()

@@ -900,6 +900,11 @@ class Live2DPreviewWindow(QWidget):
             return []
         return self.live2d_canvas.getParameterMetaList()
 
+    def get_motion_playback_state(self) -> dict | None:
+        if not self.live2d_canvas:
+            return None
+        return self.live2d_canvas.getMotionPlaybackState()
+
     def set_motion_frozen(self, frozen: bool):
         if self.live2d_canvas:
             self.live2d_canvas.setMotionFrozen(bool(frozen))

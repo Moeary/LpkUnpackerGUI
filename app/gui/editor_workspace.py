@@ -119,7 +119,9 @@ class EditorTabs(QWidget):
         key = f"editor-tab-{index}"
         self._keys.append(key)
         self._tab_labels.append(text)
-        item = self.pivot.addItem(key, text, onClick=lambda i=index: self.setCurrentIndex(i))
+        # PivotItem.itemClicked emits a checked bool.  Consume it explicitly so
+        # True cannot replace the captured page index and select page 1.
+        item = self.pivot.addItem(key, text, onClick=lambda _checked=False, i=index: self.setCurrentIndex(i))
         setFont(item, 14)
         item.setToolTip(text)
         self.pivot.adjustSize()

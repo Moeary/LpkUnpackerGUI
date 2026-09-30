@@ -684,6 +684,69 @@ def _validate_spine_timelines(document: dict[str, Any], version: str) -> None:
             raise AnimationEditingError("Unknown slot/invalid slot animation timeline.")
 
 
+@dataclass(frozen=True)
+class _ValidatedCubismMotion:
+    path: Path
+    data: dict[str, Any]
+    metadata_changed: bool
+
+
+def _read_validated_cubism_motion(path: Path) -> _ValidatedCubismMotion:
+    """Read and normalize one motion using the shared strict validator."""
+    data = _read_json(path)
+    original_meta = dict(data.get("Meta", {})) if isinstance(data.get("Meta"), dict) else None
+    _motion_meta(data)
+    return _ValidatedCubismMotion(path.resolve(), data, original_meta != data["Meta"])
+
+
+def _create_live2d_project(source: Path, data: dict[str, Any], *,
+                           parameter_inventory_path: str | os.PathLike[str] | None = None,
+                           validated_motions: Mapping[str, _ValidatedCubismMotion] | None = None
+                           ) -> AnimationEditingProject:
+    """Construct from an isolated model and motions already read by the editor.
+
+    Public callers never supply this cache. Asset boundaries, the model header,
+    and parameter inventory are still checked here; cache entries come from
+    the same validator that is used by the public factory.
+    """
+    if data.get("Version") != 3 or data.get("Type", 0) != 0:
+        raise AnimationEditingError("Only Cubism Version 3 Live2D model settings are supported.")
+    project = AnimationEditingProject(source, source, source.parent, "live2d", "3", data)
+    _add_reference(project, source.name)
+    _live2d_references(project, data["FileReferences"])
+    moc = _asset(source.parent, data["FileReferences"]["Moc"])
+    display = data["FileReferences"].get("DisplayInfo")
+    inventory = Path(parameter_inventory_path).expanduser().resolve() if parameter_inventory_path else None
+    if inventory is None and (source.parent / "live2d_parameter_inventory.json").is_file():
+        inventory = source.parent / "live2d_parameter_inventory.json"
+    project.parameters, project.inventory_source, project.warnings = _parameters(
+        moc, inventory, _asset(source.parent, display) if display else None)
+    groups = data["FileReferences"].get("Motions", {})
+    if not isinstance(groups, dict):
+        raise AnimationEditingError("Live2D Motions must be an object.")
+    cache = dict(validated_motions or {})
+    used_paths = set()
+    for group, entries in groups.items():
+        if not isinstance(entries, list):
+            raise AnimationEditingError("Live2D motion group must be a list.")
+        for index, item in enumerate(entries):
+            if not isinstance(item, dict):
+                raise AnimationEditingError("Invalid Live2D motion entry.")
+            path = _asset(source.parent, item.get("File"))
+            relative = path.relative_to(source.parent).as_posix()
+            validated = cache.get(relative)
+            if validated is None or validated.path != path:
+                validated = _read_validated_cubism_motion(path)
+                cache[relative] = validated
+            # Different Viewer entries may share a file. Each editable motion
+            # must own its curves so editing one entry cannot change another.
+            motion = copy.deepcopy(validated.data) if path in used_paths else validated.data
+            used_paths.add(path)
+            name = f"{group}[{index}]"
+            project.motions[name], project.bindings[name] = motion, (group, index)
+    return project
+
+
 def create_animation_project(model_path: str | os.PathLike[str], *,
                              parameter_inventory_path: str | os.PathLike[str] | None = None
                              ) -> AnimationEditingProject:
@@ -692,32 +755,7 @@ def create_animation_project(model_path: str | os.PathLike[str], *,
         raise AnimationEditingError(f"Select one existing model JSON or skeleton file: {source}")
     data = _read_json(source) if source.suffix.lower() == ".json" else {}
     if isinstance(data.get("FileReferences"), dict) and data["FileReferences"].get("Moc"):
-        if data.get("Version") != 3 or data.get("Type", 0) != 0:
-            raise AnimationEditingError("Only Cubism Version 3 Live2D model settings are supported.")
-        project = AnimationEditingProject(source, source, source.parent, "live2d", "3", data)
-        _add_reference(project, source.name)
-        _live2d_references(project, data["FileReferences"])
-        moc = _asset(source.parent, data["FileReferences"]["Moc"])
-        display = data["FileReferences"].get("DisplayInfo")
-        inventory = Path(parameter_inventory_path).expanduser().resolve() if parameter_inventory_path else None
-        if inventory is None and (source.parent / "live2d_parameter_inventory.json").is_file():
-            inventory = source.parent / "live2d_parameter_inventory.json"
-        project.parameters, project.inventory_source, project.warnings = _parameters(
-            moc, inventory, _asset(source.parent, display) if display else None)
-        groups = data["FileReferences"].get("Motions", {})
-        if not isinstance(groups, dict):
-            raise AnimationEditingError("Live2D Motions must be an object.")
-        for group, entries in groups.items():
-            if not isinstance(entries, list):
-                raise AnimationEditingError("Live2D motion group must be a list.")
-            for index, item in enumerate(entries):
-                if not isinstance(item, dict):
-                    raise AnimationEditingError("Invalid Live2D motion entry.")
-                motion = _read_json(_asset(source.parent, item.get("File")))
-                _motion_meta(motion)
-                name = f"{group}[{index}]"
-                project.motions[name], project.bindings[name] = motion, (group, index)
-        return project
+        return _create_live2d_project(source, data, parameter_inventory_path=parameter_inventory_path)
     wrapper = data if isinstance(data.get("skeleton"), str) else None
     skeleton = _asset(source.parent, data["skeleton"]) if wrapper else source
     root = source.parent

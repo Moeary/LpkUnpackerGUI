@@ -1,4 +1,8 @@
 import math
+import json
+import time
+import weakref
+from pathlib import Path
 import numpy as np
 from typing import Optional, List, Dict, Any
 
@@ -474,6 +478,11 @@ class Live2DCanvas(ADPOpenGLCanvas):
         self._motion_frozen = False
         self._motion_loop_enabled = False
         self._last_played_motion: tuple[str, int] | None = None
+        self._motion_playback = None
+        self._motion_scrub = None
+        self._motion_request_serial = 0
+        self._motion_started_during_update = False
+        self._updating_motion = False
         self._render_timer_id = None
         self._rendering_active = True
         self._editor_interaction = False
@@ -523,6 +532,7 @@ class Live2DCanvas(ADPOpenGLCanvas):
             pass
         self._motion_frozen = False
         self._last_played_motion = None
+        self._clear_motion_clock()
         self._advanced_params = {}
         self._part_opacity_overrides = {}
         self._part_opacity_defaults = {}
@@ -566,6 +576,7 @@ class Live2DCanvas(ADPOpenGLCanvas):
         self._motions = []
         self._last_played_motion = None
         self._motion_frozen = False
+        self._clear_motion_clock()
         self._advanced_params = {}
         self._part_opacity_overrides = {}
         self._part_opacity_defaults = {}
@@ -580,7 +591,7 @@ class Live2DCanvas(ADPOpenGLCanvas):
         if self.model is None:
             return
         if not self._motion_frozen:
-            self.model.Update()
+            self._update_model_motion()
             self._restart_loop_motion_if_finished()
         # Apply advanced parameter overrides each frame if enabled
         if self._advanced_enabled:
@@ -593,13 +604,10 @@ class Live2DCanvas(ADPOpenGLCanvas):
                 index = self._part_indices.get(part_id)
                 if index is not None:
                     self.model.SetPartOpacity(index, float(value))
-        if self._motion_frozen or self._advanced_enabled or self._part_opacity_overrides:
-            # Parameter setters update Core values; vertices are recomputed by
-            # Cubism's zero-delta update before drawing the frozen/editor pose.
-            native_model = getattr(self.model, "_model", None)
-            update = getattr(native_model, "Update", None)
-            if callable(update):
-                update(0.0)
+        # live2d-py's native Draw recomputes Cubism Core vertices before drawing.
+        # Calling SDK Update(0) here would also run motion/physics/pose, changing
+        # an otherwise frozen frame and unrelated parameters during edits.
+        # https://github.com/EasyLive2D/live2d-py/blob/v0.7.0.2/Live2D/V3/Main/src/Model.cpp#L1018
         self.model.Draw()
 
     def on_resize(self, width: int, height: int):
@@ -785,7 +793,16 @@ class Live2DCanvas(ADPOpenGLCanvas):
 
     def setMotionFrozen(self, frozen: bool):
         """Pause model updates while keeping rendering and parameter editing active."""
+        was_frozen = self._motion_frozen
         self._motion_frozen = bool(frozen)
+        if was_frozen and not frozen:
+            self._reset_update_timestamp()
+            scrub = self._motion_scrub
+            self._motion_scrub = None
+            # The SDK has no native seek.  A manually scrubbed Parameter pose
+            # can only return to motion playback by explicitly restarting it.
+            if scrub:
+                self.playMotion(scrub["group"], scrub["index"])
         self.update()
 
     def setRenderingActive(self, active: bool):
@@ -795,6 +812,7 @@ class Live2DCanvas(ADPOpenGLCanvas):
             self.killTimer(self._render_timer_id)
             self._render_timer_id = None
         elif self._rendering_active and self._gl_initialized and self._render_timer_id is None:
+            self._reset_update_timestamp()
             self._render_timer_id = self.startTimer(int(1000 / 60))
             self.update()
 
@@ -810,8 +828,8 @@ class Live2DCanvas(ADPOpenGLCanvas):
             self._part_opacity_defaults.setdefault(str(key), 1.0)
         effective = dict(self._part_opacity_defaults)
         effective.update(values)
-        self._part_opacity_overrides = {str(key): max(0.0, min(1.0, float(value)))
-                                        for key, value in effective.items()}
+        overrides = {str(key): max(0.0, min(1.0, float(value))) for key, value in effective.items()}
+        self._part_opacity_overrides = overrides
         self.update()
 
     def isMotionFrozen(self) -> bool:
@@ -833,8 +851,88 @@ class Live2DCanvas(ADPOpenGLCanvas):
                 setter(parameter_id, float(value))
             except Exception:
                 continue
+        if self._motion_frozen:
+            duration = max(0.0, float(motion.get("duration") or 0))
+            self._motion_scrub = {
+                "group": str(motion.get("group", "")), "index": int(motion.get("index", 0)),
+                "time": min(max(0.0, float(seconds)), duration) if duration else max(0.0, float(seconds)),
+                "duration": duration, "playing": False, "scrubbed": True,
+            }
         self.update()
         return values
+
+    def _clear_motion_clock(self):
+        self._motion_request_serial += 1
+        self._motion_playback = self._motion_scrub = None
+
+    def _reset_update_timestamp(self):
+        # live2d-py's wrapper computes the SDK delta from _lastFrame.  Frozen or
+        # hidden time must not become a 100 ms jump on the next native Update.
+        if self.model is not None and hasattr(self.model, "_lastFrame"):
+            self.model._lastFrame = time.time()
+
+    def _update_model_motion(self):
+        previous = getattr(self.model, "_lastFrame", None)
+        self._motion_started_during_update = False
+        self._updating_motion = True
+        try:
+            self.model.Update()
+        finally:
+            self._updating_motion = False
+        current = getattr(self.model, "_lastFrame", None)
+        if (self._motion_playback and self._motion_playback["playing"]
+                and not self._motion_started_during_update
+                and previous is not None and current is not None):
+            # This is the exact capped delta used by the installed LAppModel,
+            # not the UI timer or time spent waiting while the page is hidden.
+            delta = max(0.0, min(float(current) - float(previous), 0.1))
+            self._motion_playback["time"] += delta
+
+    def getMotionPlaybackState(self) -> dict | None:
+        state = self._motion_scrub if self._motion_frozen and self._motion_scrub else self._motion_playback
+        if state is None:
+            return None
+        result = dict(state)
+        duration = float(result["duration"])
+        if duration > 0:
+            result["time"] = (float(result["time"]) % duration if result.get("native_loop")
+                              else min(float(result["time"]), duration))
+        result["frozen"] = self._motion_frozen
+        return result
+
+    def _start_native_motion(self, group: str, index: int):
+        self._motion_request_serial += 1
+        serial = self._motion_request_serial
+        owner = weakref.ref(self)
+        motion = self.findMotion(group, index) or {}
+        duration = max(0.0, float(motion.get("duration") or 0))
+        native_loop = False
+        try:
+            data = json.loads(Path(str(motion.get("file") or "")).read_text(encoding="utf-8-sig"))
+            native_loop = bool((data.get("Meta") or {}).get("Loop"))
+        except (OSError, ValueError):
+            pass
+
+        def started(actual_group, actual_index):
+            canvas = owner()
+            if canvas is None or canvas._motion_request_serial != serial:
+                return
+            canvas._motion_playback = {
+                "group": str(actual_group), "index": int(actual_index), "duration": duration,
+                "time": 0.0, "playing": True, "native_loop": native_loop, "scrubbed": False,
+            }
+            canvas._motion_started_during_update = canvas._updating_motion
+
+        def finished(actual_group, actual_index):
+            canvas = owner()
+            if canvas is None or canvas._motion_request_serial != serial or canvas._motion_playback is None:
+                return
+            if (canvas._motion_playback["group"], canvas._motion_playback["index"]) == (str(actual_group), int(actual_index)):
+                canvas._motion_playback.update(playing=False, time=duration)
+
+        self.model.StartMotion(group, index, 3, onStartMotionHandler=started, onFinishMotionHandler=finished)
+        self._last_played_motion = (str(group), int(index))
+        self._motion_scrub = None
 
     def _restart_loop_motion_if_finished(self):
         if not self._motion_loop_enabled or self._last_played_motion is None or self.model is None:
@@ -846,7 +944,7 @@ class Live2DCanvas(ADPOpenGLCanvas):
             if not bool(is_finished()):
                 return
             group, index = self._last_played_motion
-            self.model.StartMotion(group, index, 3)
+            self._start_native_motion(group, index)
         except Exception:
             pass
 
@@ -884,6 +982,7 @@ class Live2DCanvas(ADPOpenGLCanvas):
         """
         if self.model is None:
             return
+        self._clear_motion_clock()
         for name in (
             "StopAllMotions",
             "ResetExpressions",
@@ -913,8 +1012,8 @@ class Live2DCanvas(ADPOpenGLCanvas):
         if reset_state:
             self.resetMotionState()
         try:
-            self.model.StartMotion(group, index, 3)
-            self._last_played_motion = (str(group), int(index))
+            self._reset_update_timestamp()
+            self._start_native_motion(group, index)
             return True
         except Exception:
             pass

@@ -11,7 +11,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-from PySide6.QtCore import QCoreApplication, QEvent, QObject, Signal
+from PySide6.QtCore import QCoreApplication, QEvent, QObject, Signal, QTimer, Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QVBoxLayout, QWidget
 
 from tests.test_live2d_editor_session import make_model
@@ -152,6 +153,7 @@ class Live2DEditorPageTests(unittest.TestCase):
         self.assertFalse(self.page.session.dirty)
         self.page.redo()
         self.assertTrue(self.page.session.dirty)
+        self.page.tabs.setCurrentWidget(self.page.artmesh_tab)
         self.page.artmesh_inspector.select_entry("ArtMeshFace")
         self.page.part_opacity.setValue(0)
         self.assertEqual(self.page.preview.parts["PartFace"], 0)
@@ -174,7 +176,9 @@ class Live2DEditorPageTests(unittest.TestCase):
         with patch("app.gui.Live2DCanvas.live2d.clearBuffer"):
             Live2DCanvas.setPartOpacityOverrides(canvas, {"PartFace": 0}, {"PartFace": .7})
             Live2DCanvas.on_draw(canvas)
-            self.assertEqual(calls, [("parameters",), ("part", 0, 0), ("update", 0), ("draw",)])
+            # live2d-py Draw updates Cubism Core itself. SDK Update(0) would
+            # additionally evaluate Physics/Pose and drift a frozen pose.
+            self.assertEqual(calls, [("parameters",), ("part", 0, 0), ("draw",)])
             calls.clear()
             Live2DCanvas.setPartOpacityOverrides(canvas, {})
             Live2DCanvas.on_draw(canvas)
@@ -365,6 +369,59 @@ class Live2DEditorPageTests(unittest.TestCase):
         for path, digest in original_hashes.items():
             self.assertEqual(hashlib.sha256(Path(path).read_bytes()).hexdigest(), digest)
         self.assertEqual(psd.settings_manager.get("psd.project_files"), [str(first.project_file)])
+
+    def test_action_mouse_dialog_guard_create_copy_delete_undo_and_save_reopen(self):
+        from app.gui.editor_actions import ActionNameDialog
+        self.open()
+        self.page.resize(1040, 760)
+        self.page.show()
+        self.app.processEvents()
+        before = self.model.read_bytes()
+        failures = []
+        def click_dialog(button, name=None, confirm=True, repeat=False):
+            def answer():
+                try:
+                    dialog = self.page._action_dialog
+                    self.assertIsNotNone(dialog)
+                    self.assertTrue(dialog.isWindow())
+                    self.assertIs(self.app.activeModalWidget(), dialog)
+                    if repeat:
+                        self.page._create_motion()
+                        self.assertEqual(len([item for item in self.page.findChildren(ActionNameDialog) if item.isVisible()]), 1)
+                    if name is not None:
+                        dialog.name_edit.setText(name)
+                    QTest.mouseClick(dialog.yesButton if confirm else dialog.cancelButton, Qt.LeftButton)
+                except BaseException as exc:
+                    failures.append(exc)
+                    if self.page._action_dialog:
+                        self.page._action_dialog.reject()
+            QTimer.singleShot(0, answer)
+            QTest.mouseClick(button, Qt.LeftButton)
+            self.app.processEvents()
+            self.assertFalse(failures, failures)
+            self.assertIsNone(self.page._action_dialog)
+        click_dialog(self.page.new_motion_button, confirm=False, repeat=True)
+        self.assertFalse(self.page.session.dirty)
+        click_dialog(self.page.new_motion_button, "NewPose", repeat=True)
+        self.assertEqual(self.page._current_motion(), "NewPose")
+        self.page.session.set_keyframes("NewPose", "ParamAngleY", [{"time": 0, "value": -10}, {"time": 2, "value": 10}])
+        click_dialog(self.page.clone_motion_button, "CopyPose")
+        self.assertEqual(self.page._current_motion(), "CopyPose")
+        self.assertEqual(self.page.session.keyframes("NewPose", "ParamAngleY"), self.page.session.keyframes("CopyPose", "ParamAngleY"))
+        click_dialog(self.page.delete_motion_button, confirm=False)
+        self.assertIn("CopyPose", self.page.session.project.motions)
+        click_dialog(self.page.delete_motion_button)
+        self.assertNotIn("CopyPose", self.page.session.project.motions)
+        self.page.undo_button.click()
+        self.assertIn("CopyPose", self.page.session.project.motions)
+        self.page.redo_button.click()
+        self.assertNotIn("CopyPose", self.page.session.project.motions)
+        saved = self.page.save_copy(str(self.root / "actions"))
+        self.assertTrue(saved)
+        self.assertTrue(self.page.open_source(saved["model_path"]))
+        self.assertIn("NewPose[0]", self.page.session.project.motions)
+        self.assertNotIn("CopyPose[0]", self.page.session.project.motions)
+        self.assertEqual(self.model.read_bytes(), before)
 
 
 if __name__ == "__main__":

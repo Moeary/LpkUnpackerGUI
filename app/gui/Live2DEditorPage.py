@@ -24,6 +24,7 @@ from app.gui.ArtMeshInspector import ArtMeshInspector
 from app.gui.live2d_editor_panels import ProjectBoundModPage
 from app.gui.PsdReconstructionPage import PsdReconstructionPage
 from app.gui.editor_timeline import AnimationTimelineEditor
+from app.gui.editor_actions import ActionComboBox, ActionDeleteDialog, ActionNameDialog, action_text, close_editor_popup
 from app.gui.editor_workspace import EditorViewportLayout, EditorWorkspace, FluentEditorTabs
 from app.i18n import get_i18n, tr
 
@@ -97,28 +98,8 @@ def _text(key: str, **values) -> str:
     return tr(key, default=LIVE2D_EDITOR_TEXT[key], **values)
 
 
-class _MotionDialog(MessageBoxBase):
-    def __init__(self, title: str, parent, duration: bool = True):
-        super().__init__(parent)
-        self.viewLayout.addWidget(SubtitleLabel(title, self.widget))
-        self.viewLayout.addWidget(BodyLabel(_text("editor.live2d.motion_name"), self.widget))
-        self.name_edit = LineEdit(self.widget)
-        self.viewLayout.addWidget(self.name_edit)
-        self.duration_spin = DoubleSpinBox(self.widget)
-        self.duration_spin.setRange(.01, 3600)
-        self.duration_spin.setDecimals(3)
-        self.duration_spin.setValue(3)
-        if duration:
-            self.viewLayout.addWidget(BodyLabel(_text("editor.live2d.duration"), self.widget))
-            self.viewLayout.addWidget(self.duration_spin)
-        else:
-            self.duration_spin.hide()
-        self.widget.setMinimumWidth(320)
-        self.yesButton.setText(tr("common.confirm", default="确定"))
-        self.cancelButton.setText(tr("common.cancel", default="取消"))
-
-    def validate(self):
-        return bool(self.name_edit.text().strip())
+class _MotionDialog(ActionNameDialog):
+    """Compatibility name for the shared owned native dialog."""
 
 
 class _ParameterValue:
@@ -160,8 +141,10 @@ class Live2DEditorPage(QFrame):
         self.last_open_error = ""
         self._refreshing = False
         self._active = False
+        self._action_dialog = None
         self._manual_pose = False
         self._selected_parameter = ""
+        self._inspector_session = None
         self._parameter_spins: dict[str, _ParameterValue] = {}
         self._mod_preview_model_id = ""
         self._external_editor = ""
@@ -281,39 +264,28 @@ class Live2DEditorPage(QFrame):
         row = QHBoxLayout()
         self.motion_label = CaptionLabel(timeline_host)
         self.motion_label.hide()
-        self.motion_combo = ComboBox(timeline_host)
-        self.motion_combo.setMinimumWidth(80)
-        self.motion_combo.setMaximumWidth(125)
+        self.motion_combo = ActionComboBox(timeline_host)
         self.motion_combo.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        self.motion_combo.setFixedWidth(110)
         self.motion_combo.currentIndexChanged.connect(self._motion_changed)
         self.new_motion_button = TransparentToolButton(FluentIcon.ADD, timeline_host)
         self.clone_motion_button = TransparentToolButton(FluentIcon.COPY, timeline_host)
+        self.delete_motion_button = TransparentToolButton(FluentIcon.REMOVE, timeline_host)
         self.key_pose_button = TransparentToolButton(FluentIcon.ACCEPT, timeline_host)
-        for button in (self.new_motion_button, self.clone_motion_button, self.key_pose_button):
+        for button in (self.new_motion_button, self.delete_motion_button, self.clone_motion_button, self.key_pose_button):
             button.setFixedSize(28, 28)
         self.new_motion_button.clicked.connect(self._create_motion)
         self.clone_motion_button.clicked.connect(self._clone_motion)
+        self.delete_motion_button.clicked.connect(self._delete_motion)
         self.key_pose_button.clicked.connect(self._key_current_pose)
         row.addWidget(self.motion_combo)
+        for button in (self.new_motion_button, self.delete_motion_button, self.clone_motion_button):
+            row.addWidget(button)
         self.track_label = CaptionLabel(timeline_host)
         self.track_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         row.addWidget(self.track_label, 1)
-        self.motion_options_button = TransparentToolButton(FluentIcon.MORE, timeline_host)
-        self.motion_options_button.setFixedSize(26, 28)
-        row.addWidget(self.motion_options_button)
+        row.addWidget(self.key_pose_button)
         row.addSpacing(28)
         timeline_layout.addLayout(row)
-        self.motion_options_menu = RoundMenu(parent=self)
-        options = QWidget(self.motion_options_menu)
-        options.setFixedSize(220, 42)
-        commands = QHBoxLayout(options)
-        commands.setContentsMargins(6, 4, 6, 4)
-        for button in (self.new_motion_button, self.clone_motion_button, self.key_pose_button):
-            commands.addWidget(button)
-        commands.addStretch(1)
-        self.motion_options_menu.addWidget(options, selectable=False)
-        self.motion_options_button.clicked.connect(lambda: self.motion_options_menu.exec(self.motion_options_button.mapToGlobal(QPoint(0, self.motion_options_button.height()))))
         self.timeline = AnimationTimelineEditor(timeline_host)
         self.timeline.canvas.setMinimumHeight(80)
         self.timeline.timeChanged.connect(self._seek)
@@ -543,10 +515,13 @@ class Live2DEditorPage(QFrame):
         for widget, key in labels.items():
             widget.setText(_text("editor.live2d." + key))
         for button, key in ((self.undo_button, "undo"), (self.redo_button, "redo"), (self.help_button, "help"),
-                            (self.new_motion_button, "new_motion"), (self.clone_motion_button, "clone_motion"),
-                            (self.key_pose_button, "key_pose"), (self.motion_options_button, "motion")):
+                            (self.key_pose_button, "key_pose")):
             button.setToolTip(_text("editor.live2d." + key))
             button.setAccessibleName(button.toolTip())
+        for button, key in ((self.new_motion_button, "new"), (self.clone_motion_button, "copy"), (self.delete_motion_button, "delete")):
+            button.setToolTip(action_text("editor.actions." + key))
+            button.setAccessibleName(button.toolTip())
+        self.motion_combo.retranslate_ui()
         self.use_for_mod_button.setToolTip(_text("editor.live2d.mod_hint"))
         self.parameter_name.setText(_text("editor.live2d.selected_parameter"))
         for index, key in enumerate(("parameters", "parts", "textures", "psd", "mod")):
@@ -622,7 +597,7 @@ class Live2DEditorPage(QFrame):
             self._populate_motions()
             self._populate_parameters()
             self._populate_textures()
-            self._refresh_mesh()
+            self._refresh_mesh_if_visible()
             self._mod_preview_model_id = ""
             self._bind_subprojects()
             self.source_label.setText(candidate.source_path.name)
@@ -653,7 +628,7 @@ class Live2DEditorPage(QFrame):
                     self._populate_motions()
                     self._populate_parameters()
                     self._populate_textures()
-                    self._refresh_mesh()
+                    self._refresh_mesh_if_visible()
                 except Exception as rollback_error:
                     self._status(str(rollback_error))
             if candidate:
@@ -879,7 +854,7 @@ class Live2DEditorPage(QFrame):
             if self.preview and self.session:
                 self.preview.load_model(str(self.session.model_path))
                 self._native_model_ready()
-                self._refresh_mesh()
+                self._refresh_mesh_if_visible()
             self._mod_preview_model_id = ""
             self.preview_toolbar.hide()
             previous.close()
@@ -1113,10 +1088,11 @@ class Live2DEditorPage(QFrame):
             self.preview.set_motion_frozen(True)
 
     def _create_motion(self):
-        if not self.session:
+        if not self.session or self._action_dialog is not None:
             return
-        dialog = _MotionDialog(_text("editor.live2d.new_motion"), self.window())
-        if dialog.exec() != QDialog.Accepted:
+        names = set(self.session.project.motions) | set(self.session.project.document["FileReferences"].get("Motions", {}))
+        dialog = _MotionDialog(action_text("editor.actions.new"), self.window(), existing_names=names)
+        if self._exec_action_dialog(dialog) != QDialog.Accepted:
             return
         try:
             name = dialog.name_edit.text().strip()
@@ -1128,21 +1104,52 @@ class Live2DEditorPage(QFrame):
             self._error(exc)
 
     def _clone_motion(self):
-        if not self.session or not self._current_motion():
+        if not self.session or not self._current_motion() or self._action_dialog is not None:
             return
-        dialog = _MotionDialog(_text("editor.live2d.clone_motion"), self.window(), duration=False)
-        if dialog.exec() == QDialog.Accepted:
+        source = self._current_motion()
+        names = set(self.session.project.motions) | set(self.session.project.document["FileReferences"].get("Motions", {}))
+        dialog = _MotionDialog(action_text("editor.actions.copy"), self.window(), duration=False, existing_names=names)
+        if self._exec_action_dialog(dialog) == QDialog.Accepted:
             try:
                 name = dialog.name_edit.text().strip()
-                self.session.clone_motion(self._current_motion(), name)
+                self.session.clone_motion(source, name)
                 self._populate_motions(name)
                 self._update_actions()
             except Exception as exc:
                 self._error(exc)
 
+    def _exec_action_dialog(self, dialog):
+        close_editor_popup()
+        self.timeline.set_playing(False)
+        self._action_dialog = dialog
+        try:
+            return dialog.exec()
+        finally:
+            self._action_dialog = None
+            dialog.deleteLater()
+
+    def _delete_motion(self):
+        if not self.session or not self._current_motion() or self._action_dialog is not None:
+            return
+        name = self._current_motion()
+        if self._exec_action_dialog(ActionDeleteDialog(name, self.window())) != QDialog.Accepted:
+            return
+        try:
+            self.session.delete_motion(name)
+            self._populate_motions()
+            self._apply_preview_pose()
+            self._update_actions()
+        except Exception as exc:
+            self._error(exc)
+
     def _schedule_mesh_refresh(self):
         if self.tabs.currentWidget() is self.artmesh_tab:
             self._mesh_timer.start()
+
+    def _refresh_mesh_if_visible(self):
+        self._inspector_session = None
+        if self.tabs.currentWidget() is self.artmesh_tab:
+            self._refresh_mesh()
 
     def _refresh_mesh(self):
         if not self.session:
@@ -1150,12 +1157,15 @@ class Live2DEditorPage(QFrame):
         try:
             path = (self._preview_session or self.session).write_inspector_metadata(self._pose())
             self.artmesh_inspector.load_metadata(path)
+            self._inspector_session = self._preview_session or self.session
         except Exception as exc:
             self._error(exc)
 
     def _native_drawable_clicked(self, drawable_id: str):
         # Some wrappers return a Part ID from HitPart. Only an actual drawable
         # match can replace the more precise pose-geometry click selection.
+        if self._inspector_session is not (self._preview_session or self.session):
+            self._refresh_mesh()
         if any(entry.drawable_id == drawable_id for entry in self.artmesh_inspector.entries):
             in_mod = self.tabs.currentWidget() is self.mod_tab
             if not in_mod:
@@ -1170,6 +1180,8 @@ class Live2DEditorPage(QFrame):
         in_mod = self.tabs.currentWidget() is self.mod_tab
         if not in_mod:
             self.tabs.setCurrentWidget(self.artmesh_tab)
+        # MOD keeps its own tab visible while picking a trigger in the stage.
+        # It still needs the current pose geometry for an accurate hit test.
         self._refresh_mesh()
         canvas = ((self._preview_session or self.session).mesh_data or {}).get("canvas", {})
         x = normalized_x * float(canvas.get("width", 1))
@@ -1478,6 +1490,7 @@ class Live2DEditorPage(QFrame):
         self.new_motion_button.setEnabled(bool(session))
         self.use_for_mod_button.setEnabled(bool(session))
         self.clone_motion_button.setEnabled(bool(session and self._current_motion()))
+        self.delete_motion_button.setEnabled(bool(session and self._current_motion()))
         self.key_pose_button.setEnabled(bool(session and self._current_motion() and self._selected_parameter))
         self.parameter_tab.setEnabled(bool(session))
         self.artmesh_tab.setEnabled(bool(session))
