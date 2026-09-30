@@ -1,6 +1,7 @@
 from PySide6.QtCore import QThread, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
+    QApplication,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -9,6 +10,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QToolButton,
+    QPlainTextEdit,
     QSizePolicy,
     QScrollArea,
     QVBoxLayout,
@@ -859,9 +861,56 @@ class SettingsPage(QFrame):
             (self.image_viewer_button, self.image_viewer_clear_button),
         )
 
+        mcp_card, mcp_layout = self._new_settings_card(content, "settingsMcpCard")
+        right_column.addWidget(mcp_card)
+        self.mcp_title = SubtitleLabel("", mcp_card)
+        self.mcp_description = CaptionLabel("", mcp_card)
+        self.mcp_description.setWordWrap(True)
+        self.mcp_config_button = PushButton("", mcp_card)
+        self.mcp_config_button.clicked.connect(self.show_animation_mcp_config)
+        mcp_layout.addWidget(self.mcp_title)
+        mcp_layout.addWidget(self.mcp_description)
+        mcp_layout.addWidget(self.mcp_config_button)
+
         left_column.addStretch(1)
         right_column.addStretch(1)
         main_layout.addStretch(1)
+
+    def show_animation_mcp_config(self):
+        import json
+        from app.core.mcp_launch import animation_mcp_config
+
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            tr("settings.mcp.workspace"),
+            self.settings_manager.get_output_root(),
+        )
+        if not directory:
+            return
+        configuration = json.dumps(animation_mcp_config(directory), ensure_ascii=False, indent=2)
+        dialog = QDialog(self)
+        dialog.setWindowTitle(tr("settings.mcp.dialog_title"))
+        dialog.resize(760, 460)
+        layout = QVBoxLayout(dialog)
+        description = BodyLabel(
+            tr("settings.mcp.instructions"),
+            dialog,
+        )
+        description.setWordWrap(True)
+        layout.addWidget(description)
+        editor = QPlainTextEdit(dialog)
+        editor.setReadOnly(True)
+        editor.setPlainText(configuration)
+        layout.addWidget(editor, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, dialog)
+        copy_button = buttons.addButton(
+            tr("settings.mcp.copy"),
+            QDialogButtonBox.ButtonRole.ActionRole,
+        )
+        copy_button.clicked.connect(lambda: QApplication.clipboard().setText(configuration))
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.exec()
 
     def load_current_settings(self):
         self._syncing_ui = True
@@ -1137,6 +1186,9 @@ class SettingsPage(QFrame):
         self._syncing_ui = True
         try:
             self.title_label.setText(tr("settings.title"))
+            self.mcp_title.setText(tr("settings.mcp.title"))
+            self.mcp_description.setText(tr("settings.mcp.description"))
+            self.mcp_config_button.setText(tr("settings.mcp.button"))
 
             self.language_section_title.setText(tr("settings.section.language"))
             self.language_label.setText(tr("settings.language_label"))

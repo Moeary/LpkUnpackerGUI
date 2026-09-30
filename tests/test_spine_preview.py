@@ -10,6 +10,7 @@ from app.core.spine_preview import (
     SpineRuntimeUnavailableError,
     SpineVersionMismatchError,
     _atlas_page_names,
+    _match_skeleton_atlases,
     discover_spine_runtime,
     load_spine_asset,
     make_spine_preview_plan,
@@ -62,6 +63,27 @@ class SpinePreviewTests(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.temp, ignore_errors=True)
+
+    def test_adjacent_models_select_atlas_by_attachment_path(self):
+        wrong = self.asset_dir / "aaa.atlas"
+        wrong.write_text("page.png\nsize: 64,64\nwrong-region\n  xy: 0,0\n  size: 8,8\n", encoding="utf-8")
+        skeleton = self.asset_dir / "skeleton.json"
+        data = json.loads(skeleton.read_text(encoding="utf-8"))
+        for skins in (
+            {"default": {"slot": {"display-name": {"path": "region-a"}}}},
+            [{"name": "default", "attachments": {"slot": {"display-name": {"path": "region-a"}}}}],
+        ):
+            with self.subTest(skins=type(skins).__name__):
+                data["skins"] = skins
+                skeleton.write_text(json.dumps(data), encoding="utf-8")
+                asset = load_spine_asset(skeleton)
+                self.assertEqual(list(asset.atlas_paths), [self.asset_dir / "sample.atlas"])
+
+    def test_binary_atlas_selection_uses_export_suffixes(self):
+        expected = self.asset_dir / "spineboy-pma.atlas"
+        result = _match_skeleton_atlases(self.asset_dir / "spineboy-pro.skel", None,
+                                         [self.asset_dir / "coin.atlas", expected])
+        self.assertEqual(result, [expected])
 
     def _native_root(self, *versions: str) -> Path:
         root = self.temp / "spine_native"

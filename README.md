@@ -52,6 +52,18 @@ pixi run start
 pixi run check
 ```
 
+### AI 动画编辑（MCP）
+
+设置页的“AI 动画编辑 · MCP”可生成客户端配置。服务通过本地 stdio 通信，由 MCP 客户端按需启动，也可从源码运行：
+
+```powershell
+pixi run mcp-animation --workspace "D:\AnimationWorkspace"
+```
+
+可读取 Live2D 参数范围或 Spine 骨骼结构，新建动作、修改关键帧，再将模型与动作另存为工作目录内的独立副本。Live2D 使用 `.motion3.json`，Spine 使用骨骼 JSON 动画；原模型不被覆盖。新动作只能使用模型已有的绑定，缺少腿部参数的 Live2D 模型不能凭空生成屈膝形变。
+
+连接方式、工具调用顺序和限制见 [动画 MCP 使用说明](assets/docs/animation-mcp.md)。
+
 ## 一、资源提取与预览
 
 这一部分负责先把来源中的资源找出来，再决定是完整解包、只提取贴图，还是直接预览。

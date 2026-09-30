@@ -967,6 +967,7 @@ def _asset_from_model_config(path: Path, data: Mapping[str, Any]) -> SpinePrevie
 def _asset_from_skeleton(path: Path, data: Mapping[str, Any] | None) -> SpinePreviewAsset:
     root = path.parent.resolve()
     atlas_paths = _nearby_atlases(root, path)
+    atlas_paths = _match_skeleton_atlases(path, data, atlas_paths)
     textures: list[Path] = []
     for atlas in atlas_paths:
         for page in _atlas_page_names(atlas):
@@ -1051,6 +1052,59 @@ def _nearby_atlases(root: Path, skeleton: Path | None) -> list[Path]:
     else:
         candidates.sort(key=lambda item: str(item).lower())
     return candidates
+
+
+def _match_skeleton_atlases(
+    skeleton: Path, data: Mapping[str, Any] | None, candidates: list[Path],
+) -> list[Path]:
+    """Disambiguate adjacent models by their actual attachment image paths."""
+    if len(candidates) < 2:
+        return candidates
+    required: set[str] = set()
+    raw_skins = data.get("skins", {}) if isinstance(data, Mapping) else {}
+    if isinstance(raw_skins, list):
+        skins = [skin.get("attachments", {}) for skin in raw_skins if isinstance(skin, Mapping)]
+    elif isinstance(raw_skins, Mapping):
+        skins = list(raw_skins.values())
+    else:
+        skins = []
+    for skin in skins:
+        if not isinstance(skin, Mapping):
+            continue
+        for slot in skin.values():
+            if not isinstance(slot, Mapping):
+                continue
+            for name, attachment in slot.items():
+                if not isinstance(attachment, Mapping):
+                    continue
+                kind = attachment.get("type", "region")
+                if kind not in {"region", "mesh", "weightedmesh", "skinnedmesh"}:
+                    continue
+                image_path = attachment.get("path", name)
+                if isinstance(image_path, str):
+                    required.add(image_path)
+    if required:
+        from app.core.spine_atlas import SpineAtlasError, parse_atlas
+
+        matching = []
+        for candidate in candidates:
+            try:
+                names = {region.name for region in parse_atlas(candidate).regions}
+            except (OSError, ValueError, SpineAtlasError):
+                continue
+            if required.issubset(names):
+                matching.append(candidate)
+        if len(matching) == 1:
+            return matching
+        if matching:
+            candidates = matching
+    # Binary skeletons have no cheap attachment inventory; use conventional
+    # editor export suffixes only when one unambiguous basename matches.
+    def base(path: Path) -> str:
+        return re.sub(r"(?:[-_](?:pro|ess|pma))+$", "", path.stem.casefold())
+
+    named = [candidate for candidate in candidates if base(candidate) == base(skeleton)]
+    return named if len(named) == 1 else candidates
 
 
 def _atlas_page_names(path: Path) -> list[str]:

@@ -90,7 +90,9 @@ def build_nuitka_args(compiler: str, *, require_native: bool = False) -> list[st
         "--enable-plugin=pyside6",
         "--output-dir=build",
         "--output-filename=LpkUnpackerGUI.exe",
-        "--windows-console-mode=disable",
+        # Preserve redirected stdin/stdout for --mcp-animation; launching the
+        # GUI from Explorer still creates no console with attach mode.
+        "--windows-console-mode=attach",
         "--include-data-dir=./assets=assets",
         "--include-data-dir=./app/tools/AssetStudioCLI=tools/AssetStudioCLI",
         "--include-data-dir=./app/i18n/locales=app/i18n/locales",
@@ -102,10 +104,11 @@ def build_nuitka_args(compiler: str, *, require_native: bool = False) -> list[st
         # alongside the pinned PyOpenGL version.
         "--include-package=OpenGL_accelerate",
         "--include-package=psd_tools",
+        "--include-package=mcp",
         "--windows-icon-from-ico=assets/app/icon.ico",
         "--nofollow-import-to=matplotlib,scipy,pandas,tkinter",
         "--python-flag=no_site",
-        "--python-flag=no_docstrings",
+        # FastMCP builds tool descriptions from docstrings at runtime.
         "--remove-output",
         "app/main.py",
     ]

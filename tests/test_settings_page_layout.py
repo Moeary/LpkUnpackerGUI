@@ -60,6 +60,7 @@ class SettingsPageLayoutTests(unittest.TestCase):
                         "settingsPhotoshopCard",
                         "settingsSpineCard",
                         "settingsTextureCard",
+                        "settingsMcpCard",
                     },
                 )
                 self.assertEqual(page.settings_scroll.horizontalScrollBar().maximum(), 0)

@@ -1006,5 +1006,12 @@
   "preview.fit_model": "适应预览窗口",
   "preview.spine_native_pose_unavailable": "当前原生后端尚不支持人物姿态 PSD；部件编辑请使用 Spine 图集 PSD 导出。",
   "settings.tool_download_cancel": "取消下载 / 构建",
-  "settings.tool_download_cancelling": "正在取消，请稍候……"
+  "settings.tool_download_cancelling": "正在取消，请稍候……",
+  "settings.mcp.title": "AI 动画编辑 · MCP",
+  "settings.mcp.description": "本地 stdio 服务：读取 Live2D 参数或 Spine 骨骼、新建动作、编辑关键帧并另存模型副本。配置后由 AI 客户端按需启动。",
+  "settings.mcp.button": "生成 MCP 客户端配置…",
+  "settings.mcp.workspace": "选择动画 MCP 工作目录",
+  "settings.mcp.dialog_title": "MCP 客户端配置",
+  "settings.mcp.instructions": "将配置添加到支持 MCP 的 AI 客户端。客户端按需启动服务；新动作保存为工作目录内的独立副本。",
+  "settings.mcp.copy": "复制配置"
 }

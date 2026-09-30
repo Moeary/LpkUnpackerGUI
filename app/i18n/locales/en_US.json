@@ -1006,5 +1006,12 @@
   "preview.fit_model": "Fit model to viewport",
   "preview.spine_native_pose_unavailable": "Native pose PSD export is not supported yet. Use Spine atlas PSD export for part editing.",
   "settings.tool_download_cancel": "Cancel download / build",
-  "settings.tool_download_cancelling": "Cancelling, please wait…"
+  "settings.tool_download_cancelling": "Cancelling, please wait…",
+  "settings.mcp.title": "AI animation editing · MCP",
+  "settings.mcp.description": "Local stdio service: inspect Live2D parameters or Spine bones, create animations, edit keyframes, and save model copies. Started on demand by your AI client.",
+  "settings.mcp.button": "Generate MCP client configuration…",
+  "settings.mcp.workspace": "Choose animation MCP workspace",
+  "settings.mcp.dialog_title": "MCP client configuration",
+  "settings.mcp.instructions": "Add this configuration to an MCP client. The client starts the service on demand; edited animations are saved as independent copies inside the workspace.",
+  "settings.mcp.copy": "Copy configuration"
 }

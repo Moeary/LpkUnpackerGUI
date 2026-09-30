@@ -122,6 +122,7 @@ class PsdLayer:
     group: Optional[str] = None
     role: str = PSD_GROUP_ORIGINAL
     unit_id: Optional[str] = None
+    blend_mode: str = "normal"
 
 
 class _BoundPsdLayers:
@@ -2046,7 +2047,12 @@ def _render_mesh_layers(
             if coordinate_scale != 1.0
             else source_image
         )
-        layers.append(PsdLayer(layer_name, image, left, top, group_name))
+        layers.append(
+            PsdLayer(
+                layer_name, image, left, top, group_name,
+                blend_mode=str(drawable.get("blend_mode", "normal")),
+            )
+        )
         layer_metadata.append(
             {
                 "kind": "drawable-mesh",
@@ -2063,6 +2069,8 @@ def _render_mesh_layers(
                 "opacity": drawable.get("opacity", 1.0),
                 "render_order": drawable.get("render_order", 0),
                 "draw_order": drawable.get("draw_order", 0),
+                "blend_mode": drawable.get("blend_mode", "normal"),
+                "blend_mode_value": drawable.get("blend_mode_value", 0),
                 "coordinate_scale": coordinate_scale,
             }
         )
@@ -3052,7 +3060,7 @@ def _save_psd(
 ) -> None:
     from psd_tools import PSDImage
     from psd_tools.api.layers import PixelLayer
-    from psd_tools.constants import Compression
+    from psd_tools.constants import BlendMode, Compression
 
     limits = resource_limits or PsdResourceLimits()
     _validate_canvas_size(size, limits, "PSD export")
@@ -3081,6 +3089,33 @@ def _save_psd(
         except Exception:
             pass
 
+    def set_blend_mode(pixel: Any, mode: str) -> None:
+        # Cubism's compatibility multiply uses the same RGB blend as PSD
+        # Multiply over the opaque artwork below it.  Treating a shadow mesh
+        # as Normal replaces that artwork with the shadow texture instead.
+        # Retain the blend on the actual ArtMesh layer so it stays editable
+        # and keeps its normal texture-space reverse mapping.
+        modes = {
+            "normal": BlendMode.NORMAL,
+            "add-compatible": BlendMode.LINEAR_DODGE,
+            "multiply-compatible": BlendMode.MULTIPLY,
+            "add": BlendMode.LINEAR_DODGE,
+            "darken": BlendMode.DARKEN,
+            "multiply": BlendMode.MULTIPLY,
+            "color-burn": BlendMode.COLOR_BURN,
+            "linear-burn": BlendMode.LINEAR_BURN,
+            "lighten": BlendMode.LIGHTEN,
+            "screen": BlendMode.SCREEN,
+            "color-dodge": BlendMode.COLOR_DODGE,
+            "overlay": BlendMode.OVERLAY,
+            "soft-light": BlendMode.SOFT_LIGHT,
+            "hard-light": BlendMode.HARD_LIGHT,
+            "linear-light": BlendMode.LINEAR_LIGHT,
+            "hue": BlendMode.HUE,
+            "color": BlendMode.COLOR,
+        }
+        pixel.blend_mode = modes.get(str(mode).lower(), BlendMode.NORMAL)
+
     # Every edit unit receives its own Original/Paint/AI_Edit anchors.  A
     # semantic group, when present, is only an outer organization layer and is
     # never used as the binding identity.
@@ -3093,6 +3128,7 @@ def _save_psd(
                 left=layer.left, compression=compression,
             )
             set_layer_id(pixel, 100000 + index * 10 + 5)
+            set_blend_mode(pixel, layer.blend_mode)
             continue
         unit_name = str(layer.unit_id or layer.name)
         semantic_name = str(layer.group or "").strip()
@@ -3123,6 +3159,7 @@ def _save_psd(
             compression=compression,
         )
         set_layer_id(pixel, 100000 + index * 10 + 5)
+        set_blend_mode(pixel, layer.blend_mode)
 
     total = max(1, len(layers))
     step = max(1, total // 40)

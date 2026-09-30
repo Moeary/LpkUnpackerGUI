@@ -1006,5 +1006,12 @@
   "preview.fit_model": "プレビューに合わせる",
   "preview.spine_native_pose_unavailable": "ネイティブのポーズ PSD 出力は未対応です。パーツ編集には Spine アトラス PSD 出力を使用してください。",
   "settings.tool_download_cancel": "ダウンロード / ビルドを中止",
-  "settings.tool_download_cancelling": "中止しています。お待ちください…"
+  "settings.tool_download_cancelling": "中止しています。お待ちください…",
+  "settings.mcp.title": "AI アニメーション編集 · MCP",
+  "settings.mcp.description": "ローカル stdio サービス：Live2D パラメータや Spine ボーンの確認、アニメーションの作成、キーフレームの編集、モデルコピーの保存。AI クライアントが必要時に起動します。",
+  "settings.mcp.button": "MCP クライアント設定を生成…",
+  "settings.mcp.workspace": "アニメーション MCP 作業フォルダーを選択",
+  "settings.mcp.dialog_title": "MCP クライアント設定",
+  "settings.mcp.instructions": "MCP 対応 AI クライアントに設定を追加してください。クライアントがサービスを起動し、編集結果は作業フォルダー内の独立コピーに保存されます。",
+  "settings.mcp.copy": "設定をコピー"
 }

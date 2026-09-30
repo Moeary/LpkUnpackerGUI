@@ -8,6 +8,7 @@ platforms = ["win-64"]
 [tasks]
 start = "python -m app.main"
 cli = "python -m app.cli"
+mcp-animation = "python -m app.mcp_server"
 native-converter = "pwsh -NoProfile -ExecutionPolicy Bypass -File third_party/wang606_spine_converter/build_native.ps1"
 native-spine = "python scripts/build_native.py --all"
 native-build = { depends-on = ["native-converter", "native-spine"], cmd = "python scripts/verify_native_build.py --require-notices" }
@@ -35,3 +36,4 @@ zstandard = ">=0.23.0"
 opencv-python = ">=4.13.0.92, <5"
 psd-tools = ">=1.17.0, <2"
 pyopengl-accelerate = "==3.1.10"
+mcp = ">=1.28, <2"

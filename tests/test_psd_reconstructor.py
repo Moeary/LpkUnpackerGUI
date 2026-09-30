@@ -17,6 +17,43 @@ from app.core.psd_reconstructor import (
 
 
 class PsdReconstructorTests(unittest.TestCase):
+    def test_pose_psd_preserves_multiply_shadow_and_exact_repack(self):
+        from psd_tools import PSDImage
+        from psd_tools.constants import BlendMode
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model, original = self._make_source(root, second_drawable=False)
+            sidecar = root / "demo.drawables.json"
+            mesh = json.loads(sidecar.read_text(encoding="utf-8"))
+            mesh["drawables"][0]["blend_mode"] = "multiply-compatible"
+            mesh["drawables"][0]["blend_mode_value"] = 2
+            sidecar.write_text(json.dumps(mesh), encoding="utf-8")
+            result = reconstruct_live2d_psd(model, root / "export", mode="mesh")
+            psd = PSDImage.open(result.psd_path)
+            self.assertEqual(psd[0].blend_mode, BlendMode.MULTIPLY)
+            metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(metadata["layers"][0]["blend_mode"], "multiply-compatible")
+            repacked = repack_atlas_png_from_psd(result.psd_path, root / "repacked")
+            np.testing.assert_array_equal(np.asarray(Image.open(repacked.output_paths[0])), original)
+
+    def test_multiply_artmesh_darkens_background_in_saved_composite(self):
+        from psd_tools import PSDImage
+        from app.core.psd_reconstructor import _save_psd
+
+        layers = [
+            PsdLayer("Face", Image.new("RGBA", (4, 4), (200, 160, 120, 255))),
+            PsdLayer(
+                "Shadow", Image.new("RGBA", (4, 4), (128, 128, 128, 255)),
+                blend_mode="multiply-compatible",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "multiply.psd"
+            _save_psd(path, (4, 4), layers, flat_layers=True)
+            pixel = PSDImage.open(path).composite(force=True).getpixel((2, 2))
+            np.testing.assert_allclose(pixel, (100, 80, 60, 255), atol=1)
+
     def test_pose_psd_keeps_interleaved_render_order_without_groups(self):
         from psd_tools import PSDImage
         from app.core.psd_reconstructor import _save_psd
