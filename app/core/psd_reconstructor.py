@@ -490,7 +490,10 @@ def reconstruct_live2d_psd(
         limits,
         "PSD export",
     )
-    _save_psd(psd_path, size, layers, progress=progress, resource_limits=limits)
+    _save_psd(
+        psd_path, size, layers, progress=progress, resource_limits=limits,
+        flat_layers=(mode == "mesh"),
+    )
     _emit(progress, 98, "Writing metadata")
     _refresh_pixel_references_from_psd(psd_path, layer_metadata)
     metadata = _build_export_metadata(
@@ -1962,11 +1965,6 @@ def _render_mesh_layers(
 
     layers: list[PsdLayer] = []
     layer_metadata: list[dict[str, Any]] = []
-    clean_source_composite = (
-        Image.new("RGBA", source_size, (0, 0, 0, 0))
-        if coordinate_scale < 1.0
-        else None
-    )
     total = max(1, len(ordered))
     for index, drawable in enumerate(ordered):
         if not drawable.get("visible", True):
@@ -2043,11 +2041,6 @@ def _render_mesh_layers(
             layer[crop_top : crop_top + height, crop_left : crop_left + width],
             "RGBA",
         )
-        if clean_source_composite is not None:
-            clean_source_composite.alpha_composite(
-                source_image,
-                dest=(source_left, source_top),
-            )
         image = (
             _resize_rgba_premultiplied(source_image, (output_width, output_height))
             if coordinate_scale != 1.0
@@ -2077,17 +2070,8 @@ def _render_mesh_layers(
 
     if not layers:
         raise PsdReconstructionError("No drawable layers were rendered.")
-    if clean_source_composite is not None:
-        clean_target = _resize_rgba_premultiplied(clean_source_composite, size)
-        seam_underlay, seam_overlay = _build_seam_protection_layers(
-            clean_target,
-            size,
-            layers,
-        )
-        if seam_underlay is not None:
-            layers.insert(0, seam_underlay)
-        if seam_overlay is not None:
-            layers.append(seam_overlay)
+    # Keep one editable layer per drawable.  Global seam-cover layers obscure
+    # edits underneath them and have no ArtMesh identity for reverse mapping.
     return layers, size, layer_metadata
 
 
@@ -3063,6 +3047,8 @@ def _save_psd(
     layers: list[PsdLayer],
     progress: Optional[ProgressCallback] = None,
     resource_limits: PsdResourceLimits | None = None,
+    *,
+    flat_layers: bool = False,
 ) -> None:
     from psd_tools import PSDImage
     from psd_tools.api.layers import PixelLayer
@@ -3099,6 +3085,15 @@ def _save_psd(
     # semantic group, when present, is only an outer organization layer and is
     # never used as the binding identity.
     for index, layer in enumerate(layers):
+        if flat_layers:
+            # Input order is Cubism's back-to-front render order.  Grouping
+            # nonadjacent drawables by part changes that order and occlusion.
+            pixel = PixelLayer.frompil(
+                layer.image, psd, name=layer.name, top=layer.top,
+                left=layer.left, compression=compression,
+            )
+            set_layer_id(pixel, 100000 + index * 10 + 5)
+            continue
         unit_name = str(layer.unit_id or layer.name)
         semantic_name = str(layer.group or "").strip()
         if semantic_name and semantic_name not in semantic_groups:

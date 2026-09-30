@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QInputDialog,
     QAbstractButton,
@@ -82,6 +83,9 @@ from app.gui.Live2DPreviewWindow import Live2DPreviewWindow
 from app.gui.ArtMeshInspector import ArtMeshInspectorDialog
 from app.gui.PreviewPage import ImagePreviewPanel
 from app.i18n import get_i18n, tr
+
+
+MAX_WIDGET_SIZE = 16777215
 
 
 class PsdReconstructionThread(QThread):
@@ -336,6 +340,7 @@ class PsdReconstructionPage(QFrame):
         self.pending_multi_psd_paths: list[str] = []
         self.pending_pose_scheme_id = ""
         self._log_expanded = False
+        self._expanded_log_height = 220
         self._preview_dock_timer = QTimer(self)
         self._preview_dock_timer.setInterval(700)
         self._preview_dock_timer.timeout.connect(self._send_preview_dock_geometry)
@@ -396,9 +401,14 @@ class PsdReconstructionPage(QFrame):
         self.drop_sub_label.setVisible(False)
         self.main_layout.addWidget(self.drop_frame)
 
-        self.content_splitter = QSplitter(Qt.Horizontal, self)
+        self.workspace_splitter = QSplitter(Qt.Vertical, self)
+        self.workspace_splitter.setChildrenCollapsible(False)
+        self.main_layout.addWidget(self.workspace_splitter, 1)
+
+        self.content_splitter = QSplitter(Qt.Horizontal, self.workspace_splitter)
         self.content_splitter.setChildrenCollapsible(False)
-        self.main_layout.addWidget(self.content_splitter, 1)
+        self.content_splitter.setMinimumHeight(240)
+        self.workspace_splitter.addWidget(self.content_splitter)
 
         self.left_scroll = SingleDirectionScrollArea(
             orient=Qt.Vertical,
@@ -409,7 +419,7 @@ class PsdReconstructionPage(QFrame):
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
         self.left_scroll.enableTransparentBackground()
-        self.left_scroll.setMinimumWidth(390)
+        self.left_scroll.setMinimumWidth(340)
         self.left_panel = QWidget()
         self.left_panel_layout = QVBoxLayout(self.left_panel)
         self.left_panel_layout.setContentsMargins(0, 0, 10, 0)
@@ -417,12 +427,38 @@ class PsdReconstructionPage(QFrame):
         self.left_scroll.setWidget(self.left_panel)
         self.content_splitter.addWidget(self.left_scroll)
 
-        self.right_panel = QWidget(self.content_splitter)
+        self.right_column = QWidget(self.content_splitter)
+        self.right_column_layout = QVBoxLayout(self.right_column)
+        self.right_column_layout.setContentsMargins(0, 0, 0, 0)
+        self.right_column_layout.setSpacing(10)
+        self.right_scroll = SingleDirectionScrollArea(
+            orient=Qt.Vertical,
+            parent=self.right_column,
+        )
+        self.right_scroll.setWidgetResizable(True)
+        self.right_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.right_scroll.enableTransparentBackground()
+        self.right_scroll.setMinimumWidth(340)
+        self.right_panel = QWidget()
         self.right_panel_layout = QVBoxLayout(self.right_panel)
-        self.right_panel_layout.setContentsMargins(8, 0, 0, 0)
+        self.right_panel_layout.setContentsMargins(10, 0, 0, 0)
         self.right_panel_layout.setSpacing(10)
-        self.content_splitter.addWidget(self.right_panel)
-        self.content_splitter.setSizes([420, 980])
+        self.right_scroll.setWidget(self.right_panel)
+        self.right_column_layout.addWidget(self.right_scroll, 1)
+        self.right_footer = QWidget(self.right_column)
+        self.right_footer_layout = QVBoxLayout(self.right_footer)
+        self.right_footer_layout.setContentsMargins(10, 0, 0, 0)
+        self.right_footer_layout.setSpacing(8)
+        self.right_column_layout.addWidget(self.right_footer)
+        self.content_splitter.addWidget(self.right_column)
+        self.content_splitter.setStretchFactor(0, 1)
+        self.content_splitter.setStretchFactor(1, 1)
+        self.content_splitter.setSizes([500, 500])
+        self.content_splitter.splitterMoved.connect(
+            lambda *_args: self._arrange_button_rows()
+        )
 
         self.project_frame = CardWidget(self.left_panel)
         self.project_frame.setObjectName("psdProjectFrame")
@@ -456,7 +492,7 @@ class PsdReconstructionPage(QFrame):
         self.project_combo.currentIndexChanged.connect(self.on_project_combo_changed)
         self.project_layout.addWidget(self.project_combo)
 
-        self.project_button_layout = QVBoxLayout()
+        self.project_button_layout = QGridLayout()
         self.project_button_layout.setSpacing(8)
         self.new_project_button = PushButton("", self.project_frame)
         self.new_project_button.clicked.connect(self.create_project_from_current_source)
@@ -465,9 +501,9 @@ class PsdReconstructionPage(QFrame):
         self.open_project_folder_button = PushButton("", self.project_frame)
         self.open_project_folder_button.setEnabled(False)
         self.open_project_folder_button.clicked.connect(self.open_current_project_folder)
-        self.project_button_layout.addWidget(self.new_project_button)
-        self.project_button_layout.addWidget(self.save_project_button)
-        self.project_button_layout.addWidget(self.open_project_folder_button)
+        self.project_button_layout.addWidget(self.new_project_button, 0, 0)
+        self.project_button_layout.addWidget(self.save_project_button, 0, 1)
+        self.project_button_layout.addWidget(self.open_project_folder_button, 0, 2)
         self.project_layout.addLayout(self.project_button_layout)
 
         self.project_status_label = CaptionLabel("", self.project_frame)
@@ -476,16 +512,12 @@ class PsdReconstructionPage(QFrame):
 
         self.left_panel_layout.addWidget(self.project_frame)
 
-        # Keep the workflow label and translated actions in separate rows.
-        # At large fonts the Chinese labels are wider than a narrow sidebar;
-        # a horizontal segment would elide them even though the scroll area
-        # still has usable vertical space.
         self.workflow_layout = QVBoxLayout()
         self.workflow_layout.setSpacing(10)
         self.workflow_label = SubtitleLabel("", self.left_panel)
         self.workflow_segment = QFrame(self.left_panel)
         self.workflow_segment.setObjectName("psdWorkflowSegment")
-        self.workflow_segment_layout = QVBoxLayout(self.workflow_segment)
+        self.workflow_segment_layout = QGridLayout(self.workflow_segment)
         self.workflow_segment_layout.setContentsMargins(3, 3, 3, 3)
         self.workflow_segment_layout.setSpacing(3)
         self.export_flow_button = PushButton("", self.workflow_segment)
@@ -494,8 +526,8 @@ class PsdReconstructionPage(QFrame):
         self.repack_flow_button = PushButton("", self.workflow_segment)
         self.repack_flow_button.setObjectName("psdWorkflowButton")
         self.repack_flow_button.clicked.connect(lambda: self.set_workflow("repack"))
-        self.workflow_segment_layout.addWidget(self.export_flow_button)
-        self.workflow_segment_layout.addWidget(self.repack_flow_button)
+        self.workflow_segment_layout.addWidget(self.export_flow_button, 0, 0)
+        self.workflow_segment_layout.addWidget(self.repack_flow_button, 0, 1)
         self.workflow_layout.addWidget(self.workflow_label)
         self.workflow_layout.addWidget(self.workflow_segment)
         self.left_panel_layout.addLayout(self.workflow_layout)
@@ -572,6 +604,8 @@ class PsdReconstructionPage(QFrame):
         self.mode_combo.addItem("", userData="atlas-components")
         self.mode_combo.addItem(tr("psd.mode.atlas_artmesh"), userData="atlas-artmesh")
         self.mode_combo.currentIndexChanged.connect(self.on_mode_changed)
+        self.mode_combo.setMinimumWidth(0)
+        self.mode_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.mode_layout.addWidget(self.mode_label)
         self.mode_layout.addWidget(self.mode_combo)
         self.mode_hint_label = CaptionLabel("", self.mode_frame)
@@ -602,9 +636,10 @@ class PsdReconstructionPage(QFrame):
         self.mesh_canvas_hint_label = CaptionLabel("", self.mesh_canvas_frame)
         self.mesh_canvas_hint_label.setWordWrap(True)
         self.mesh_canvas_layout.addWidget(self.mesh_canvas_label)
-        self.mesh_canvas_layout.addWidget(self.mesh_canvas_preset_combo)
-        self.mesh_canvas_layout.addWidget(self.mesh_canvas_spin)
-        self.mesh_canvas_layout.addStretch(1)
+        self.mesh_canvas_input_layout = QHBoxLayout()
+        self.mesh_canvas_input_layout.addWidget(self.mesh_canvas_preset_combo, 1)
+        self.mesh_canvas_input_layout.addWidget(self.mesh_canvas_spin, 1)
+        self.mesh_canvas_layout.addLayout(self.mesh_canvas_input_layout)
         self.mode_container_layout.addWidget(self.mesh_canvas_frame)
         self.mode_container_layout.addWidget(self.mesh_canvas_hint_label)
         self.export_card_layout.addWidget(self.mode_frame)
@@ -617,10 +652,12 @@ class PsdReconstructionPage(QFrame):
         self.output_button = PushButton("", self.export_card)
         self.output_button.clicked.connect(self.browse_output)
         self.output_layout.addWidget(self.output_label)
-        self.output_layout.addWidget(self.output_edit)
-        self.output_layout.addWidget(self.output_button)
+        self.output_input_layout = QHBoxLayout()
+        self.output_input_layout.addWidget(self.output_edit, 1)
+        self.output_input_layout.addWidget(self.output_button)
+        self.output_layout.addLayout(self.output_input_layout)
         self.export_card_layout.addLayout(self.output_layout)
-        self.left_panel_layout.addWidget(self.export_card)
+        self.right_panel_layout.addWidget(self.export_card)
 
         self.repack_card = CardWidget(self.left_panel)
         self.repack_card.setObjectName("psdRepackCard")
@@ -656,12 +693,11 @@ class PsdReconstructionPage(QFrame):
         self.repack_photoshop_button.clicked.connect(self.open_current_psd_in_photoshop)
         self.repack_psd_layout.addWidget(self.pose_scheme_label)
         self.repack_psd_layout.addWidget(self.pose_scheme_combo)
-        self.repack_psd_layout.addWidget(self.repack_photoshop_button)
+        self.repack_psd_button_layout = QHBoxLayout()
+        self.repack_psd_button_layout.addWidget(self.repack_photoshop_button)
+        self.repack_psd_button_layout.addWidget(self.repack_psd_button)
+        self.repack_psd_layout.addLayout(self.repack_psd_button_layout)
         self.repack_card_layout.addLayout(self.repack_psd_layout)
-        # Keep this action inside the repack card.  It used to be added to
-        # both this card and the action row, so Qt silently reparented it and
-        # left the export workflow with a stray/duplicated control.
-        self.repack_card_layout.addWidget(self.repack_psd_button)
 
         self.metadata_frame = QFrame(self.repack_card)
         self.metadata_layout = QVBoxLayout(self.metadata_frame)
@@ -699,45 +735,45 @@ class PsdReconstructionPage(QFrame):
         self.repack_output_layout.addWidget(self.repack_output_label)
         self.repack_output_layout.addWidget(self.repack_output_edit)
         self.repack_card_layout.addLayout(self.repack_output_layout)
-        self.left_panel_layout.addWidget(self.repack_card)
+        self.right_panel_layout.addWidget(self.repack_card)
 
-        self.action_layout = QVBoxLayout()
-        self.reconstruct_button = PrimaryPushButton("", self.left_panel)
+        self.action_layout = QGridLayout()
+        self.reconstruct_button = PrimaryPushButton("", self.right_footer)
         self.reconstruct_button.clicked.connect(self.start_reconstruction)
-        self.open_output_button = PushButton("", self.left_panel)
+        self.open_output_button = PushButton("", self.right_footer)
         self.open_output_button.setEnabled(False)
         self.open_output_button.clicked.connect(self.open_output_folder)
-        self.open_photoshop_button = PushButton("", self.left_panel)
+        self.open_photoshop_button = PushButton("", self.right_footer)
         self.open_photoshop_button.setEnabled(False)
         self.open_photoshop_button.clicked.connect(self.open_current_psd_in_photoshop)
         # Kept for compatibility with older signal paths, but it is no longer
         # part of the layout.  Leaving a parented visible widget here caused
         # the stray button at the page's top-left corner.
         self.open_photoshop_button.setVisible(False)
-        self.artmesh_inspector_button = PushButton("", self.left_panel)
+        self.artmesh_inspector_button = PushButton("", self.right_footer)
         self.artmesh_inspector_button.clicked.connect(self.open_artmesh_inspector)
         self.artmesh_inspector_button.setEnabled(False)
-        self.multi_repack_button = PushButton("", self.left_panel)
+        self.multi_repack_button = PushButton("", self.right_footer)
         self.multi_repack_button.clicked.connect(self.start_multi_repack)
         self.multi_repack_button.setVisible(False)
-        self.preview_toggle_button = PushButton("", self.left_panel)
+        self.preview_toggle_button = PushButton("", self.right_footer)
         self.preview_toggle_button.clicked.connect(self.toggle_preview_panel)
-        self.action_layout.addWidget(self.reconstruct_button)
-        self.action_layout.addWidget(self.artmesh_inspector_button)
-        self.action_layout.addWidget(self.open_output_button)
-        self.action_layout.addWidget(self.preview_toggle_button)
-        self.left_panel_layout.addLayout(self.action_layout)
+        self.action_layout.addWidget(self.reconstruct_button, 0, 0)
+        self.action_layout.addWidget(self.artmesh_inspector_button, 0, 1)
+        self.action_layout.addWidget(self.open_output_button, 1, 0)
+        self.action_layout.addWidget(self.preview_toggle_button, 1, 1)
+        self.right_footer_layout.addLayout(self.action_layout)
 
         self.progress_layout = QHBoxLayout()
-        self.progress_bar = ProgressBar(self.left_panel)
+        self.progress_bar = ProgressBar(self.right_footer)
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
-        self.stage_label = CaptionLabel("", self.left_panel)
+        self.stage_label = CaptionLabel("", self.right_footer)
         self.stage_label.setMinimumWidth(160)
         self.stage_label.setWordWrap(True)
         self.progress_layout.addWidget(self.progress_bar, 1)
         self.progress_layout.addWidget(self.stage_label)
-        self.left_panel_layout.addLayout(self.progress_layout)
+        self.right_footer_layout.addLayout(self.progress_layout)
 
         self.preview_control_frame = CardWidget(self.left_panel)
         self.preview_control_frame.setObjectName("psdPreviewControlFrame")
@@ -762,7 +798,7 @@ class PsdReconstructionPage(QFrame):
         self.preview_texture_layout.addWidget(self.preview_texture_combo)
         self.preview_control_layout.addLayout(self.preview_texture_layout)
 
-        self.preview_action_layout = QVBoxLayout()
+        self.preview_action_layout = QGridLayout()
         self.preview_action_layout.setSpacing(8)
         self.preview_image_button = PrimaryPushButton("", self.preview_control_frame)
         self.preview_image_button.clicked.connect(self.load_selected_preview_images)
@@ -770,9 +806,9 @@ class PsdReconstructionPage(QFrame):
         self.preview_live2d_button.clicked.connect(self.load_selected_preview_live2d)
         self.preview_close_button = PushButton("", self.preview_control_frame)
         self.preview_close_button.clicked.connect(self.close_preview_panel)
-        self.preview_action_layout.addWidget(self.preview_image_button)
-        self.preview_action_layout.addWidget(self.preview_live2d_button)
-        self.preview_action_layout.addWidget(self.preview_close_button)
+        self.preview_action_layout.addWidget(self.preview_image_button, 0, 0)
+        self.preview_action_layout.addWidget(self.preview_live2d_button, 0, 1)
+        self.preview_action_layout.addWidget(self.preview_close_button, 0, 2)
         self.preview_control_layout.addLayout(self.preview_action_layout)
 
         self.preview_hint_label = CaptionLabel("", self.preview_control_frame)
@@ -805,7 +841,14 @@ class PsdReconstructionPage(QFrame):
 
         self.left_panel_layout.addStretch(1)
 
-        self.preview_frame = CardWidget(self.right_panel)
+        self.preview_dialog = QDialog(self)
+        self.preview_dialog.setModal(False)
+        self.preview_dialog.setMinimumSize(540, 360)
+        self.preview_dialog.resize(960, 700)
+        self.preview_dialog.finished.connect(self._on_preview_dialog_closed)
+        self.preview_dialog_layout = QVBoxLayout(self.preview_dialog)
+        self.preview_dialog_layout.setContentsMargins(12, 12, 12, 12)
+        self.preview_frame = CardWidget(self.preview_dialog)
         self.preview_frame.setObjectName("psdPreviewFrame")
         self.preview_layout = QVBoxLayout(self.preview_frame)
         self.preview_layout.setContentsMargins(16, 16, 16, 16)
@@ -827,13 +870,9 @@ class PsdReconstructionPage(QFrame):
         self.live2d_preview_host_layout.setSpacing(0)
         self.live2d_preview_host.setVisible(False)
         self.preview_layout.addWidget(self.live2d_preview_host, 1)
-        self.right_panel_layout.addWidget(self.preview_frame, 1)
-        # Keep a useful workspace visible beside the scrollable controls.  The
-        # preview can still be hidden with the existing action button, while
-        # the diagnostic log lives in its own compact bottom panel.
-        self.preview_frame.setVisible(True)
+        self.preview_dialog_layout.addWidget(self.preview_frame, 1)
 
-        self.log_frame = CardWidget(self)
+        self.log_frame = CardWidget(self.workspace_splitter)
         self.log_frame.setObjectName("psdLogFrame")
         self.log_layout = QVBoxLayout(self.log_frame)
         self.log_layout.setContentsMargins(16, 10, 16, 10)
@@ -856,7 +895,9 @@ class PsdReconstructionPage(QFrame):
         self.log_text.setMinimumHeight(0)
         self.log_text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.log_layout.addWidget(self.log_text, 1)
-        self.main_layout.addWidget(self.log_frame)
+        self.workspace_splitter.addWidget(self.log_frame)
+        self.workspace_splitter.setStretchFactor(0, 1)
+        self.workspace_splitter.setStretchFactor(1, 0)
 
         self._configure_responsive_controls()
         self._set_log_expanded(False)
@@ -910,7 +951,7 @@ class PsdReconstructionPage(QFrame):
         self.open_photoshop_button.setText(tr("psd.pose.open_photoshop"))
         self.artmesh_inspector_button.setText(tr("psd.inspector.title"))
         self.preview_toggle_button.setText(
-            tr("psd.preview.hide") if not self.preview_frame.isHidden() else tr("psd.preview.show")
+            tr("psd.preview.hide") if self.preview_dialog.isVisible() else tr("psd.preview.show")
         )
         self.preview_control_title_label.setText(tr("psd.preview.controls"))
         self.preview_source_label.setText(tr("psd.preview.source"))
@@ -924,6 +965,7 @@ class PsdReconstructionPage(QFrame):
         self.motion_play_button.setText(tr("psd.preview.play_motion"))
         self.motion_hint_label.setText(tr("psd.preview.motion_hint"))
         self.preview_title_label.setText(tr("psd.preview.title"))
+        self.preview_dialog.setWindowTitle(tr("psd.preview.title"))
         self.preview_placeholder_label.setText(tr("psd.preview.placeholder"))
         self.preview_image_panel.retranslate_ui()
         self.log_label.setText(tr("psd.log"))
@@ -937,6 +979,8 @@ class PsdReconstructionPage(QFrame):
         self.refresh_project_combo()
         self.refresh_preview_source_combo()
         self._update_project_header()
+        self._configure_responsive_controls()
+        self._arrange_button_rows()
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -1564,6 +1608,7 @@ class PsdReconstructionPage(QFrame):
         self.mark_project_dirty()
 
     def on_mode_changed(self, *_args):
+        self.mode_combo.setToolTip(self.mode_combo.currentText())
         self.update_mode_hint()
         self.mark_project_dirty()
 
@@ -2345,7 +2390,7 @@ class PsdReconstructionPage(QFrame):
         try:
             self.current_project = select_repack(self.current_project, version_id)
             self.set_preview_source_to_repack(version_id)
-            if self.preview_mode == "current" and not self.preview_frame.isHidden():
+            if self.preview_mode == "current" and self.preview_dialog.isVisible():
                 self.start_project_preview("current")
         except Exception as exc:
             self.append_log(tr("psd.warning_prefix", message=str(exc)))
@@ -2742,7 +2787,6 @@ class PsdReconstructionPage(QFrame):
             return
         version_id = str(repack_entry.get("id") or version_id)
 
-        self.set_preview_visible(True, stop_process=False)
         self.clear_live2d_preview_widget()
         self.live2d_preview_host.setVisible(False)
         self.preview_image_panel.setVisible(False)
@@ -2759,6 +2803,7 @@ class PsdReconstructionPage(QFrame):
 
     def on_preview_workspace_ready(self, model_json_path: str, version_id: str):
         if self.current_project:
+            self.set_preview_visible(False, stop_process=False)
             self.unifiedPreviewRequested.emit(
                 model_json_path,
                 str(self.current_project.project_file),
@@ -2884,7 +2929,7 @@ class PsdReconstructionPage(QFrame):
             pass
 
     def _preview_dock_rect(self) -> dict | None:
-        if self.preview_frame.isHidden():
+        if not self.preview_dialog.isVisible():
             return None
         if hasattr(self, "preview_image_panel") and self.preview_image_panel.isVisible():
             rect = self.preview_image_panel.preview_rect()
@@ -2927,75 +2972,143 @@ class PsdReconstructionPage(QFrame):
         self.set_preview_visible(False, stop_process=False)
 
     def toggle_preview_panel(self):
-        self.set_preview_visible(self.preview_frame.isHidden())
+        self.set_preview_visible(not self.preview_dialog.isVisible())
+
+    def _on_preview_dialog_closed(self, _result: int):
+        self.close_project_preview()
+        self.preview_toggle_button.setText(tr("psd.preview.show"))
 
     def set_preview_visible(self, visible: bool, stop_process: bool = True):
-        if not visible and stop_process:
-            self.close_project_preview()
-        self.preview_frame.setVisible(visible)
-        if visible and self.preview_image_panel.isHidden() and self.live2d_preview_host.isHidden():
-            self.preview_placeholder_label.setVisible(True)
+        if visible:
+            if self.preview_image_panel.isHidden() and self.live2d_preview_host.isHidden():
+                self.preview_placeholder_label.setVisible(True)
+            self.preview_dialog.show()
+            self.preview_dialog.raise_()
+            self.preview_dialog.activateWindow()
+        else:
+            self.preview_dialog.close()
+            if stop_process:
+                self.close_project_preview()
         self.preview_toggle_button.setText(tr("psd.preview.hide") if visible else tr("psd.preview.show"))
 
     def _configure_responsive_controls(self):
-        """Keep row controls shrinkable inside the narrow PSD sidebar.
-
-        QFluent buttons and combo boxes report their full translated text as
-        the layout hint.  Treating those hints as hard minimum widths makes
-        the scroll area's child wider than its viewport, which clips the
-        export/repack controls.  The controls still expand to the available
-        width, but may shrink when the window is narrow or the UI font is
-        scaled up.
-        """
+        """Reserve enough room for translated labels at the active font size."""
         for button in self.findChildren(QAbstractButton):
-            button_height = max(32, min(52, button.fontMetrics().lineSpacing() + 12))
-            button.setMinimumHeight(button_height)
-            button.setMaximumHeight(button_height)
+            if isinstance(button, (ComboBox, EditableComboBox)):
+                continue
+            if not isinstance(button, (PushButton, PrimaryPushButton, QPushButton)):
+                continue
+            button.setMinimumHeight(max(36, button.fontMetrics().lineSpacing() + 16))
+            button.setMaximumHeight(MAX_WIDGET_SIZE)
             if button is self.log_toggle_button:
                 button.setMinimumWidth(52)
                 button.setMaximumWidth(64)
                 button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
             else:
-                button.setMinimumWidth(80)
-                button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+                button.setMinimumWidth(max(74, button.fontMetrics().horizontalAdvance(button.text()) + 28))
+                button.setMaximumWidth(MAX_WIDGET_SIZE)
+                button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         for control_type in (QComboBox, QLineEdit, QAbstractSpinBox):
             for control in self.findChildren(control_type):
                 control.setMinimumWidth(0)
-                control_height = max(32, min(52, control.fontMetrics().lineSpacing() + 10))
+                control_height = max(34, control.fontMetrics().lineSpacing() + 14)
                 control.setMinimumHeight(control_height)
-                control.setMaximumHeight(control_height)
-                control.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+                control.setMaximumHeight(MAX_WIDGET_SIZE)
+                control.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         for label in self.findChildren(CaptionLabel):
             if label.wordWrap():
                 label.setMinimumWidth(0)
-                label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        self.workflow_label.setMinimumWidth(80)
-        self.workflow_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+                label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         self.repack_card_title.setMinimumWidth(0)
-        self.repack_card_title.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.repack_card_title.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         self.mesh_canvas_label.setWordWrap(True)
         self.mesh_canvas_label.setMinimumWidth(0)
-        self.mesh_canvas_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        for button in (
+        self.mesh_canvas_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        self.mode_combo.setMinimumWidth(0)
+        self.mode_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+
+    def _arrange_button_rows(self):
+        """Keep each action legible when translated text needs another row."""
+        if not hasattr(self, "preview_action_layout"):
+            return
+        available = max(
+            1,
+            self.left_scroll.viewport().width()
+            - self.left_panel_layout.contentsMargins().right()
+            - self.preview_control_layout.contentsMargins().left()
+            - self.preview_control_layout.contentsMargins().right(),
+        )
+
+        def fits(buttons: tuple[QAbstractButton, ...], layout: QGridLayout, width: int = available) -> bool:
+            needed = sum(
+                max(button.minimumWidth(), button.fontMetrics().horizontalAdvance(button.text()) + 28)
+                for button in buttons
+            )
+            return needed + max(8, layout.horizontalSpacing()) * (len(buttons) - 1) <= width
+
+        projects = (
             self.new_project_button,
             self.save_project_button,
             self.open_project_folder_button,
+        )
+        for button in projects:
+            self.project_button_layout.removeWidget(button)
+        if fits(projects, self.project_button_layout):
+            for column, button in enumerate(projects):
+                self.project_button_layout.addWidget(button, 0, column)
+        else:
+            self.project_button_layout.addWidget(projects[0], 0, 0)
+            self.project_button_layout.addWidget(projects[1], 0, 1)
+            self.project_button_layout.addWidget(projects[2], 1, 0, 1, 2)
+
+        flows = (self.export_flow_button, self.repack_flow_button)
+        for button in flows:
+            self.workflow_segment_layout.removeWidget(button)
+        if fits(flows, self.workflow_segment_layout):
+            self.workflow_segment_layout.addWidget(flows[0], 0, 0)
+            self.workflow_segment_layout.addWidget(flows[1], 0, 1)
+        else:
+            self.workflow_segment_layout.addWidget(flows[0], 0, 0)
+            self.workflow_segment_layout.addWidget(flows[1], 1, 0)
+
+        preview_actions = (
+            self.preview_image_button,
+            self.preview_live2d_button,
+            self.preview_close_button,
+        )
+        for button in preview_actions:
+            self.preview_action_layout.removeWidget(button)
+        if fits(preview_actions, self.preview_action_layout):
+            for column, button in enumerate(preview_actions):
+                self.preview_action_layout.addWidget(button, 0, column)
+        else:
+            self.preview_action_layout.addWidget(preview_actions[0], 0, 0)
+            self.preview_action_layout.addWidget(preview_actions[2], 0, 1)
+            self.preview_action_layout.addWidget(preview_actions[1], 1, 0, 1, 2)
+
+        right_available = max(1, self.right_scroll.viewport().width() - self.right_panel_layout.contentsMargins().left())
+        actions = (
             self.reconstruct_button,
-            self.repack_psd_button,
             self.artmesh_inspector_button,
             self.open_output_button,
             self.preview_toggle_button,
-        ):
-            button.setMinimumWidth(0)
-            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        for button in (self.export_flow_button, self.repack_flow_button):
-            button.setMinimumWidth(0)
-            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        )
+        for button in actions:
+            self.action_layout.removeWidget(button)
+        if fits(actions[:2], self.action_layout, right_available) and fits(actions[2:], self.action_layout, right_available):
+            self.action_layout.addWidget(actions[0], 0, 0)
+            self.action_layout.addWidget(actions[1], 0, 1)
+            self.action_layout.addWidget(actions[2], 1, 0)
+            self.action_layout.addWidget(actions[3], 1, 1)
+        else:
+            self.action_layout.addWidget(actions[0], 0, 0)
+            self.action_layout.addWidget(actions[3], 0, 1)
+            self.action_layout.addWidget(actions[2], 1, 0, 1, 2)
+            self.action_layout.addWidget(actions[1], 2, 0, 1, 2)
 
-    def _log_text_max_height(self) -> int:
-        """Return a compact logical-pixel limit that follows the window size."""
-        page_height = max(1, self.height())
-        return max(140, min(280, int(page_height * 0.30)))
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        QTimer.singleShot(0, self._arrange_button_rows)
 
     def _update_log_toggle_button(self):
         if not hasattr(self, "log_toggle_button"):
@@ -3003,13 +3116,19 @@ class PsdReconstructionPage(QFrame):
         self.log_toggle_button.setText("-" if self._log_expanded else "+")
 
     def _set_log_expanded(self, expanded: bool):
+        if self._log_expanded == bool(expanded) and self.log_text.isHidden() != bool(expanded):
+            return
+        sizes = self.workspace_splitter.sizes()
+        if self._log_expanded and sizes:
+            self._expanded_log_height = max(150, sizes[1])
         self._log_expanded = bool(expanded)
         self.log_text.setVisible(self._log_expanded)
-        self.log_text.setMaximumHeight(
-            self._log_text_max_height() if self._log_expanded else 0
-        )
+        self.log_frame.setMinimumHeight(150 if self._log_expanded else 0)
+        self.log_frame.setMaximumHeight(MAX_WIDGET_SIZE if self._log_expanded else 72)
         self._update_log_toggle_button()
-        self.log_frame.updateGeometry()
+        total = max(1, sum(sizes) or self.workspace_splitter.height())
+        log_height = min(self._expanded_log_height, total // 2) if self._log_expanded else 72
+        self.workspace_splitter.setSizes([max(240, total - log_height), log_height])
 
     def toggle_log_panel(self):
         self._set_log_expanded(not self._log_expanded)
@@ -3030,9 +3149,7 @@ class PsdReconstructionPage(QFrame):
 
     def updateUIScale(self, window_width, window_height):
         self._configure_responsive_controls()
-        self.log_text.setMaximumHeight(
-            self._log_text_max_height() if self._log_expanded else 0
-        )
+        self._arrange_button_rows()
         font = QApplication.instance().font()
         for label in self.findChildren(SubtitleLabel):
             label_font = label.font()

@@ -83,7 +83,9 @@ atlas-artmesh    按每个 ArtMesh 的 UV/indices 提取 atlas 覆盖层
 
 有可用的 Cubism Core DLL 时，导出会优先从真实 `.moc3`/模型读取 drawable 数据；没有 DLL 时，才使用模型目录中的 `*.drawables.json` 等侧车数据。`parameter_values` 或姿态参数只影响 `mesh` 的姿态快照；`atlas-artmesh` 使用静态 UV/indices，不按姿态透明度裁掉覆盖。
 
-每个导出的 ArtMesh 编辑单元都采用以下 PSD 结构：
+人物姿态 `mesh` 导出使用普通 ArtMesh 像素图层，严格保持 `render_order` 的后到前顺序，不建立语义集合、空绘制组或全局补缝层。每个像素层有持久 ID；直接在对应层修改，并保留旁边的元数据和 baseline 文件。此模式经过姿态变形、遮罩和采样，不能视为原作者 PSD 的恢复。
+
+图集模式的编辑单元采用以下 PSD 结构：
 
 ```text
 <ArtMesh 单元>

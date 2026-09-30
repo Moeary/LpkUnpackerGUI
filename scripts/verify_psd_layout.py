@@ -55,6 +55,7 @@ def main() -> int:
     os.environ["QT_QPA_PLATFORM"] = args.platform
     os.environ.setdefault("QT_SCALE_FACTOR", str(args.dpr))
 
+    from PySide6.QtGui import QFontDatabase
     from PySide6.QtWidgets import QApplication
     from qfluentwidgets import Theme
 
@@ -64,11 +65,18 @@ def main() -> int:
     from app.i18n import get_i18n
 
     app = QApplication.instance() or QApplication([])
+    if args.platform == "offscreen" and sys.platform == "win32":
+        # Qt's offscreen plugin sees no system fonts on Windows.  Register the
+        # installed CJK font so screenshots still show the actual labels.
+        font_file = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "msyh.ttc"
+        if font_file.is_file():
+            QFontDatabase.addApplicationFont(str(font_file))
     get_i18n().set_language(args.language)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     page = PsdReconstructionPage()
     apply_application_font(app, "", args.point_size, root=page)
+    page.updateUIScale(args.width, args.height)
     page.resize(args.width, args.height)
     page.show()
     app.processEvents()
@@ -81,6 +89,7 @@ def main() -> int:
         else None,
         "language": get_i18n().language,
         "point_size": app.font().pointSize(),
+        "font_family": app.font().family(),
         "themes": {},
     }
     for theme_name, theme in (("light", Theme.LIGHT), ("dark", Theme.DARK)):
@@ -94,6 +103,12 @@ def main() -> int:
             "log_height": page.log_frame.height(),
             "left_width": page.left_scroll.viewport().width(),
             "left_panel_min_hint": page.left_panel.minimumSizeHint().width(),
+            "right_width": page.right_scroll.viewport().width(),
+            "right_panel_min_hint": page.right_panel.minimumSizeHint().width(),
+            "left_content_height": page.left_panel.sizeHint().height(),
+            "right_content_height": page.right_panel.sizeHint().height(),
+            "right_footer_height": page.right_footer.height(),
+            "primary_action_visible": page.reconstruct_button.isVisible(),
             "screenshot": str(collapsed_path.resolve()),
         }
         page.append_log("layout acceptance error", expand=True)
@@ -104,7 +119,7 @@ def main() -> int:
             "log_expanded": page._log_expanded,
             "log_visible": page.log_text.isVisible(),
             "log_height": page.log_frame.height(),
-            "log_text_max_height": page.log_text.maximumHeight(),
+            "splitter_sizes": page.workspace_splitter.sizes(),
             "screenshot": str(expanded_path.resolve()),
         }
         page.toggle_log_panel()
@@ -116,6 +131,8 @@ def main() -> int:
         repack = {
             "left_width": page.left_scroll.viewport().width(),
             "left_panel_min_hint": page.left_panel.minimumSizeHint().width(),
+            "right_width": page.right_scroll.viewport().width(),
+            "right_panel_min_hint": page.right_panel.minimumSizeHint().width(),
             "screenshot": str(repack_path.resolve()),
         }
         page.set_workflow("export")
@@ -124,6 +141,17 @@ def main() -> int:
             "expanded": expanded,
             "repack": repack,
         }
+
+    page.set_preview_visible(True)
+    app.processEvents()
+    preview_path = args.output_dir / "preview-dialog.png"
+    page.preview_dialog.grab().save(str(preview_path))
+    report["preview_dialog"] = {
+        "visible": page.preview_dialog.isVisible(),
+        "size": [page.preview_dialog.width(), page.preview_dialog.height()],
+        "screenshot": str(preview_path.resolve()),
+    }
+    page.close_preview_panel()
 
     try:
         import OpenGL

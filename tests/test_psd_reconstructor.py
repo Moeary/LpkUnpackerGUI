@@ -17,6 +17,26 @@ from app.core.psd_reconstructor import (
 
 
 class PsdReconstructorTests(unittest.TestCase):
+    def test_pose_psd_keeps_interleaved_render_order_without_groups(self):
+        from psd_tools import PSDImage
+        from app.core.psd_reconstructor import _save_psd
+
+        # Head/body/head drawables must remain interleaved, even when their
+        # semantic part names repeat.  Verify the saved PSD's actual composite.
+        layers = [
+            PsdLayer("Back", Image.new("RGBA", (4, 4), "red"), group="Head"),
+            PsdLayer("Middle", Image.new("RGBA", (4, 4), "blue"), group="Body"),
+            PsdLayer("Front", Image.new("RGBA", (4, 4), "lime"), group="Head"),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pose.psd"
+            _save_psd(path, (4, 4), layers, flat_layers=True)
+            psd = PSDImage.open(path)
+            self.assertEqual([layer.name for layer in psd], ["Back", "Middle", "Front"])
+            self.assertTrue(all(not layer.is_group() for layer in psd))
+            self.assertEqual(psd.composite(force=True).getpixel((2, 2)), (0, 255, 0, 255))
+            self.assertEqual(len({layer.layer_id for layer in psd}), 3)
+
     def _apply_test_mask(self, *, inverted: bool, texture_alpha: int) -> np.ndarray:
         """Apply one small mask and return the resulting alpha channel."""
         import cv2
@@ -49,6 +69,24 @@ class PsdReconstructorTests(unittest.TestCase):
         inverted = self._apply_test_mask(inverted=True, texture_alpha=0)
         self.assertTrue(np.all(normal == 0))
         self.assertTrue(np.all(inverted == 200))
+
+    def test_scaled_pose_exports_only_bound_drawables(self):
+        from psd_tools import PSDImage
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model, original = self._make_source(root, second_drawable=False)
+            result = reconstruct_live2d_psd(
+                model, root / "scaled", mode="mesh",
+                resource_limits={"mesh_max_dimension": 8},
+            )
+            psd = PSDImage.open(result.psd_path)
+            metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+            self.assertLessEqual(max(psd.size), 8)
+            self.assertEqual([layer.name for layer in psd], [item["name"] for item in metadata["layers"]])
+            self.assertTrue(all(not layer.is_group() for layer in psd))
+            repacked = repack_atlas_png_from_psd(result.psd_path, root / "repacked")
+            np.testing.assert_array_equal(np.asarray(Image.open(repacked.output_paths[0])), original)
 
     def test_partial_inverted_mask_uses_one_minus_mask_alpha(self):
         alpha = self._apply_test_mask(inverted=True, texture_alpha=128)
@@ -176,27 +214,22 @@ class PsdReconstructorTests(unittest.TestCase):
             self.assertNotEqual((int(target["left"]), int(target["top"])), (0, 0))
 
             psd = PSDImage.open(str(result.psd_path))
-            unit = next(
-                layer
-                for layer in psd.descendants()
-                if int(getattr(layer, "layer_id", 0) or 0) == int(target["unit_group_id"])
-            )
-            original_group = next(child for child in unit if child.name == "Original")
-            paint_group = next(child for child in unit if child.name == "Paint")
-            original_pixel = next(child for child in original_group if child.name == target["name"])
+            original_pixel = next(layer for layer in psd if layer.layer_id == target["layer_id"])
             baseline = np.asarray(original_pixel.topil().convert("RGBA"), dtype=np.uint8)
             coords = np.argwhere(baseline[:, :, 3] > 0)
             self.assertGreaterEqual(len(coords), 3)
             local_y, local_x = [int(value) for value in coords[len(coords) // 2]]
 
-            PixelLayer.frompil(
-                Image.new("RGBA", (1, 1), (255, 0, 255, 255)),
-                paint_group,
-                name="mesh_one_pixel_probe",
-                top=int(original_pixel.top) + local_y,
-                left=int(original_pixel.left) + local_x,
+            edited = original_pixel.topil().convert("RGBA")
+            edited.putpixel((local_x, local_y), (255, 0, 255, 255))
+            from psd_tools.constants import Tag
+            replacement = PixelLayer.frompil(
+                edited, psd, name=original_pixel.name,
+                top=original_pixel.top, left=original_pixel.left,
                 compression=Compression.RAW,
             )
+            replacement.tagged_blocks.set_data(Tag.LAYER_ID, target["layer_id"])
+            psd.remove(original_pixel)
             edited_psd = root / "mesh-edited.psd"
             psd.save(str(edited_psd))
             repacked = repack_atlas_png_from_psd(
@@ -215,8 +248,8 @@ class PsdReconstructorTests(unittest.TestCase):
                 64,
             )
 
-    def test_mesh_moved_layer_legacy_baseline_uses_current_origin(self):
-        """Legacy mesh metadata must tolerate moving the PSD unit as a whole."""
+    def test_mesh_moved_flat_layer_without_pixel_edits_preserves_texture(self):
+        """Moving a flat layer alone must not invent texture pixel edits."""
         from psd_tools import PSDImage
 
         with tempfile.TemporaryDirectory() as directory:
@@ -227,16 +260,8 @@ class PsdReconstructorTests(unittest.TestCase):
             target = metadata["layers"][0]
 
             psd = PSDImage.open(str(result.psd_path))
-            unit = next(
-                layer
-                for layer in psd.descendants()
-                if int(getattr(layer, "layer_id", 0) or 0) == int(target["unit_group_id"])
-            )
-            # Move the drawable content together; psd-tools computes the
-            # enclosing group position from these leaf-layer offsets.
-            for leaf in unit.descendants():
-                if not leaf.is_group():
-                    leaf.offset = (int(leaf.left) + 2, int(leaf.top) + 3)
+            pixel = next(layer for layer in psd if layer.layer_id == target["layer_id"])
+            pixel.offset = (int(pixel.left) + 2, int(pixel.top) + 3)
             moved_psd = root / "mesh-moved.psd"
             psd.save(str(moved_psd))
 
@@ -260,8 +285,7 @@ class PsdReconstructorTests(unittest.TestCase):
             )
             output = np.asarray(Image.open(repacked.output_paths[0]).convert("RGBA"))
             changed = np.any(np.asarray(original) != output, axis=2)
-            self.assertGreater(int(changed.sum()), 0)
-            self.assertLess(int(changed.sum()), int(changed.size))
+            self.assertEqual(int(changed.sum()), 0)
             self.assertFalse(repacked.warnings)
 
     def test_legacy_numeric_overlays_follow_the_flat_psd_stack(self):
