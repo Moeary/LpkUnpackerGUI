@@ -46,23 +46,6 @@ class ThemeTests(unittest.TestCase):
 
         widget.close()
 
-    def test_auto_theme_uses_qt_color_scheme(self):
-        style_hints = self.app.styleHints()
-        if not hasattr(style_hints, "setColorScheme"):
-            self.skipTest("Qt does not expose a controllable color scheme")
-        if style_hints.colorScheme() == Qt.ColorScheme.Unknown:
-            self.skipTest("Qt platform does not expose the system color scheme")
-
-        previous = style_hints.colorScheme()
-        try:
-            style_hints.setColorScheme(Qt.ColorScheme.Dark)
-            self.assertEqual(apply_application_theme("auto"), self._theme("dark"))
-            style_hints.setColorScheme(Qt.ColorScheme.Light)
-            self.assertEqual(apply_application_theme("auto"), self._theme("light"))
-        finally:
-            if previous.name != "Unknown":
-                style_hints.setColorScheme(previous)
-
     def test_auto_theme_resolution_uses_qt_scheme_when_available(self):
         class FakeStyleHints:
             @staticmethod

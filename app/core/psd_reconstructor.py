@@ -555,7 +555,7 @@ def repack_atlas_png_from_psd(
     metadata = _read_json(metadata_file)
     if metadata.get("format") != METADATA_FORMAT:
         raise PsdReconstructionError(f"Unsupported PSD metadata file: {metadata_file}")
-    _validate_metadata_source_summaries(metadata)
+    _validate_metadata_source_summaries(metadata, metadata_file)
     mode = str(metadata.get("mode") or "")
     if mode not in {"atlas-components", "atlas-artmesh", "mesh"}:
         raise PsdReconstructionError(
@@ -569,7 +569,7 @@ def repack_atlas_png_from_psd(
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-    textures = _metadata_textures(metadata)
+    textures = _metadata_textures(metadata, metadata_file)
     layers_metadata = _metadata_layers(
         metadata,
         {"drawable-mesh"}
@@ -925,7 +925,7 @@ def _load_mesh_repack_canvases(
     for texture in textures:
         width = int(texture["width"])
         height = int(texture["height"])
-        source_path = _resolve_repack_texture_path(texture, input_texture_paths)
+        source_path = _resolve_repack_texture_path(texture, input_texture_paths, metadata_file)
         _ensure_repack_source(source_path, texture, output_path, metadata_file)
         with Image.open(source_path) as source_image:
             image = source_image.convert("RGBA")
@@ -934,7 +934,7 @@ def _load_mesh_repack_canvases(
                 f"Texture size changed for {source_path}: expected {width}x{height}, "
                 f"got {image.width}x{image.height}. Repack aborted to preserve the fixed baseline."
             )
-        _validate_texture_digest(source_path, texture, image)
+        _validate_texture_digest(source_path, texture, image, metadata_file)
         canvases[int(texture["index"])] = np.asarray(image).copy()
     return canvases, warnings
 
@@ -957,7 +957,7 @@ def _load_atlas_repack_canvases(
     for texture in textures:
         width = int(texture["width"])
         height = int(texture["height"])
-        source_path = _resolve_repack_texture_path(texture, input_texture_paths)
+        source_path = _resolve_repack_texture_path(texture, input_texture_paths, metadata_file)
         _ensure_repack_source(source_path, texture, output_path, metadata_file)
         with Image.open(source_path) as source_image:
             image = source_image.convert("RGBA")
@@ -966,7 +966,7 @@ def _load_atlas_repack_canvases(
                 f"Texture size changed for {source_path}: expected {width}x{height}, "
                 f"got {image.width}x{image.height}. Repack aborted to preserve the fixed baseline."
             )
-        _validate_texture_digest(source_path, texture, image)
+        _validate_texture_digest(source_path, texture, image, metadata_file)
         canvases[int(texture["index"])] = image
     return canvases, warnings
 
@@ -975,6 +975,7 @@ def _validate_texture_digest(
     source_path: Path,
     texture: Mapping[str, Any],
     image: Image.Image,
+    metadata_file: Path | None = None,
 ) -> None:
     expected = str(texture.get("rgba_sha256") or "")
     fixed_source = str(texture.get("source_path") or "")
@@ -983,7 +984,7 @@ def _validate_texture_digest(
     # In a multi-PSD pass source_path may be the previous output.  Only the
     # path recorded in metadata is the immutable baseline whose digest must
     # still match.
-    if source_path.resolve() != Path(fixed_source).resolve():
+    if source_path.resolve() != _resolve_repack_texture_path(texture, None, metadata_file):
         return
     actual = _rgba_sha256(image)
     if actual != expected:
@@ -996,6 +997,7 @@ def _validate_texture_digest(
 def _resolve_repack_texture_path(
     texture: Mapping[str, Any],
     input_texture_paths: Mapping[int, str | Path] | None,
+    metadata_file: Path | None = None,
 ) -> Path:
     texture_index = int(texture["index"])
     candidate = (input_texture_paths or {}).get(texture_index)
@@ -1005,7 +1007,10 @@ def _resolve_repack_texture_path(
             f"No source texture path is available for texture index {texture_index} "
             f"({texture.get('relative_path') or texture.get('name') or '?'})"
         )
-    return Path(str(value)).resolve()
+    path = Path(str(value))
+    if not candidate and not path.is_absolute() and metadata_file is not None:
+        path = metadata_file.parent / path
+    return path.resolve()
 
 
 def _ensure_repack_source(
@@ -1024,7 +1029,7 @@ def _ensure_repack_source(
         return
     target = (output_path / _texture_output_name(texture)).resolve()
     fixed_source_value = str(texture.get("source_path") or "")
-    fixed_source = Path(fixed_source_value).resolve() if fixed_source_value else None
+    fixed_source = _resolve_repack_texture_path(texture, None, metadata_file) if fixed_source_value else None
     # A multi-PSD pass may intentionally feed the preceding pass's output
     # back into the next pass.  That is safe when the input differs from the
     # immutable source path.  A direct repack that resolves to the source
@@ -1317,7 +1322,7 @@ def _file_summary(path: Path | None) -> dict[str, Any] | None:
     }
 
 
-def _validate_metadata_source_summaries(metadata: Mapping[str, Any]) -> None:
+def _validate_metadata_source_summaries(metadata: Mapping[str, Any], metadata_file: Path | None = None) -> None:
     """Reject a model/moc replacement when newer metadata has a summary."""
     for key, label in (
         ("source_model_summary", "model JSON"),
@@ -1329,7 +1334,10 @@ def _validate_metadata_source_summaries(metadata: Mapping[str, Any]) -> None:
         path_value = str(summary.get("path") or "")
         if not path_value:
             continue
-        path = Path(path_value).resolve()
+        path = Path(path_value)
+        if not path.is_absolute() and metadata_file is not None:
+            path = metadata_file.parent / path
+        path = path.resolve()
         if not path.is_file():
             raise PsdReconstructionError(
                 f"Source {label} is missing: {path}. Re-export the PSD from the fixed model baseline."
@@ -3235,7 +3243,7 @@ def _default_metadata_path(psd_path: Path) -> Path:
     )
 
 
-def _metadata_textures(metadata: dict[str, Any]) -> list[dict[str, Any]]:
+def _metadata_textures(metadata: dict[str, Any], metadata_file: Path | None = None) -> list[dict[str, Any]]:
     textures = metadata.get("textures")
     if not isinstance(textures, list) or not textures:
         raise PsdReconstructionError("PSD metadata does not contain texture entries.")
@@ -3243,18 +3251,24 @@ def _metadata_textures(metadata: dict[str, Any]) -> list[dict[str, Any]]:
     source_root = None
     source_root_value = metadata.get("source_root")
     if isinstance(source_root_value, str) and source_root_value:
-        source_root = Path(source_root_value).resolve()
+        source_root = Path(source_root_value)
+        if not source_root.is_absolute() and metadata_file is not None:
+            source_root = metadata_file.parent / source_root
+        source_root = source_root.resolve()
     source_model = metadata.get("source_model")
     if source_root is None and isinstance(source_model, str) and source_model:
-        source_root = Path(source_model).resolve().parent
+        source_model_path = Path(source_model)
+        if not source_model_path.is_absolute() and metadata_file is not None:
+            source_model_path = metadata_file.parent / source_model_path
+        source_root = source_model_path.resolve().parent
 
     normalized = []
     for item in textures:
         if not isinstance(item, dict):
             continue
         relative_path = str(item.get("relative_path") or item.get("name") or "")
-        source_path = ""
-        if source_root and relative_path:
+        source_path = str(item.get("source_path") or "")
+        if not source_path and source_root and relative_path:
             source_path = str((source_root / relative_path).resolve())
         normalized.append(
             {

@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QInputDialog,
     QCompleter,
+    QStackedWidget,
 )
 from PySide6.QtCore import (
     Qt,
@@ -33,14 +34,15 @@ from PySide6.QtCore import (
     QPoint,
     QEvent,
     QStringListModel,
+    QSignalBlocker,
 )
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QColor, QPixmap
 from qfluentwidgets import (SubtitleLabel, BodyLabel, CaptionLabel, PushButton, Slider, CheckBox, SpinBox, InfoBar, InfoBarPosition,
                            CardWidget, SingleDirectionScrollArea, TextBrowser, ColorDialog, FluentIcon, IconWidget,
-                           ComboBox, EditableComboBox, LineEdit)
+                           ComboBox, EditableComboBox, LineEdit, TransparentToolButton)
 
 from app.core.assetstudio_cli import AssetStudioCLI
-from app.core.model import prepare_model_json_for_preview, resolve_live2d_package
+from app.core.model import resolve_live2d_package
 from app.core.model.motions import load_live2d_motions
 from app.core.preview import prepare_preview_import, prepare_spine_preview_import, prepare_package_preview_import
 from app.core.spine_preview import (
@@ -68,8 +70,24 @@ from app.gui.SettingsPage import ToolchainInstallWorker
 from app.gui.ImagePreviewPanel import ImagePreviewPanel
 from app.gui.Live2DPreviewWindow import Live2DPreviewWindow
 from app.gui.SpinePreviewWidget import SpinePreviewWidget
+from app.gui.PreviewArtMeshPanel import PreviewArtMeshPanel
+from app.gui.editor_workspace import EditorTabs, EditorViewportLayout, EditorComboBox
 from app.i18n import get_i18n, tr
 from app.paths import PROJECT_ROOT
+
+
+PREVIEW_LAYOUT_TEXT = {
+    "preview.layout.animation_parameters": "动画与参数",
+    "preview.layout.display_interaction": "显示与交互",
+    "preview.layout.animation": "动画",
+    "preview.layout.display": "显示",
+    "preview.layout.artmesh": "ArtMesh 部件",
+    "preview.layout.empty": "载入资源后显示对应的预览控制。",
+}
+
+
+def _layout_text(key):
+    return tr(key, PREVIEW_LAYOUT_TEXT[key])
 
 try:
     from shiboken6 import isValid as _is_qt_object_valid
@@ -546,6 +564,7 @@ class ModelPreviewImportThread(QThread):
     def run(self):
         try:
             result = prepare_preview_import(self.source_path, self.temp_root)
+            self.editor_model_json = str(result.package.model_json)
             self.modelReady.emit(
                 str(result.preview_model_json),
                 str(result.temp_dir or ""),
@@ -742,6 +761,7 @@ class FolderPreviewScanThread(QThread):
             "kind": "model",
             "path": preview_path,
             "prepared_model_json": preview_path,
+            "editor_model_json": str(result.package.model_json),
             "source_path": os.path.abspath(path),
             "source_dir": str(result.package.root_dir),
             "temp_dir": temp_dir,
@@ -789,6 +809,7 @@ class FolderPreviewScanThread(QThread):
                     "kind": "model",
                     "path": preview_path,
                     "prepared_model_json": preview_path,
+                    "editor_model_json": str(result.package.model_json),
                     "source_path": os.path.abspath(path),
                     "source_dir": str(result.package.root_dir),
                     "temp_dir": temp_dir,
@@ -1815,6 +1836,17 @@ class PreviewPage(QFrame):
         self._advanced_enabled_before_freeze = False
         self._psd_project_context = None
         self._pending_psd_project_context = None
+        self._resource_mode = "empty"
+        self._artmesh_loaded_for = None
+        self._live2d_load_timer = QTimer(self)
+        self._live2d_load_timer.setSingleShot(True)
+        self._live2d_load_timer.setInterval(50)
+        self._live2d_load_timer.timeout.connect(self.preview_current_model)
+        self._parameter_refresh_retries = 0
+        self._parameter_refresh_timer = QTimer(self)
+        self._parameter_refresh_timer.setSingleShot(True)
+        self._parameter_refresh_timer.setInterval(120)
+        self._parameter_refresh_timer.timeout.connect(lambda: self._refresh_parameter_controls(self._parameter_refresh_retries))
 
         self.setupUI()
         self.retranslate_ui()
@@ -1837,7 +1869,7 @@ class PreviewPage(QFrame):
             pass
 
     def setupUI(self):
-        self.main_layout = QVBoxLayout(self)
+        self.main_layout = EditorViewportLayout(self)
         self.main_layout.setContentsMargins(20, 18, 20, 20)
         self.main_layout.setSpacing(12)
 
@@ -1874,7 +1906,7 @@ class PreviewPage(QFrame):
         # 左侧：导入、设置和控制按钮
         left_widget = QWidget()
         self.left_sidebar = left_widget
-        left_widget.setMinimumWidth(260)
+        left_widget.setMinimumWidth(200)
         left_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(0, 10, 12, 0)
@@ -1896,7 +1928,7 @@ class PreviewPage(QFrame):
         self.source_edit.setMinimumHeight(34)
         import_layout.addWidget(self.source_edit)
 
-        source_button_row = QHBoxLayout()
+        source_button_row = QVBoxLayout()
         source_button_row.setSpacing(8)
         self.source_file_btn = PushButton("", import_card)
         self.source_file_btn.setIcon(FluentIcon.FOLDER)
@@ -1926,16 +1958,18 @@ class PreviewPage(QFrame):
         for _widget in (self.spine_runtime_label, self.spine_runtime_edit, self.spine_runtime_btn):
             _widget.setVisible(False)
 
-        image_limit_row = QHBoxLayout()
+        image_limit_row = QVBoxLayout()
         image_limit_row.setSpacing(8)
         self.image_limit_label = BodyLabel("", import_card)
+        self.image_limit_label.setWordWrap(True)
         self.image_limit_spinbox = SpinBox(import_card)
+        self.image_limit_spinbox.setSymbolVisible(False)
+        self.image_limit_spinbox.setFixedWidth(80)
         self.image_limit_spinbox.setRange(1, 500)
         self.image_limit_spinbox.setValue(int(self.settings_manager.get("preview.image_limit", 48) or 48))
         self.image_limit_spinbox.valueChanged.connect(self.on_preview_image_limit_changed)
         image_limit_row.addWidget(self.image_limit_label)
         image_limit_row.addWidget(self.image_limit_spinbox)
-        image_limit_row.addStretch(1)
         import_layout.addLayout(image_limit_row)
         left_layout.addWidget(import_card)
 
@@ -1955,11 +1989,11 @@ class PreviewPage(QFrame):
 
         left_layout.addWidget(self.model_info_text_box)
 
-        # 左侧只保留导入、显示和交互设置。
+        # Display and interaction controls move into the format-aware right tabs.
         self.settings_panel = Live2DSettingsPanel(self, mode="display")
         self.settings_panel.settingsChanged.connect(self.on_settings_changed)
         self.settings_panel.requestRefreshParams.connect(self.on_request_refresh_params)
-        left_layout.addWidget(self.settings_panel, 1)
+        left_layout.addStretch(1)
 
         # 控制按钮区域
         button_layout = QHBoxLayout()
@@ -1981,7 +2015,7 @@ class PreviewPage(QFrame):
 
         # 中间：统一的图片 / Live2D 预览舞台
         right_widget = QWidget()
-        right_widget.setMinimumWidth(360)
+        right_widget.setMinimumWidth(280)
         right_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         right_layout = QVBoxLayout(right_widget)
         right_layout.setContentsMargins(12, 10, 0, 0)
@@ -2015,37 +2049,23 @@ class PreviewPage(QFrame):
         editor_toolbar.addWidget(self.open_editor_btn)
         editor_toolbar.addStretch(1)
         stage_toolbar.addLayout(editor_toolbar)
-        resource_toolbar = QHBoxLayout()
+        resource_toolbar = editor_toolbar
         resource_toolbar.setSpacing(8)
-        resource_toolbar.addStretch(1)
-
-        self.export_preview_btn = PushButton("", self.preview_stage)
-        self.export_preview_btn.setIcon(FluentIcon.DOWNLOAD)
+        self.export_preview_btn = TransparentToolButton(FluentIcon.DOWNLOAD, self.preview_stage)
+        self.export_preview_btn.setFixedSize(32, 32)
         self.export_preview_btn.setEnabled(False)
         self.export_preview_btn.clicked.connect(self.export_preview_resources)
         resource_toolbar.addWidget(self.export_preview_btn)
 
-        self.preview_stage_close_btn = PushButton("", self.preview_stage)
-        self.preview_stage_close_btn.setText("X")
-        self.preview_stage_close_btn.setFixedSize(34, 30)
-        self.preview_stage_close_btn.setStyleSheet("""
-            PushButton {
-                border: 1px solid palette(mid);
-                border-radius: 6px;
-                background: palette(base);
-                color: palette(text);
-                font-size: 18px;
-                font-weight: 600;
-            }
-            PushButton:hover {
-                border-color: #F1A7A7;
-                background: palette(alternate-base);
-                color: #C42B1C;
-            }
-        """)
+        self.preview_stage_close_btn = TransparentToolButton(FluentIcon.CLOSE, self.preview_stage)
+        self.preview_stage_close_btn.setFixedSize(32, 32)
         self.preview_stage_close_btn.clicked.connect(self.close_preview_window)
         resource_toolbar.addWidget(self.preview_stage_close_btn)
-        stage_toolbar.addLayout(resource_toolbar)
+        self.resource_combo = EditorComboBox(self.preview_stage)
+        self.resource_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.resource_combo.currentIndexChanged.connect(self._resource_selected)
+        self.resource_combo.hide()
+        stage_toolbar.addWidget(self.resource_combo)
         self.preview_stage_layout.addLayout(stage_toolbar)
 
         self.preview_dock_area = QFrame(self.preview_stage)
@@ -2070,7 +2090,9 @@ class PreviewPage(QFrame):
         self.image_preview_panel = ImagePreviewPanel(self.preview_dock_area)
         self.image_preview_panel.setVisible(False)
         self.image_preview_panel.itemActivated.connect(self.on_preview_item_activated)
+        self.image_preview_panel.itemsChanged.connect(self._sync_resource_selector)
         self.preview_dock_layout.addWidget(self.image_preview_panel, 1)
+        self.image_item_list = self.image_preview_panel.take_item_list()
 
         self.spine_preview = SpinePreviewWidget(self.preview_dock_area)
         self.spine_preview.setVisible(False)
@@ -2087,11 +2109,28 @@ class PreviewPage(QFrame):
         # 右侧：触发动作与高级参数编辑
         action_widget = QWidget()
         self.right_sidebar = action_widget
-        action_widget.setMinimumWidth(250)
+        action_widget.setMinimumWidth(300)
         action_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         action_layout = QVBoxLayout(action_widget)
         action_layout.setContentsMargins(12, 10, 0, 0)
         action_layout.setSpacing(10)
+        self.resource_details_stack = QStackedWidget(action_widget)
+        self.resource_details_stack.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        action_layout.addWidget(self.resource_details_stack, 1)
+        self.empty_details = BodyLabel(action_widget)
+        self.empty_details.setWordWrap(True)
+        self.empty_details.setAlignment(Qt.AlignCenter)
+        self.resource_details_stack.addWidget(self.empty_details)
+        self.resource_details_stack.addWidget(self.image_item_list)
+        self.live2d_details = EditorTabs(action_widget)
+        self.spine_details = EditorTabs(action_widget)
+        self.resource_details_stack.addWidget(self.live2d_details)
+        self.resource_details_stack.addWidget(self.spine_details)
+        self.live2d_animation_tab = QWidget(self.live2d_details)
+        live2d_actions = EditorViewportLayout(self.live2d_animation_tab)
+        live2d_actions.setContentsMargins(0, 0, 0, 0)
+        live2d_actions.setSpacing(8)
+        self.live2d_details.addTab(self.live2d_animation_tab, "")
 
         self.motion_group = CardWidget(action_widget)
         motion_layout = QVBoxLayout(self.motion_group)
@@ -2133,8 +2172,8 @@ class PreviewPage(QFrame):
         self.save_pose_scheme_btn.setVisible(False)
         self.motion_hint_label = BodyLabel("", self.motion_group)
         self.motion_hint_label.setWordWrap(True)
-        motion_layout.addWidget(self.motion_hint_label)
-        action_layout.addWidget(self.motion_group)
+        self.motion_hint_label.hide()
+        live2d_actions.addWidget(self.motion_group)
 
         self.spine_controls = SpineAnimationControls(action_widget)
         self.spine_controls.skinChanged.connect(self._on_spine_skin_changed)
@@ -2145,7 +2184,7 @@ class PreviewPage(QFrame):
         self.spine_controls.resetRequested.connect(self._on_spine_reset_requested)
         self.spine_controls.exportRequested.connect(self._on_spine_export_requested)
         self.spine_controls.setVisible(False)
-        action_layout.addWidget(self.spine_controls, 1)
+        self.spine_details.addTab(self.spine_controls, "")
 
         self.advanced_panel = Live2DSettingsPanel(action_widget, mode="parameters")
         self.advanced_panel.settingsChanged.connect(self.on_advanced_settings_changed)
@@ -2181,13 +2220,17 @@ class PreviewPage(QFrame):
         self.motion_timeline.setRange(0, 1000)
         self.motion_timeline.valueChanged.connect(self._on_motion_timeline_slider_changed)
         timeline_layout.addWidget(self.motion_timeline)
-        timeline_detail = QHBoxLayout()
+        timeline_detail = QVBoxLayout()
         self.motion_time_spin = SpinBox(self.motion_timeline_frame)
+        self.motion_time_spin.setSymbolVisible(False)
+        self.motion_time_spin.setFixedWidth(126)
         self.motion_time_spin.setRange(0, 0)
         self.motion_time_spin.setSingleStep(33)
         self.motion_time_spin.setSuffix(" ms")
         self.motion_time_spin.valueChanged.connect(self._on_motion_timeline_spin_changed)
         self.motion_time_label = CaptionLabel("", self.motion_timeline_frame)
+        self.motion_time_label.setWordWrap(True)
+        self.motion_time_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         timeline_detail.addWidget(self.motion_time_spin)
         timeline_detail.addWidget(self.motion_time_label, 1)
         timeline_layout.addLayout(timeline_detail)
@@ -2195,13 +2238,20 @@ class PreviewPage(QFrame):
         pose_layout.addWidget(self.motion_timeline_frame)
         self.save_pose_scheme_btn.setParent(self.pose_controls_card)
         pose_layout.addWidget(self.save_pose_scheme_btn)
-        action_layout.addWidget(self.pose_controls_card)
-        action_layout.addWidget(self.advanced_panel, 1)
-        # Parameter authoring belongs to the dedicated Live2D editor. Keep
-        # compatibility controls for existing pose callbacks without showing
-        # a second editing surface in the unified preview.
-        self.pose_controls_card.hide()
-        self.advanced_panel.hide()
+        live2d_actions.addWidget(self.pose_controls_card)
+        live2d_actions.addWidget(self.advanced_panel, 1)
+        self._display_layouts = {}
+        for kind, tabs in (("live2d", self.live2d_details), ("spine", self.spine_details)):
+            host = QWidget(tabs)
+            display_layout = EditorViewportLayout(host)
+            display_layout.setContentsMargins(0, 0, 0, 0)
+            self._display_layouts[kind] = display_layout
+            tabs.addTab(host, "")
+        self._display_layouts["live2d"].addWidget(self.settings_panel, 1)
+        self.artmesh_panel = PreviewArtMeshPanel(self.live2d_details)
+        self.artmesh_panel.overridesChanged.connect(self._preview_parts_changed)
+        self.live2d_details.addTab(self.artmesh_panel, "")
+        self.live2d_details.currentChanged.connect(self._on_preview_tab_changed)
 
         # 添加到分割器
         splitter.addWidget(left_widget)
@@ -2210,7 +2260,7 @@ class PreviewPage(QFrame):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
-        splitter.setSizes([300, 520, 300])
+        splitter.setSizes([230, 540, 320])
 
         self.main_layout.addWidget(splitter, 1)
         self.main_layout.setStretch(0, 0)
@@ -2235,6 +2285,7 @@ class PreviewPage(QFrame):
         self._parameter_sync_timer.setInterval(80)
         self._parameter_sync_timer.timeout.connect(self._sync_live_parameter_controls)
         self._set_motion_debug_visible(False)
+        self._set_resource_mode("empty")
         self._restore_preview_ui_state()
 
     def retranslate_ui(self):
@@ -2260,10 +2311,18 @@ class PreviewPage(QFrame):
         self.preview_btn.setText(tr("preview.preview_model"))
         self.close_all_btn.setText(tr("preview.close_window"))
         if self.export_preview_btn:
-            self.export_preview_btn.setText(tr("preview.export_preview"))
+            self.export_preview_btn.setAccessibleName(tr("preview.export_preview"))
             self.export_preview_btn.setToolTip(tr("preview.export_preview_tooltip"))
         if self.preview_stage_close_btn:
             self.preview_stage_close_btn.setToolTip(tr("preview.close_window"))
+            self.preview_stage_close_btn.setAccessibleName(tr("preview.close_window"))
+        self.empty_details.setText(_layout_text("preview.layout.empty"))
+        for tabs, keys in ((self.live2d_details, ("animation_parameters", "display_interaction", "artmesh")),
+                           (self.spine_details, ("animation", "display"))):
+            for index, key in enumerate(keys):
+                tabs.setTabText(index, _layout_text(f"preview.layout.{key}"))
+        self.resource_combo.setToolTip(tr("preview.preview_item_list_title"))
+        self.artmesh_panel.retranslate_ui()
         if self.motion_group_title:
             self.motion_group_title.setText(tr("preview.trigger_motion"))
         if self.motion_combo:
@@ -2286,6 +2345,7 @@ class PreviewPage(QFrame):
             self.reset_pose_params_btn.setText(tr("preview.reset_advanced_params"))
         if self.motion_hint_label:
             self.motion_hint_label.setText(tr("preview.trigger_motion_hint"))
+            self.play_motion_btn.setToolTip(tr("preview.trigger_motion_hint"))
         if self.image_preview_panel:
             self.image_preview_panel.retranslate_ui()
 
@@ -2313,6 +2373,100 @@ class PreviewPage(QFrame):
     def _set_editor_source(self, kind: str | None = None, path: str | None = None):
         self._editor_source = (kind, os.path.abspath(path)) if kind and path and os.path.isfile(path) else None
         self._update_editor_button()
+
+    def _set_resource_mode(self, mode):
+        mode = mode if mode in {"live2d", "spine", "image"} else "empty"
+        if mode != self._resource_mode and mode != "live2d":
+            self._clear_live2d_controls()
+        self._resource_mode = mode
+        pages = {"empty": self.empty_details, "image": self.image_item_list,
+                 "live2d": self.live2d_details, "spine": self.spine_details}
+        self.resource_details_stack.setCurrentWidget(pages[mode])
+        for widget in (self.motion_group, self.pose_controls_card, self.advanced_panel):
+            widget.setVisible(mode == "live2d")
+        self.spine_controls.setVisible(mode == "spine")
+        if mode in self._display_layouts:
+            self._display_layouts[mode].addWidget(self.settings_panel, 1)
+            self.settings_panel.show()
+            self.settings_panel.set_spine_mode(mode == "spine")
+        if mode == "image":
+            self.image_item_list.show()
+        self.image_limit_label.setVisible(mode != "spine")
+        self.image_limit_spinbox.setVisible(mode != "spine")
+
+    def _clear_live2d_controls(self):
+        self._live2d_load_timer.stop()
+        self._parameter_refresh_timer.stop()
+        if self._parameter_sync_timer:
+            self._parameter_sync_timer.stop()
+        self._artmesh_loaded_for = None
+        if hasattr(self, "artmesh_panel"):
+            self.artmesh_panel.clear()
+        if self.advanced_panel:
+            self.advanced_panel.rebuild_advanced_params([])
+            with QSignalBlocker(self.advanced_panel.advanced_enable_check):
+                self.advanced_panel.advanced_enable_check.setChecked(False)
+        if self.freeze_motion_check:
+            with QSignalBlocker(self.freeze_motion_check):
+                self.freeze_motion_check.setChecked(False)
+        if self.motion_combo:
+            self._populate_motion_controls([])
+        self._update_motion_timeline_visibility()
+
+    def _sync_resource_selector(self):
+        panel = self.image_preview_panel
+        if panel is None:
+            return
+        with QSignalBlocker(self.resource_combo):
+            self.resource_combo.clear()
+            for index, item in enumerate(panel._preview_items):
+                self.resource_combo.addItem(str(item.get("label") or Path(item.get("path", "")).name), userData=index)
+            self.resource_combo.setCurrentIndex(panel._current_index)
+        self.resource_combo.setVisible(len(panel._preview_items) > 1)
+
+    def _resource_selected(self, index):
+        item_index = self.resource_combo.itemData(index)
+        if item_index is not None:
+            self.on_preview_item_activated(int(item_index))
+
+    def _preview_parameters(self):
+        meta = self.live2d_preview.get_parameter_meta_list() if self.live2d_preview else []
+        return {str(item["id"]): float(item.get("value", 0)) for item in meta if item.get("id")}
+
+    def _ensure_artmesh_loaded(self):
+        if self._resource_mode != "live2d" or not self.current_model_path:
+            return False
+        if self._artmesh_loaded_for == self.current_model_path:
+            return True
+        latest = self._load_latest_preview_settings() or {}
+        dll = (latest.get("tools") or {}).get("cubism_core_dll_path")
+        if not dll:
+            getter = getattr(self.settings_manager, "get_cubism_core_dll_path", None)
+            dll = getter() if callable(getter) else None
+        if self.artmesh_panel.load_source(self.current_model_path, dll):
+            self._artmesh_loaded_for = self.current_model_path
+            return True
+        return False
+
+    def _on_preview_tab_changed(self, index):
+        if index == 2 and self._ensure_artmesh_loaded():
+            self.artmesh_panel.refresh(self._preview_parameters())
+
+    def _preview_parts_changed(self, values, defaults):
+        setter = getattr(self.live2d_preview, "set_part_opacity_overrides", None)
+        if callable(setter):
+            setter(values, defaults)
+
+    def _preview_drawable_clicked(self, drawable_id):
+        if self._ensure_artmesh_loaded() and any(entry.drawable_id == str(drawable_id)
+                                               for entry in self.artmesh_panel.inspector.entries):
+            self.live2d_details.setCurrentIndex(2)
+            self.artmesh_panel.select_drawable(drawable_id)
+
+    def _preview_model_point_clicked(self, x, y):
+        if self._ensure_artmesh_loaded():
+            self.live2d_details.setCurrentIndex(2)
+            self.artmesh_panel.select_model_point(x, y, self._preview_parameters())
 
     def _update_editor_button(self):
         button = self.open_editor_btn
@@ -2345,6 +2499,9 @@ class PreviewPage(QFrame):
                 root = str(Path(directory).resolve())
                 if source.is_relative_to(Path(root)):
                     roots.add(root)
+        for root in self._editor_leased_dirs:
+            if source.is_relative_to(Path(root)):
+                roots.add(root)
         if not roots:
             return None
         token = uuid.uuid4().hex
@@ -2402,6 +2559,8 @@ class PreviewPage(QFrame):
             for timer in (self._parameter_sync_timer, self._preview_dock_timer):
                 if timer is not None:
                     timer.stop()
+        elif self._resource_mode == "live2d" and self.advanced_panel.isVisible():
+            self._parameter_sync_timer.start()
         self._native_playback_suspended = not active
         self._preview_page_active = active
 
@@ -2431,9 +2590,12 @@ class PreviewPage(QFrame):
         if not self.prepare_shutdown():
             return False
         self.set_active(False)
+        self._live2d_load_timer.stop()
+        self._parameter_refresh_timer.stop()
         self._terminate_preview_process()
         self._destroy_embedded_live2d()
         self._destroy_embedded_spine()
+        self.artmesh_panel.shutdown()
         # MainWindow releases editor leases after editor shutdown. A copying
         # editor may still need the source even after this view is destroyed.
         for cleanup in (self._cleanup_model_preview_temp_dirs, self._cleanup_spine_preview_temp_dirs, self._cleanup_image_preview_temp_dirs, self._cleanup_archive_preview_temp_dirs, self._cleanup_folder_preview_temp_dirs):
@@ -2875,6 +3037,8 @@ class PreviewPage(QFrame):
             return None
         self.live2d_preview = preview
         self.preview_dock_layout.addWidget(preview, 1)
+        preview.live2d_canvas.drawableClicked.connect(self._preview_drawable_clicked)
+        preview.live2d_canvas.modelPointClicked.connect(self._preview_model_point_clicked)
         preview.hide()
         return preview
 
@@ -2931,62 +3095,16 @@ class PreviewPage(QFrame):
         self._set_spine_mode(False)
 
     def _set_spine_mode(self, active: bool):
-        """Keep the three-column host while swapping in Spine controls."""
-
+        """Swap controls by resource type without changing sidebar preferences."""
         active = bool(active)
-        if active == self._spine_mode:
-            return
+        self._spine_mode = active
         if active:
-            self._spine_sidebar_state = {
-                "right": bool(self.right_sidebar and not self.right_sidebar.isHidden()),
-                "settings": bool(self.settings_panel and not self.settings_panel.isHidden()),
-                "motion": bool(self.motion_group and not self.motion_group.isHidden()),
-                "pose": bool(self.pose_controls_card and not self.pose_controls_card.isHidden()),
-                "advanced": bool(self.advanced_panel and not self.advanced_panel.isHidden()),
-            }
-            if self.right_sidebar_btn:
-                self.right_sidebar_btn.setEnabled(True)
-            if self.settings_panel:
-                self.settings_panel.setVisible(bool(self._spine_sidebar_state.get("settings", True)))
-                self.settings_panel.set_spine_mode(True)
-            for widget in (self.motion_group, self.pose_controls_card, self.advanced_panel):
-                if widget:
-                    widget.setVisible(False)
-            if self.spine_controls:
-                self.spine_controls.setVisible(True)
-            if self.image_limit_label:
-                self.image_limit_label.setVisible(False)
-            if self.image_limit_spinbox:
-                self.image_limit_spinbox.setVisible(False)
             self._set_motion_debug_visible(False)
-            self._spine_mode = True
-            self._update_sidebar_button_text()
-            return
-
-        state = self._spine_sidebar_state or {}
-        if self.right_sidebar:
-            self.right_sidebar.setVisible(bool(state.get("right", True)))
-        if self.right_sidebar_btn:
-            self.right_sidebar_btn.setEnabled(True)
-        if self.settings_panel:
-            self.settings_panel.set_spine_mode(False)
-            self.settings_panel.setVisible(bool(state.get("settings", True)))
-        if self.image_limit_label:
-            self.image_limit_label.setVisible(True)
-        if self.image_limit_spinbox:
-            self.image_limit_spinbox.setVisible(True)
-        if self.spine_controls:
+            self._set_resource_mode("spine")
+        elif self._resource_mode == "spine":
             self.spine_controls.clear()
-            self.spine_controls.setVisible(False)
-        for widget, key in (
-            (self.motion_group, "motion"),
-            (self.pose_controls_card, "pose"),
-            (self.advanced_panel, "advanced"),
-        ):
-            if widget:
-                widget.setVisible(key == "motion" and bool(state.get(key, True)))
+            self._set_resource_mode("empty")
         self._spine_sidebar_state = None
-        self._spine_mode = False
         self._update_sidebar_button_text()
 
     def _poll_preview_process(self):
@@ -3008,8 +3126,10 @@ class PreviewPage(QFrame):
         self._last_preview_dock_rect = None
         self._set_motion_debug_visible(False)
 
-    def _show_stage_placeholder(self, text: str | None = None):
-        self._set_editor_source()
+    def _show_stage_placeholder(self, text: str | None = None, *, keep_editor_source=False):
+        if not keep_editor_source:
+            self._set_editor_source()
+        self._set_resource_mode("live2d" if keep_editor_source else "empty")
         if self.live2d_preview:
             self.live2d_preview.setVisible(False)
         if self.spine_preview:
@@ -3022,6 +3142,7 @@ class PreviewPage(QFrame):
 
     def _show_image_stage(self):
         self._set_editor_source()
+        self._set_resource_mode("image")
         if self.live2d_preview:
             self.live2d_preview.setVisible(False)
         if self.spine_preview:
@@ -3616,7 +3737,8 @@ class PreviewPage(QFrame):
                 return
             preview_model = getattr(result, "preview_model_json", None)
             if preview_model:
-                self.load_model_preview(str(preview_model), source_path)
+                self.load_model_preview(str(preview_model), source_path,
+                                        editor_model_json=str(result.package.model_json))
                 return
             self._open_spine_native_preview(result.plan)
         except Exception as exc:
@@ -4172,6 +4294,7 @@ class PreviewPage(QFrame):
         item = self._preview_items[index]
         if self.image_preview_panel:
             self.image_preview_panel.set_current_index(index, emit=False)
+            self._sync_resource_selector()
             self.image_preview_panel.setVisible(True)
         if self.preview_placeholder:
             self.preview_placeholder.setVisible(False)
@@ -4190,7 +4313,8 @@ class PreviewPage(QFrame):
             return
         prepared = item.get("prepared_model_json")
         if prepared and os.path.isfile(str(prepared)):
-            self.load_model_preview(str(prepared), source_path or str(prepared))
+            self.load_model_preview(str(prepared), source_path or str(prepared),
+                                    editor_model_json=item.get("editor_model_json"))
             return
         if source_path:
             self.start_model_preview_import(source_path)
@@ -4198,6 +4322,7 @@ class PreviewPage(QFrame):
     def activate_image_preview_item(self, item: dict):
         self._terminate_preview_process()
         self._clear_embedded_spine()
+        self._show_image_stage()
         self.current_model_path = None
         self._set_motion_debug_visible(False)
         self.preview_btn.setEnabled(False)
@@ -4252,7 +4377,8 @@ class PreviewPage(QFrame):
             result = prepare_preview_import(temp_dir, self.settings_manager.get_temp_dir())
             if result.temp_dir:
                 self._model_preview_temp_dirs.append(str(result.temp_dir))
-            self.load_model_preview(str(result.preview_model_json), source_path)
+            self.load_model_preview(str(result.preview_model_json), source_path,
+                                    editor_model_json=str(result.package.model_json))
             return
         except Exception:
             pass
@@ -4305,7 +4431,9 @@ class PreviewPage(QFrame):
     def on_model_preview_import_ready(self, model_json_path: str, temp_dir: str, source_path: str):
         if temp_dir:
             self._model_preview_temp_dirs.append(temp_dir)
-        self.load_model_preview(model_json_path, source_path)
+        worker = self.sender() or self._model_preview_thread
+        self.load_model_preview(model_json_path, source_path,
+                                editor_model_json=getattr(worker, "editor_model_json", None))
 
     def on_model_preview_import_failed(self, error: str, source_path: str):
         if _is_unity_preview_source(source_path):
@@ -4316,14 +4444,17 @@ class PreviewPage(QFrame):
             tr("preview.model_import_failed_content", error=error),
         )
 
-    def load_model_preview(self, model_json_path: str, source_path: str | None = None):
+    def load_model_preview(self, model_json_path: str, source_path: str | None = None,
+                           *, editor_model_json: str | None = None):
         self._clear_embedded_spine()
+        self._clear_live2d_controls()
+        self._set_resource_mode("live2d")
         self._psd_project_context = self._pending_psd_project_context
         self._pending_psd_project_context = None
         if self.save_pose_scheme_btn:
             self.save_pose_scheme_btn.setVisible(bool(self._psd_project_context))
         self.current_model_path = os.path.abspath(model_json_path)
-        self._set_editor_source("live2d", self.current_model_path)
+        self._set_editor_source("live2d", editor_model_json or self.current_model_path)
         self._temp_model_json_path = self.current_model_path
         self._cleanup_image_preview_temp_dirs()
 
@@ -4334,6 +4465,7 @@ class PreviewPage(QFrame):
                 "kind": "model",
                 "path": self.current_model_path,
                 "prepared_model_json": self.current_model_path,
+                "editor_model_json": editor_model_json or self.current_model_path,
                 "source_path": source_path or self.current_model_path,
                 "source_dir": model_dir,
                 "label": model_name,
@@ -4354,7 +4486,7 @@ class PreviewPage(QFrame):
             source_dir=model_dir,
             label=source_path or model_dir,
         )
-        QTimer.singleShot(50, self.preview_current_model)
+        self._live2d_load_timer.start()
         if not (self._preview_cooldown_timer and self._preview_cooldown_timer.isActive()):
             self.preview_btn.setEnabled(True)
 
@@ -4498,15 +4630,18 @@ class PreviewPage(QFrame):
                 "motion_loop": bool(self.loop_motion_check and self.loop_motion_check.isChecked()),
             })
             preview.apply_settings(settings)
+            self._set_resource_mode("live2d")
+            self._preview_parts_changed(self.artmesh_panel.part_overrides, self.artmesh_panel.part_defaults)
             preview.show()
             self._set_motion_debug_visible(True)
             self._on_motion_selection_changed(self.motion_combo.currentIndex())
-            QTimer.singleShot(120, lambda: self._refresh_parameter_controls(5))
+            self._parameter_refresh_retries = 5
+            self._parameter_refresh_timer.start()
             return True
         except Exception as exc:
             self._terminate_preview_process()
             self._set_motion_debug_visible(False)
-            self._show_stage_placeholder(tr("preview.stage_empty"))
+            self._show_stage_placeholder(tr("preview.stage_empty"), keep_editor_source=True)
             self.show_error(
                 tr("common.error"),
                 tr("preview_window.error_model_load_failed", error_type=type(exc).__name__, error=exc),
@@ -4515,37 +4650,17 @@ class PreviewPage(QFrame):
 
     def open_psd_project_preview(self, model_json_path: str, project_file: str):
         """Open a model with PSD provenance, enabling named pose export."""
-        try:
-            preview_model_json = prepare_model_json_for_preview(model_json_path)
-        except Exception as exc:
-            self.show_error(
-                tr("common.error"),
-                tr("preview_window.error_model_load_failed", error_type=type(exc).__name__, error=exc),
-            )
-            return
         self._pending_psd_project_context = {
             "project_file": os.path.abspath(project_file),
             "model_json": os.path.abspath(model_json_path),
         }
-        self.load_model_preview(str(preview_model_json), model_json_path)
+        self.start_model_preview_import(model_json_path)
 
     def open_model_preview_source(self, model_json_path: str):
         """Open a model sent by another workspace page without PSD context."""
-        try:
-            preview_model_json = prepare_model_json_for_preview(model_json_path)
-        except Exception as exc:
-            self.show_error(
-                tr("common.error"),
-                tr(
-                    "preview_window.error_model_load_failed",
-                    error_type=type(exc).__name__,
-                    error=exc,
-                ),
-            )
-            return
         self._pending_psd_project_context = None
         self._psd_project_context = None
-        self.load_model_preview(str(preview_model_json), model_json_path)
+        self.start_model_preview_import(model_json_path)
 
     def request_pose_scheme_save(self):
         context = dict(self._psd_project_context or {})
@@ -4588,7 +4703,8 @@ class PreviewPage(QFrame):
             self.advanced_panel.sync_advanced_param_values(meta)
             return
         if retries > 0:
-            QTimer.singleShot(120, lambda: self._refresh_parameter_controls(retries - 1))
+            self._parameter_refresh_retries = retries - 1
+            self._parameter_refresh_timer.start()
 
     def on_preview_window_closed(self, window):
         """预览窗口关闭处理"""

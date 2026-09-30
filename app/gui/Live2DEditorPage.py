@@ -5,7 +5,7 @@ import copy
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QFileSystemWatcher, QProcess, QSignalBlocker, Qt, QTimer, QUrl
+from PySide6.QtCore import QFileSystemWatcher, QPoint, QProcess, QSignalBlocker, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QImage, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QDialog, QFileDialog,
@@ -15,13 +15,14 @@ from PySide6.QtWidgets import (
 from qfluentwidgets import (
     BodyLabel, CaptionLabel, CardWidget, CheckBox, ComboBox, DoubleSpinBox,
     FluentIcon, LineEdit, MessageBoxBase, PrimaryPushButton,
-    PushButton, ScrollArea, Slider, SubtitleLabel, TableWidget,
+    PushButton, RoundMenu, ScrollArea, Slider, SubtitleLabel, TableWidget,
     TransparentToolButton,
 )
 
 from app.core.live2d_editor_session import Live2DEditorSession
 from app.gui.ArtMeshInspector import ArtMeshInspector
-from app.gui.Live2DModPage import Live2DModPage
+from app.gui.live2d_editor_panels import ProjectBoundModPage
+from app.gui.PsdReconstructionPage import PsdReconstructionPage
 from app.gui.editor_timeline import AnimationTimelineEditor
 from app.gui.editor_workspace import EditorViewportLayout, EditorWorkspace, FluentEditorTabs
 from app.i18n import get_i18n, tr
@@ -40,7 +41,7 @@ LIVE2D_EDITOR_TEXT = {
     "editor.live2d.textures": "贴图",
     "editor.live2d.mod": "MOD 管理",
     "editor.live2d.use_for_mod": "将当前编辑用于 MOD",
-    "editor.live2d.mod_hint": "此按钮先保存完整副本，再导入 MOD 工程；原有工程管理与换装导出可继续使用。",
+    "editor.live2d.mod_hint": "将当前模型、动作与贴图的独立快照导入本工程的 MOD 子工程；原模型保持不变。",
     "editor.live2d.search": "搜索参数名称 / ID",
     "editor.live2d.parameter": "参数 / ID",
     "editor.live2d.value": "数值",
@@ -77,6 +78,18 @@ LIVE2D_EDITOR_TEXT = {
     "editor.live2d.help": "编辑说明",
     "editor.live2d.selected_parameter": "选中参数",
     "editor.live2d.mod_preview": "MOD 皮肤：{name}",
+    "editor.live2d.psd": "PSD 工作台",
+    "editor.live2d.return_model": "返回当前模型",
+    "editor.live2d.psd_snapshot": "PSD 快照 / 回写预览：{name}",
+    "editor.live2d.project_busy": "PSD 或 MOD 任务仍在处理中，请待任务完成后再保存、切换或关闭。",
+    "editor.live2d.psd_applied": "回写版本贴图已应用到当前模型；可撤销，动作保持不变。",
+    "editor.live2d.project_open": "打开模型 / 工程",
+    "editor.live2d.project_save": "保存工程副本",
+    "editor.live2d.project_unsaved": "当前模型、PSD 或 MOD 工程有修改。保存完整工程副本后继续？",
+    "editor.live2d.psd_missing_version": "先选择一个有效的回写或复合版本。",
+    "editor.live2d.return_failed": "当前编辑模型预览恢复失败，操作已停止。",
+    "editor.live2d.open_short": "打开",
+    "editor.live2d.save_short": "保存",
 }
 
 
@@ -132,12 +145,19 @@ class _ParameterValue:
 
 
 class Live2DEditorPage(QFrame):
+    sourceOpened = Signal(str)
+    sourceFailed = Signal(str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("live2dEditorPage")
         self.i18n = get_i18n()
         self.session: Live2DEditorSession | None = None
         self.preview = None
+        self._preview_session = None
+        self._preview_context = ""
+        self._binding_projects = False
+        self.last_open_error = ""
         self._refreshing = False
         self._active = False
         self._manual_pose = False
@@ -170,6 +190,8 @@ class Live2DEditorPage(QFrame):
         root.setSpacing(7)
         header = QHBoxLayout()
         self.title_label = SubtitleLabel(self)
+        self.title_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.title_label.setMinimumWidth(100)
         self.open_button = PushButton(FluentIcon.FOLDER, "", self)
         self.undo_button = TransparentToolButton(FluentIcon.CANCEL, self)
         self.redo_button = TransparentToolButton(FluentIcon.SYNC, self)
@@ -181,18 +203,34 @@ class Live2DEditorPage(QFrame):
         self.redo_button.clicked.connect(self.redo)
         self.save_button.clicked.connect(self._choose_save_copy)
         header.addWidget(self.title_label, 1)
+        self.source_label = CaptionLabel(self)
+        self.source_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.source_label.setMinimumWidth(100)
+        self.source_label.setMaximumWidth(160)
+        self.source_label.hide()
+        header.addWidget(self.source_label)
         for button in (self.open_button, self.undo_button, self.redo_button, self.save_button, self.help_button):
             header.addWidget(button)
         root.addLayout(header)
-        self.source_label = CaptionLabel(self)
-        self.source_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-        root.addWidget(self.source_label)
         self.source_hint = CaptionLabel(self)
         self.source_hint.hide()
         self.stage = QWidget(self)
         self.stage.setMinimumSize(220, 120)
         self.stage_layout = QVBoxLayout(self.stage)
         self.stage_layout.setContentsMargins(0, 0, 0, 0)
+        self.stage_layout.setSpacing(0)
+        self.preview_toolbar = QWidget(self.stage)
+        self.preview_toolbar.setFixedHeight(32)
+        preview_toolbar_layout = QHBoxLayout(self.preview_toolbar)
+        preview_toolbar_layout.setContentsMargins(6, 0, 6, 0)
+        self.preview_context_label = CaptionLabel(self.preview_toolbar)
+        self.preview_context_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.return_model_button = PushButton(self.preview_toolbar)
+        self.return_model_button.clicked.connect(self.return_to_current_model)
+        preview_toolbar_layout.addWidget(self.preview_context_label, 1)
+        preview_toolbar_layout.addWidget(self.return_model_button)
+        self.preview_toolbar.hide()
+        self.stage_layout.addWidget(self.preview_toolbar)
         self.empty_label = BodyLabel(self.stage)
         self.empty_label.setAlignment(Qt.AlignCenter)
         self.empty_label.setWordWrap(True)
@@ -204,6 +242,24 @@ class Live2DEditorPage(QFrame):
         self._build_parameter_tab()
         self._build_artmesh_tab()
         self._build_texture_tab()
+        self.psd_tab = QWidget(self.tabs)
+        psd_layout = EditorViewportLayout(self.psd_tab)
+        psd_layout.setContentsMargins(4, 4, 4, 4)
+        self.psd_panel = PsdReconstructionPage(self.psd_tab, compact=True)
+        self.psd_panel.managed_project_root_provider = lambda: self.session.root / "psd" if self.session else None
+        self.psd_panel.projectRequested.connect(lambda path: self.open_psd_workspace(project_file=path))
+        self.psd_panel.newProjectRequested.connect(self._new_psd_project)
+        self.psd_panel.sourceRequested.connect(lambda path: self.open_psd_workspace(model_path=path))
+        self.psd_panel.capturePoseRequested.connect(self._capture_psd_pose)
+        self.psd_panel.repackApplyRequested.connect(self.apply_psd_version)
+        self.psd_panel.repackModRequested.connect(self.send_psd_version_to_mod)
+        self.psd_panel.projectChanged.connect(self._psd_project_changed)
+        self.psd_panel.unifiedPreviewRequested.connect(self._open_psd_preview)
+        self.psd_panel.previewClosed.connect(self.return_to_current_model)
+        self.psd_panel.export_snapshot_provider = self._psd_export_snapshot
+        self.psd_panel.preview_command_handler = self._psd_preview_command
+        psd_layout.addWidget(self.psd_panel)
+        self.tabs.addTab(self.psd_tab, "")
         self.mod_tab = QWidget(self.tabs)
         mod_layout = QVBoxLayout(self.mod_tab)
         mod_layout.setContentsMargins(4, 4, 4, 4)
@@ -212,36 +268,52 @@ class Live2DEditorPage(QFrame):
         mod_layout.addWidget(self.use_for_mod_button)
         self.mod_hint = CaptionLabel(self.mod_tab)
         self.mod_hint.hide()
-        self.mod_panel = Live2DModPage(self.mod_tab, compact=True)
+        self.mod_panel = ProjectBoundModPage(lambda: self.session, self.mod_tab)
         self.mod_panel.previewModelRequested.connect(self._open_mod_preview)
         self.mod_panel.triggerSelectionChanged.connect(self._mod_trigger_selected)
+        self.mod_panel.projectChanged.connect(self._mod_project_changed)
         mod_layout.addWidget(self.mod_panel, 1)
         self.tabs.addTab(self.mod_tab, "")
         timeline_host = QWidget(self)
-        timeline_layout = QVBoxLayout(timeline_host)
+        timeline_layout = EditorViewportLayout(timeline_host)
         timeline_layout.setContentsMargins(0, 0, 0, 0)
         timeline_layout.setSpacing(4)
         row = QHBoxLayout()
         self.motion_label = CaptionLabel(timeline_host)
+        self.motion_label.hide()
         self.motion_combo = ComboBox(timeline_host)
-        self.motion_combo.setMinimumWidth(100)
-        self.motion_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.motion_combo.setMinimumWidth(80)
+        self.motion_combo.setMaximumWidth(125)
+        self.motion_combo.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.motion_combo.setFixedWidth(110)
         self.motion_combo.currentIndexChanged.connect(self._motion_changed)
-        self.new_motion_button = PushButton(timeline_host)
-        self.clone_motion_button = PushButton(timeline_host)
-        self.key_pose_button = PushButton(timeline_host)
+        self.new_motion_button = TransparentToolButton(FluentIcon.ADD, timeline_host)
+        self.clone_motion_button = TransparentToolButton(FluentIcon.COPY, timeline_host)
+        self.key_pose_button = TransparentToolButton(FluentIcon.ACCEPT, timeline_host)
+        for button in (self.new_motion_button, self.clone_motion_button, self.key_pose_button):
+            button.setFixedSize(28, 28)
         self.new_motion_button.clicked.connect(self._create_motion)
         self.clone_motion_button.clicked.connect(self._clone_motion)
         self.key_pose_button.clicked.connect(self._key_current_pose)
-        row.addWidget(self.motion_label)
-        row.addWidget(self.motion_combo, 1)
-        row.addWidget(self.new_motion_button)
-        row.addWidget(self.clone_motion_button)
-        row.addWidget(self.key_pose_button)
-        timeline_layout.addLayout(row)
+        row.addWidget(self.motion_combo)
         self.track_label = CaptionLabel(timeline_host)
         self.track_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        timeline_layout.addWidget(self.track_label)
+        row.addWidget(self.track_label, 1)
+        self.motion_options_button = TransparentToolButton(FluentIcon.MORE, timeline_host)
+        self.motion_options_button.setFixedSize(26, 28)
+        row.addWidget(self.motion_options_button)
+        row.addSpacing(28)
+        timeline_layout.addLayout(row)
+        self.motion_options_menu = RoundMenu(parent=self)
+        options = QWidget(self.motion_options_menu)
+        options.setFixedSize(220, 42)
+        commands = QHBoxLayout(options)
+        commands.setContentsMargins(6, 4, 6, 4)
+        for button in (self.new_motion_button, self.clone_motion_button, self.key_pose_button):
+            commands.addWidget(button)
+        commands.addStretch(1)
+        self.motion_options_menu.addWidget(options, selectable=False)
+        self.motion_options_button.clicked.connect(lambda: self.motion_options_menu.exec(self.motion_options_button.mapToGlobal(QPoint(0, self.motion_options_button.height()))))
         self.timeline = AnimationTimelineEditor(timeline_host)
         self.timeline.canvas.setMinimumHeight(80)
         self.timeline.timeChanged.connect(self._seek)
@@ -250,6 +322,7 @@ class Live2DEditorPage(QFrame):
         timeline_layout.addWidget(self.timeline, 1)
         self.workspace = EditorWorkspace(self.stage, self.tabs, timeline_host, self,
                                          settings_key="live2d", settings=self.mod_panel.settings_manager)
+        self.workspace.move_toolbar_to(header)
         self.main_splitter = self.workspace.horizontal_splitter
         self.vertical_splitter = self.workspace.vertical_splitter
         self.workspace.panelVisibilityChanged.connect(self._panel_visibility_changed)
@@ -350,6 +423,9 @@ class Live2DEditorPage(QFrame):
         inspector.atlas_canvas.setMinimumSize(220, 135)
         inspector.details.setMaximumHeight(64)
         inspector.main_layout.setContentsMargins(4, 4, 4, 4)
+        inspector.details.hide()
+        inspector.status_label.hide()
+        inspector.details.textChanged.connect(lambda: inspector.setToolTip(inspector.details.toPlainText()))
         inspector.refresh_button.clicked.disconnect()
         inspector.refresh_button.clicked.connect(self._refresh_mesh)
         inspector.selectionChanged.connect(self._artmesh_selected)
@@ -458,8 +534,7 @@ class Live2DEditorPage(QFrame):
             self.title_label: "title", self.open_button: "open", self.save_button: "save",
             self.empty_label: "empty",
             self.source_hint: "source_hint", self.parameter_hint: "parameter_hint",
-            self.motion_label: "motion", self.new_motion_button: "new_motion",
-            self.clone_motion_button: "clone_motion", self.key_pose_button: "key_pose",
+            self.motion_label: "motion",
             self.replace_texture_button: "replace_texture", self.choose_editor_button: "choose_editor",
             self.edit_texture_button: "edit_texture", self.texture_hint: "texture_hint",
             self.part_visible: "visible", self.local_preview_label: "local_preview",
@@ -467,12 +542,20 @@ class Live2DEditorPage(QFrame):
         }
         for widget, key in labels.items():
             widget.setText(_text("editor.live2d." + key))
-        for button, key in ((self.undo_button, "undo"), (self.redo_button, "redo"), (self.help_button, "help")):
+        for button, key in ((self.undo_button, "undo"), (self.redo_button, "redo"), (self.help_button, "help"),
+                            (self.new_motion_button, "new_motion"), (self.clone_motion_button, "clone_motion"),
+                            (self.key_pose_button, "key_pose"), (self.motion_options_button, "motion")):
             button.setToolTip(_text("editor.live2d." + key))
+            button.setAccessibleName(button.toolTip())
         self.use_for_mod_button.setToolTip(_text("editor.live2d.mod_hint"))
         self.parameter_name.setText(_text("editor.live2d.selected_parameter"))
-        for index, key in enumerate(("parameters", "parts", "textures", "mod")):
+        for index, key in enumerate(("parameters", "parts", "textures", "psd", "mod")):
             self.tabs.setTabText(index, _text("editor.live2d." + key))
+        self.return_model_button.setText(_text("editor.live2d.return_model"))
+        self.open_button.setText(_text("editor.live2d.open_short"))
+        self.save_button.setText(_text("editor.live2d.save_short"))
+        self.open_button.setToolTip(_text("editor.live2d.project_open"))
+        self.save_button.setToolTip(_text("editor.live2d.project_save"))
         self.parameter_search.setPlaceholderText(_text("editor.live2d.search"))
         self.parameter_table.setHorizontalHeaderLabels([_text("editor.live2d." + key) for key in ("parameter", "value", "range")])
         self.editor_label.setText(self._external_editor or _text("editor.live2d.default_editor"))
@@ -480,27 +563,39 @@ class Live2DEditorPage(QFrame):
         self.timeline.retranslate_ui()
         self.workspace.retranslate_ui()
         self.mod_panel.retranslate_ui()
+        self.psd_panel.retranslate_ui()
         self._update_actions()
 
     def _choose_source(self):
-        path, _ = QFileDialog.getOpenFileName(self, _text("editor.live2d.open"), "", "Live2D (*.json *.moc3)")
+        path, _ = QFileDialog.getOpenFileName(self, _text("editor.live2d.project_open"), "", "Live2D (*.json *.moc3 *.lpk)")
         if path:
             self.open_source(path)
 
     def open_source(self, path: str) -> bool:
         """Prepare and validate a replacement before releasing the active session."""
         candidate = None
+        self.last_open_error = ""
         previous = self.session
+        previous_psd = copy.deepcopy(self.psd_panel.current_project)
+        if previous_psd:
+            previous_psd.data["ui_state"] = self.psd_panel._current_ui_state()
+        previous_mod = copy.deepcopy(self.mod_panel.current_project)
+        previous_psd_dirty = self.psd_panel._project_dirty
+        previous_mod_dirty = self.mod_panel._dirty
         created_preview = self.preview is None
         try:
-            if self.mod_panel.worker and self.mod_panel.worker.isRunning():
-                self._status(_text("editor.live2d.busy"))
+            if self._projects_busy():
+                self.last_open_error = _text("editor.live2d.project_busy")
+                self._status(self.last_open_error)
+                self.sourceFailed.emit(path)
                 return False
             candidate = Live2DEditorSession(path)
             if not self._confirm_session_changes():
                 candidate.close()
                 return False
             self.timeline.set_playing(False)
+            if not self.return_to_current_model():
+                raise RuntimeError(_text("editor.live2d.return_failed"))
             self.session = candidate
             if self.preview is None:
                 from app.gui.Live2DPreviewWindow import Live2DPreviewWindow
@@ -529,39 +624,290 @@ class Live2DEditorPage(QFrame):
             self._populate_textures()
             self._refresh_mesh()
             self._mod_preview_model_id = ""
+            self._bind_subprojects()
             self.source_label.setText(candidate.source_path.name)
             self.source_label.setToolTip(str(candidate.source_path))
             self._native_model_ready()
             self.set_active(self.isVisible())
-            if previous:
-                previous.close()
             self._update_actions()
             self._status("; ".join(candidate.warnings))
+            if previous:
+                previous.close()
+            self.sourceOpened.emit(path)
             return True
         except Exception as exc:
             if self.session is candidate:
                 self.session = previous
+            if previous and self.preview:
+                try:
+                    self.preview.load_model(str(previous.model_path))
+                    self._binding_projects = True
+                    try:
+                        self.psd_panel.bind_project(previous_psd)
+                        self.mod_panel.bind_project(previous_mod)
+                        self.psd_panel._project_dirty = previous_psd_dirty
+                        self.mod_panel._dirty = previous_mod_dirty
+                    finally:
+                        self._binding_projects = False
+                    self._native_model_ready()
+                    self._populate_motions()
+                    self._populate_parameters()
+                    self._populate_textures()
+                    self._refresh_mesh()
+                except Exception as rollback_error:
+                    self._status(str(rollback_error))
             if candidate:
                 candidate.close()
             if created_preview and self.preview:
                 self.preview.close()
                 self.preview.deleteLater()
                 self.preview = None
+                self.empty_label.show()
+            self._error(exc)
+            self.last_open_error = str(exc)
+            self.sourceFailed.emit(path)
+            return False
+
+    def _projects_busy(self) -> bool:
+        return bool((self.mod_panel.worker and self.mod_panel.worker.isRunning()) or self.psd_panel.is_busy())
+
+    def _bind_subprojects(self):
+        self._binding_projects = True
+        try:
+            self.psd_panel.bind_project(getattr(self.session, "psd_project", None))
+            self.mod_panel.bind_project(getattr(self.session, "mod_project", None))
+            if self.session:
+                self.mod_panel.set_source(str(self.session.model_path))
+        finally:
+            self._binding_projects = False
+
+    def _psd_project_changed(self, project):
+        if self.session and not self._binding_projects:
+            self.session.bind_psd_project(project)
+            if self.psd_panel._project_dirty:
+                self.session.mark_project_changed()
+            self._update_actions()
+
+    def _mod_project_changed(self, project):
+        if self.session and not self._binding_projects:
+            if project is not None:
+                self.session.bind_mod_project(project)
+            if self.mod_panel._dirty:
+                self.session.mark_project_changed()
+            self._update_actions()
+
+    def _flush_subprojects(self):
+        if not self.session:
+            return
+        if self.psd_panel.current_project:
+            self.psd_panel.save_current_project()
+        if self.mod_panel.current_project and not self.mod_panel.flush_pending_changes():
+            raise RuntimeError(_text("editor.live2d.project_unsaved"))
+        self.session.flush_projects(psd_project=self.psd_panel.current_project,
+                                    mod_project=self.mod_panel.current_project)
+
+    def open_psd_workspace(self, model_path=None, project_file=None) -> bool:
+        try:
+            if self._projects_busy():
+                self._status(_text("editor.live2d.project_busy"))
+                return False
+            if project_file and not self.session:
+                from app.core.psd_project import load_project
+                if not self.open_source(str(load_project(project_file).base_model_json)):
+                    return False
+            elif model_path:
+                source = Path(model_path).resolve()
+                active_paths = {self.session.model_path.resolve(), self.session.source_path.resolve()} if self.session else set()
+                if source not in active_paths and not self.open_source(str(source)):
+                    return False
+            elif not self.session:
+                path, _ = QFileDialog.getOpenFileName(self, _text("editor.live2d.project_open"), "", "Live2D (*.json *.moc3 *.lpk)")
+                if not path or not self.open_source(path):
+                    return False
+            same_project = (self.psd_panel.current_project and project_file
+                            and Path(project_file).resolve() == self.psd_panel.current_project.project_file.resolve())
+            if project_file and self.psd_panel.current_project and not same_project:
+                # Keep edits and UI choices in the owned project before changing
+                # the active child; importing a recent file never writes its source.
+                self.psd_panel.save_current_project()
+            if not same_project and (project_file or not self.psd_panel.current_project):
+                project = (self.session.attach_psd_project(project_file) if project_file
+                           else self.session.ensure_psd_project())
+                self._binding_projects = True
+                try:
+                    self.psd_panel.bind_project(project)
+                finally:
+                    self._binding_projects = False
+            self.tabs.setCurrentWidget(self.psd_tab)
+            self.workspace.set_panel_visible("details", True)
+            self._update_actions()
+            return True
+        except Exception as exc:
             self._error(exc)
             return False
 
-    def _open_mod_preview(self, path: str):
-        # The signal is delivered synchronously. mapped_mod_skin_preview owns
-        # its staging files until open_source has made its independent copy.
-        model_id = self.mod_panel.requested_preview_model_id
-        if self.open_source(path):
-            self._mod_preview_model_id = model_id
-            model = self.mod_panel.model_by_id(model_id)
-            if model:
-                self.source_label.setText(_text("editor.live2d.mod_preview", name=model.get("skin_name") or model_id))
-                self.source_label.setToolTip(str(self.mod_panel.current_project.project_file))
-            self.mod_panel.note_preview_opened(model_id)
+    def _new_psd_project(self):
+        if not self.session:
+            return self.open_psd_workspace()
+        if not self.psd_panel.current_project:
+            return self.open_psd_workspace()
+        if not self._confirm_session_changes():
+            return False
+        name = self.psd_panel._prompt_non_empty_name("psd.project.new_dialog_title", "psd.project.new_dialog_prompt", self.session.source_path.stem)
+        if not name:
+            return False
+        try:
+            from app.core.psd_project import create_project_from_source
+            snapshot = self._psd_export_snapshot()
+            project = create_project_from_source(snapshot, project_name=name, output_root=self.session.root / "psd-imports")
+            return self.open_psd_workspace(project_file=str(project.project_file))
+        except Exception as exc:
+            self._error(exc)
+            return False
+
+    def _psd_export_snapshot(self):
+        if not self.session:
+            raise RuntimeError(_text("editor.live2d.empty"))
+        project = self.session.ensure_psd_project()
+        target = project.project_dir / "snapshots" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        result = self.session.export_snapshot(target)
+        return str(result["model_path"] if isinstance(result, dict) else result)
+
+    def _capture_psd_pose(self):
+        if not self.session or not self.open_psd_workspace():
+            return
+        name = self.psd_panel._prompt_non_empty_name("psd.project.new_dialog_title", "psd.export.name", "")
+        if name:
+            self.psd_panel.create_pose_scheme_from_preview({"project_file": str(self.psd_panel.current_project.project_file),
+                                                           "name": name, "parameters": self._pose()})
+
+    def _psd_version_textures(self, token: str) -> dict[int, Path]:
+        from app.core.psd_project import find_composite_entry, find_repack_entry, resolve_project_path
+        project = self.psd_panel.current_project
+        if not project or not token.startswith(("repack:", "composite:")):
+            raise ValueError(_text("editor.live2d.psd_missing_version"))
+        kind, version_id = token.split(":", 1)
+        entry = find_repack_entry(project, version_id) if kind == "repack" else find_composite_entry(project, version_id)
+        if not entry:
+            raise ValueError(_text("editor.live2d.psd_missing_version"))
+        values = entry.get("texture_outputs") or {str(index): value for index, value in enumerate(entry.get("output_paths") or [])}
+        return {int(index): resolve_project_path(project, path) for index, path in values.items()}
+
+    def _psd_version_workspace(self, token: str):
+        from app.core.psd_project import prepare_repack_preview_workspace
+        # Validate the selected history entry before preparing its model.
+        self._psd_version_textures(token)
+        return prepare_repack_preview_workspace(self.psd_panel.current_project, token.split(":", 1)[1])
+
+    def apply_psd_version(self, token: str) -> bool:
+        try:
+            if not self.session or self._projects_busy():
+                return False
+            if not self.return_to_current_model():
+                raise RuntimeError(_text("editor.live2d.return_failed"))
+            self.session.apply_texture_package(self._psd_version_workspace(token))
+            self._reload_preview_textures()
+            self._status(_text("editor.live2d.psd_applied"))
+            self._update_actions()
+            return True
+        except Exception as exc:
+            self._error(exc)
+            return False
+
+    def send_psd_version_to_mod(self, token: str) -> bool:
+        try:
+            if not self.session or self._projects_busy():
+                return False
+            import shutil
+            from app.core.model import resolve_live2d_package
+            version_model = self._psd_version_workspace(token)
+            info = self.session.validate_texture_package(version_model)
+            target = self.session.root / "mod-inputs" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            result = self.session.export_snapshot(target)
+            model_path = str(result["model_path"] if isinstance(result, dict) else result)
+            package = resolve_live2d_package(model_path)
+            for index, texture in enumerate(info.textures):
+                if not 0 <= index < len(package.texture_paths):
+                    raise ValueError(f"Texture index out of range: {index}")
+                shutil.copy2(texture, package.texture_paths[index])
+            if not self.mod_panel.current_project:
+                self.mod_panel.bind_project(self.session.ensure_mod_project())
+            self.mod_panel.queue_source_imports([model_path])
+            self.tabs.setCurrentWidget(self.mod_tab)
+            return True
+        except Exception as exc:
+            self._error(exc)
+            return False
+
+    def _open_psd_preview(self, path: str, project_file: str):
+        self._open_workspace_preview(path, _text("editor.live2d.psd_snapshot", name=Path(path).name))
+
+    def _open_workspace_preview(self, path: str, label: str) -> bool:
+        if not self.preview or not self.session:
+            return False
+        candidate = None
+        previous = self._preview_session
+        try:
+            candidate = Live2DEditorSession(path)
+            self.timeline.set_playing(False)
+            self._preview_session = candidate
+            self.preview.load_model(str(candidate.model_path))
+            self._preview_context = label
+            self.preview_context_label.setText(label)
+            self.preview_context_label.setToolTip(str(path))
+            self.preview_toolbar.show()
+            self._native_model_ready()
             self.workspace.set_panel_visible("preview", True)
+            if previous:
+                previous.close()
+            return True
+        except Exception as exc:
+            self._preview_session = previous
+            if candidate:
+                candidate.close()
+            self.preview.load_model(str(previous.model_path if previous else self.session.model_path))
+            self._error(exc)
+            return False
+
+    def return_to_current_model(self) -> bool:
+        previous = self._preview_session
+        if not previous:
+            return True
+        try:
+            self._preview_session = None
+            self._preview_context = ""
+            if self.preview and self.session:
+                self.preview.load_model(str(self.session.model_path))
+                self._native_model_ready()
+                self._refresh_mesh()
+            self._mod_preview_model_id = ""
+            self.preview_toolbar.hide()
+            previous.close()
+            return True
+        except Exception as exc:
+            self._preview_session = previous
+            self._error(exc)
+            return False
+
+    def _psd_preview_command(self, payload: dict) -> bool:
+        if not self.preview or not self._preview_session:
+            return False
+        if payload.get("type") == "play_motion":
+            self.preview.set_motion_frozen(False)
+            self.preview.play_motion(str(payload.get("group") or ""), int(payload.get("index") or 0))
+            return True
+        if payload.get("type") == "set_selected_motion":
+            self.preview.set_selected_motion(str(payload.get("group") or ""), int(payload.get("index") or 0))
+            return True
+        return False
+
+    def _open_mod_preview(self, path: str):
+        model_id = self.mod_panel.requested_preview_model_id
+        model = self.mod_panel.model_by_id(model_id)
+        label = _text("editor.live2d.mod_preview", name=(model or {}).get("skin_name") or model_id)
+        if self._open_workspace_preview(path, label):
+            self._mod_preview_model_id = model_id
+            self.mod_panel.note_preview_opened(model_id)
 
     def _mod_trigger_selected(self, drawable_id: str):
         if self.session and drawable_id:
@@ -589,11 +935,14 @@ class Live2DEditorPage(QFrame):
         if not self.session or not self.preview:
             return
         values = self._pose()
+        render_session = self._preview_session or self.session
+        supported = {parameter["id"] for parameter in render_session.parameters}
+        values = {key: value for key, value in values.items() if key in supported}
         self.preview.apply_settings({"advanced_enabled": True, "advanced_params": values})
         defaults = {str(part["id"]): float(part.get("opacity", 1))
-                    for part in (self.session.mesh_data or {}).get("parts", [])}
-        self.preview.set_part_opacity_overrides(self.session.part_overrides, defaults)
-        self._sync_parameter_values(values)
+                    for part in (render_session.mesh_data or {}).get("parts", [])}
+        self.preview.set_part_opacity_overrides({key: value for key, value in self.session.part_overrides.items() if key in defaults}, defaults)
+        self._sync_parameter_values(self._pose())
 
     def _populate_parameters(self):
         self._refreshing = True
@@ -669,6 +1018,8 @@ class Live2DEditorPage(QFrame):
             self._refresh_track()
 
     def _parameter_value_changed(self, parameter_id: str, value: float):
+        if not self.return_to_current_model():
+            return
         if self._refreshing or not self.session:
             return
         try:
@@ -710,12 +1061,15 @@ class Live2DEditorPage(QFrame):
             frames = self.session.keyframes(motion, self._selected_parameter)
             duration = float(self.session.project.motions[motion]["Meta"]["Duration"])
             self.timeline.set_track(frames, duration, ["value"], editable=True)
-            self.track_label.setText(f"{motion} · {self._selected_parameter}")
+            self.track_label.setText(self._selected_parameter)
+            self.track_label.setToolTip(f"{motion} · {self._selected_parameter}")
         else:
             self.timeline.set_track([], 3, ["value"], editable=False)
             self.track_label.setText(_text("editor.live2d.track_empty"))
 
     def _frames_edited(self, frames: list):
+        if not self.return_to_current_model():
+            return
         motion = self._current_motion()
         if self._refreshing or not self.session or not motion or not self._selected_parameter:
             return
@@ -794,7 +1148,7 @@ class Live2DEditorPage(QFrame):
         if not self.session:
             return
         try:
-            path = self.session.write_inspector_metadata(self._pose())
+            path = (self._preview_session or self.session).write_inspector_metadata(self._pose())
             self.artmesh_inspector.load_metadata(path)
         except Exception as exc:
             self._error(exc)
@@ -817,7 +1171,7 @@ class Live2DEditorPage(QFrame):
         if not in_mod:
             self.tabs.setCurrentWidget(self.artmesh_tab)
         self._refresh_mesh()
-        canvas = (self.session.mesh_data or {}).get("canvas", {})
+        canvas = ((self._preview_session or self.session).mesh_data or {}).get("canvas", {})
         x = normalized_x * float(canvas.get("width", 1))
         y = normalized_y * float(canvas.get("height", 1))
         from app.gui.ArtMeshInspector import _point_in_triangle
@@ -837,7 +1191,8 @@ class Live2DEditorPage(QFrame):
     def _artmesh_selected(self, entry):
         if not self.session or not entry:
             return
-        image = self.session.local_artmesh_image(entry.raw)
+        render_session = self._preview_session or self.session
+        image = render_session.local_artmesh_image(entry.raw)
         if image:
             data = image.tobytes("raw", "RGBA")
             qimage = QImage(data, image.width, image.height, image.width * 4, QImage.Format_RGBA8888).copy()
@@ -846,7 +1201,7 @@ class Live2DEditorPage(QFrame):
         else:
             self.artmesh_image.clear()
         part_id = str(entry.raw.get("parent_part_id") or "")
-        available = bool(part_id and int(entry.raw.get("parent_part_index", -1)) >= 0)
+        available = bool(not self._preview_session and part_id and int(entry.raw.get("parent_part_index", -1)) >= 0)
         self.part_opacity.setEnabled(available)
         self.part_visible.setEnabled(available)
         opacity = self.session.part_overrides.get(part_id, next((float(p.get("opacity", 1)) for p in (self.session.mesh_data or {}).get("parts", []) if p["id"] == part_id), 1))
@@ -966,6 +1321,9 @@ class Live2DEditorPage(QFrame):
             self._status(_text("editor.live2d.texture_reloaded"))
 
     def _reload_preview_textures(self):
+        if self._preview_session:
+            if not self.return_to_current_model():
+                raise RuntimeError(_text("editor.live2d.return_failed"))
         if self.preview and self.session:
             self.preview.load_model(str(self.session.model_path))
             self._native_model_ready()
@@ -975,6 +1333,8 @@ class Live2DEditorPage(QFrame):
 
     def undo(self):
         try:
+            if not self.return_to_current_model():
+                return
             if self.session and self.session.undo():
                 self.timeline.set_playing(False)
                 self._manual_pose = bool(self.session.parameter_overrides)
@@ -986,6 +1346,8 @@ class Live2DEditorPage(QFrame):
 
     def redo(self):
         try:
+            if not self.return_to_current_model():
+                return
             if self.session and self.session.redo():
                 self.timeline.set_playing(False)
                 self._manual_pose = bool(self.session.parameter_overrides)
@@ -1005,19 +1367,29 @@ class Live2DEditorPage(QFrame):
         return bool(self.save_copy(str(Path(parent) / name)))
 
     def _use_edited_for_mod(self):
-        if self._choose_save_copy() and self.last_saved_copy:
-            self.mod_panel.queue_source_imports([self.last_saved_copy["model_path"]])
+        if not self.session or self._projects_busy():
+            return
+        try:
+            if not self.mod_panel.current_project:
+                self.mod_panel.bind_project(self.session.ensure_mod_project())
+            target = self.session.root / "mod-inputs" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            self.mod_panel.queue_source_imports([str(self.session.export_snapshot(target))])
+        except Exception as exc:
+            self._error(exc)
 
     def save_copy(self, output_dir: str) -> dict | None:
         if not self.session:
             return None
         try:
+            if self._projects_busy():
+                raise RuntimeError(_text("editor.live2d.project_busy"))
             # An external editor may have saved immediately before this click.
             # Accept that final valid texture revision before making the copy.
             for index in range(len(self.session.texture_paths)):
                 self.session.accept_texture_change(index)
+            self._flush_subprojects()
             self.last_saved_copy = self.session.save_copy(output_dir)
-            self.mod_panel.set_source(self.last_saved_copy["model_path"])
+            self.mod_panel.set_source(str(self.session.model_path))
             self._status(_text("editor.live2d.saved", path=output_dir))
             self._update_actions()
             return self.last_saved_copy
@@ -1034,20 +1406,19 @@ class Live2DEditorPage(QFrame):
             except Exception as exc:
                 self._error(exc)
                 return False
-        if not self.session.dirty:
+        if not self.session.dirty and not self.psd_panel._project_dirty and not self.mod_panel._dirty:
             return True
-        answer = QMessageBox.warning(self, _text("editor.live2d.unsaved_title"), _text("editor.live2d.unsaved_message"),
+        answer = QMessageBox.warning(self, _text("editor.live2d.unsaved_title"), _text("editor.live2d.project_unsaved"),
                                      QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel, QMessageBox.Cancel)
         if answer == QMessageBox.Save:
             return self._choose_save_copy()
         return answer == QMessageBox.Discard
 
     def confirm_discard_or_save(self) -> bool:
-        worker = self.mod_panel.worker
-        if worker and worker.isRunning():
-            self._status(_text("editor.live2d.busy"))
+        if self._projects_busy():
+            self._status(_text("editor.live2d.project_busy"))
             return False
-        return self._confirm_session_changes() and self.mod_panel.confirm_discard_or_save()
+        return self._confirm_session_changes()
 
     def set_active(self, active: bool):
         self._active = bool(active)
@@ -1062,6 +1433,8 @@ class Live2DEditorPage(QFrame):
         self._texture_timer.stop()
         self._mesh_timer.stop()
         self.mod_panel._project_search_timer.stop()
+        if not self.psd_panel.shutdown():
+            return False
         worker = self.mod_panel.worker
         if worker and worker.isRunning():
             worker.wait(30000)
@@ -1074,16 +1447,28 @@ class Live2DEditorPage(QFrame):
             self.preview.close()
             self.preview.deleteLater()
             self.preview = None
+        if self._preview_session:
+            self._preview_session.close()
+            self._preview_session = None
         if self.session:
             self.session.close()
             self.session = None
         return True
 
     def _tab_changed(self, *_args):
+        if self._binding_projects:
+            return
         if self.tabs.currentWidget() is getattr(self, "artmesh_tab", None):
             self._refresh_mesh()
         elif self.tabs.currentWidget() is getattr(self, "texture_tab", None):
             self._refresh_texture_image()
+        elif self.tabs.currentWidget() is getattr(self, "psd_tab", None) and self.session and not self.psd_panel.current_project:
+            self.open_psd_workspace()
+        elif self.tabs.currentWidget() is getattr(self, "mod_tab", None) and self.session and not self.mod_panel.current_project:
+            try:
+                self.mod_panel.bind_project(self.session.ensure_mod_project())
+            except Exception as exc:
+                self._error(exc)
 
     def _update_actions(self):
         session = self.session
@@ -1097,11 +1482,13 @@ class Live2DEditorPage(QFrame):
         self.parameter_tab.setEnabled(bool(session))
         self.artmesh_tab.setEnabled(bool(session))
         self.texture_tab.setEnabled(bool(session and session.texture_paths))
+        self.psd_tab.setEnabled(bool(session))
+        self.mod_tab.setEnabled(bool(session))
         self.motion_combo.setEnabled(bool(session and session.project.motions))
-        title = _text("editor.live2d.title")
-        if session:
-            title += " · " + _text("editor.live2d.modified" if session.dirty else "editor.live2d.clean")
-        self.title_label.setText(title)
+        dirty = bool(session and (session.dirty or self.psd_panel._project_dirty or self.mod_panel._dirty))
+        self.title_label.setText(_text("editor.live2d.title") + (" *" if dirty else ""))
+        self.title_label.setToolTip(_text("editor.live2d.modified" if dirty else "editor.live2d.clean"))
+        self.source_label.setVisible(bool(session))
 
     def _status(self, text: str):
         self.status_label.setText(text)

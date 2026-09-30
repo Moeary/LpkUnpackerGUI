@@ -571,14 +571,10 @@ def _add_reference(project: AnimationEditingProject, relative: Any) -> Path:
 
 
 def _live2d_references(project: AnimationEditingProject, value: Any, key: str = "") -> None:
-    if isinstance(value, dict):
-        for child_key, child in value.items():
-            _live2d_references(project, child, child_key)
-    elif isinstance(value, list):
-        for child in value:
-            _live2d_references(project, child, key)
-    elif isinstance(value, str) and key != "Name":
-        _add_reference(project, value)
+    from app.core.live2d_references import iter_live2d_asset_references
+
+    for relative in iter_live2d_asset_references(value, key):
+        _add_reference(project, relative)
 
 
 def _spine_assets(project: AnimationEditingProject) -> None:

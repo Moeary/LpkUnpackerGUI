@@ -143,17 +143,23 @@ class DummyPreviewPage(QFrame):
         self.can_close = True
         self.prepare_count = self.shutdown_count = 0
         self.leases = set()
+        self.lease_counter = 0
+        self.errors = []
 
     def set_active(self, active):
         self.active = active
 
     def acquire_editor_source(self, path):
-        token = str(len(self.leases)) + path
+        self.lease_counter += 1
+        token = str(self.lease_counter) + path
         self.leases.add(token)
         return token
 
     def release_editor_source(self, token):
         self.leases.discard(token)
+
+    def show_error(self, title, message):
+        self.errors.append((title, message))
 
     def prepare_shutdown(self):
         self.prepare_count += 1
@@ -170,6 +176,10 @@ class DummyLive2DEditor(QFrame):
         self.setObjectName("live2dEditorPage")
         self.mod_panel = QFrame(self)
         self.mod_panel.setObjectName("live2dModPage")
+        self.psd_panel = QFrame(self)
+        self.psd_panel.setObjectName("psdReconstructionPage")
+        self.psd_opened = []
+        self.last_open_error = self.open_error = ""
         self.active = False
         self.confirm_ok = self.accept_source = True
         self.opened = []
@@ -177,7 +187,12 @@ class DummyLive2DEditor(QFrame):
 
     def open_source(self, path):
         self.opened.append(path)
+        self.last_open_error = self.open_error
         return self.accept_source
+
+    def open_psd_workspace(self, model_path=None, project_file=None):
+        self.psd_opened.append((model_path, project_file))
+        return True
 
     def set_active(self, active):
         self.active = active
@@ -241,7 +256,7 @@ class MainWindowEditorNavigationTests(unittest.TestCase):
 
         self.module = importlib.import_module("app.gui.MainWindow")
         with patch.multiple(
-            self.module, SettingsManager=TempSettings,
+            self.module, SettingsManager=TempSettings, _DISABLE_NATIVE_PREVIEW=False,
             ExtractorPage=_page_factory("extractorPage"),
             PreviewPage=DummyPreviewPage,
             Live2DEditorPage=DummyLive2DEditor, SpineEditorPage=DummySpineEditor,
@@ -270,6 +285,9 @@ class MainWindowEditorNavigationTests(unittest.TestCase):
         self.assertIsNotNone(window.navigationInterface.widget("live2dEditorPage"))
         self.assertIsNotNone(window.navigationInterface.widget("spineEditorPage"))
         self.assertNotIn("live2dModPage", window.navigationInterface.panel.items)
+        self.assertIs(window.psdReconstructionPage, window.live2dEditorPage.psd_panel)
+        self.assertNotIn("psdReconstructionPage", window.navigationInterface.panel.items)
+        self.assertEqual(window.stackedWidget.indexOf(window.psdReconstructionPage), -1)
         theme = window.theme_toggle_button.mapTo(window, QPoint(0, 0))
         settings = window.navigationInterface.widget("settingsPage").mapTo(window, QPoint(0, 0))
         self.assertLess(theme.y(), settings.y())
@@ -304,6 +322,85 @@ class MainWindowEditorNavigationTests(unittest.TestCase):
         self.assertEqual(window.settingsPage.reload_count, 0)
         self.assertTrue(window.live2dEditorPage.dirty)
         self.assertIs(window.stackedWidget.currentWidget(), window.live2dEditorPage)
+
+    def test_visible_editor_failure_is_distinct_from_cancel_and_success(self):
+        model = self.root / "model.json"
+        model.write_text("{}", encoding="utf-8")
+        window = self.window
+        window.switchTo(window.previewPage)
+        editor = window.live2dEditorPage
+        editor.accept_source = False
+        editor.open_error = "Referenced MOC3 is missing"
+        window.previewPage.editorRequested.emit("live2d", str(model))
+        self.assertIs(window.stackedWidget.currentWidget(), window.previewPage)
+        self.assertEqual(window.previewPage.errors[-1][1], editor.open_error)
+        self.assertFalse(window.previewPage.leases)
+        editor.open_error = ""
+        window.previewPage.editorRequested.emit("live2d", str(model))
+        self.assertEqual(len(window.previewPage.errors), 1)
+        editor.accept_source = True
+        window.previewPage.editorRequested.emit("live2d", str(model))
+        self.assertIs(window.stackedWidget.currentWidget(), editor)
+        self.assertFalse(window.previewPage.leases)
+
+    def test_async_completion_releases_only_its_source_in_either_order(self):
+        editor = self.window.spineEditorPage
+        paths = [self.root / "a.json", self.root / "b.json"]
+        for path in paths:
+            path.write_text("{}", encoding="utf-8")
+        for reverse in (False, True):
+            for path in paths:
+                self.assertTrue(self.window.open_model_editor("spine", str(path)))
+            self.assertEqual(len(self.window.previewPage.leases), 2)
+            first, second = paths[::-1] if reverse else paths
+            editor.sourceOpened.emit(str(first))
+            self.assertEqual(len(self.window.previewPage.leases), 1)
+            remaining = self.window._editor_source_leases[editor]
+            self.assertEqual(list(remaining.values()), [os.path.normcase(os.path.abspath(second))])
+            editor.last_open_error = "Conversion failed"
+            with patch.object(self.window, "_show_editor_open_error") as report:
+                editor.sourceFailed.emit(str(second))
+                report.assert_called_once_with("Conversion failed")
+            self.assertFalse(self.window.previewPage.leases)
+
+    def test_same_source_cancel_does_not_release_pending_copy(self):
+        path = self.root / "a.json"
+        path.write_text("{}", encoding="utf-8")
+        editor = self.window.spineEditorPage
+        self.assertTrue(self.window.open_model_editor("spine", str(path)))
+        pending = set(self.window.previewPage.leases)
+        editor.accept_source = False
+        self.assertFalse(self.window.open_model_editor("spine", str(path)))
+        self.assertEqual(self.window.previewPage.leases, pending)
+        editor.sourceOpened.emit(str(path))
+        self.assertFalse(self.window.previewPage.leases)
+
+    def test_legacy_pose_save_uses_copied_project_without_rebinding_original(self):
+        source = self.root / "source.lpkpsdproj.json"
+        source.write_text('{"original":true}', encoding="utf-8")
+        copy = self.root / "PSD" / "project.lpkpsdproj.json"
+        copy.parent.mkdir()
+        copy.write_text("{}", encoding="utf-8")
+        panel = self.window.psdReconstructionPage
+        panel.current_project = SimpleNamespace(project_file=copy)
+        received = []
+
+        def save_pose(payload):
+            received.append(payload)
+            # The PSD handler reloads a mismatched path, so this assertion
+            # protects the independent editor package rather than just a spy.
+            self.assertEqual(Path(payload["project_file"]), copy)
+            Path(payload["project_file"]).write_text('{"poses":["new"]}', encoding="utf-8")
+
+        panel.create_pose_scheme_from_preview = save_pose
+        payload = {"model_json_path": "source.model3.json", "project_file": str(source), "name": "new"}
+        self.window.save_psd_pose_scheme(payload)
+        self.assertEqual(source.read_text(encoding="utf-8"), '{"original":true}')
+        self.assertEqual(payload["project_file"], str(source))
+        self.assertEqual(len(received), 1)
+        self.assertIs(self.window.stackedWidget.currentWidget(), self.window.live2dEditorPage)
+        self.window.switchTo(panel)
+        self.assertEqual(self.window.live2dEditorPage.psd_opened[-1], (None, None))
 
     def test_cancelled_close_does_not_shutdown_any_editor(self):
         window = self.window

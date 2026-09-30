@@ -12,7 +12,6 @@ import io
 import json
 import math
 import os
-import re
 import shutil
 import tempfile
 import time
@@ -27,6 +26,8 @@ from app.core.animation_editing import (
 )
 from app.core.model.motions import _evaluate_segments
 from app.core.psd_reconstructor import resolve_live2d_source
+from app.core.live2d_references import iter_live2d_asset_references
+from app.core.live2d_editor_project import Live2DEditorProjects
 
 
 EDITOR_MANIFEST = "lpk_live2d_editor.json"
@@ -118,7 +119,9 @@ class Live2DEditorSession:
         self._temporary = tempfile.TemporaryDirectory(prefix="lpk-live2d-editor-")
         self.root = Path(self._temporary.name) / "model"
         self.root.mkdir()
-        self.model_path = self.root / self.source_path.name
+        self.model_path = self.root / "model.json"
+        self._project_revision = 0
+        self._projects = Live2DEditorProjects(self)
         self.original_bindings: dict[tuple[str, int], int] = {}
         self._copied: set[str] = set()
         self.warnings: list[str] = []
@@ -178,12 +181,13 @@ class Live2DEditorSession:
             manifest = self.source_root / EDITOR_MANIFEST
             if manifest.is_file():
                 state = _read_json(manifest)
-                if state.get("format") == "LpkUnpacker.Live2DEditor" and state.get("version") == 1:
+                if state.get("format") == "LpkUnpacker.Live2DEditor" and state.get("version") in (1, 2):
                     known = {p["id"]: p for p in self.parameters}
                     self.parameter_overrides = {k: float(v) for k, v in state.get("pose_parameters", {}).items()
                                                 if k in known and known[k]["min"] <= float(v) <= known[k]["max"]}
                     self.part_overrides = {k: float(v) for k, v in state.get("preview_part_opacity", {}).items()
                                            if math.isfinite(float(v)) and 0 <= float(v) <= 1}
+                    self._projects.restore(self.source_root, state)
             self._undo: list[dict] = []
             self._redo: list[dict] = []
             self._saved_signature = self._signature()
@@ -217,19 +221,8 @@ class Live2DEditorSession:
         return True
 
     def _copy_references(self, value: Any, key: str = "") -> None:
-        if isinstance(value, dict):
-            for child_key, child in value.items():
-                self._copy_references(child, child_key)
-        elif isinstance(value, list):
-            for child in value:
-                self._copy_references(child, key)
-        elif isinstance(value, str) and key != "Name":
-            # Live2DViewerEX skin menus refer to an in-model command, not a
-            # disk asset. Retain the original menu in exported copies; only
-            # this exact command grammar is excluded from the asset scan.
-            if key == "NextMtn" and re.fullmatch(r"SwitchSkin:[0-9]+", value):
-                return
-            self._copy_asset(value)
+        for relative in iter_live2d_asset_references(value, key):
+            self._copy_asset(relative)
 
     def _snapshot(self) -> dict:
         project = self.project
@@ -261,6 +254,7 @@ class Live2DEditorSession:
         snapshot = self._snapshot()
         snapshot["modified"] = sorted(snapshot["modified"])
         snapshot["textures"] = [hashlib.sha256(data).hexdigest() for data in snapshot["textures"]]
+        snapshot["project_revision"] = self._project_revision
         return hashlib.sha256(json.dumps(snapshot, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
     def _record(self, action) -> Any:
@@ -279,6 +273,56 @@ class Live2DEditorSession:
     @property
     def dirty(self) -> bool:
         return self._signature() != self._saved_signature
+
+    @property
+    def psd_project(self):
+        return self._projects.get("psd")
+
+    @property
+    def mod_project(self):
+        return self._projects.get("mods")
+
+    @property
+    def workspace_dirty(self):
+        return self.dirty
+
+    def mark_project_changed(self):
+        self._project_revision += 1
+
+    mark_workspace_dirty = mark_project_changed
+
+    def ensure_psd_project(self):
+        return self._projects.ensure("psd")
+
+    def ensure_mod_project(self):
+        return self._projects.ensure("mods")
+
+    def attach_psd_project(self, source):
+        return self._projects.attach("psd", source)
+
+    def attach_mod_project(self, source):
+        return self._projects.attach("mods", source)
+
+    import_psd_project = attach_psd_project
+    import_mod_project = attach_mod_project
+
+    def bind_psd_project(self, project):
+        return self._projects.bind("psd", project)
+
+    def bind_mod_project(self, project):
+        return self._projects.bind("mods", project)
+
+    def detach_psd_project(self):
+        return self._projects.detach("psd")
+
+    def detach_mod_project(self):
+        return self._projects.detach("mods")
+
+    def flush_projects(self, psd_project=None, mod_project=None):
+        if psd_project is not None:
+            self.bind_psd_project(psd_project)
+        if mod_project is not None:
+            self.bind_mod_project(mod_project)
 
     @property
     def can_undo(self) -> bool:
@@ -385,19 +429,50 @@ class Live2DEditorSession:
                 temporary.unlink()
 
     def replace_texture(self, index: int, source: str | Path) -> bool:
-        with Image.open(source) as image:
-            if image.size != self.texture_sizes[index]:
-                raise AnimationEditingError(f"Texture size must remain {self.texture_sizes[index][0]} × {self.texture_sizes[index][1]}.")
-            buffer = io.BytesIO()
-            image.convert("RGBA").save(buffer, format="PNG")
-            data = buffer.getvalue()
-        if data == self._texture_data[index]:
+        return self.replace_textures({index: source})
+
+    def replace_textures(self, sources: Mapping[int, str | Path]) -> bool:
+        replacements = {}
+        for index, source in sources.items():
+            if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(self.texture_paths):
+                raise AnimationEditingError(f"Unknown texture index: {index}")
+            with Image.open(source) as image:
+                if image.size != self.texture_sizes[index]:
+                    raise AnimationEditingError(f"Texture size must remain {self.texture_sizes[index][0]} × {self.texture_sizes[index][1]}.")
+                buffer = io.BytesIO()
+                image.convert("RGBA").save(buffer, format="PNG")
+                data = buffer.getvalue()
+            if data != self._texture_data[index]:
+                replacements[index] = data
+        if not replacements:
             return False
         def apply():
-            self._write_texture(self.texture_paths[index], data)
-            self._texture_data[index] = data
+            for index, data in replacements.items():
+                self._write_texture(self.texture_paths[index], data)
+                self._texture_data[index] = data
         self._record(apply)
         return True
+
+    def validate_texture_package(self, source: str | Path):
+        """Validate a PSD/MOD preview package against this model before use."""
+        info = resolve_live2d_source(Path(source))
+        moc = self.root / _relative(self.original_document["FileReferences"]["Moc"])
+        if info.moc3 is None or not info.moc3.is_file() or hashlib.sha256(info.moc3.read_bytes()).digest() != hashlib.sha256(moc.read_bytes()).digest():
+            raise AnimationEditingError("Texture package belongs to a different MOC3 model.")
+        if len(info.textures) != len(self.texture_paths):
+            raise AnimationEditingError("Texture package must contain the same texture count.")
+        expected = [path.relative_to(self.root).as_posix() for path in self.texture_paths]
+        actual = [path.relative_to(info.root_dir).as_posix() for path in info.textures]
+        if actual != expected:
+            raise AnimationEditingError("Texture package must retain the model's texture order and paths.")
+        for index, path in enumerate(info.textures):
+            if self._image_size(path) != self.texture_sizes[index]:
+                raise AnimationEditingError(f"Texture package size changed at index {index}.")
+        return info
+
+    def apply_texture_package(self, source: str | Path) -> bool:
+        info = self.validate_texture_package(source)
+        return self.replace_textures(dict(enumerate(info.textures)))
 
     def accept_texture_change(self, index: int) -> bool:
         path = self.texture_paths[index]
@@ -452,7 +527,27 @@ class Live2DEditorSession:
         self._write_json(path, metadata)
         return path
 
-    def save_copy(self, output_dir: str | Path) -> dict[str, Any]:
+    def export_snapshot(self, output_dir: str | Path) -> Path:
+        output = Path(output_dir).expanduser().resolve()
+        if not output.is_relative_to(self.root):
+            return Path(self.save_copy(output, include_projects=False, mark_saved=False)["model_path"])
+        if output.exists() or output.is_relative_to(self.source_root):
+            raise AnimationEditingError("Create a snapshot in a new editor workspace directory.")
+        # The animation exporter forbids a destination inside its input root.
+        # Export independently first, then publish the immutable snapshot into
+        # a new managed directory without consuming the editor's dirty state.
+        with tempfile.TemporaryDirectory(prefix="lpk-editor-export-") as temporary:
+            exported = self.save_copy(Path(temporary) / "model", include_projects=False, mark_saved=False)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix=".lpk-snapshot-", dir=output.parent) as publishing:
+                stage = Path(publishing) / "model"
+                shutil.copytree(Path(exported["model_path"]).parent, stage)
+                _rename_directory(stage, output)
+        return output / "model.json"
+
+    export_model_snapshot = export_snapshot
+
+    def save_copy(self, output_dir: str | Path, *, include_projects: bool = True, mark_saved: bool = True) -> dict[str, Any]:
         output = Path(output_dir).expanduser().resolve()
         if output.exists() or output.is_relative_to(self.source_root) or self.source_root.is_relative_to(output):
             raise AnimationEditingError("Save to a new folder outside the source package.")
@@ -489,10 +584,12 @@ class Live2DEditorSession:
                 else:
                     originals[original_index] = dict(originals[original_index], File=item["File"])
             self._write_json(Path(result["model_path"]), document)
-            self._write_json(stage / EDITOR_MANIFEST, {"format": "LpkUnpacker.Live2DEditor", "version": 1,
+            projects = self._projects.export(stage) if include_projects else {}
+            self._write_json(stage / "model.drawables.json", self.snapshot_mesh(self.parameter_overrides))
+            self._write_json(stage / EDITOR_MANIFEST, {"format": "LpkUnpacker.Live2DEditor", "version": 2,
                                "source_path": str(self.source_path), "pose_parameters": self.parameter_overrides,
                                "preview_part_opacity": self.part_overrides, "warnings": self.warnings,
-                               "authoring_source": None})
+                               "authoring_source": None, "model": "model.json", "projects": projects})
             manifest_path = Path(result["manifest_path"])
             manifest = _read_json(manifest_path)
             manifest["animations"] = [self.project._summary(name) for name in sorted(modified)]
@@ -504,7 +601,8 @@ class Live2DEditorSession:
                     result[key] = str(output) + value[len(old_prefix):]
             result["animation_paths"] = animation_paths
             _rename_directory(stage, output)
-        self._saved_signature = self._signature()
+        if mark_saved:
+            self._saved_signature = self._signature()
         return dict(result, editor_manifest_path=str(output / EDITOR_MANIFEST))
 
     def close(self) -> None:

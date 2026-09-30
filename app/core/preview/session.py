@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import shutil
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -12,6 +13,8 @@ from app.core.model import (
     prepare_model_json_for_preview,
     resolve_live2d_package,
 )
+from app.core.animation_editing import AnimationEditingError, _relative
+from app.core.live2d_references import iter_live2d_asset_references
 from app.core.spine_preview import (
     SpineAssetNotFoundError,
     SpinePreviewAsset,
@@ -102,8 +105,7 @@ def prepare_preview_import(
 
     direct = _try_direct_package(source_path)
     if direct:
-        preview_json = prepare_model_json_for_preview(direct.model_json)
-        return PreviewImportResult(package=direct, preview_model_json=preview_json)
+        return _prepare_direct_preview_copy(direct, Path(temp_root))
 
     source_type = detect_source_type(source_path)
     if source_type not in {
@@ -136,6 +138,37 @@ def prepare_preview_import(
             preview_model_json=preview_json,
             temp_dir=temp_dir,
         )
+    except Exception:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+
+
+def _prepare_direct_preview_copy(package: Live2DPackage, temp_root: Path) -> PreviewImportResult:
+    """Normalize only a disposable copy; retain its complete model for editors."""
+    source_root = package.root_dir.resolve()
+    temp_root = temp_root.resolve()
+    if temp_root.is_relative_to(source_root):
+        raise Live2DPackageError("Choose a preview temporary directory outside the source model package.")
+    # A motion reference escaping this copy would let motion_fixed write back
+    # into the source. Validate semantic asset fields before normalization.
+    document = json.loads(package.model_json.read_text(encoding="utf-8-sig"))
+    try:
+        for value in iter_live2d_asset_references(document.get("FileReferences", {})):
+            relative = _relative(value)
+            if not (source_root / relative).resolve().is_relative_to(source_root):
+                raise Live2DPackageError(f"Escaping Live2D preview asset: {value}")
+    except AnimationEditingError as exc:
+        raise Live2DPackageError(str(exc)) from exc
+    for path in source_root.rglob("*"):
+        if not path.resolve().is_relative_to(source_root):
+            raise Live2DPackageError(f"Escaping Live2D package resource: {path}")
+    temp_root.mkdir(parents=True, exist_ok=True)
+    temp_dir = Path(tempfile.mkdtemp(prefix="lpk_preview_model_", dir=temp_root))
+    try:
+        shutil.copytree(source_root, temp_dir, dirs_exist_ok=True)
+        copied = resolve_live2d_package(temp_dir / package.model_json.relative_to(source_root))
+        preview_json = prepare_model_json_for_preview(copied.model_json)
+        return PreviewImportResult(package=copied, preview_model_json=preview_json, temp_dir=temp_dir)
     except Exception:
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise

@@ -11,7 +11,7 @@ from PySide6.QtGui import QPainter
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QSplitter, QSplitterHandle, QStackedWidget, QVBoxLayout, QWidget, QSizePolicy
 from qfluentwidgets import (
     BodyLabel, CaptionLabel, CardWidget, FluentIcon, Pivot, TransparentToolButton,
-    TransparentTogglePushButton, PushButton, ComboBox,
+    TransparentToggleToolButton, PushButton, ComboBox,
     ScrollArea, setFont,
 )
 
@@ -41,6 +41,11 @@ class EditorComboBox(ComboBox):
 
     def addItem(self, text, userData=None, *, icon=None):  # noqa: N802
         super().addItem(text, icon=icon, userData=userData)
+
+    def minimumSizeHint(self):  # noqa: N802
+        # A selected long path/track should be clipped by the Fluent button,
+        # while its popup and tooltip retain the complete name.
+        return QSize(max(60, self.minimumWidth()), super().minimumSizeHint().height())
 
 
 class EditorViewportLayout(QVBoxLayout):
@@ -89,6 +94,8 @@ class EditorTabs(QWidget):
             button.setFixedSize(24, 30)
             button.hide()
         tab_row = QHBoxLayout()
+        self.tab_row = tab_row
+        self._corner_space = 0
         tab_row.setContentsMargins(0, 0, 0, 0)
         tab_row.setSpacing(2)
         tab_row.addWidget(self.back_button)
@@ -161,7 +168,7 @@ class EditorTabs(QWidget):
         bar.setValue(bar.value() + offset)
 
     def _update_tab_arrows(self, *args):
-        overflow = self._natural_tab_width() > self.width()
+        overflow = self._natural_tab_width() > self.width() - self._corner_space
         self.back_button.setVisible(overflow)
         self.forward_button.setVisible(overflow)
 
@@ -170,13 +177,18 @@ class EditorTabs(QWidget):
                    for key, label in zip(self._keys, self._tab_labels))
 
     def _fit_tab_items(self):
-        overflow = self._natural_tab_width() > self.width()
-        available = max(70, self.width() - (52 if overflow else 0) - 24)
+        overflow = self._natural_tab_width() > self.width() - self._corner_space
+        available = max(70, self.width() - self._corner_space - (52 if overflow else 0) - 24)
         for key, label in zip(self._keys, self._tab_labels):
             item = self.pivot.widget(key)
             item.setText(item.fontMetrics().elidedText(label, Qt.TextElideMode.ElideRight, available))
         self.pivot.adjustSize()
         self._update_tab_arrows()
+
+    def reserve_corner(self, width: int):
+        self._corner_space = max(0, int(width))
+        self.tab_row.setContentsMargins(0, 0, self._corner_space, 0)
+        self._fit_tab_items()
 
     def resizeEvent(self, event):  # noqa: N802
         super().resizeEvent(event)
@@ -194,18 +206,15 @@ class EditorPanel(CardWidget):
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.setMinimumSize(140, 90)
         layout = EditorViewportLayout(self)
-        layout.setContentsMargins(12, 7, 12, 10)
-        layout.setSpacing(7)
-        header = QHBoxLayout()
-        header.setSpacing(8)
+        layout.setContentsMargins(10, 7, 10, 9)
+        layout.setSpacing(0)
         self.title = BodyLabel(self)
-        header.addWidget(self.title)
-        header.addStretch(1)
+        self.title.hide()
         self.hide_button = TransparentToolButton(FluentIcon.HIDE, self)
-        self.hide_button.setFixedSize(28, 28)
+        self.hide_button.setFixedSize(24, 24)
         self.hide_button.clicked.connect(self.hideRequested)
-        header.addWidget(self.hide_button)
-        layout.addLayout(header)
+        if isinstance(content, EditorTabs):
+            content.reserve_corner(28)
         if panel == "timeline":
             self.scroll = ScrollArea(self)
             self.scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -218,9 +227,16 @@ class EditorPanel(CardWidget):
             layout.addWidget(content, 1)
         self.retranslate_ui()
 
+    def resizeEvent(self, event):  # noqa: N802
+        super().resizeEvent(event)
+        self.hide_button.move(self.width() - self.hide_button.width() - 9, 9)
+        self.hide_button.raise_()
+
     def retranslate_ui(self):
         name = _text(f"editor.workspace.{self.panel}")
         self.title.setText(name)
+        self.setAccessibleName(name)
+        self.hide_button.setAccessibleName(_text("editor.workspace.hide", panel=name))
         self.hide_button.setToolTip(_text("editor.workspace.hide", panel=name))
 
 
@@ -281,8 +297,8 @@ class EditorWorkspace(QWidget):
         self._restoring = False
         self._initial_show = False
         self._visibility = {"preview": True, "details": True, "timeline": True}
-        self._horizontal_sizes = [620, 380]
-        self._vertical_sizes = [450, 255]
+        self._horizontal_sizes = [550, 450]
+        self._vertical_sizes = [450, 195]
         self._settings = (settings or SettingsManager()) if settings_key and settings is not False else None
         layout = EditorViewportLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -292,39 +308,38 @@ class EditorWorkspace(QWidget):
         bar.setContentsMargins(2, 0, 2, 0)
         bar.setSpacing(5)
         self.layout_label = CaptionLabel(self)
-        bar.addWidget(self.layout_label)
-        self.preview_toggle = TransparentTogglePushButton(FluentIcon.VIEW, "", self)
-        self.details_toggle = TransparentTogglePushButton(FluentIcon.EDIT, "", self)
-        self.timeline_toggle = TransparentTogglePushButton(FluentIcon.HISTORY, "", self)
+        self.layout_label.hide()
+        self.preview_toggle = TransparentToggleToolButton(FluentIcon.VIEW, self)
+        self.details_toggle = TransparentToggleToolButton(FluentIcon.EDIT, self)
+        self.timeline_toggle = TransparentToggleToolButton(FluentIcon.HISTORY, self)
         self._toggles = {"preview": self.preview_toggle, "details": self.details_toggle, "timeline": self.timeline_toggle}
         for panel, button in self._toggles.items():
             button.setChecked(True)
-            button.setFixedHeight(30)
+            button.setFixedSize(30, 30)
             button.clicked.connect(lambda checked, name=panel: self.set_panel_visible(name, checked))
             bar.addWidget(button)
-        bar.addStretch(1)
         self.reset_button = TransparentToolButton(FluentIcon.SYNC, self)
         self.reset_button.setFixedSize(30, 30)
         self.reset_button.clicked.connect(self.reset_layout)
         bar.addWidget(self.reset_button)
         layout.addWidget(self.layout_toolbar)
         self._body = _ViewportStack(self)
-        self.vertical_splitter = _WorkspaceSplitter(Qt.Orientation.Vertical, self)
-        self.horizontal_splitter = _WorkspaceSplitter(Qt.Orientation.Horizontal, self.vertical_splitter)
-        self.preview_panel = EditorPanel(preview, "preview", self.horizontal_splitter)
+        self.horizontal_splitter = _WorkspaceSplitter(Qt.Orientation.Horizontal, self)
+        self.vertical_splitter = _WorkspaceSplitter(Qt.Orientation.Vertical, self.horizontal_splitter)
+        self.preview_panel = EditorPanel(preview, "preview", self.vertical_splitter)
         self.details_panel = EditorPanel(details, "details", self.horizontal_splitter)
         self.timeline_panel = EditorPanel(timeline, "timeline", self.vertical_splitter)
-        self.horizontal_splitter.addWidget(self.preview_panel)
-        self.horizontal_splitter.addWidget(self.details_panel)
-        self.vertical_splitter.addWidget(self.horizontal_splitter)
+        self.vertical_splitter.addWidget(self.preview_panel)
         self.vertical_splitter.addWidget(self.timeline_panel)
-        self.horizontal_splitter.setStretchFactor(0, 3)
-        self.horizontal_splitter.setStretchFactor(1, 2)
-        self.vertical_splitter.setStretchFactor(0, 3)
-        self.vertical_splitter.setStretchFactor(1, 2)
+        self.horizontal_splitter.addWidget(self.vertical_splitter)
+        self.horizontal_splitter.addWidget(self.details_panel)
+        self.horizontal_splitter.setStretchFactor(0, 11)
+        self.horizontal_splitter.setStretchFactor(1, 9)
+        self.vertical_splitter.setStretchFactor(0, 1)
+        self.vertical_splitter.setStretchFactor(1, 0)
         self.horizontal_splitter.setSizes(self._horizontal_sizes)
         self.vertical_splitter.setSizes(self._vertical_sizes)
-        self._body.addWidget(self.vertical_splitter)
+        self._body.addWidget(self.horizontal_splitter)
         empty = QWidget(self)
         empty_layout = QVBoxLayout(empty)
         empty_layout.addStretch(1)
@@ -357,6 +372,11 @@ class EditorWorkspace(QWidget):
     def toggle_panel(self, panel: str):
         self.set_panel_visible(panel, not self.is_panel_visible(panel))
 
+    def move_toolbar_to(self, layout: QHBoxLayout):
+        """Place the permanent visibility controls in the page's header."""
+        self.layout().removeWidget(self.layout_toolbar)
+        layout.addWidget(self.layout_toolbar)
+
     def set_panel_visible(self, panel: str, visible: bool):
         if panel not in self._panels:
             raise ValueError(f"Unknown editor panel: {panel}")
@@ -367,7 +387,7 @@ class EditorWorkspace(QWidget):
         self._visibility[panel] = visible
         self._panels[panel].setVisible(visible)
         self._toggles[panel].setChecked(visible)
-        self.horizontal_splitter.setVisible(self._visibility["preview"] or self._visibility["details"])
+        self.vertical_splitter.setVisible(self._visibility["preview"] or self._visibility["timeline"])
         self._body.setCurrentIndex(0 if any(self._visibility.values()) else 1)
         if visible:
             self.horizontal_splitter.setSizes(self._horizontal_sizes)
@@ -382,10 +402,10 @@ class EditorWorkspace(QWidget):
         # A remaining pane expands when its neighbour is hidden. Remember the
         # split only while both panes are present, so repeated collapse/restore
         # operations recover the user's proportions instead of drifting.
-        if self._visibility["preview"] and self._visibility["details"] and all(horizontal):
+        left_visible = self._visibility["preview"] or self._visibility["timeline"]
+        if left_visible and self._visibility["details"] and all(horizontal):
             self._horizontal_sizes = horizontal
-        top_visible = self._visibility["preview"] or self._visibility["details"]
-        if top_visible and self._visibility["timeline"] and all(vertical):
+        if self._visibility["preview"] and self._visibility["timeline"] and all(vertical):
             self._vertical_sizes = vertical
 
     def _splitter_moved(self, position, index):
@@ -394,10 +414,10 @@ class EditorWorkspace(QWidget):
         self._remember_sizes()
         horizontal = self.horizontal_splitter.sizes()
         vertical = self.vertical_splitter.sizes()
-        updates = {"preview": horizontal[0] > 0, "details": horizontal[1] > 0, "timeline": vertical[1] > 0}
-        # Dragging the complete top row to zero collapses both side panes.
-        if vertical[0] == 0:
-            updates["preview"] = updates["details"] = False
+        updates = {"preview": vertical[0] > 0, "details": horizontal[1] > 0, "timeline": vertical[1] > 0}
+        # Collapsing the complete left column hides preview and timeline.
+        if horizontal[0] == 0:
+            updates["preview"] = updates["timeline"] = False
         for panel, visible in updates.items():
             if self._visibility[panel] != visible:
                 self.set_panel_visible(panel, visible)
@@ -410,9 +430,9 @@ class EditorWorkspace(QWidget):
             panel.show()
             self._toggles[name].setChecked(True)
             self.panelVisibilityChanged.emit(name, True)
-        self.horizontal_splitter.show()
+        self.vertical_splitter.show()
         self._body.setCurrentIndex(0)
-        self._horizontal_sizes = [620, 380]
+        self._horizontal_sizes = [550, 450]
         self._vertical_sizes = self._default_vertical_sizes()
         self.horizontal_splitter.setSizes(self._horizontal_sizes)
         self.vertical_splitter.setSizes(self._vertical_sizes)
@@ -421,9 +441,10 @@ class EditorWorkspace(QWidget):
         self.save_layout()
 
     def save_layout(self):
-        if not self._settings or self._restoring:
+        if not self._settings or self._restoring or not self._initial_show:
             return
-        state = {"horizontal": bytes(self.horizontal_splitter.saveState()).hex(),
+        state = {"version": 2, "layout": "left-preview-timeline",
+                 "horizontal": bytes(self.horizontal_splitter.saveState()).hex(),
                  "vertical": bytes(self.vertical_splitter.saveState()).hex(),
                  "sizes-h": self._horizontal_sizes, "sizes-v": self._vertical_sizes,
                  "visible": dict(self._visibility)}
@@ -437,7 +458,15 @@ class EditorWorkspace(QWidget):
         self._restoring = True
         saved = self._settings.get(f"editor_layouts.{self._settings_key}", {})
         saved = saved if isinstance(saved, dict) else {}
+        # The old vertical-over-horizontal tree cannot be restored into this
+        # layout. Migrate to the new visible default rather than reinterpret
+        # its byte states or keep a hidden, unexpectedly narrow workspace.
+        migrated = bool(saved) and (saved.get("version") != 2 or saved.get("layout") != "left-preview-timeline")
+        if migrated:
+            saved = {}
         if not saved:
+            self._horizontal_sizes = [550, 450]
+            self.horizontal_splitter.setSizes(self._horizontal_sizes)
             self._vertical_sizes = self._default_vertical_sizes()
             self.vertical_splitter.setSizes(self._vertical_sizes)
         visibility = saved.get("visible", {})
@@ -460,14 +489,18 @@ class EditorWorkspace(QWidget):
             self._panels[name].setVisible(visible)
             self._toggles[name].setChecked(visible)
             self.panelVisibilityChanged.emit(name, visible)
-        self.horizontal_splitter.setVisible(self._visibility["preview"] or self._visibility["details"])
+        self.vertical_splitter.setVisible(self._visibility["preview"] or self._visibility["timeline"])
         self._body.setCurrentIndex(0 if any(self._visibility.values()) else 1)
+        self.horizontal_splitter.setSizes(self._horizontal_sizes)
+        self.vertical_splitter.setSizes(self._vertical_sizes)
         self._restoring = False
         self.retranslate_ui()
+        if migrated:
+            self.save_layout()
 
     def _default_vertical_sizes(self):
         available = self.vertical_splitter.height() - self.vertical_splitter.handleWidth()
-        bottom = max(270, self.timeline_panel.content.minimumSizeHint().height() + 60)
+        bottom = 195
         return [max(160, available - bottom), bottom]
 
     def showEvent(self, event):  # noqa: N802
@@ -482,7 +515,8 @@ class EditorWorkspace(QWidget):
         self.layout_label.setText(_text("editor.workspace.layout"))
         for name, button in self._toggles.items():
             title = _text(f"editor.workspace.{name}")
-            button.setText(title)
+            button.setText("")
+            button.setAccessibleName(title)
             button.setToolTip(_text("editor.workspace.hide" if self._visibility[name] else "editor.workspace.show", panel=title))
             self._panels[name].retranslate_ui()
         self.reset_button.setToolTip(_text("editor.workspace.reset"))

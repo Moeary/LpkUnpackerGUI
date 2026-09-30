@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -86,9 +87,11 @@ class SpineEditorPageTests(unittest.TestCase):
         old = self.page.session
         self.assertTrue(self.page.open_source(str(self.root / "missing.json")))
         self.wait(lambda: bool(failed))
+        self.assertTrue(self.page.last_open_error)
         self.assertIs(self.page.session, old)
         self.assertTrue(old.project.model_path.is_file())
         self.page.open_source(str(self.model))
+        self.assertEqual(self.page.last_open_error, "")
         self.assertEqual(len(opened), 2)
 
     def test_timeline_edits_undo_redo_and_export_reopen_source_unchanged(self):
@@ -125,6 +128,53 @@ class SpineEditorPageTests(unittest.TestCase):
         self.app.processEvents()
         self.assertFalse(self.page.timeline.is_playing)
         self.assertFalse(self.page.session.dirty)
+
+    def test_new_animation_waits_for_snapshot_and_genuine_reload_errors_remain_visible(self):
+        self.open()
+        loaded_names = {"Idle"}
+        requested, errors = [], []
+        self.page.preview.previewFailed.connect(errors.append)
+
+        def native_set_animation(name, loop):
+            requested.append(name)
+            if name not in loaded_names:
+                self.page.preview.previewFailed.emit(f"Spine animation is unavailable: {name}")
+
+        def native_open(plan):
+            loaded_names.update(self.page.session.animation_names)
+
+        plan = SimpleNamespace(dynamic=True, asset=SimpleNamespace(atlas_paths=("model.atlas",)))
+        with patch.object(self.page.preview, "set_animation", side_effect=native_set_animation), \
+             patch.object(self.page.preview, "open_plan", side_effect=native_open), \
+             patch.object(self.page.preview, "set_time") as set_time, \
+             patch("app.gui.SpineEditorPage.QInputDialog.getText", return_value=("Reach", True)):
+            self.page.new_button.click()
+            self.assertEqual(self.page.animation_name, "Reach")
+            self.assertTrue(self.page._pending_preview)
+            self.assertEqual(requested, [])
+            self.assertEqual(errors, [])
+
+            # The debounce has expired, but the snapshot worker has not loaded
+            # the updated native model. Changing selection must still defer.
+            self.page._preview_timer.stop()
+            self.page._pending_preview = False
+            with patch.object(self.page, "_preview_worker", object()):
+                self.page.animation_combo.setCurrentIndex(self.page.animation_combo.findData("Idle"))
+                self.page.animation_combo.setCurrentIndex(self.page.animation_combo.findData("Reach"))
+                self.page.timeline.set_time(.75)
+                self.assertEqual(requested, [])
+                self.page._load_preview(plan)
+            self.assertEqual(requested, ["Reach"])
+            set_time.assert_called_with(.75)
+            self.assertEqual(errors, [])
+
+            # If a loaded runtime really lacks the requested animation, its
+            # error must still be reported rather than filtered by its text.
+            loaded_names.remove("Reach")
+            with patch.object(self.page.preview, "open_plan"):
+                self.page._load_preview(plan)
+            self.assertEqual(errors, ["Spine animation is unavailable: Reach"])
+            self.assertIn("Reach", self.page.status_label.text())
 
     def test_discard_save_cancellation_keeps_document_and_source(self):
         self.open()

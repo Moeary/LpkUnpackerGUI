@@ -149,13 +149,29 @@ class Live2DEditorSessionTests(unittest.TestCase):
 
     def test_virtual_skin_menu_does_not_allow_unsafe_asset_paths(self):
         document = json.loads(self.model.read_text(encoding="utf-8"))
-        for key, value in (("NextMtn", "SwitchSkin:../model0.json"), ("NextMtn", "Other:0"),
-                           ("NextMtn", "../outside.json"), ("File", "SwitchSkin:0")):
+        for key, value in (("File", "../outside.json"), ("Sound", "../outside.wav"),
+                           ("File", "D:/outside.json"), ("File", "SwitchSkin:0")):
             with self.subTest(key=key, value=value):
                 document["FileReferences"]["Motions"] = {"Menu": [{key: value}]}
                 self.model.write_text(json.dumps(document), encoding="utf-8")
                 with self.assertRaises(AnimationEditingError):
                     Live2DEditorSession(self.model)
+
+    def test_viewer_commands_and_inline_physics_are_opaque_metadata(self):
+        document = json.loads(self.model.read_text(encoding="utf-8"))
+        entry = {"Command": "start_mtn init#9:init;start_mtn Idle;start_mtn Idle#1",
+                 "PostCommand": "parameters lock drag $drag 0", "Text": "Press [~]",
+                 "Choices": [{"NextMtn": "touch#9:enable", "Language": "ja"}]}
+        document["FileReferences"]["Motions"] = {"Menu": [entry]}
+        document["FileReferences"]["PhysicsV2"] = {"Name": "inline:physics", "Code": "param x;y"}
+        self.model.write_text(json.dumps(document), encoding="utf-8")
+        other = Live2DEditorSession(self.model)
+        self.addCleanup(other.close)
+        result = other.save_copy(self.root / "viewer-copy")
+        saved = json.loads(Path(result["model_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(saved["FileReferences"]["Motions"]["Menu"], [entry])
+        self.assertEqual(saved["FileReferences"]["PhysicsV2"], document["FileReferences"]["PhysicsV2"])
+        self.assertTrue(all("start_mtn" not in value for value in other.project.references))
 
     def test_locked_texture_does_not_consume_undo_or_redo_history(self):
         replacement = self.root / "replacement.png"

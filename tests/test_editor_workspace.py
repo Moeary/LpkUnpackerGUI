@@ -99,19 +99,37 @@ class EditorWorkspaceTests(unittest.TestCase):
             self.assertTrue(all(restored.is_panel_visible(panel) for panel in restored._panels))
             self.assertTrue(Path(directory, "settings.json").is_file())
 
-    def test_default_footer_is_visible_and_small_or_expanded_timeline_can_scroll(self):
+    def test_default_toolbar_is_visible_and_small_or_expanded_timeline_can_scroll(self):
         workspace, timeline = self.workspace()
         scroll = workspace.timeline_panel.scroll
         self.assertEqual(scroll.verticalScrollBar().maximum(), 0)
         bottom = timeline.add_button.mapTo(scroll.viewport(), QPoint(0, timeline.add_button.height())).y()
         self.assertLessEqual(bottom, scroll.viewport().height())
-        self.assertGreaterEqual(timeline.add_button.y(), timeline.canvas.geometry().bottom())
+        self.assertLess(timeline.add_button.geometry().bottom(), timeline.canvas.y())
         timeline.table_check.setChecked(True)
         timeline.curve_controls_check.setChecked(True)
         workspace.vertical_splitter.setSizes([600, 110])
         self.app.processEvents()
         self.assertGreater(scroll.verticalScrollBar().maximum(), 0)
-        self.assertGreaterEqual(timeline.add_button.y(), timeline.canvas.geometry().bottom())
+        self.assertLess(timeline.add_button.geometry().bottom(), timeline.canvas.y())
+
+    def test_right_panel_has_full_height_and_old_layout_is_migrated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = SettingsManager(Path(directory) / "settings.json")
+            settings.set("editor_layouts.test", {"sizes-h": [800, 200], "sizes-v": [200, 700],
+                                                "visible": {"preview": False, "details": False, "timeline": False}})
+            workspace, _ = self.workspace(settings)
+            self.assertTrue(all(workspace.is_panel_visible(panel) for panel in workspace._panels))
+            self.assertIs(workspace.horizontal_splitter.widget(0), workspace.vertical_splitter)
+            self.assertIs(workspace.horizontal_splitter.widget(1), workspace.details_panel)
+            self.assertEqual(workspace.details_panel.height(), workspace.vertical_splitter.height())
+            self.assertGreaterEqual(workspace.timeline_panel.height(), 180)
+            self.assertLessEqual(workspace.timeline_panel.height(), 210)
+            horizontal = workspace.horizontal_splitter.sizes()
+            self.assertAlmostEqual(horizontal[0] / sum(horizontal), .55, delta=.035)
+            saved = settings.get("editor_layouts.test")
+            self.assertEqual(saved["version"], 2)
+            self.assertEqual(saved["layout"], "left-preview-timeline")
 
     def test_narrow_fluent_tabs_scroll_to_all_four_items(self):
         tabs = EditorTabs()

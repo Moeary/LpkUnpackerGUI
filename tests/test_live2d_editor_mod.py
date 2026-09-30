@@ -21,9 +21,8 @@ from app.core.live2dviewer_mod_project import (
     create_project_from_base_source, export_live2dviewer_mod,
 )
 from app.gui.Live2DEditorPage import Live2DEditorPage
-from tests.test_live2d_editor_page import _Preview
+from tests.test_live2d_editor_page import _Preview, _EditorTestSettings
 from tests.test_live2d_editor_session import make_model
-from tests.test_live2d_mod_page_smoke import _TestSettings
 
 
 class Live2DEditorModTests(unittest.TestCase):
@@ -41,10 +40,13 @@ class Live2DEditorModTests(unittest.TestCase):
                                 {"Id": "ArtMeshBound", "Motion": "TapFace"}]
         self.model.write_text(json.dumps(document), encoding="utf-8")
         self.original_hashes = self.hashes(self.model.parent)
-        self.settings = _TestSettings(self.root)
+        self.settings = _EditorTestSettings(self.root)
         self.settings_patch = patch("app.gui.Live2DModPage.SettingsManager", return_value=self.settings)
         self.settings_patch.start()
         self.addCleanup(self.settings_patch.stop)
+        self.psd_settings_patch = patch("app.gui.PsdReconstructionPage.SettingsManager", return_value=self.settings)
+        self.psd_settings_patch.start()
+        self.addCleanup(self.psd_settings_patch.stop)
         self.page = Live2DEditorPage()
         self.addCleanup(self.cleanup_page)
         self.mod = self.page.mod_panel
@@ -72,9 +74,11 @@ class Live2DEditorModTests(unittest.TestCase):
         self.assertFalse(self.errors, self.errors)
 
     def new_project(self):
+        if not self.page.session:
+            self.open()
         project = create_project_from_base_source(self.model, project_name="TestMOD", output_root=self.root / "projects")
         self.mod.set_current_project(project)
-        return project
+        return self.mod.current_project
 
     def open(self, model=None):
         with patch("app.gui.Live2DPreviewWindow.Live2DPreviewWindow", _Preview):
@@ -114,7 +118,10 @@ class Live2DEditorModTests(unittest.TestCase):
             self.page._use_edited_for_mod()
         self.wait_worker()
         self.assertEqual(len(self.mod.current_project.models), 1)
-        self.assertTrue(Path(self.page.last_saved_copy["model_path"]).is_file())
+        imported = self.mod.current_project.base_model_json
+        self.assertTrue(imported.is_file())
+        self.assertIn("Pose", json.loads(imported.read_text(encoding="utf-8"))["FileReferences"]["Motions"])
+        self.assertTrue(self.page.session.dirty)  # Importing a snapshot is not a root save.
         self.add_skin()
         # The unit fixture intentionally has an invalid MOC. Give its imported
         # package the matching static geometry sidecar; real native validation
@@ -135,25 +142,27 @@ class Live2DEditorModTests(unittest.TestCase):
         self.assertTrue((exported / "skin_manifest.json").is_file())
         self.assertTrue((exported / "texture_mapping.json").is_file())
         self.mod.preview_export_model()
-        self.assertIn("Pose[0]", self.page.session.project.motions)
-        self.assertEqual(self.page.session.keyframes("Pose[0]", "ParamAngleY")[-1]["value"], 10)
+        self.assertIn("Pose", self.page.session.project.motions)
+        self.assertIn("Pose[0]", self.page._preview_session.project.motions)
+        self.assertEqual(self.page.session.keyframes("Pose", "ParamAngleY")[-1]["value"], 10)
         self.assertEqual(self.original_hashes, self.hashes(self.model.parent))
 
-    def test_texture_only_skin_preview_and_canceled_dirty_switch(self):
+    def test_texture_only_skin_preview_preserves_anchor_and_unsaved_changes(self):
         self.new_project()
         skin = self.add_skin()
-        self.open()
         self.mod.preview_main_model()
         original_session = self.page.session
         self.page._parameter_spins["ParamAngleY"].setValue(20)
-        with patch("app.gui.Live2DEditorPage.QMessageBox.warning", return_value=QMessageBox.Cancel):
-            self.mod.model_selector.setCurrentIndex(1)
-        self.assertIs(self.page.session, original_session)
-        self.assertEqual(self.mod.model_selector.currentIndex(), 0)
-        self.page.undo()
         self.mod.model_selector.setCurrentIndex(1)
-        self.assertIsNot(self.page.session, original_session)
-        self.assertEqual(self.page.session.texture_paths[0].read_bytes(), skin.read_bytes())
+        self.assertIs(self.page.session, original_session)
+        self.assertEqual(self.mod.model_selector.currentIndex(), 1)
+        self.assertTrue(self.page.session.dirty)
+        self.assertEqual(self.page._preview_session.texture_paths[0].read_bytes(), skin.read_bytes())
+        with patch("app.gui.Live2DEditorPage.QMessageBox.warning", return_value=QMessageBox.Cancel):
+            self.assertFalse(self.page.confirm_discard_or_save())
+        self.assertTrue(self.page.return_to_current_model())
+        self.assertEqual(self.page.preview.values["ParamAngleY"], 20)
+        self.assertIs(self.page.session, original_session)
         self.assertTrue(self.mod.selected_mapping_button.isEnabled())
         self.assertEqual(self.original_hashes, self.hashes(self.model.parent))
 
@@ -185,14 +194,15 @@ class Live2DEditorModTests(unittest.TestCase):
         self.assertTrue(self.mod.rename_project_button.isEnabled())
         self.assertTrue(self.mod.delete_project_button.isEnabled())
         self.assertTrue(self.mod.save_project_button.isEnabled())
-        with patch("app.gui.Live2DModPage.ProjectNameDialog") as dialog:
+        with patch("app.gui.live2d_editor_panels.ProjectNameDialog") as dialog:
             dialog.return_value.exec.return_value = QDialog.Accepted
             dialog.return_value.project_name = "RenamedMOD"
             self.mod.rename_current_project()
         self.assertEqual(self.mod.current_project.project_name, "RenamedMOD")
+        project_file = str(self.mod.current_project.project_file)
         self.mod.clear_current_project()
-        self.mod.project_combo.setText("RenamedMOD")
-        self.mod.open_project_file()
+        with patch("app.gui.live2d_editor_panels.QFileDialog.getOpenFileName", return_value=(project_file, "")):
+            self.mod.open_project_file()
         self.assertIsNotNone(self.mod.current_project)
         skin_id = str(self.mod.current_project.models[1]["id"])
         with patch("app.gui.Live2DModPage.TextureGalleryDialog.exec", return_value=QDialog.Accepted) as gallery:
@@ -210,6 +220,45 @@ class Live2DEditorModTests(unittest.TestCase):
             self.mod.delete_current_project()
         self.assertIsNone(self.mod.current_project)
         self.assertTrue(directory.is_dir())
+        self.assertEqual(self.original_hashes, self.hashes(self.model.parent))
+
+    def test_mod_picker_imports_recent_and_switches_owned_projects_without_writing_sources(self):
+        self.open()
+        first = create_project_from_base_source(self.model, project_name="MOD Alpha", output_root=self.root / "legacy")
+        second = create_project_from_base_source(self.model, project_name="MOD Beta", output_root=self.settings.get_output_dir("live2dviewer_mod"))
+        original_hashes = {str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+                           for root in (first.project_dir, second.project_dir)
+                           for path in root.rglob("*") if path.is_file()}
+        self.settings.set("live2dviewer_mod.project_files", [str(first.project_file)])
+        self.page.tabs.setCurrentWidget(self.page.mod_tab)
+        self.page.resize(1040, 760)
+        self.page.show()
+        self.mod.workflow_tabs.setCurrentIndex(0)
+        self.mod.refresh_project_combo()
+        self.app.processEvents()
+        self.assertTrue(self.mod.project_combo.isVisible())
+        def select(path):
+            index = self.mod.project_combo.findData(str(path))
+            self.assertGreaterEqual(index, 0, self.mod.discover_project_files())
+            label = self.mod.project_combo.itemText(index)
+            self.assertEqual(self.mod.project_path_from_search(label, allow_partial=False), str(path))
+            self.mod.project_combo.setCurrentIndex(index)
+            self.app.processEvents()
+        select(first.project_file)
+        owned_first = self.mod.current_project.project_file
+        self.assertTrue(owned_first.is_relative_to(self.page.session.root / "mods"))
+        self.mod.rename_skin(str(self.mod.current_project.models[0]["id"]), "Owned edit")
+        select(second.project_file)
+        owned_second = self.mod.current_project.project_file
+        select(owned_first)
+        self.assertEqual(self.mod.current_project.project_file, owned_first)
+        self.assertEqual(self.mod.current_project.models[0]["skin_name"], "Owned edit")
+        select(owned_second)
+        self.assertEqual(self.mod.current_project.project_file, owned_second)
+        self.assertFalse(self.errors, self.errors)
+        for path, digest in original_hashes.items():
+            self.assertEqual(hashlib.sha256(Path(path).read_bytes()).hexdigest(), digest)
+        self.assertEqual(self.settings.get("live2dviewer_mod.project_files"), [str(first.project_file)])
         self.assertEqual(self.original_hashes, self.hashes(self.model.parent))
 
 

@@ -7,7 +7,7 @@ import io
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QPoint, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QFileDialog, QFormLayout, QGridLayout, QHBoxLayout, QInputDialog, QListWidgetItem,
@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
 from qfluentwidgets import (
     BodyLabel as QLabel, CaptionLabel, CheckBox as QCheckBox,
     DoubleSpinBox as QDoubleSpinBox, FluentIcon, ListWidget as QListWidget,
-    PrimaryPushButton, PushButton as QPushButton, ScrollArea as QScrollArea,
+    PrimaryPushButton, PushButton as QPushButton, RoundMenu, ScrollArea as QScrollArea,
     SearchLineEdit, SubtitleLabel, TransparentToolButton, TreeWidget as QTreeWidget,
 )
 
@@ -340,6 +340,7 @@ class SpineEditorPage(QWidget):
         self.setObjectName("spineEditorPage")
         self.setAcceptDrops(True)
         self.session: SpineEditorSession | None = None
+        self.last_open_error = ""
         self._request = 0
         self._workers: list[QThread] = []
         self._open_worker = None
@@ -379,14 +380,17 @@ class SpineEditorPage(QWidget):
         layout.addLayout(header)
         self.animation_label, self.skin_label, self.duration_label = CaptionLabel(self), CaptionLabel(self), CaptionLabel(self)
         self.animation_combo, self.skin_combo = QComboBox(self), QComboBox(self)
-        self.animation_combo.setMinimumWidth(130)
-        self.animation_combo.setMaximumWidth(200)
+        self.animation_combo.setMinimumWidth(80)
+        self.animation_combo.setMaximumWidth(125)
+        self.animation_combo.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self.animation_label.hide()
         self.skin_combo.setFixedWidth(160)
         self.duration_spin = QDoubleSpinBox(self)
         self.duration_spin.setRange(0.001, 100000)
         self.duration_spin.setDecimals(3)
         self.duration_spin.setValue(2)
         self.duration_spin.setFixedWidth(132)
+        self.duration_spin.setSuffix(" s")
         self.new_button = TransparentToolButton(FluentIcon.ADD, self)
         self.clone_button = TransparentToolButton(FluentIcon.COPY, self)
         self.delete_animation_button = TransparentToolButton(FluentIcon.DELETE, self)
@@ -410,6 +414,7 @@ class SpineEditorPage(QWidget):
         view_controls.addWidget(self.skin_label)
         view_controls.addWidget(self.skin_combo)
         view_controls.addStretch(1)
+        view_controls.addSpacing(28)
         stage_layout.addLayout(view_controls)
         self.preview_stack = QStackedWidget(self)
         self.preview_stack.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
@@ -439,7 +444,10 @@ class SpineEditorPage(QWidget):
         details_layout.setContentsMargins(0, 0, 0, 0)
         details_layout.setSpacing(8)
         self.search_edit = SearchLineEdit(self)
-        details_layout.addWidget(self.search_edit)
+        search_row = QHBoxLayout()
+        search_row.addWidget(self.search_edit, 1)
+        search_row.addSpacing(28)
+        details_layout.addLayout(search_row)
         self.details_splitter = QSplitter(Qt.Orientation.Vertical, self)
         self.details_splitter.setHandleWidth(7)
         self.details_splitter.setChildrenCollapsible(False)
@@ -459,20 +467,39 @@ class SpineEditorPage(QWidget):
         self.track_label.hide()
         self.duration_label.hide()
         self.track_combo, self.channel_combo = _TrackComboBox(self), QComboBox(self)
-        self.track_combo.setMinimumWidth(130)
+        self.track_combo.setMinimumWidth(80)
+        self.track_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.channel_combo.setMinimumWidth(90)
-        for widget in (self.animation_label, self.animation_combo, self.new_button, self.clone_button, self.delete_animation_button):
-            track_bar.addWidget(widget)
+        track_bar.addWidget(self.animation_combo)
         track_bar.addWidget(self.track_combo, 1)
-        track_bar.addWidget(self.channel_combo)
-        track_bar.addWidget(self.duration_spin)
+        self.animation_options_button = TransparentToolButton(FluentIcon.MORE, self)
+        self.animation_options_button.setFixedSize(26, 28)
+        track_bar.addWidget(self.animation_options_button)
+        track_bar.addSpacing(28)
+        self.animation_options_menu = RoundMenu(parent=self)
+        options = QWidget(self.animation_options_menu)
+        options.setFixedSize(280, 82)
+        options_layout = QVBoxLayout(options)
+        options_layout.setContentsMargins(7, 3, 7, 3)
+        commands = QHBoxLayout()
+        commands.addWidget(self.new_button)
+        commands.addWidget(self.clone_button)
+        commands.addWidget(self.delete_animation_button)
+        commands.addStretch(1)
+        options_layout.addLayout(commands)
+        channel_row = QHBoxLayout()
+        channel_row.addWidget(self.channel_combo, 1)
+        channel_row.addWidget(self.duration_spin)
+        options_layout.addLayout(channel_row)
+        self.animation_options_menu.addWidget(options, selectable=False)
+        self.animation_options_button.clicked.connect(lambda: self.animation_options_menu.exec(self.animation_options_button.mapToGlobal(QPoint(0, self.animation_options_button.height()))))
         timeline_layout.addLayout(track_bar)
         self.timeline = AnimationTimelineEditor(self)
         self.timeline.set_allowed_interpolations(["linear", "stepped", "bezier"])
         timeline_layout.addWidget(self.timeline, 1)
         self.workspace = EditorWorkspace(stage, self.details_widget, timeline_panel, self,
                                          settings_key="spine", settings=layout_settings)
-        self.workspace.timeline_panel.setMinimumHeight(245)
+        self.workspace.move_toolbar_to(header)
         self.model_splitter = self.workspace.horizontal_splitter
         self.vertical_splitter = self.workspace.vertical_splitter
         self.workspace.panelVisibilityChanged.connect(self._panel_visibility_changed)
@@ -531,6 +558,7 @@ class SpineEditorPage(QWidget):
             self.open_source(source)
 
     def open_source(self, path: str) -> bool:
+        self.last_open_error = ""
         if self._closing:
             self.sourceFailed.emit(path)
             return False
@@ -585,6 +613,7 @@ class SpineEditorPage(QWidget):
         self.sourceOpened.emit(worker.source)
 
     def _source_failed(self, worker, error: str):
+        self.last_open_error = str(error) if worker is self._open_worker else ""
         if worker is self._open_worker:
             self._open_worker = None
             self.status_label.setText(_text("spine_editor.failed", error=error))
@@ -691,12 +720,15 @@ class SpineEditorPage(QWidget):
         self._refresh_track()
         self._refresh_layers()
         self._show_selection()
-        if self.animation_name:
-            self.preview.set_animation(self.animation_name, False)
-        else:
-            self.preview.reset_pose()
-        self.preview.set_paused(True)
-        self.preview.set_time(0)
+        # A newly created animation belongs to the next snapshot. The current
+        # native model still contains the previous document until it is loaded.
+        if not self._pending_preview and self._preview_worker is None:
+            if self.animation_name:
+                self.preview.set_animation(self.animation_name, False)
+            else:
+                self.preview.reset_pose()
+            self.preview.set_paused(True)
+            self.preview.set_time(0)
         self._update_actions()
 
     def _skin_changed(self, name: str):
@@ -842,6 +874,7 @@ class SpineEditorPage(QWidget):
             self._report_error(exc)
             self._refresh_track()
             return False
+        self._pending_preview = True
         if refresh_tree:
             self._populate()
         else:
@@ -849,7 +882,6 @@ class SpineEditorPage(QWidget):
             self._refresh_track()
             self._refresh_layers()
             self._show_selection()
-        self._pending_preview = True
         self._preview_timer.start()
         self._update_actions()
         self.status_label.setText(_text("spine_editor.modified") if self.session.dirty else _text("spine_editor.ready"))
@@ -1060,6 +1092,7 @@ class SpineEditorPage(QWidget):
                             (self.duration_spin, "duration"), (self.track_combo, "track"), (self.channel_combo, "track")):
             widget.setToolTip(_text(f"spine_editor.{key}"))
         self.search_edit.setPlaceholderText(_text("spine_editor.search"))
+        self.animation_options_button.setToolTip(_text("spine_editor.animation") + " · " + _text("spine_editor.duration"))
         self.workspace.retranslate_ui()
         for index, key in enumerate(("skeleton", "layers", "atlas")):
             self.tabs.setTabText(index, _text(f"spine_editor.{key}"))

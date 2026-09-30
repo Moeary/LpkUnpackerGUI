@@ -3,7 +3,7 @@ import os
 from PySide6.QtCore import QEvent, Qt
 from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLayout, QSizePolicy
 from qfluentwidgets import FluentIcon as FIF
-from qfluentwidgets import FluentWindow, NavigationItemPosition
+from qfluentwidgets import FluentWindow, NavigationItemPosition, InfoBar, InfoBarPosition
 from qfluentwidgets import isDarkTheme
 
 from app.core.font_helper import apply_application_font
@@ -186,9 +186,11 @@ class MainWindow(FluentWindow):
         self.spineEditorPage = self._create_page(SpineEditorPage, "spineEditorPage")
         self.live2dModPage = getattr(self.live2dEditorPage, "mod_panel", None)
         self._editor_source_leases = {}
-        self.psdReconstructionPage = self._create_page(
-            PsdReconstructionPage, "psdReconstructionPage"
-        )
+        self._opening_editor_request = None
+        self.psdReconstructionPage = getattr(self.live2dEditorPage, "psd_panel", None)
+        self._embedded_psd_workspace = self.psdReconstructionPage is not None
+        if self.psdReconstructionPage is None:
+            self.psdReconstructionPage = self._create_page(PsdReconstructionPage, "psdReconstructionPage")
         self.spineConverterPage = self._create_page(SpineConverterPage, "spineConverterPage")
         self.settingsPage = self._create_page(SettingsPage, "settingsPage")
 
@@ -197,7 +199,7 @@ class MainWindow(FluentWindow):
             "unifiedPreviewRequested",
             None,
         )
-        if unified_preview_requested is not None and hasattr(unified_preview_requested, "connect"):
+        if not self._embedded_psd_workspace and unified_preview_requested is not None and hasattr(unified_preview_requested, "connect"):
             unified_preview_requested.connect(self.open_psd_preview)
         # The Live2D editor owns its MOD panel's preview signal. Connecting it
         # again here would load the same model twice and switch pages midway.
@@ -208,7 +210,8 @@ class MainWindow(FluentWindow):
             for signal_name in ("sourceOpened", "sourceFailed"):
                 signal = getattr(page, signal_name, None)
                 if signal is not None and hasattr(signal, "connect"):
-                    signal.connect(lambda _result, editor=page: self._release_editor_source_leases(editor))
+                    signal.connect(lambda source, editor=page, failed=signal_name == "sourceFailed":
+                                   self._editor_source_completed(editor, source, failed))
         pose_scheme_requested = getattr(self.previewPage, "poseSchemeRequested", None)
         pose_scheme_handler = getattr(
             self.psdReconstructionPage,
@@ -260,6 +263,7 @@ class MainWindow(FluentWindow):
             print(f"Error creating {page_cls.__name__}: {e}")
             page = QFrame(self)
             page.setObjectName(object_name)
+            page._creation_error = str(e)
             return page
 
     def initWindow(self):
@@ -361,18 +365,8 @@ class MainWindow(FluentWindow):
 
         try:
             self.addSubInterface(
-                self.psdReconstructionPage,
-                FIF.IMAGE_EXPORT,
-                tr("main.nav.psd_reconstruction"),
-                NavigationItemPosition.SCROLL,
-            )
-        except Exception as e:
-            print(f"Error adding PsdReconstructionPage to navigation: {e}")
-
-        try:
-            self.addSubInterface(
                 self.live2dEditorPage,
-                FIF.EDIT,
+                FIF.PEOPLE,
                 tr("main.nav.live2d_editor"),
                 NavigationItemPosition.SCROLL,
             )
@@ -380,7 +374,7 @@ class MainWindow(FluentWindow):
             print(f"Error adding Live2DEditorPage to navigation: {e}")
 
         self.addSubInterface(
-            self.spineEditorPage, FIF.EDIT, tr("main.nav.spine_editor"), NavigationItemPosition.SCROLL,
+            self.spineEditorPage, FIF.IOT, tr("main.nav.spine_editor"), NavigationItemPosition.SCROLL,
         )
 
         try:
@@ -496,7 +490,6 @@ class MainWindow(FluentWindow):
         for page, key in (
             (self.extractorPage, "main.nav.extractor"),
             (self.previewPage, "main.nav.preview_native"),
-            (self.psdReconstructionPage, "main.nav.psd_reconstruction"),
             (self.live2dEditorPage, "main.nav.live2d_editor"),
             (self.spineEditorPage, "main.nav.spine_editor"),
             (self.spineConverterPage, "main.nav.spine_converter"),
@@ -555,44 +548,81 @@ class MainWindow(FluentWindow):
                     print(f"Error refreshing {page.objectName()} after font change: {exc}")
 
     def open_psd_preview(self, model_json_path: str, project_file: str):
-        self.switchTo(self.previewPage)
-        handler = getattr(self.previewPage, "open_psd_project_preview", None)
+        if not self.open_psd_workspace(project_file=project_file):
+            return False
+        handler = getattr(self.live2dEditorPage, "_open_psd_preview", None)
         if callable(handler):
             handler(model_json_path, project_file)
+            return True
+        return False
 
-    def _release_editor_source_leases(self, page):
-        leases = getattr(self, "_editor_source_leases", {}).pop(page, set())
+    def _release_editor_source_leases(self, page, source=None, token=None):
+        leases = getattr(self, "_editor_source_leases", {}).get(page, {})
+        if token is not None:
+            selected = [token] if token in leases else []
+        elif source is not None:
+            path = os.path.normcase(os.path.abspath(source))
+            selected = [key for key, value in leases.items() if value == path][:1]
+            active = self._opening_editor_request
+            if active and active[0] is page and active[2] == path and active[1] in leases:
+                selected = [active[1]]
+        else:
+            selected = list(leases)
         release = getattr(getattr(self, "previewPage", None), "release_editor_source", None)
-        if callable(release):
-            for lease in leases:
+        for lease in selected:
+            leases.pop(lease, None)
+            if callable(release):
                 release(lease)
+        if not leases:
+            self._editor_source_leases.pop(page, None)
+
+    def _editor_source_completed(self, page, source, failed):
+        self._release_editor_source_leases(page, source)
+        # Synchronous failures are reported by open_model_editor once it has
+        # the return value. Cancelled opens deliberately carry no error text.
+        if failed and not (self._opening_editor_request and self._opening_editor_request[0] is page):
+            error = str(getattr(page, "last_open_error", "") or "")
+            if error:
+                self._show_editor_open_error(error)
+
+    def _show_editor_open_error(self, error):
+        reporter = getattr(self.previewPage, "show_error", None)
+        if self.stackedWidget.currentWidget() is self.previewPage and callable(reporter):
+            reporter(tr("editor.navigation.open_failed"), str(error))
+        else:
+            InfoBar.error(title=tr("editor.navigation.open_failed"), content=str(error),
+                          isClosable=True, position=InfoBarPosition.TOP, duration=6000, parent=self)
 
     def open_model_editor(self, kind: str, model_path: str) -> bool:
         """Open the resolved preview model after the editor accepts its new source."""
         page = {"live2d": self.live2dEditorPage, "spine": self.spineEditorPage}.get(kind)
         if page is None or not os.path.isfile(model_path):
+            self._show_editor_open_error(model_path)
             return False
         opener = getattr(page, "open_source", None)
         if not callable(opener):
+            self._show_editor_open_error(getattr(page, "_creation_error", tr("editor.navigation.open_failed")))
             return False
         acquire = getattr(self.previewPage, "acquire_editor_source", None)
         lease = acquire(model_path) if callable(acquire) else None
         if lease is not None:
-            self._editor_source_leases.setdefault(page, set()).add(lease)
+            self._editor_source_leases.setdefault(page, {})[lease] = os.path.normcase(os.path.abspath(model_path))
+        self._opening_editor_request = (page, lease, os.path.normcase(os.path.abspath(model_path)))
+        error = ""
         try:
             accepted = bool(opener(model_path))
+            if not accepted:
+                error = str(getattr(page, "last_open_error", "") or "")
         except Exception as exc:
-            report = getattr(self.previewPage, "show_error", None)
-            if callable(report):
-                report(tr("editor.navigation.open_failed"), str(exc))
+            error = str(exc)
             accepted = False
+        finally:
+            self._opening_editor_request = None
         asynchronous = hasattr(page, "sourceOpened") and hasattr(page, "sourceFailed")
-        if not accepted or not asynchronous:
-            pending = self._editor_source_leases.get(page, set())
-            pending.discard(lease)
-            release = getattr(self.previewPage, "release_editor_source", None)
-            if lease is not None and callable(release):
-                release(lease)
+        if lease is not None and (not accepted or not asynchronous):
+            self._release_editor_source_leases(page, token=lease)
+        if error:
+            self._show_editor_open_error(error)
         if accepted:
             self.switchTo(page)
         return accepted
@@ -619,5 +649,25 @@ class MainWindow(FluentWindow):
         )
         if not callable(handler):
             return
-        self.switchTo(self.psdReconstructionPage)
-        handler(payload)
+        if self.open_psd_workspace(payload.get("model_json_path"), payload.get("project_file")):
+            copied_payload = dict(payload)
+            project = getattr(self.psdReconstructionPage, "current_project", None)
+            copied_project_file = getattr(project, "project_file", None)
+            if copied_project_file:
+                copied_payload["project_file"] = str(copied_project_file)
+            handler(copied_payload)
+
+    def open_psd_workspace(self, model_path=None, project_file=None):
+        opener = getattr(self.live2dEditorPage, "open_psd_workspace", None)
+        if not callable(opener):
+            return False
+        if opener(model_path=model_path, project_file=project_file):
+            self.switchTo(self.live2dEditorPage)
+            return True
+        return False
+
+    def switchTo(self, interface):  # noqa: N802
+        if interface is getattr(self, "psdReconstructionPage", None):
+            self.open_psd_workspace()
+            return
+        super().switchTo(interface)

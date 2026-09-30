@@ -12,15 +12,15 @@ import copy
 import math
 import time
 
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QPolygonF
 from PySide6.QtWidgets import (
     QAbstractItemView, QHBoxLayout, QTableWidgetItem,
-    QVBoxLayout, QWidget, QSizePolicy,
+    QGridLayout, QVBoxLayout, QWidget, QSizePolicy,
 )
 from qfluentwidgets import (
     CaptionLabel, CheckBox, DoubleSpinBox, FluentIcon, PushButton, Slider,
-    TableWidget, TransparentToolButton,
+    RoundMenu, TableWidget, TransparentToolButton, TransparentToggleToolButton,
 )
 
 from app.i18n import tr
@@ -285,50 +285,65 @@ class AnimationTimelineEditor(QWidget):
         self.timer.timeout.connect(self._tick)
         layout = EditorViewportLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
+        layout.setSpacing(5)
         bar = QHBoxLayout()
-        bar.setSpacing(7)
+        bar.setSpacing(4)
         self.play_button = TransparentToolButton(FluentIcon.PLAY, self)
-        self.play_button.setFixedSize(30, 30)
-        self.loop_check = CheckBox(self)
+        self.play_button.setFixedSize(26, 28)
+        self.loop_check = TransparentToggleToolButton(FluentIcon.SYNC, self)
+        self.loop_check.setFixedSize(26, 28)
         self.loop_check.setChecked(True)
         self.time_spin = DoubleSpinBox(self)
-        self.time_spin.setDecimals(4)
+        self.time_spin.setDecimals(3)
         self.time_spin.setRange(0, self.duration)
         self.time_spin.setSingleStep(1 / 30)
-        self.time_spin.setFixedWidth(136)
+        self.time_spin.setSuffix(" s")
+        self.time_spin.setSymbolVisible(False)
+        self.time_spin.setFixedWidth(83)
         self.seek_slider = Slider(Qt.Orientation.Horizontal, self)
         self.seek_slider.setRange(0, 10000)
         self.duration_label = CaptionLabel(self)
+        self.duration_label.hide()
         self.field_combo = EditorComboBox(self)
-        self.field_combo.setFixedWidth(74)
-        for widget in (self.play_button, self.loop_check, self.time_spin, self.seek_slider, self.duration_label, self.field_combo):
-            bar.addWidget(widget, 1 if widget is self.seek_slider else 0)
-        layout.addLayout(bar)
-        self.canvas = _TimelineCanvas(self)
-        layout.addWidget(self.canvas, 1)
-        actions = QHBoxLayout()
-        actions.setSpacing(8)
+        self.field_combo.setFixedWidth(90)
         self.add_button = TransparentToolButton(FluentIcon.ADD, self)
         self.delete_button = TransparentToolButton(FluentIcon.DELETE, self)
-        self.add_button.setFixedSize(28, 28)
-        self.delete_button.setFixedSize(28, 28)
+        self.add_button.setFixedSize(24, 28)
+        self.delete_button.setFixedSize(24, 28)
         self.interpolation_combo = EditorComboBox(self)
         self.interpolation_combo.setMinimumWidth(106)
         self.interpolation_combo.setMaximumWidth(140)
         for value in ("linear", "stepped", "bezier", "inverse_stepped"):
             self.interpolation_combo.addItem(value, value)
         self.hint = CaptionLabel(self)
+        self.hint.hide()
         self.hint.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.table_check = CheckBox(self)
         self.curve_controls_check = CheckBox(self)
-        actions.addWidget(self.add_button)
-        actions.addWidget(self.delete_button)
-        actions.addWidget(self.interpolation_combo)
-        actions.addWidget(self.hint, 1)
-        actions.addWidget(self.table_check)
-        actions.addWidget(self.curve_controls_check)
-        layout.addLayout(actions)
+        self.more_button = TransparentToolButton(FluentIcon.MORE, self)
+        self.more_button.setFixedSize(24, 28)
+        for widget in (self.play_button, self.loop_check, self.time_spin, self.seek_slider,
+                       self.add_button, self.delete_button, self.field_combo, self.more_button):
+            bar.addWidget(widget, 1 if widget is self.seek_slider else 0)
+        layout.addLayout(bar)
+        self.canvas = _TimelineCanvas(self)
+        layout.addWidget(self.canvas, 1)
+        self.options_menu = RoundMenu(parent=self)
+        options = QWidget(self.options_menu)
+        options.setFixedSize(320, 83)
+        options_layout = QVBoxLayout(options)
+        options_layout.setContentsMargins(8, 4, 8, 4)
+        interpolation_row = QHBoxLayout()
+        self.interpolation_label = CaptionLabel(self)
+        interpolation_row.addWidget(self.interpolation_label)
+        interpolation_row.addWidget(self.interpolation_combo, 1)
+        options_layout.addLayout(interpolation_row)
+        checks = QHBoxLayout()
+        checks.addWidget(self.table_check)
+        checks.addWidget(self.curve_controls_check)
+        options_layout.addLayout(checks)
+        self.options_menu.addWidget(options, selectable=False)
+        self.more_button.clicked.connect(lambda: self.options_menu.exec(self.more_button.mapToGlobal(QPoint(0, self.more_button.height()))))
         self.table = TableWidget(self)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -337,23 +352,24 @@ class AnimationTimelineEditor(QWidget):
         self.table.setVisible(False)
         layout.addWidget(self.table)
         self.curve_controls = QWidget(self)
-        curves = QHBoxLayout(self.curve_controls)
+        curves = QGridLayout(self.curve_controls)
         curves.setContentsMargins(0, 0, 0, 0)
         curves.setSpacing(7)
         self.control_spins = []
-        for name in ("cx1", "cy1", "cx2", "cy2"):
-            curves.addWidget(CaptionLabel(name, self))
+        for index, name in enumerate(("cx1", "cy1", "cx2", "cy2")):
+            row, column = divmod(index, 2)
+            curves.addWidget(CaptionLabel(name, self), row, column * 2)
             spin = DoubleSpinBox(self)
             spin.setDecimals(4)
             spin.setSingleStep(0.05)
             spin.setRange(0, 1) if name.startswith("cx") else spin.setRange(-10000, 10000)
             spin.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
-            spin.setMinimumWidth(126)
-            spin.setMaximumWidth(132)
-            curves.addWidget(spin)
+            spin.setSymbolVisible(False)
+            spin.setMinimumWidth(75)
+            curves.addWidget(spin, row, column * 2 + 1)
             self.control_spins.append(spin)
         self.apply_curve_button = PushButton(FluentIcon.ACCEPT, "", self)
-        curves.addWidget(self.apply_curve_button)
+        curves.addWidget(self.apply_curve_button, 2, 0, 1, 4)
         self.curve_controls.setVisible(False)
         layout.addWidget(self.curve_controls)
         self.play_button.clicked.connect(lambda: self.set_playing(not self.is_playing))
@@ -549,6 +565,7 @@ class AnimationTimelineEditor(QWidget):
         self.interpolation_combo.setEnabled(self.editable and selected)
         hint = _text("editor.timeline.readonly" if not self.editable else "editor.timeline.hint" if self._frames else "editor.timeline.empty")
         self.hint.setToolTip(hint)
+        self.canvas.setToolTip(hint)
         self._updating = True
         frame = self._frames[self.selected_index] if selected else {}
         self.hint.setText(_text("editor.timeline.selection", index=self.selected_index + 1, time=f"{float(frame.get('time', 0)):.3f}") if selected else hint)
@@ -607,8 +624,13 @@ class AnimationTimelineEditor(QWidget):
         self.play_button.setToolTip(_text("editor.timeline.pause" if self.is_playing else "editor.timeline.play"))
         self.add_button.setToolTip(_text("editor.timeline.add"))
         self.delete_button.setToolTip(_text("editor.timeline.delete"))
-        for widget, key in ((self.loop_check, "loop"), (self.apply_curve_button, "apply_curve")):
-            widget.setText(_text(f"editor.timeline.{key}"))
+        self.loop_check.setToolTip(_text("editor.timeline.loop"))
+        self.loop_check.setAccessibleName(_text("editor.timeline.loop"))
+        self.time_spin.setToolTip(_text("editor.timeline.time"))
+        self.more_button.setToolTip(_text("editor.timeline.interpolation") + " · " + _text("editor.timeline.table") + " · " + _text("editor.timeline.controls"))
+        self.more_button.setAccessibleName(self.more_button.toolTip())
+        self.interpolation_label.setText(_text("editor.timeline.interpolation"))
+        self.apply_curve_button.setText(_text("editor.timeline.apply_curve"))
         self.table_check.setText(_text("editor.timeline.table"))
         self.curve_controls_check.setText(_text("editor.timeline.controls"))
         self._updating = True

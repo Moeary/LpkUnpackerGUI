@@ -1,9 +1,11 @@
 import json
 import os
 import re
+import shutil
+from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QProcess, QThread, QTimer, QUrl, Signal, QStringListModel
+from PySide6.QtCore import Qt, QProcess, QThread, QTimer, QUrl, Signal, QStringListModel, QSize
 from PySide6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -39,6 +41,7 @@ from qfluentwidgets import (
     ProgressBar,
     PushButton,
     SpinBox,
+    ScrollArea,
     SingleDirectionScrollArea,
     SubtitleLabel,
     TextEdit,
@@ -82,10 +85,37 @@ from app.core.settings_manager import SettingsManager
 from app.gui.Live2DPreviewWindow import Live2DPreviewWindow
 from app.gui.ArtMeshInspector import ArtMeshInspectorDialog
 from app.gui.PreviewPage import ImagePreviewPanel
+from app.gui.editor_workspace import EditorComboBox, EditorViewportLayout, FluentEditorTabs
 from app.i18n import get_i18n, tr
 
 
 MAX_WIDGET_SIZE = 16777215
+
+PSD_WORKSPACE_TEXT = {
+    "psd.workspace.export": "导出与姿态",
+    "psd.workspace.repack": "PSD 回写",
+    "psd.workspace.versions": "版本与预览",
+    "psd.workspace.project": "工程与工具",
+    "psd.workspace.bound": "PSD 子工程随当前 Live2D 工程一起保存。导出是独立快照，查看版本不会替换当前动作。",
+    "psd.workspace.capture_pose": "保存当前预览参数为预设",
+    "psd.workspace.import_project": "导入 PSD 工程副本",
+    "psd.workspace.external_psd": "选择外部 PSD",
+    "psd.workspace.single_repack": "回写选中 PSD",
+    "psd.workspace.multi_repack": "多 PSD 按顺序回写",
+    "psd.workspace.apply_version": "应用版本贴图到当前模型",
+    "psd.workspace.send_mod": "将版本贴图送入 MOD",
+    "psd.workspace.version_hint": "原始项是 PSD 工程的导出源快照。回写版本仅提供贴图；应用后可撤销，当前动作保持不变。",
+    "psd.workspace.empty": "先打开 Live2D 工程，再创建或导入 PSD 子工程。",
+}
+
+
+def _workspace_text(key: str) -> str:
+    return tr(key, default=PSD_WORKSPACE_TEXT[key])
+
+
+class _WorkspaceEditableCombo(EditableComboBox):
+    def minimumSizeHint(self):  # noqa: N802
+        return QSize(max(80, self.minimumWidth()), super().minimumSizeHint().height())
 
 
 class PsdReconstructionThread(QThread):
@@ -301,14 +331,27 @@ class PsdPreviewPrepareThread(QThread):
 
 class PsdReconstructionPage(QFrame):
     unifiedPreviewRequested = Signal(str, str)
+    projectChanged = Signal(object)
+    projectRequested = Signal(str)
+    newProjectRequested = Signal()
+    sourceRequested = Signal(str)
+    capturePoseRequested = Signal()
+    repackApplyRequested = Signal(str)
+    repackModRequested = Signal(str)
+    previewClosed = Signal()
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, compact: bool = False, settings=None):
         super().__init__(parent)
+        self._compact = bool(compact)
+        self.export_snapshot_provider = None
+        self.preview_command_handler = None
+        self._export_snapshot = ""
+        self._bound_project_files: list[str] = []
         self.setObjectName("psdReconstructionPage")
         self.setAcceptDrops(True)
 
         self.i18n = get_i18n()
-        self.settings_manager = SettingsManager()
+        self.settings_manager = settings or SettingsManager()
         self.selected_source = ""
         self.selected_metadata = ""
         self.manual_repack_psd = ""
@@ -320,6 +363,7 @@ class PsdReconstructionPage(QFrame):
         self.project_worker: PsdProjectImportThread | None = None
         self.preview_prepare_worker: PsdPreviewPrepareThread | None = None
         self.current_project: Live2DPSDProject | None = None
+        self.managed_project_root_provider = None
         self._project_combo_refreshing = False
         self._pose_scheme_refreshing = False
         self._parameter_preset_refreshing = False
@@ -344,14 +388,23 @@ class PsdReconstructionPage(QFrame):
         self._preview_dock_timer = QTimer(self)
         self._preview_dock_timer.setInterval(700)
         self._preview_dock_timer.timeout.connect(self._send_preview_dock_geometry)
+        self._arrange_timer = QTimer(self)
+        self._arrange_timer.setSingleShot(True)
+        self._arrange_timer.timeout.connect(self._arrange_button_rows)
+        self._last_project_timer = QTimer(self)
+        self._last_project_timer.setSingleShot(True)
+        self._last_project_timer.timeout.connect(lambda: self.load_last_project(silent=True))
         app = QApplication.instance()
         if app is not None:
             app.aboutToQuit.connect(self.close_project_preview)
 
         self.setupUI()
+        if self._compact:
+            self._build_compact_workspace()
         self.retranslate_ui()
         self.i18n.languageChanged.connect(self.retranslate_ui)
-        QTimer.singleShot(0, lambda: self.load_last_project(silent=True))
+        if not self._compact:
+            self._last_project_timer.start(0)
 
     def setupUI(self):
         self.main_layout = QVBoxLayout(self)
@@ -472,7 +525,7 @@ class PsdReconstructionPage(QFrame):
         self.project_name_edit.setPlaceholderText("")
         self.project_name_edit.setVisible(False)
 
-        self.project_combo = EditableComboBox(self.project_frame)
+        self.project_combo = (_WorkspaceEditableCombo if self._compact else EditableComboBox)(self.project_frame)
         self.project_combo.setPlaceholderText("")
         self.project_combo.setClearButtonEnabled(True)
         self._project_completer_model = QStringListModel(self.project_combo)
@@ -559,7 +612,7 @@ class PsdReconstructionPage(QFrame):
 
         self.export_name_layout = QVBoxLayout()
         self.export_name_label = BodyLabel("", self.export_card)
-        self.export_name_edit = EditableComboBox(self.export_card)
+        self.export_name_edit = (_WorkspaceEditableCombo if self._compact else EditableComboBox)(self.export_card)
         self.export_name_edit.setClearButtonEnabled(True)
         self._parameter_preset_completer_model = QStringListModel(
             self.export_name_edit
@@ -599,7 +652,7 @@ class PsdReconstructionPage(QFrame):
         self.mode_container_layout.setSpacing(6)
         self.mode_layout = QVBoxLayout()
         self.mode_label = SubtitleLabel("", self.mode_frame)
-        self.mode_combo = ComboBox(self.mode_frame)
+        self.mode_combo = (EditorComboBox if self._compact else ComboBox)(self.mode_frame)
         self.mode_combo.addItem("", userData="mesh")
         self.mode_combo.addItem("", userData="atlas-components")
         self.mode_combo.addItem(tr("psd.mode.atlas_artmesh"), userData="atlas-artmesh")
@@ -617,7 +670,7 @@ class PsdReconstructionPage(QFrame):
         self.mesh_canvas_layout = QVBoxLayout(self.mesh_canvas_frame)
         self.mesh_canvas_layout.setContentsMargins(0, 0, 0, 0)
         self.mesh_canvas_label = BodyLabel("", self.mesh_canvas_frame)
-        self.mesh_canvas_preset_combo = ComboBox(self.mesh_canvas_frame)
+        self.mesh_canvas_preset_combo = (EditorComboBox if self._compact else ComboBox)(self.mesh_canvas_frame)
         self.mesh_canvas_preset_combo.addItem("2048 px", userData=2048)
         self.mesh_canvas_preset_combo.addItem("4096 px", userData=4096)
         self.mesh_canvas_preset_combo.addItem("", userData="custom")
@@ -670,7 +723,7 @@ class PsdReconstructionPage(QFrame):
 
         self.repack_psd_layout = QVBoxLayout()
         self.pose_scheme_label = BodyLabel("", self.repack_card)
-        self.pose_scheme_combo = EditableComboBox(self.repack_card)
+        self.pose_scheme_combo = (_WorkspaceEditableCombo if self._compact else EditableComboBox)(self.repack_card)
         self.pose_scheme_combo.setClearButtonEnabled(True)
         self._psd_completer_model = QStringListModel(self.pose_scheme_combo)
         self._psd_completer = QCompleter(
@@ -785,7 +838,7 @@ class PsdReconstructionPage(QFrame):
 
         self.preview_source_layout = QVBoxLayout()
         self.preview_source_label = BodyLabel("", self.preview_control_frame)
-        self.preview_source_combo = ComboBox(self.preview_control_frame)
+        self.preview_source_combo = (EditorComboBox if self._compact else ComboBox)(self.preview_control_frame)
         self.preview_source_combo.currentIndexChanged.connect(self.on_preview_source_changed)
         self.preview_source_layout.addWidget(self.preview_source_label)
         self.preview_source_layout.addWidget(self.preview_source_combo)
@@ -793,7 +846,7 @@ class PsdReconstructionPage(QFrame):
 
         self.preview_texture_layout = QVBoxLayout()
         self.preview_texture_label = BodyLabel("", self.preview_control_frame)
-        self.preview_texture_combo = ComboBox(self.preview_control_frame)
+        self.preview_texture_combo = (EditorComboBox if self._compact else ComboBox)(self.preview_control_frame)
         self.preview_texture_layout.addWidget(self.preview_texture_label)
         self.preview_texture_layout.addWidget(self.preview_texture_combo)
         self.preview_control_layout.addLayout(self.preview_texture_layout)
@@ -825,7 +878,7 @@ class PsdReconstructionPage(QFrame):
         self.motion_layout.addWidget(self.motion_title_label)
         self.motion_row_layout = QHBoxLayout()
         self.motion_label = BodyLabel("", self.motion_frame)
-        self.motion_combo = ComboBox(self.motion_frame)
+        self.motion_combo = (EditorComboBox if self._compact else ComboBox)(self.motion_frame)
         self.motion_combo.currentIndexChanged.connect(self.on_motion_selection_changed)
         self.motion_row_layout.addWidget(self.motion_label)
         self.motion_row_layout.addWidget(self.motion_combo, 1)
@@ -906,6 +959,132 @@ class PsdReconstructionPage(QFrame):
         self.log_toggle_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self._apply_static_styles()
 
+    def _build_compact_workspace(self):
+        """Rehouse the complete workbench as single-column editor workflows."""
+        while self.main_layout.count():
+            item = self.main_layout.takeAt(0)
+            if item.widget():
+                item.widget().hide()
+        self.title_label.hide()
+        self.current_project_title_label.hide()
+        self.unsaved_label.hide()
+        self.main_layout.setContentsMargins(0, 0, 0, 0)
+        self.main_layout.setSpacing(8)
+        self.workspace_splitter.hide()
+        self.workspace_splitter.setMinimumSize(0, 0)
+        self.content_splitter.setMinimumSize(0, 0)
+        self.left_scroll.setMinimumWidth(0)
+        self.right_scroll.setMinimumWidth(0)
+        self.bound_hint = CaptionLabel(_workspace_text("psd.workspace.bound"), self)
+        self.bound_hint.setWordWrap(True)
+        self.bound_hint.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.main_layout.addWidget(self.bound_hint)
+        self.workflow_tabs = FluentEditorTabs(self)
+        self.workflow_tabs.setMinimumWidth(0)
+        self.workflow_tabs.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self._compact_scrolls = []
+        self._compact_pages = []
+        for key in ("export", "repack", "versions", "project"):
+            scroll = ScrollArea(self.workflow_tabs)
+            scroll.setWidgetResizable(True)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            scroll.enableTransparentBackground()
+            content = QWidget(scroll)
+            layout = EditorViewportLayout(content)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(8)
+            scroll.setWidget(content)
+            self.workflow_tabs.addTab(scroll, _workspace_text("psd.workspace." + key))
+            self._compact_scrolls.append(scroll)
+            self._compact_pages.append((content, layout))
+        self.main_layout.addWidget(self.workflow_tabs, 1)
+        cards = ((self.export_card, 0), (self.repack_card, 1),
+                 (self.preview_control_frame, 2), (self.motion_frame, 2),
+                 (self.project_frame, 3), (self.log_frame, 3))
+        for card, index in cards:
+            content, layout = self._compact_pages[index]
+            card.setParent(content)
+            card.setMinimumWidth(0)
+            layout.addWidget(card)
+            card.show()
+        self.capture_pose_button = PushButton(_workspace_text("psd.workspace.capture_pose"), self.export_card)
+        self.capture_pose_button.clicked.connect(self.capturePoseRequested)
+        self.export_card_layout.insertWidget(1, self.capture_pose_button)
+        self.import_project_button = PushButton(_workspace_text("psd.workspace.import_project"), self.project_frame)
+        self.import_project_button.clicked.connect(self.browse_project_file)
+        self.project_layout.insertWidget(3, self.import_project_button)
+        self.external_psd_button = PushButton(_workspace_text("psd.workspace.external_psd"), self.repack_card)
+        self.external_psd_button.clicked.connect(self.browse_repack_psd_file)
+        self.repack_card_layout.insertWidget(1, self.external_psd_button)
+        self.single_repack_button = PrimaryPushButton(_workspace_text("psd.workspace.single_repack"), self.repack_card)
+        self.single_repack_button.clicked.connect(lambda: self.start_reconstruction(self.selected_repack_psd_path()))
+        self.repack_card_layout.addWidget(self.single_repack_button)
+        self.multi_repack_button.setParent(self.repack_card)
+        self.multi_repack_button.setText(_workspace_text("psd.workspace.multi_repack"))
+        self.repack_card_layout.addWidget(self.multi_repack_button)
+        self.multi_repack_button.show()
+        self.metadata_frame.show()
+        self.apply_version_button = PrimaryPushButton(_workspace_text("psd.workspace.apply_version"), self.preview_control_frame)
+        self.apply_version_button.clicked.connect(lambda: self.repackApplyRequested.emit(self.preview_source_token()))
+        self.send_mod_button = PushButton(_workspace_text("psd.workspace.send_mod"), self.preview_control_frame)
+        self.send_mod_button.clicked.connect(lambda: self.repackModRequested.emit(self.preview_source_token()))
+        self.version_hint = CaptionLabel(_workspace_text("psd.workspace.version_hint"), self.preview_control_frame)
+        self.version_hint.setWordWrap(True)
+        self.preview_control_layout.addWidget(self.version_hint)
+        self.preview_control_layout.addWidget(self.apply_version_button)
+        self.preview_control_layout.addWidget(self.send_mod_button)
+        self.tools_card = CardWidget(self._compact_pages[3][0])
+        tools = QVBoxLayout(self.tools_card)
+        tools.setContentsMargins(12, 12, 12, 12)
+        for button in (self.artmesh_inspector_button, self.open_output_button, self.preview_toggle_button):
+            self.action_layout.removeWidget(button)
+            button.setParent(self.tools_card)
+            tools.addWidget(button)
+        self._compact_pages[3][1].insertWidget(1, self.tools_card)
+        self.right_footer.setParent(self)
+        self.right_footer_layout.setContentsMargins(0, 0, 0, 0)
+        self.main_layout.addWidget(self.right_footer)
+        self.right_footer.show()
+        self.stage_label.setMinimumWidth(0)
+        self.stage_label.setMaximumWidth(130)
+        for _content, layout in self._compact_pages:
+            layout.addStretch(1)
+        self.project_combo.show()
+        self.project_title_label.hide()
+        self.project_status_label.hide()
+        self.source_edit.setToolTip(_workspace_text("psd.workspace.bound"))
+        self.preview_hint_label.hide()
+        self.version_hint.hide()
+        self.output_edit.setReadOnly(True)
+        self.output_button.hide()
+        self._compact_button_grids = []
+        for owner_layout, old_layout, buttons in (
+            (self.source_layout, self.source_button_layout, (self.source_file_button, self.source_folder_button)),
+            (self.repack_psd_layout, self.repack_psd_button_layout, (self.repack_photoshop_button, self.repack_psd_button)),
+            (self.metadata_layout, self.metadata_button_layout, (self.metadata_button, self.metadata_default_button)),
+        ):
+            owner_layout.removeItem(old_layout)
+            for button in buttons:
+                old_layout.removeWidget(button)
+            grid = QGridLayout()
+            grid.setSpacing(8)
+            owner_layout.addLayout(grid)
+            self._compact_button_grids.append((grid, buttons))
+        self.workflow_tabs.currentChanged.connect(self._compact_workflow_changed)
+        self._set_log_expanded(False)
+
+    def _compact_workflow_changed(self, index: int):
+        if index < 2:
+            self.set_workflow("repack" if index else "export")
+        self._update_workflow_ui()
+        self._arrange_timer.start(0)
+
+    def hasHeightForWidth(self):  # noqa: N802
+        return False if self._compact else super().hasHeightForWidth()
+
+    def heightForWidth(self, width):  # noqa: N802
+        return -1 if self._compact else super().heightForWidth(width)
+
     def retranslate_ui(self):
         self.title_label.setText(tr("psd.title"))
         self.desc_label.setText(tr("psd.description"))
@@ -919,6 +1098,10 @@ class PsdReconstructionPage(QFrame):
         self.open_project_folder_button.setText(tr("psd.project.open_folder"))
         self.project_status_label.setText(tr("psd.project.no_project"))
         self.pose_scheme_label.setText(tr("psd.pose.scheme"))
+        self.metadata_label.setText(tr("psd.metadata_file"))
+        self.metadata_edit.setPlaceholderText(tr("psd.placeholder_metadata"))
+        self.metadata_button.setText(tr("psd.browse_metadata"))
+        self.metadata_default_button.setText(tr("psd.use_default_metadata"))
         self.export_card_title.setText(tr("psd.export.card_title"))
         self.repack_card_title.setText(tr("psd.repack.card_title"))
         self.export_name_label.setText(tr("psd.export.name"))
@@ -941,7 +1124,8 @@ class PsdReconstructionPage(QFrame):
         self.mode_combo.setItemText(2, tr("psd.mode.atlas_artmesh"))
         self.mesh_canvas_label.setText(tr("psd.mesh_canvas.max_dimension"))
         self.mesh_canvas_preset_combo.setItemText(2, tr("psd.mesh_canvas.custom"))
-        self.mesh_canvas_spin.setSpecialValueText(tr("psd.mesh_canvas.original"))
+        self.mesh_canvas_spin.setSpecialValueText("0 px" if self._compact else tr("psd.mesh_canvas.original"))
+        self.mesh_canvas_spin.setToolTip(tr("psd.mesh_canvas.original"))
         self.mesh_canvas_hint_label.setText(tr("psd.mesh_canvas.hint"))
         self.output_label.setText(tr("psd.output_directory"))
         self.output_edit.setPlaceholderText(tr("psd.placeholder_output"))
@@ -981,6 +1165,16 @@ class PsdReconstructionPage(QFrame):
         self._update_project_header()
         self._configure_responsive_controls()
         self._arrange_button_rows()
+        if self._compact and hasattr(self, "workflow_tabs"):
+            for index, key in enumerate(("export", "repack", "versions", "project")):
+                self.workflow_tabs.setTabText(index, _workspace_text("psd.workspace." + key))
+            for widget, key in ((self.bound_hint, "bound"), (self.capture_pose_button, "capture_pose"),
+                                (self.import_project_button, "import_project"), (self.external_psd_button, "external_psd"),
+                                (self.single_repack_button, "single_repack"), (self.multi_repack_button, "multi_repack"),
+                                (self.apply_version_button, "apply_version"), (self.send_mod_button, "send_mod"),
+                                (self.version_hint, "version_hint")):
+                widget.setText(_workspace_text("psd.workspace." + key))
+            self._update_project_header()
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -1059,6 +1253,10 @@ class PsdReconstructionPage(QFrame):
             self._sync_default_metadata()
             self._sync_repack_output_dir()
             self.append_log(tr("psd.selected_source", path=selected))
+            return
+
+        if self._compact:
+            self.sourceRequested.emit(selected)
             return
 
         self.selected_source = selected
@@ -1276,6 +1474,7 @@ class PsdReconstructionPage(QFrame):
                 self.current_project,
                 str(preset.get("id") or ""),
             )
+            self.projectChanged.emit(self.current_project)
         except Exception as exc:
             self.append_log(tr("psd.warning_prefix", message=str(exc)))
 
@@ -1300,6 +1499,8 @@ class PsdReconstructionPage(QFrame):
         )
 
     def start_reconstruction(self, direct_psd_path: str = ""):
+        if self._is_busy or (self._compact and not self.current_project):
+            return
         self.pending_repack_id = ""
         self.pending_repack_dir = ""
         self.pending_repack_source = ""
@@ -1318,6 +1519,7 @@ class PsdReconstructionPage(QFrame):
             return
 
         if self.workflow == "repack":
+            metadata_path = self.metadata_edit.text().strip() or None
             source = direct_psd_path or self.selected_repack_psd_path()
             if not source:
                 InfoBar.warning(
@@ -1398,14 +1600,33 @@ class PsdReconstructionPage(QFrame):
             mode_text = self.mode_combo.currentText()
             if self.current_project:
                 try:
+                    if self._compact and self.export_snapshot_provider:
+                        source = str(self.export_snapshot_provider())
+                        self._export_snapshot = source
+                    scheme_preset_id = preset_id
+                    existing_scheme = find_pose_scheme(self.current_project, preset_id)
+                    if self._compact and existing_scheme and existing_scheme.get("psd"):
+                        # Keep every earlier export and its baseline intact.
+                        scheme_preset_id = f"{preset_id}-{datetime.now():%Y%m%d-%H%M%S-%f}"
                     self.current_project, scheme, scheme_dir = create_pose_scheme(
                         self.current_project,
                         pose_name,
                         0,
                         parameter_values,
                         pose_source=pose_source,
-                        parameter_preset_id=preset_id,
+                        parameter_preset_id=scheme_preset_id,
                     )
+                    if self._compact and self._export_snapshot:
+                        package = resolve_live2d_package(source)
+                        for index, target_value in enumerate(scheme.get("source_textures") or []):
+                            if index < len(package.texture_paths):
+                                shutil.copy2(package.texture_paths[index], resolve_project_path(self.current_project, target_value))
+                        scheme["editor_snapshot"] = Path(source).relative_to(self.current_project.project_dir).as_posix()
+                        for stored in self.current_project.data.get("pose_schemes") or []:
+                            if stored.get("id") == scheme.get("id"):
+                                stored.update(scheme)
+                        save_project(self.current_project.project_dir, self.current_project.data)
+                        self.projectChanged.emit(self.current_project)
                 except Exception as exc:
                     InfoBar.warning(
                         title=tr("common.warning"),
@@ -1599,6 +1820,11 @@ class PsdReconstructionPage(QFrame):
         self.motion_play_button.setEnabled(not busy and bool(self._motion_items))
         self.update_preview_controls()
         self._update_action_availability()
+        if self._compact and hasattr(self, "single_repack_button"):
+            self.single_repack_button.setEnabled(not busy and bool(self.selected_repack_psd_path()))
+            self.multi_repack_button.setEnabled(not busy and bool(self.project_psd_choices()))
+            self.import_project_button.setEnabled(not busy)
+            self.capture_pose_button.setEnabled(not busy and self.current_project is not None)
 
     def set_workflow(self, workflow: str):
         self.workflow = "repack" if workflow == "repack" else "export"
@@ -1644,12 +1870,14 @@ class PsdReconstructionPage(QFrame):
 
     def _update_workflow_ui(self):
         is_repack = self.workflow == "repack"
-        self.export_card.setVisible(not is_repack)
-        self.repack_card.setVisible(is_repack)
+        self.export_card.setVisible(self._compact or not is_repack)
+        self.repack_card.setVisible(self._compact or is_repack)
         self.reconstruct_button.setText(
             tr("psd.repack.single_button") if is_repack else tr("psd.export_button")
         )
-        self.multi_repack_button.setVisible(False)
+        self.multi_repack_button.setVisible(self._compact)
+        if self._compact and hasattr(self, "workflow_tabs"):
+            self.reconstruct_button.setVisible(self.workflow_tabs.currentIndex() < 2)
         self._style_workflow_button(self.export_flow_button, not is_repack)
         self._style_workflow_button(self.repack_flow_button, is_repack)
         self.update_mode_hint()
@@ -1658,7 +1886,7 @@ class PsdReconstructionPage(QFrame):
     def _update_action_availability(self, *_args):
         if not hasattr(self, "reconstruct_button"):
             return
-        if self._is_busy:
+        if self._is_busy or (self._compact and not self.current_project):
             self.reconstruct_button.setEnabled(False)
             return
         if self.workflow == "export":
@@ -2029,6 +2257,7 @@ class PsdReconstructionPage(QFrame):
                 self.current_project,
                 str(scheme.get("id") or ""),
             )
+            self.projectChanged.emit(self.current_project)
         except Exception as exc:
             self.append_log(tr("psd.warning_prefix", message=str(exc)))
             return
@@ -2039,6 +2268,9 @@ class PsdReconstructionPage(QFrame):
         self._sync_repack_output_dir()
 
     def create_project_from_current_source(self):
+        if self._compact:
+            self.newProjectRequested.emit()
+            return
         source = self.source_edit.text().strip()
         if not source:
             InfoBar.warning(
@@ -2085,6 +2317,9 @@ class PsdReconstructionPage(QFrame):
             tr("psd.project.filter"),
         )
         if path:
+            if self._compact:
+                self.projectRequested.emit(path)
+                return
             try:
                 self.set_current_project(load_project(path))
                 self.append_log(tr("psd.project.opened", path=path))
@@ -2123,6 +2358,9 @@ class PsdReconstructionPage(QFrame):
                 )
 
     def remember_project_file(self, project: Live2DPSDProject):
+        if self._compact:
+            self._bound_project_files = [str(project.project_file)]
+            return
         path = str(project.project_file)
         recent = self._recent_project_files()
         recent = [item for item in recent if str(Path(item).resolve()) != path]
@@ -2166,6 +2404,14 @@ class PsdReconstructionPage(QFrame):
             seen.add(key)
             paths.append(key)
 
+        if self._compact:
+            for path in self._bound_project_files:
+                add(path)
+            root = self.managed_project_root_provider() if self.managed_project_root_provider else None
+            if root and Path(root).is_dir():
+                for path in sorted(Path(root).rglob(PROJECT_FILE_NAME)):
+                    add(path)
+
         last_project = str(self.settings_manager.get("psd.last_project_file", "") or "").strip()
         if last_project:
             add(last_project)
@@ -2197,8 +2443,16 @@ class PsdReconstructionPage(QFrame):
         self.project_combo.clear()
         paths = self.discover_project_files()
         completion_labels: list[str] = []
+        entries = []
         for path in paths:
-            label = Path(path).parent.name
+            try:
+                label = load_project(path).project_name
+            except Exception:
+                label = Path(path).parent.name
+            entries.append((path, label))
+        for path, label in entries:
+            if self._compact and sum(name == label for _, name in entries) > 1:
+                label = f"{label} · {Path(path).parent.name}"
             self.project_combo.addItem(label, userData=path)
             completion_labels.append(label)
         self._project_completer_model.setStringList(completion_labels)
@@ -2220,6 +2474,9 @@ class PsdReconstructionPage(QFrame):
             return
         if self.current_project and str(self.current_project.project_file) == path:
             return
+        if self._compact:
+            self.projectRequested.emit(path)
+            return
         try:
             self.set_current_project(load_project(path))
             self.append_log(tr("psd.project.opened", path=path))
@@ -2237,6 +2494,7 @@ class PsdReconstructionPage(QFrame):
             return
         self._project_dirty = True
         self._update_project_header()
+        self.projectChanged.emit(self.current_project)
 
     def _update_project_header(self):
         if not hasattr(self, "current_project_title_label"):
@@ -2249,6 +2507,10 @@ class PsdReconstructionPage(QFrame):
             self.current_project_title_label.setText(tr("psd.project.header_none"))
         self.unsaved_label.setVisible(bool(self.current_project and self._project_dirty))
         self.unsaved_label.setToolTip(tr("psd.project.unsaved_tooltip"))
+        if self._compact and hasattr(self, "bound_hint"):
+            self.bound_hint.setText(self.current_project_title_label.text())
+            path = str(self.current_project.project_file) if self.current_project else ""
+            self.bound_hint.setToolTip(_workspace_text("psd.workspace.bound") + ("\n" + path if path else ""))
 
     def _current_ui_state(self) -> dict:
         return {
@@ -2277,6 +2539,7 @@ class PsdReconstructionPage(QFrame):
         self.refresh_project_combo(select_project_file=str(project_file))
         self._update_project_header()
         self.append_log(tr("psd.project.saved", path=str(project_file)))
+        self.projectChanged.emit(self.current_project)
 
     def open_current_project_folder(self):
         if not self.current_project:
@@ -2349,6 +2612,46 @@ class PsdReconstructionPage(QFrame):
         self.refresh_motion_controls(project.base_model_json)
         self._ui_refreshing = False
         self._update_project_header()
+        self.projectChanged.emit(self.current_project)
+
+    def bind_project(self, project: Live2DPSDProject | None):
+        """Bind the owner editor's isolated child project without opening a model."""
+        if project is not None:
+            self.set_current_project(project)
+            return
+        self.close_project_preview()
+        self.current_project = None
+        self._project_dirty = False
+        self._bound_project_files = []
+        self.manual_repack_psd = ""
+        self.selected_metadata = ""
+        self.last_psd_path = ""
+        self.source_edit.clear()
+        self.metadata_edit.clear()
+        self.output_edit.clear()
+        self.repack_output_edit.clear()
+        self.refresh_project_ui()
+        self.refresh_project_combo()
+        self._update_action_availability()
+
+    def is_busy(self) -> bool:
+        return self._is_busy or any(worker is not None and worker.isRunning()
+                   for worker in (self.worker, self.project_worker, self.preview_prepare_worker))
+
+    def shutdown(self) -> bool:
+        self._arrange_timer.stop()
+        self._last_project_timer.stop()
+        self._preview_dock_timer.stop()
+        for worker in (self.worker, self.project_worker, self.preview_prepare_worker):
+            if worker is not None and worker.isRunning():
+                worker.wait(30000)
+                if worker.isRunning():
+                    return False
+        self.close_project_preview()
+        self.preview_dialog.close()
+        if self.artmesh_inspector_dialog:
+            self.artmesh_inspector_dialog.close()
+        return True
 
     def refresh_project_ui(
         self,
@@ -2441,9 +2744,10 @@ class PsdReconstructionPage(QFrame):
 
     def on_preview_source_changed(self, *_args):
         token = self.preview_source_token()
-        if token.startswith("repack:") and self.current_project:
+        if token.startswith("repack:") and self.current_project and not self._compact:
             try:
                 self.current_project = select_repack(self.current_project, token.split(":", 1)[1])
+                self.projectChanged.emit(self.current_project)
             except Exception as exc:
                 self.append_log(tr("psd.warning_prefix", message=str(exc)))
         self.refresh_preview_texture_combo()
@@ -2581,6 +2885,13 @@ class PsdReconstructionPage(QFrame):
         self.preview_live2d_button.setEnabled(has_project)
         self.motion_play_button.setEnabled(has_project and bool(self._motion_items))
         self.preview_hint_label.setText(tr("psd.preview.hint_live2d_enabled"))
+        if self._compact and hasattr(self, "apply_version_button"):
+            has_version = has_project and self.preview_source_token().startswith(("repack:", "composite:"))
+            self.apply_version_button.setEnabled(has_version and not self.is_busy())
+            self.send_mod_button.setEnabled(has_version and not self.is_busy())
+            self.preview_live2d_button.setToolTip(self.preview_hint_label.text())
+            self.apply_version_button.setToolTip(self.version_hint.text())
+            self.send_mod_button.setToolTip(self.version_hint.text())
 
     @staticmethod
     def _combo_index_by_data(combo: ComboBox, value: str) -> int:
@@ -2645,6 +2956,7 @@ class PsdReconstructionPage(QFrame):
             self.refresh_project_combo(select_project_file=str(self.current_project.project_file))
             self._project_dirty = False
             self._update_project_header()
+            self.projectChanged.emit(self.current_project)
         except Exception as exc:
             self.append_log(tr("psd.warning_prefix", message=str(exc)))
 
@@ -2653,7 +2965,12 @@ class PsdReconstructionPage(QFrame):
         try:
             project_file = str(payload.get("project_file") or "")
             if not self.current_project or str(self.current_project.project_file) != str(Path(project_file).resolve()):
-                self.set_current_project(load_project(project_file))
+                if self._compact:
+                    self.projectRequested.emit(project_file)
+                    if not self.current_project:
+                        return
+                else:
+                    self.set_current_project(load_project(project_file))
             name = str(payload.get("name") or "").strip()
             parameters = {
                 str(key): float(value)
@@ -2664,6 +2981,7 @@ class PsdReconstructionPage(QFrame):
                 name,
                 parameters,
             )
+            self.projectChanged.emit(self.current_project)
             self.set_workflow("export")
             self.refresh_parameter_preset_controls(str(preset.get("id") or ""))
             self.refresh_project_combo(
@@ -2897,6 +3215,8 @@ class PsdReconstructionPage(QFrame):
             )
 
     def _send_preview_command(self, payload: dict) -> bool:
+        if self._compact and self.preview_command_handler:
+            return bool(self.preview_command_handler(payload))
         window = self.live2d_preview_window
         if window is None:
             return False
@@ -2970,6 +3290,8 @@ class PsdReconstructionPage(QFrame):
     def close_preview_panel(self):
         self.close_project_preview()
         self.set_preview_visible(False, stop_process=False)
+        if self._compact:
+            self.previewClosed.emit()
 
     def toggle_preview_panel(self):
         self.set_preview_visible(not self.preview_dialog.isVisible())
@@ -3025,11 +3347,29 @@ class PsdReconstructionPage(QFrame):
         self.mesh_canvas_label.setMinimumWidth(0)
         self.mesh_canvas_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         self.mode_combo.setMinimumWidth(0)
-        self.mode_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.mode_combo.setSizePolicy(QSizePolicy.Expanding if self._compact else QSizePolicy.Ignored, QSizePolicy.Fixed)
+        if self._compact:
+            self.output_edit.setReadOnly(True)
+            for control_type in (ComboBox, EditableComboBox, LineEdit):
+                for control in self.findChildren(control_type):
+                    control.setMinimumWidth(0)
+                    control.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
     def _arrange_button_rows(self):
         """Keep each action legible when translated text needs another row."""
         if not hasattr(self, "preview_action_layout"):
+            return
+        if self._compact and hasattr(self, "_compact_scrolls"):
+            grids = [(self.project_button_layout, (self.new_project_button, self.save_project_button, self.open_project_folder_button)),
+                     (self.preview_action_layout, (self.preview_image_button, self.preview_live2d_button, self.preview_close_button))]
+            grids.extend(self._compact_button_grids)
+            for layout, buttons in grids:
+                for button in buttons:
+                    layout.removeWidget(button)
+                width = max(1, self.width() - 34)
+                needed = sum(button.minimumWidth() for button in buttons) + 16
+                for index, button in enumerate(buttons):
+                    layout.addWidget(button, 0 if needed <= width else index, index if needed <= width else 0)
             return
         available = max(
             1,
@@ -3108,7 +3448,7 @@ class PsdReconstructionPage(QFrame):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        QTimer.singleShot(0, self._arrange_button_rows)
+        self._arrange_timer.start(0)
 
     def _update_log_toggle_button(self):
         if not hasattr(self, "log_toggle_button"):
@@ -3116,6 +3456,14 @@ class PsdReconstructionPage(QFrame):
         self.log_toggle_button.setText("-" if self._log_expanded else "+")
 
     def _set_log_expanded(self, expanded: bool):
+        if self._compact:
+            self._log_expanded = bool(expanded)
+            self.log_text.setVisible(self._log_expanded)
+            self.log_text.setMinimumHeight(180 if expanded else 0)
+            self.log_frame.setMinimumHeight(0)
+            self.log_frame.setMaximumHeight(MAX_WIDGET_SIZE if expanded else 60)
+            self._update_log_toggle_button()
+            return
         if self._log_expanded == bool(expanded) and self.log_text.isHidden() != bool(expanded):
             return
         sizes = self.workspace_splitter.sizes()

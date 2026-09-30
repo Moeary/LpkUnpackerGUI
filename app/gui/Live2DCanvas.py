@@ -256,8 +256,9 @@ class ADPOpenGLCanvas(QOpenGLWindow):
         if math.isclose(aspect, self._source_aspect_ratio, rel_tol=1e-4):
             return
         self._source_aspect_ratio = aspect
-        if self.context() is not None and self.isValid():
-            self.__create_canvas_framebuffer()
+        # Model-ready signals run outside paintGL and may arrive while a
+        # different editor's GL context is current. Allocate lazily in paintGL.
+        self.update()
 
     def __create_canvas_framebuffer(self, force: bool = False):
         # Determine device-pixel size for FBO
@@ -306,18 +307,10 @@ class ADPOpenGLCanvas(QOpenGLWindow):
         self.on_resize(self._fbo_width, self._fbo_height)
 
     def resizeGL(self, w, h):
-        # Recreate FBO when widget size or DPR changes
-        old_dpr = self._dpr
+        # Qt may issue a final resize while a native surface is being hidden
+        # or closed. Only paintGL owns framebuffer deletion/allocation.
         self._dpr = float(self.devicePixelRatioF()) if hasattr(self, 'devicePixelRatioF') else float(self.devicePixelRatio())
-        desired_w, desired_h = self._desired_canvas_size(w, h)
-        if (
-            desired_w != self._fbo_width
-            or desired_h != self._fbo_height
-            or self._dpr != old_dpr
-        ):
-            self.__create_canvas_framebuffer()
-        # Notify subclass with pixel sizes
-        self.on_resize(self._fbo_width, self._fbo_height)
+        self.update()
 
     def paintGL(self):
         # Only allocate/delete GL resources while this window's context is current.
