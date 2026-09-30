@@ -7,6 +7,10 @@ def _configure_qt_environment():
 
     # Keep the stdio MCP entry point free of GUI imports and startup output.
     # Qt 6 enables DPI scaling by default; Live2D requires shared GL contexts.
+    # On Windows the native previews use desktop GL entry points. Qt's ANGLE
+    # backend creates an OpenGL ES context that PyOpenGL cannot use through WGL.
+    if sys.platform == "win32":
+        QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_UseDesktopOpenGL, True)
     if hasattr(Qt.ApplicationAttribute, "AA_ShareOpenGLContexts"):
         QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
     QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)

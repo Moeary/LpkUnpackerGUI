@@ -29,7 +29,7 @@ class SettingsPageLayoutTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
-    def test_settings_are_split_into_two_scrollable_columns(self):
+    def test_categories_show_one_scrollable_column_without_clipped_fields(self):
         with tempfile.TemporaryDirectory() as directory:
             settings_path = Path(directory) / "settings.json"
 
@@ -40,7 +40,7 @@ class SettingsPageLayoutTests(unittest.TestCase):
             with patch.object(settings_page_module, "SettingsManager", TempSettings):
                 page = settings_page_module.SettingsPage()
             try:
-                self.assertEqual(page.settings_columns_layout.count(), 2)
+                page.show()
                 self.assertEqual(
                     page.settings_scroll.horizontalScrollBarPolicy(),
                     Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
@@ -56,14 +56,54 @@ class SettingsPageLayoutTests(unittest.TestCase):
                         "settingsRuntimeCard",
                         "settingsArchiveCard",
                         "settingsAssetToolsCard",
+                        "settingsCubismCard",
                         "settingsDownloadCard",
                         "settingsPhotoshopCard",
                         "settingsSpineCard",
                         "settingsTextureCard",
                         "settingsMcpCard",
+                        "settingsMcpConnectionCard",
+                        "settingsMcpGuideCard",
                     },
                 )
-                self.assertEqual(page.settings_scroll.horizontalScrollBar().maximum(), 0)
+                controls = {
+                    "general": (page.font_family_combo, page.output_root_edit),
+                    "live2d": (page.cubism_core_edit, page.photoshop_edit),
+                    "spine": (page.spine_runtime_version_combo, page.spine_editor_edit),
+                    "resources": (page.archive_tool_edit, page.assetstudio_tool_edit),
+                    "ai": (page.mcp_port_spin, page.mcp_config_button, page.mcp_save_guide_button),
+                    "other": (page.texture_viewer_combo,),
+                }
+                for width, height in ((1320, 900), (1040, 760)):
+                    page.resize(width, height)
+                    for category, fields in controls.items():
+                        with self.subTest(width=width, category=category):
+                            self.assertTrue(page.select_settings_category(category))
+                            self.app.processEvents()
+                            self.app.processEvents()
+                            self.assertLess(page.category_list.geometry().right(), page.settings_scroll.geometry().left())
+                            self.assertEqual(page.settings_scroll.horizontalScrollBar().maximum(), 0)
+                            selected_cards = dict(page._settings_categories)[category]
+                            for _key, cards in page._settings_categories:
+                                for card in cards:
+                                    self.assertEqual(card.isVisibleTo(page), card in selected_cards)
+                            for field in fields:
+                                self.assertTrue(field.isVisibleTo(page), field.objectName())
+                                self.assertGreater(field.width(), 90)
+                                origin = field.mapTo(page.settings_content, field.rect().topLeft())
+                                self.assertGreaterEqual(origin.x(), 0)
+                                self.assertLessEqual(origin.x() + field.width(), page.settings_content.width())
+                                page.settings_scroll.ensureWidgetVisible(field)
+                                self.app.processEvents()
+                                origin = field.mapTo(page.settings_scroll.viewport(), field.rect().topLeft())
+                                self.assertGreaterEqual(origin.y(), 0)
+                                self.assertLessEqual(origin.y() + field.height(), page.settings_scroll.viewport().height())
+                self.assertTrue(page.theme_combo.isHidden())
+                self.assertFalse(page.cubism_core_edit.isVisibleTo(page))
+                page.select_settings_category("resources")
+                self.app.processEvents()
+                self.assertTrue(page.assetstudio_tool_edit.isVisibleTo(page))
+                self.assertFalse(page.cubism_core_edit.isVisibleTo(page))
             finally:
                 page.close()
                 page.deleteLater()

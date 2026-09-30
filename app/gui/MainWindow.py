@@ -1,14 +1,17 @@
 import os
 
 from PySide6.QtCore import QEvent, Qt
-from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout
+from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLayout, QSizePolicy
 from qfluentwidgets import FluentIcon as FIF
 from qfluentwidgets import FluentWindow, NavigationItemPosition
+from qfluentwidgets import isDarkTheme
 
 from app.core.font_helper import apply_application_font
 from app.core.settings_manager import SettingsManager
 from app.gui.theme import apply_application_theme
 from app.i18n import get_i18n, normalize_language_code, tr
+from app.gui.Live2DEditorPage import Live2DEditorPage
+from app.gui.SpineEditorPage import SpineEditorPage
 
 
 try:
@@ -157,6 +160,15 @@ class MainWindow(FluentWindow):
     def __init__(self):
         super().__init__()
         self.setMicaEffectEnabled(False)
+        # A stacked layout otherwise combines the size hints of every hidden
+        # page, so opening an inspector can enlarge unrelated pages as well.
+        # Each page keeps its own scrolling/splitter layout within the viewport.
+        self.stackedWidget.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        # Wrapped labels in nested tabs also report a preferred height for
+        # width. On Windows, a default top-level constraint treats that as a
+        # minimum and grows the window even though the page can scroll/shrink.
+        self.hBoxLayout.setSizeConstraint(QLayout.SetNoConstraint)
+        self.setMinimumSize(1040, 760)
 
         self.settings_manager = SettingsManager()
         self.i18n = get_i18n()
@@ -170,7 +182,10 @@ class MainWindow(FluentWindow):
         self.previewPage = self._create_page(PreviewPage, "previewPage")
         self.encryptionPage = None
         self.steamWorkshopPage = None
-        self.live2dModPage = self._create_page(Live2DModPage, "live2dModPage")
+        self.live2dEditorPage = self._create_page(Live2DEditorPage, "live2dEditorPage")
+        self.spineEditorPage = self._create_page(SpineEditorPage, "spineEditorPage")
+        self.live2dModPage = getattr(self.live2dEditorPage, "mod_panel", None)
+        self._editor_source_leases = {}
         self.psdReconstructionPage = self._create_page(
             PsdReconstructionPage, "psdReconstructionPage"
         )
@@ -184,13 +199,16 @@ class MainWindow(FluentWindow):
         )
         if unified_preview_requested is not None and hasattr(unified_preview_requested, "connect"):
             unified_preview_requested.connect(self.open_psd_preview)
-        mod_preview_requested = getattr(
-            self.live2dModPage,
-            "previewModelRequested",
-            None,
-        )
-        if mod_preview_requested is not None and hasattr(mod_preview_requested, "connect"):
-            mod_preview_requested.connect(self.open_live2d_mod_preview)
+        # The Live2D editor owns its MOD panel's preview signal. Connecting it
+        # again here would load the same model twice and switch pages midway.
+        editor_requested = getattr(self.previewPage, "editorRequested", None)
+        if editor_requested is not None and hasattr(editor_requested, "connect"):
+            editor_requested.connect(self.open_model_editor)
+        for page in (self.live2dEditorPage, self.spineEditorPage):
+            for signal_name in ("sourceOpened", "sourceFailed"):
+                signal = getattr(page, signal_name, None)
+                if signal is not None and hasattr(signal, "connect"):
+                    signal.connect(lambda _result, editor=page: self._release_editor_source_leases(editor))
         pose_scheme_requested = getattr(self.previewPage, "poseSchemeRequested", None)
         pose_scheme_handler = getattr(
             self.psdReconstructionPage,
@@ -226,6 +244,8 @@ class MainWindow(FluentWindow):
 
         self.initWindow()
         self.initNavigation()
+        self.stackedWidget.currentChanged.connect(self._on_page_changed)
+        self._on_page_changed()
         self.apply_theme()
         self.updateFontSize()
 
@@ -288,6 +308,28 @@ class MainWindow(FluentWindow):
             # while the main window is closing.
             event.ignore()
             return
+        prepare_preview = getattr(preview_page, "prepare_shutdown", None)
+        if callable(prepare_preview) and prepare_preview() is False:
+            event.ignore()
+            return
+        for page in (getattr(self, "live2dEditorPage", None), getattr(self, "spineEditorPage", None)):
+            confirm = getattr(page, "confirm_discard_or_save", None)
+            if callable(confirm) and not confirm():
+                event.ignore()
+                return
+        shutdown_preview = getattr(preview_page, "shutdown", None)
+        if callable(shutdown_preview) and shutdown_preview() is False:
+            event.ignore()
+            return
+        shutdown_mcp = getattr(settings_page, "shutdown_animation_mcp", None)
+        if callable(shutdown_mcp) and shutdown_mcp() is False:
+            event.ignore()
+            return
+        for page in (getattr(self, "live2dEditorPage", None), getattr(self, "spineEditorPage", None)):
+            shutdown = getattr(page, "shutdown", None)
+            if callable(shutdown):
+                shutdown()
+            self._release_editor_source_leases(page)
         # Store the restore rectangle, not the maximized monitor rectangle.
         # Otherwise opening the next session looks maximized but its titlebar
         # and Windows restore state disagree.
@@ -329,15 +371,23 @@ class MainWindow(FluentWindow):
 
         try:
             self.addSubInterface(
-                self.live2dModPage,
+                self.live2dEditorPage,
                 FIF.EDIT,
-                tr("main.nav.live2d_mod"),
+                tr("main.nav.live2d_editor"),
                 NavigationItemPosition.SCROLL,
             )
         except Exception as e:
-            print(f"Error adding Live2DModPage to navigation: {e}")
+            print(f"Error adding Live2DEditorPage to navigation: {e}")
+
+        self.addSubInterface(
+            self.spineEditorPage, FIF.EDIT, tr("main.nav.spine_editor"), NavigationItemPosition.SCROLL,
+        )
 
         try:
+            self.theme_toggle_button = self.navigationInterface.addItem(
+                "themeToggle", FIF.CONSTRACT, "", onClick=self.toggle_theme,
+                selectable=False, position=NavigationItemPosition.BOTTOM,
+            )
             self.addSubInterface(
                 self.spineConverterPage,
                 FIF.SYNC,
@@ -356,6 +406,27 @@ class MainWindow(FluentWindow):
             )
         except Exception as e:
             print(f"Error adding SettingsPage to navigation: {e}")
+
+    def _on_page_changed(self, _index=None):
+        current = self.stackedWidget.currentWidget()
+        for page in (self.previewPage, self.live2dEditorPage, self.spineEditorPage):
+            activate = getattr(page, "set_active", None)
+            if callable(activate):
+                activate(page is current)
+            elif page is not current:
+                pause = getattr(page, "pause_playback", None)
+                if callable(pause):
+                    pause()
+
+    def toggle_theme(self):
+        self.on_theme_changed("light" if isDarkTheme() else "dark")
+
+    def _update_theme_toggle(self):
+        button = getattr(self, "theme_toggle_button", None)
+        if button is not None:
+            text = tr("main.theme.switch_light" if isDarkTheme() else "main.theme.switch_dark")
+            button.setText(text)
+            button.setToolTip(text)
 
     def eventFilter(self, obj, event):
         if obj is self and event.type() == QEvent.Resize:
@@ -382,7 +453,8 @@ class MainWindow(FluentWindow):
             self.previewPage,
             self.encryptionPage,
             self.steamWorkshopPage,
-            self.live2dModPage,
+            self.live2dEditorPage,
+            self.spineEditorPage,
             self.psdReconstructionPage,
             self.spineConverterPage,
             self.settingsPage,
@@ -399,6 +471,7 @@ class MainWindow(FluentWindow):
         except Exception as e:
             print(f"Error applying theme: {e}")
             apply_application_theme("light", self)
+        self._update_theme_toggle()
 
     def retranslate_ui(self):
         self.setWindowTitle(tr("main.window_title"))
@@ -409,7 +482,8 @@ class MainWindow(FluentWindow):
             self.previewPage,
             self.encryptionPage,
             self.steamWorkshopPage,
-            self.live2dModPage,
+            self.live2dEditorPage,
+            self.spineEditorPage,
             self.psdReconstructionPage,
             self.spineConverterPage,
             self.settingsPage,
@@ -419,6 +493,21 @@ class MainWindow(FluentWindow):
                     page.retranslate_ui()
                 except Exception as e:
                     print(f"Error re-translating {page.objectName()}: {e}")
+        for page, key in (
+            (self.extractorPage, "main.nav.extractor"),
+            (self.previewPage, "main.nav.preview_native"),
+            (self.psdReconstructionPage, "main.nav.psd_reconstruction"),
+            (self.live2dEditorPage, "main.nav.live2d_editor"),
+            (self.spineEditorPage, "main.nav.spine_editor"),
+            (self.spineConverterPage, "main.nav.spine_converter"),
+            (self.settingsPage, "main.nav.settings"),
+        ):
+            if page is self.previewPage and _DISABLE_NATIVE_PREVIEW:
+                continue
+            item = self.navigationInterface.widget(page.objectName())
+            if item is not None:
+                item.setText(tr(key))
+        self._update_theme_toggle()
 
     def on_language_changed(self, language: str):
         normalized = normalize_language_code(language)
@@ -427,6 +516,9 @@ class MainWindow(FluentWindow):
 
     def on_theme_changed(self, theme: str):
         self.settings_manager.set("theme", str(theme).lower())
+        sync = getattr(self.settingsPage, "sync_theme_selection", None)
+        if callable(sync):
+            sync(str(theme).lower())
         self.apply_theme()
 
     def on_font_changed(self, family: str, size: int):
@@ -450,7 +542,8 @@ class MainWindow(FluentWindow):
             self.previewPage,
             self.encryptionPage,
             self.steamWorkshopPage,
-            self.live2dModPage,
+            self.live2dEditorPage,
+            self.spineEditorPage,
             self.psdReconstructionPage,
             self.spineConverterPage,
             self.settingsPage,
@@ -466,6 +559,43 @@ class MainWindow(FluentWindow):
         handler = getattr(self.previewPage, "open_psd_project_preview", None)
         if callable(handler):
             handler(model_json_path, project_file)
+
+    def _release_editor_source_leases(self, page):
+        leases = getattr(self, "_editor_source_leases", {}).pop(page, set())
+        release = getattr(getattr(self, "previewPage", None), "release_editor_source", None)
+        if callable(release):
+            for lease in leases:
+                release(lease)
+
+    def open_model_editor(self, kind: str, model_path: str) -> bool:
+        """Open the resolved preview model after the editor accepts its new source."""
+        page = {"live2d": self.live2dEditorPage, "spine": self.spineEditorPage}.get(kind)
+        if page is None or not os.path.isfile(model_path):
+            return False
+        opener = getattr(page, "open_source", None)
+        if not callable(opener):
+            return False
+        acquire = getattr(self.previewPage, "acquire_editor_source", None)
+        lease = acquire(model_path) if callable(acquire) else None
+        if lease is not None:
+            self._editor_source_leases.setdefault(page, set()).add(lease)
+        try:
+            accepted = bool(opener(model_path))
+        except Exception as exc:
+            report = getattr(self.previewPage, "show_error", None)
+            if callable(report):
+                report(tr("editor.navigation.open_failed"), str(exc))
+            accepted = False
+        asynchronous = hasattr(page, "sourceOpened") and hasattr(page, "sourceFailed")
+        if not accepted or not asynchronous:
+            pending = self._editor_source_leases.get(page, set())
+            pending.discard(lease)
+            release = getattr(self.previewPage, "release_editor_source", None)
+            if lease is not None and callable(release):
+                release(lease)
+        if accepted:
+            self.switchTo(page)
+        return accepted
 
     def open_live2d_mod_preview(self, model_json_path: str):
         self.switchTo(self.previewPage)

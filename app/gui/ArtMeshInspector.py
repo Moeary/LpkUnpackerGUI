@@ -18,21 +18,19 @@ from typing import Any, Iterable, Mapping
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import (
-    QComboBox,
     QDialog,
-    QDialogButtonBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
-    QListWidget,
     QListWidgetItem,
-    QPushButton,
     QSplitter,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
+)
+from qfluentwidgets import (
+    ComboBox as QComboBox, LineEdit as QLineEdit, ListWidget as QListWidget,
+    PushButton as QPushButton, TextEdit as QTextEdit,
 )
 
 from app.i18n import get_i18n, tr
@@ -937,17 +935,17 @@ class ArtMeshInspectorDialog(QDialog):
         layout = QVBoxLayout(self)
         self.inspector = ArtMeshInspector(metadata_path, self)
         layout.addWidget(self.inspector, 1)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, self)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-        self.buttons = buttons
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        self.close_button = QPushButton(tr("psd.inspector.close"), self)
+        self.close_button.clicked.connect(self.reject)
+        buttons.addWidget(self.close_button)
+        layout.addLayout(buttons)
         self.i18n.languageChanged.connect(self.retranslate_ui)
 
     def retranslate_ui(self, *_args) -> None:
         self.setWindowTitle(tr("psd.inspector.title"))
-        self.buttons.button(QDialogButtonBox.StandardButton.Close).setText(
-            tr("psd.inspector.close")
-        )
+        self.close_button.setText(tr("psd.inspector.close"))
 
 
 __all__ = ["ArtMeshEntry", "ArtMeshInspector", "ArtMeshInspectorDialog"]

@@ -1,0 +1,495 @@
+"""Shared Fluent editor panels and a recoverable, resizable workspace.
+
+Layout preferences live in SettingsManager; no model or project files are touched.
+The permanent layout bar remains available even with every panel collapsed.
+"""
+
+from __future__ import annotations
+
+from PySide6.QtCore import QByteArray, QPointF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QPainter
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QSplitter, QSplitterHandle, QStackedWidget, QVBoxLayout, QWidget, QSizePolicy
+from qfluentwidgets import (
+    BodyLabel, CaptionLabel, CardWidget, FluentIcon, Pivot, TransparentToolButton,
+    TransparentTogglePushButton, PushButton, ComboBox,
+    ScrollArea, setFont,
+)
+
+from app.i18n import tr
+from app.core.settings_manager import SettingsManager
+
+
+WORKSPACE_TEXT = {
+    "editor.workspace.preview": "预览",
+    "editor.workspace.details": "编辑面板",
+    "editor.workspace.timeline": "时间轴",
+    "editor.workspace.layout": "布局",
+    "editor.workspace.reset": "重置布局",
+    "editor.workspace.hide": "收起{panel}",
+    "editor.workspace.show": "恢复{panel}",
+    "editor.workspace.empty": "面板已收起，可在上方恢复预览、编辑面板或时间轴",
+    "editor.workspace.resize": "拖动调整面板宽度或高度；双击重置布局",
+}
+
+
+def _text(key: str, **values) -> str:
+    return tr(key, WORKSPACE_TEXT[key], **values)
+
+
+class EditorComboBox(ComboBox):
+    """Real Fluent combo with Qt-compatible positional userData arguments."""
+
+    def addItem(self, text, userData=None, *, icon=None):  # noqa: N802
+        super().addItem(text, icon=icon, userData=userData)
+
+
+class EditorViewportLayout(QVBoxLayout):
+    """Scroll panes own their height; do not inflate the top-level minimum."""
+
+    def hasHeightForWidth(self):
+        return False
+
+    def heightForWidth(self, _width):
+        return -1
+
+    def minimumHeightForWidth(self, _width):
+        return -1
+
+
+class _ViewportStack(QStackedWidget):
+    def hasHeightForWidth(self):
+        return False
+
+    def heightForWidth(self, _width):
+        return -1
+
+    def minimumSizeHint(self):
+        return QSize(100, 70)
+
+
+class EditorTabs(QWidget):
+    """Fluent Pivot + stack with the small QTabWidget API used by both pages."""
+
+    currentChanged = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.pivot = Pivot(self)
+        self.pivot.setFixedHeight(34)
+        self.tab_scroll = ScrollArea(self)
+        self.tab_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.tab_scroll.setFixedHeight(39)
+        self.tab_scroll.setWidget(self.pivot)
+        self.tab_scroll.setWidgetResizable(False)
+        self.tab_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.tab_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.back_button = TransparentToolButton(FluentIcon.LEFT_ARROW, self)
+        self.forward_button = TransparentToolButton(FluentIcon.CHEVRON_RIGHT, self)
+        for button in (self.back_button, self.forward_button):
+            button.setFixedSize(24, 30)
+            button.hide()
+        tab_row = QHBoxLayout()
+        tab_row.setContentsMargins(0, 0, 0, 0)
+        tab_row.setSpacing(2)
+        tab_row.addWidget(self.back_button)
+        tab_row.addWidget(self.tab_scroll, 1)
+        tab_row.addWidget(self.forward_button)
+        self.stack = _ViewportStack(self)
+        layout = EditorViewportLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        layout.addLayout(tab_row)
+        layout.addWidget(self.stack, 1)
+        self._keys = []
+        self._tab_labels = []
+        self.stack.currentChanged.connect(self._changed)
+        self.back_button.clicked.connect(lambda: self._scroll_tabs(-120))
+        self.forward_button.clicked.connect(lambda: self._scroll_tabs(120))
+        self.tab_scroll.horizontalScrollBar().rangeChanged.connect(self._update_tab_arrows)
+
+    def addTab(self, widget: QWidget, text: str) -> int:  # noqa: N802
+        index = self.stack.addWidget(widget)
+        key = f"editor-tab-{index}"
+        self._keys.append(key)
+        self._tab_labels.append(text)
+        item = self.pivot.addItem(key, text, onClick=lambda i=index: self.setCurrentIndex(i))
+        setFont(item, 14)
+        item.setToolTip(text)
+        self.pivot.adjustSize()
+        if index == 0:
+            self.pivot.setCurrentItem(key)
+        self._fit_tab_items()
+        return index
+
+    def setTabText(self, index: int, text: str):  # noqa: N802
+        self._tab_labels[index] = text
+        self.pivot.setItemText(self._keys[index], text)
+        self.pivot.widget(self._keys[index]).setToolTip(text)
+        self.pivot.adjustSize()
+        self._fit_tab_items()
+
+    def tabText(self, index: int) -> str:  # noqa: N802
+        return self._tab_labels[index]
+
+    def currentIndex(self) -> int:  # noqa: N802
+        return self.stack.currentIndex()
+
+    def currentWidget(self) -> QWidget:  # noqa: N802
+        return self.stack.currentWidget()
+
+    def setCurrentWidget(self, widget: QWidget):  # noqa: N802
+        self.stack.setCurrentWidget(widget)
+
+    def setCurrentIndex(self, index: int):  # noqa: N802
+        self.stack.setCurrentIndex(index)
+
+    def widget(self, index: int) -> QWidget:
+        return self.stack.widget(index)
+
+    def count(self) -> int:
+        return self.stack.count()
+
+    def _changed(self, index: int):
+        if 0 <= index < len(self._keys):
+            self.pivot.setCurrentItem(self._keys[index])
+            self._fit_tab_items()
+            self.tab_scroll.ensureWidgetVisible(self.pivot.widget(self._keys[index]), 8, 0)
+        self.currentChanged.emit(index)
+
+    def _scroll_tabs(self, offset: int):
+        bar = self.tab_scroll.horizontalScrollBar()
+        bar.setValue(bar.value() + offset)
+
+    def _update_tab_arrows(self, *args):
+        overflow = self._natural_tab_width() > self.width()
+        self.back_button.setVisible(overflow)
+        self.forward_button.setVisible(overflow)
+
+    def _natural_tab_width(self):
+        return sum(self.pivot.widget(key).fontMetrics().horizontalAdvance(label) + 24
+                   for key, label in zip(self._keys, self._tab_labels))
+
+    def _fit_tab_items(self):
+        overflow = self._natural_tab_width() > self.width()
+        available = max(70, self.width() - (52 if overflow else 0) - 24)
+        for key, label in zip(self._keys, self._tab_labels):
+            item = self.pivot.widget(key)
+            item.setText(item.fontMetrics().elidedText(label, Qt.TextElideMode.ElideRight, available))
+        self.pivot.adjustSize()
+        self._update_tab_arrows()
+
+    def resizeEvent(self, event):  # noqa: N802
+        super().resizeEvent(event)
+        self._fit_tab_items()
+
+
+class EditorPanel(CardWidget):
+    hideRequested = Signal()
+
+    def __init__(self, content: QWidget, panel: str, parent=None):
+        super().__init__(parent)
+        self.panel = panel
+        self.content = content
+        self.setBorderRadius(8)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        self.setMinimumSize(140, 90)
+        layout = EditorViewportLayout(self)
+        layout.setContentsMargins(12, 7, 12, 10)
+        layout.setSpacing(7)
+        header = QHBoxLayout()
+        header.setSpacing(8)
+        self.title = BodyLabel(self)
+        header.addWidget(self.title)
+        header.addStretch(1)
+        self.hide_button = TransparentToolButton(FluentIcon.HIDE, self)
+        self.hide_button.setFixedSize(28, 28)
+        self.hide_button.clicked.connect(self.hideRequested)
+        header.addWidget(self.hide_button)
+        layout.addLayout(header)
+        if panel == "timeline":
+            self.scroll = ScrollArea(self)
+            self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+            self.scroll.setWidgetResizable(True)
+            self.scroll.setWidget(content)
+            self.scroll.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+            self.scroll.setMinimumSize(0, 0)
+            layout.addWidget(self.scroll, 1)
+        else:
+            layout.addWidget(content, 1)
+        self.retranslate_ui()
+
+    def retranslate_ui(self):
+        name = _text(f"editor.workspace.{self.panel}")
+        self.title.setText(name)
+        self.hide_button.setToolTip(_text("editor.workspace.hide", panel=name))
+
+
+class _Grip(QSplitterHandle):
+    resetRequested = Signal()
+
+    def __init__(self, orientation, parent):
+        super().__init__(orientation, parent)
+        self.setToolTip(_text("editor.workspace.resize"))
+
+    def paintEvent(self, event):  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(self.palette().mid().color())
+        x, y = self.width() / 2, self.height() / 2
+        for offset in (-10, -5, 0, 5, 10):
+            point = QPointF(x, y + offset) if self.orientation() == Qt.Orientation.Horizontal else QPointF(x + offset, y)
+            painter.drawEllipse(point, 1.2, 1.2)
+
+    def mouseDoubleClickEvent(self, event):  # noqa: N802
+        self.resetRequested.emit()
+        event.accept()
+
+
+class _WorkspaceSplitter(QSplitter):
+    resetRequested = Signal()
+
+    def __init__(self, orientation, parent=None):
+        super().__init__(orientation, parent)
+        self.setHandleWidth(10)
+        self.setChildrenCollapsible(True)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+
+    def createHandle(self):  # noqa: N802
+        handle = _Grip(self.orientation(), self)
+        handle.resetRequested.connect(self.resetRequested)
+        return handle
+
+    def hasHeightForWidth(self):
+        return False
+
+    def heightForWidth(self, _width):
+        return -1
+
+    def minimumSizeHint(self):
+        return QSize(280, 100)
+
+
+class EditorWorkspace(QWidget):
+    panelVisibilityChanged = Signal(str, bool)
+
+    def __init__(self, preview: QWidget, details: QWidget, timeline: QWidget,
+                 parent=None, settings_key: str | None = None, settings=None):
+        super().__init__(parent)
+        self.setObjectName("editorWorkspace")
+        self._settings_key = settings_key
+        self._restoring = False
+        self._initial_show = False
+        self._visibility = {"preview": True, "details": True, "timeline": True}
+        self._horizontal_sizes = [620, 380]
+        self._vertical_sizes = [450, 255]
+        self._settings = (settings or SettingsManager()) if settings_key and settings is not False else None
+        layout = EditorViewportLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(5)
+        self.layout_toolbar = QWidget(self)
+        bar = QHBoxLayout(self.layout_toolbar)
+        bar.setContentsMargins(2, 0, 2, 0)
+        bar.setSpacing(5)
+        self.layout_label = CaptionLabel(self)
+        bar.addWidget(self.layout_label)
+        self.preview_toggle = TransparentTogglePushButton(FluentIcon.VIEW, "", self)
+        self.details_toggle = TransparentTogglePushButton(FluentIcon.EDIT, "", self)
+        self.timeline_toggle = TransparentTogglePushButton(FluentIcon.HISTORY, "", self)
+        self._toggles = {"preview": self.preview_toggle, "details": self.details_toggle, "timeline": self.timeline_toggle}
+        for panel, button in self._toggles.items():
+            button.setChecked(True)
+            button.setFixedHeight(30)
+            button.clicked.connect(lambda checked, name=panel: self.set_panel_visible(name, checked))
+            bar.addWidget(button)
+        bar.addStretch(1)
+        self.reset_button = TransparentToolButton(FluentIcon.SYNC, self)
+        self.reset_button.setFixedSize(30, 30)
+        self.reset_button.clicked.connect(self.reset_layout)
+        bar.addWidget(self.reset_button)
+        layout.addWidget(self.layout_toolbar)
+        self._body = _ViewportStack(self)
+        self.vertical_splitter = _WorkspaceSplitter(Qt.Orientation.Vertical, self)
+        self.horizontal_splitter = _WorkspaceSplitter(Qt.Orientation.Horizontal, self.vertical_splitter)
+        self.preview_panel = EditorPanel(preview, "preview", self.horizontal_splitter)
+        self.details_panel = EditorPanel(details, "details", self.horizontal_splitter)
+        self.timeline_panel = EditorPanel(timeline, "timeline", self.vertical_splitter)
+        self.horizontal_splitter.addWidget(self.preview_panel)
+        self.horizontal_splitter.addWidget(self.details_panel)
+        self.vertical_splitter.addWidget(self.horizontal_splitter)
+        self.vertical_splitter.addWidget(self.timeline_panel)
+        self.horizontal_splitter.setStretchFactor(0, 3)
+        self.horizontal_splitter.setStretchFactor(1, 2)
+        self.vertical_splitter.setStretchFactor(0, 3)
+        self.vertical_splitter.setStretchFactor(1, 2)
+        self.horizontal_splitter.setSizes(self._horizontal_sizes)
+        self.vertical_splitter.setSizes(self._vertical_sizes)
+        self._body.addWidget(self.vertical_splitter)
+        empty = QWidget(self)
+        empty_layout = QVBoxLayout(empty)
+        empty_layout.addStretch(1)
+        self.empty_label = BodyLabel(self)
+        self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_label.setWordWrap(True)
+        empty_layout.addWidget(self.empty_label)
+        self.empty_reset_button = PushButton(FluentIcon.SYNC, "", self)
+        empty_layout.addWidget(self.empty_reset_button, 0, Qt.AlignmentFlag.AlignHCenter)
+        empty_layout.addStretch(1)
+        self.empty_reset_button.clicked.connect(self.reset_layout)
+        self._body.addWidget(empty)
+        layout.addWidget(self._body, 1)
+        self._panels = {"preview": self.preview_panel, "details": self.details_panel, "timeline": self.timeline_panel}
+        for name, panel in self._panels.items():
+            panel.hideRequested.connect(lambda name=name: self.set_panel_visible(name, False))
+        self.horizontal_splitter.splitterMoved.connect(self._splitter_moved)
+        self.vertical_splitter.splitterMoved.connect(self._splitter_moved)
+        self.horizontal_splitter.resetRequested.connect(self.reset_layout)
+        self.vertical_splitter.resetRequested.connect(self.reset_layout)
+        self.retranslate_ui()
+        self._restore_timer = QTimer(self)
+        self._restore_timer.setSingleShot(True)
+        self._restore_timer.timeout.connect(self.restore_layout)
+        self._restore_timer.start(0)
+
+    def is_panel_visible(self, panel: str) -> bool:
+        return self._visibility[panel]
+
+    def toggle_panel(self, panel: str):
+        self.set_panel_visible(panel, not self.is_panel_visible(panel))
+
+    def set_panel_visible(self, panel: str, visible: bool):
+        if panel not in self._panels:
+            raise ValueError(f"Unknown editor panel: {panel}")
+        visible = bool(visible)
+        if self._visibility[panel] == visible:
+            return
+        self._remember_sizes()
+        self._visibility[panel] = visible
+        self._panels[panel].setVisible(visible)
+        self._toggles[panel].setChecked(visible)
+        self.horizontal_splitter.setVisible(self._visibility["preview"] or self._visibility["details"])
+        self._body.setCurrentIndex(0 if any(self._visibility.values()) else 1)
+        if visible:
+            self.horizontal_splitter.setSizes(self._horizontal_sizes)
+            self.vertical_splitter.setSizes(self._vertical_sizes)
+        self.retranslate_ui()
+        self.panelVisibilityChanged.emit(panel, visible)
+        self.save_layout()
+
+    def _remember_sizes(self):
+        horizontal = self.horizontal_splitter.sizes()
+        vertical = self.vertical_splitter.sizes()
+        # A remaining pane expands when its neighbour is hidden. Remember the
+        # split only while both panes are present, so repeated collapse/restore
+        # operations recover the user's proportions instead of drifting.
+        if self._visibility["preview"] and self._visibility["details"] and all(horizontal):
+            self._horizontal_sizes = horizontal
+        top_visible = self._visibility["preview"] or self._visibility["details"]
+        if top_visible and self._visibility["timeline"] and all(vertical):
+            self._vertical_sizes = vertical
+
+    def _splitter_moved(self, position, index):
+        if self._restoring:
+            return
+        self._remember_sizes()
+        horizontal = self.horizontal_splitter.sizes()
+        vertical = self.vertical_splitter.sizes()
+        updates = {"preview": horizontal[0] > 0, "details": horizontal[1] > 0, "timeline": vertical[1] > 0}
+        # Dragging the complete top row to zero collapses both side panes.
+        if vertical[0] == 0:
+            updates["preview"] = updates["details"] = False
+        for panel, visible in updates.items():
+            if self._visibility[panel] != visible:
+                self.set_panel_visible(panel, visible)
+        self.save_layout()
+
+    def reset_layout(self):
+        self._restoring = True
+        for name, panel in self._panels.items():
+            self._visibility[name] = True
+            panel.show()
+            self._toggles[name].setChecked(True)
+            self.panelVisibilityChanged.emit(name, True)
+        self.horizontal_splitter.show()
+        self._body.setCurrentIndex(0)
+        self._horizontal_sizes = [620, 380]
+        self._vertical_sizes = self._default_vertical_sizes()
+        self.horizontal_splitter.setSizes(self._horizontal_sizes)
+        self.vertical_splitter.setSizes(self._vertical_sizes)
+        self._restoring = False
+        self.retranslate_ui()
+        self.save_layout()
+
+    def save_layout(self):
+        if not self._settings or self._restoring:
+            return
+        state = {"horizontal": bytes(self.horizontal_splitter.saveState()).hex(),
+                 "vertical": bytes(self.vertical_splitter.saveState()).hex(),
+                 "sizes-h": self._horizontal_sizes, "sizes-v": self._vertical_sizes,
+                 "visible": dict(self._visibility)}
+        self._settings.set(f"editor_layouts.{self._settings_key}", state)
+
+    def restore_layout(self):
+        if not self._settings:
+            self._vertical_sizes = self._default_vertical_sizes()
+            self.vertical_splitter.setSizes(self._vertical_sizes)
+            return
+        self._restoring = True
+        saved = self._settings.get(f"editor_layouts.{self._settings_key}", {})
+        saved = saved if isinstance(saved, dict) else {}
+        if not saved:
+            self._vertical_sizes = self._default_vertical_sizes()
+            self.vertical_splitter.setSizes(self._vertical_sizes)
+        visibility = saved.get("visible", {})
+        visibility = visibility if isinstance(visibility, dict) else {}
+        for key, splitter in (("horizontal", self.horizontal_splitter), ("vertical", self.vertical_splitter)):
+            state = saved.get(key)
+            if isinstance(state, str):
+                splitter.restoreState(QByteArray.fromHex(state.encode("ascii", errors="ignore")))
+        for key, attr in (("sizes-h", "_horizontal_sizes"), ("sizes-v", "_vertical_sizes")):
+            values = saved.get(key)
+            if isinstance(values, (list, tuple)) and len(values) == 2:
+                try:
+                    sizes = [max(90, int(value)) for value in values]
+                    setattr(self, attr, sizes)
+                except (TypeError, ValueError):
+                    pass
+        for name in self._panels:
+            visible = bool(visibility.get(name, True))
+            self._visibility[name] = visible
+            self._panels[name].setVisible(visible)
+            self._toggles[name].setChecked(visible)
+            self.panelVisibilityChanged.emit(name, visible)
+        self.horizontal_splitter.setVisible(self._visibility["preview"] or self._visibility["details"])
+        self._body.setCurrentIndex(0 if any(self._visibility.values()) else 1)
+        self._restoring = False
+        self.retranslate_ui()
+
+    def _default_vertical_sizes(self):
+        available = self.vertical_splitter.height() - self.vertical_splitter.handleWidth()
+        bottom = max(270, self.timeline_panel.content.minimumSizeHint().height() + 60)
+        return [max(160, available - bottom), bottom]
+
+    def showEvent(self, event):  # noqa: N802
+        super().showEvent(event)
+        if not self._initial_show:
+            self._initial_show = True
+            # Recompute the first layout after the enclosing page has its
+            # real height. The bottom toolbar fits even on a shorter window.
+            self._restore_timer.start(0)
+
+    def retranslate_ui(self):
+        self.layout_label.setText(_text("editor.workspace.layout"))
+        for name, button in self._toggles.items():
+            title = _text(f"editor.workspace.{name}")
+            button.setText(title)
+            button.setToolTip(_text("editor.workspace.hide" if self._visibility[name] else "editor.workspace.show", panel=title))
+            self._panels[name].retranslate_ui()
+        self.reset_button.setToolTip(_text("editor.workspace.reset"))
+        self.empty_reset_button.setText(_text("editor.workspace.reset"))
+        self.empty_label.setText(_text("editor.workspace.empty"))
+
+
+FluentEditorTabs = EditorTabs
+
+__all__ = ["EditorWorkspace", "EditorPanel", "EditorTabs", "FluentEditorTabs", "EditorComboBox", "EditorViewportLayout", "WORKSPACE_TEXT"]

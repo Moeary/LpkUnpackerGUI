@@ -10,6 +10,12 @@ from scripts.build_nuitka import ROOT, build_nuitka_args, run_msvc_build
 
 
 class BuildNuitkaTests(unittest.TestCase):
+    def test_packaging_keeps_mcp_http_dynamic_imports_and_docstrings(self):
+        args = build_nuitka_args("msvc")
+        self.assertIn("--include-package=mcp", args)
+        self.assertIn("--include-package=uvicorn", args)
+        self.assertNotIn("--python-flag=no_docstrings", args)
+
     def test_build_allows_required_nuitka_helper_downloads(self):
         args = build_nuitka_args("msvc")
 

@@ -1,4 +1,4 @@
-from PySide6.QtCore import QThread, Qt, QUrl, Signal
+from PySide6.QtCore import QProcess, QProcessEnvironment, QThread, Qt, QUrl, Signal, QSize, QTimer
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
@@ -28,10 +28,13 @@ from qfluentwidgets import (
     InfoBar,
     InfoBarPosition,
     LineEdit,
+    ListWidget,
     PrimaryPushButton,
     ProgressBar,
     PushButton,
+    ScrollArea,
     SpinBox,
+    PlainTextEdit,
 )
 
 from app.core.font_helper import (
@@ -41,6 +44,10 @@ from app.core.font_helper import (
     installed_font_families,
 )
 from app.core.settings_manager import SettingsManager
+from app.core.mcp_launch import (
+    DEFAULT_MCP_PORT, animation_mcp_config, animation_mcp_endpoint,
+    animation_mcp_guide, animation_mcp_launch,
+)
 from app.core.toolchain import (
     build_spine_native_runtime,
     find_archive_extractor,
@@ -243,11 +250,19 @@ class SettingsPage(QFrame):
         self.spine_section_title = None
         self.texture_card = None
         self._tool_install_worker = None
+        self._mcp_process = None
+        self._mcp_starting = False
+        self._mcp_stopping = False
+        self._mcp_status_key = "settings.mcp.stopped"
+        self._mcp_status_error = ""
+        self._mcp_ready_buffer = ""
+        self._mcp_transport_values = ["streamable-http", "stdio"]
 
         self.setup_ui()
         self.retranslate_ui()
         self.load_current_settings()
         self.i18n.languageChanged.connect(self.retranslate_ui)
+        QApplication.instance().aboutToQuit.connect(self.shutdown_animation_mcp)
 
     @staticmethod
     def _configure_expanding(widget):
@@ -306,16 +321,19 @@ class SettingsPage(QFrame):
         layout.addWidget(control)
 
     def setup_ui(self):
-        """Build a two-column, scrollable settings surface.
+        """Keep categories fixed on the left and scroll the selected settings."""
 
-        Every field is retained, but path controls are stacked inside their
-        card.  This lets the columns shrink at high DPI without requiring a
-        minimum page width or a second horizontal scrollbar.
-        """
-
-        outer_layout = QVBoxLayout(self)
-        outer_layout.setContentsMargins(0, 0, 0, 0)
-        self.settings_scroll = QScrollArea(self)
+        outer_layout = QHBoxLayout(self)
+        outer_layout.setContentsMargins(20, 18, 20, 20)
+        outer_layout.setSpacing(18)
+        self.category_list = ListWidget(self)
+        self.category_list.setObjectName("settingsCategories")
+        self.category_list.setFixedWidth(190)
+        self.category_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.category_list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        outer_layout.addWidget(self.category_list)
+        self.settings_scroll = ScrollArea(self)
+        self.settings_scroll.enableTransparentBackground()
         self.settings_scroll.setObjectName("settingsScroll")
         self.settings_scroll.setWidgetResizable(True)
         self.settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -338,9 +356,9 @@ class SettingsPage(QFrame):
             "QWidget#settingsScrollContent { background: transparent; border: none; }"
         )
         self.settings_scroll.setWidget(content)
-        outer_layout.addWidget(self.settings_scroll)
+        outer_layout.addWidget(self.settings_scroll, 1)
         main_layout = QVBoxLayout(content)
-        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setContentsMargins(0, 0, 12, 12)
         main_layout.setSpacing(16)
 
         self.title_label = SubtitleLabel("", self)
@@ -351,18 +369,11 @@ class SettingsPage(QFrame):
         )
         main_layout.addWidget(self.title_label)
 
-        columns_layout = QHBoxLayout()
-        columns_layout.setSpacing(16)
-        left_column = QVBoxLayout()
-        right_column = QVBoxLayout()
-        left_column.setSpacing(16)
-        right_column.setSpacing(16)
-        columns_layout.addLayout(left_column, 1)
-        columns_layout.addLayout(right_column, 1)
-        self.settings_columns_layout = columns_layout
-        self.settings_left_column = left_column
-        self.settings_right_column = right_column
-        main_layout.addLayout(columns_layout, 1)
+        # Preserve the existing control construction and signal wiring. Cards
+        # now share one content column; category selection controls visibility.
+        left_column = right_column = main_layout
+        self.settings_columns_layout = None
+        self.settings_left_column = self.settings_right_column = main_layout
 
         # General preferences -------------------------------------------------
         general_card, general_layout = self._new_settings_card(
@@ -411,6 +422,8 @@ class SettingsPage(QFrame):
             self.theme_desc,
             self.theme_combo,
         )
+        for widget in (self.theme_label, self.theme_desc, self.theme_combo):
+            widget.hide()
 
         # Application font ---------------------------------------------------
         # QFluentWidgets assigns explicit fonts to its labels and controls,
@@ -549,19 +562,22 @@ class SettingsPage(QFrame):
             (self.assetstudio_tool_button, self.assetstudio_tool_auto_button),
             self.assetstudio_tool_status,
         )
-        self.cubism_core_label = BodyLabel("", asset_card)
-        self.cubism_core_desc = CaptionLabel("", asset_card)
+        cubism_card, cubism_layout = self._new_settings_card(content, "settingsCubismCard")
+        self.cubism_card = cubism_card
+        left_column.addWidget(cubism_card)
+        self.cubism_core_label = BodyLabel("", cubism_card)
+        self.cubism_core_desc = CaptionLabel("", cubism_card)
         self.cubism_core_desc.setWordWrap(True)
-        self.cubism_core_status = CaptionLabel("", asset_card)
+        self.cubism_core_status = CaptionLabel("", cubism_card)
         self.cubism_core_status.setWordWrap(True)
-        self.cubism_core_edit = LineEdit(asset_card)
+        self.cubism_core_edit = LineEdit(cubism_card)
         self.cubism_core_edit.editingFinished.connect(self.on_cubism_core_edit_finished)
-        self.cubism_core_button = PushButton("", asset_card)
+        self.cubism_core_button = PushButton("", cubism_card)
         self.cubism_core_button.clicked.connect(self.browse_cubism_core)
-        self.cubism_core_auto_button = PushButton("", asset_card)
+        self.cubism_core_auto_button = PushButton("", cubism_card)
         self.cubism_core_auto_button.clicked.connect(self.auto_detect_cubism_core)
         self._add_path_block(
-            asset_layout,
+            cubism_layout,
             self.cubism_core_label,
             self.cubism_core_desc,
             self.cubism_core_edit,
@@ -862,59 +878,380 @@ class SettingsPage(QFrame):
         )
 
         mcp_card, mcp_layout = self._new_settings_card(content, "settingsMcpCard")
+        self.mcp_card = mcp_card
         right_column.addWidget(mcp_card)
         self.mcp_title = SubtitleLabel("", mcp_card)
         self.mcp_description = CaptionLabel("", mcp_card)
         self.mcp_description.setWordWrap(True)
-        self.mcp_config_button = PushButton("", mcp_card)
-        self.mcp_config_button.clicked.connect(self.show_animation_mcp_config)
         mcp_layout.addWidget(self.mcp_title)
         mcp_layout.addWidget(self.mcp_description)
-        mcp_layout.addWidget(self.mcp_config_button)
+        transport_row = QHBoxLayout()
+        self.mcp_transport_label = BodyLabel("", mcp_card)
+        self.mcp_transport_combo = ComboBox(mcp_card)
+        for value in self._mcp_transport_values:
+            self.mcp_transport_combo.addItem(value)
+        transport_row.addWidget(self.mcp_transport_label)
+        transport_row.addWidget(self.mcp_transport_combo, 1)
+        mcp_layout.addLayout(transport_row)
+        self.mcp_workspace_label = BodyLabel("", mcp_card)
+        self.mcp_workspace_description = CaptionLabel("", mcp_card)
+        self.mcp_workspace_description.setWordWrap(True)
+        self.mcp_workspace_edit = self._configure_expanding(LineEdit(mcp_card))
+        self.mcp_workspace_button = PushButton("", mcp_card)
+        self.mcp_workspace_button.clicked.connect(self._choose_mcp_workspace)
+        self._add_path_block(
+            mcp_layout, self.mcp_workspace_label, self.mcp_workspace_description,
+            self.mcp_workspace_edit, (self.mcp_workspace_button,),
+        )
+        self.mcp_http_options = QWidget(mcp_card)
+        port_layout = QHBoxLayout(self.mcp_http_options)
+        port_layout.setContentsMargins(0, 0, 0, 0)
+        self.mcp_port_label = BodyLabel("", self.mcp_http_options)
+        self.mcp_port_spin = SpinBox(self.mcp_http_options)
+        self.mcp_port_spin.setRange(1, 65535)
+        self.mcp_port_spin.setValue(DEFAULT_MCP_PORT)
+        self.mcp_port_spin.setKeyboardTracking(False)
+        self.mcp_port_spin.setMinimumWidth(105)
+        self.mcp_port_hint = CaptionLabel("", self.mcp_http_options)
+        self.mcp_port_hint.setWordWrap(True)
+        port_layout.addWidget(self.mcp_port_label)
+        port_layout.addWidget(self.mcp_port_spin)
+        port_layout.addWidget(self.mcp_port_hint, 1)
+        mcp_layout.addWidget(self.mcp_http_options)
 
-        left_column.addStretch(1)
-        right_column.addStretch(1)
+        connection_card, connection_layout = self._new_settings_card(content, "settingsMcpConnectionCard")
+        self.mcp_connection_card = connection_card
+        right_column.addWidget(connection_card)
+        self.mcp_connection_title = SubtitleLabel("", connection_card)
+        self.mcp_status = CaptionLabel("", connection_card)
+        self.mcp_status.setWordWrap(True)
+        connection_layout.addWidget(self.mcp_connection_title)
+        connection_layout.addWidget(self.mcp_status)
+        self.mcp_endpoint_row = QWidget(connection_card)
+        endpoint_layout = QHBoxLayout(self.mcp_endpoint_row)
+        endpoint_layout.setContentsMargins(0, 0, 0, 0)
+        self.mcp_endpoint_edit = self._configure_expanding(LineEdit(self.mcp_endpoint_row))
+        self.mcp_endpoint_edit.setReadOnly(True)
+        self.mcp_copy_endpoint_button = PushButton("", self.mcp_endpoint_row)
+        self.mcp_copy_endpoint_button.clicked.connect(lambda: QApplication.clipboard().setText(self.mcp_endpoint_edit.text()))
+        endpoint_layout.addWidget(self.mcp_endpoint_edit, 1)
+        endpoint_layout.addWidget(self.mcp_copy_endpoint_button)
+        connection_layout.addWidget(self.mcp_endpoint_row)
+        self.mcp_stdio_hint = CaptionLabel("", connection_card)
+        self.mcp_stdio_hint.setWordWrap(True)
+        connection_layout.addWidget(self.mcp_stdio_hint)
+        actions = QHBoxLayout()
+        self.mcp_start_button = PrimaryPushButton("", connection_card)
+        self.mcp_stop_button = PushButton("", connection_card)
+        self.mcp_config_button = PushButton("", connection_card)
+        self.mcp_start_button.clicked.connect(self.start_animation_mcp)
+        self.mcp_stop_button.clicked.connect(self.shutdown_animation_mcp)
+        self.mcp_config_button.clicked.connect(self.show_animation_mcp_config)
+        for button in (self.mcp_start_button, self.mcp_stop_button, self.mcp_config_button):
+            actions.addWidget(button)
+        actions.addStretch(1)
+        connection_layout.addLayout(actions)
+        self.mcp_log_toggle = PushButton("", connection_card)
+        connection_layout.addWidget(self.mcp_log_toggle)
+        self.mcp_log = PlainTextEdit(connection_card)
+        self.mcp_log.setReadOnly(True)
+        self.mcp_log.setMaximumBlockCount(200)
+        self.mcp_log.setFixedHeight(130)
+        self.mcp_log.hide()
+        self.mcp_log_toggle.clicked.connect(lambda: self.mcp_log.setVisible(self.mcp_log.isHidden()))
+        connection_layout.addWidget(self.mcp_log)
+
+        guide_card, guide_layout = self._new_settings_card(content, "settingsMcpGuideCard")
+        self.mcp_guide_card = guide_card
+        right_column.addWidget(guide_card)
+        self.mcp_guide_title = SubtitleLabel("", guide_card)
+        self.mcp_guide_hint = CaptionLabel("", guide_card)
+        self.mcp_guide_hint.setWordWrap(True)
+        guide_layout.addWidget(self.mcp_guide_title)
+        guide_layout.addWidget(self.mcp_guide_hint)
+        guide_actions = QHBoxLayout()
+        self.mcp_view_guide_button = PushButton("", guide_card)
+        self.mcp_copy_guide_button = PushButton("", guide_card)
+        self.mcp_save_guide_button = PushButton("", guide_card)
+        self.mcp_view_guide_button.clicked.connect(self.show_animation_mcp_guide)
+        self.mcp_copy_guide_button.clicked.connect(self.copy_animation_mcp_guide)
+        self.mcp_save_guide_button.clicked.connect(self.save_animation_mcp_guide)
+        for button in (self.mcp_view_guide_button, self.mcp_copy_guide_button, self.mcp_save_guide_button):
+            guide_actions.addWidget(button)
+        guide_actions.addStretch(1)
+        guide_layout.addLayout(guide_actions)
+        self.mcp_transport_combo.currentIndexChanged.connect(self._mcp_preferences_changed)
+        self.mcp_port_spin.valueChanged.connect(self._mcp_preferences_changed)
+        self.mcp_workspace_edit.editingFinished.connect(self._mcp_preferences_changed)
+
         main_layout.addStretch(1)
+        self._settings_categories = [
+            ("general", [general_card, runtime_card]),
+            ("live2d", [cubism_card, photoshop_card]),
+            ("spine", [spine_card]),
+            ("resources", [archive_card, asset_card, download_card]),
+            ("ai", [mcp_card, connection_card, guide_card]),
+            ("other", [texture_card]),
+        ]
+        for key, _cards in self._settings_categories:
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, key)
+            item.setSizeHint(QSize(0, 46))
+            self.category_list.addItem(item)
+        self.category_list.currentRowChanged.connect(self._on_settings_category_changed)
+        self.category_list.setCurrentRow(0)
 
-    def show_animation_mcp_config(self):
-        import json
-        from app.core.mcp_launch import animation_mcp_config
+    def _on_settings_category_changed(self, row: int) -> None:
+        if not 0 <= row < len(self._settings_categories):
+            return
+        key, selected = self._settings_categories[row]
+        for _key, cards in self._settings_categories:
+            for card in cards:
+                card.setVisible(card in selected)
+        self.title_label.setText(tr(f"settings.category.{key}"))
+        self.settings_content.layout().activate()
+        QTimer.singleShot(0, self.settings_scroll, lambda: self.settings_scroll.verticalScrollBar().setValue(0))
 
+    def select_settings_category(self, key: str) -> bool:
+        for row, (category, _cards) in enumerate(self._settings_categories):
+            if category == key:
+                self.category_list.setCurrentRow(row)
+                return True
+        return False
+
+    def sync_theme_selection(self, theme: str) -> None:
+        """Update the compatibility combo without reloading settings or models."""
+        self.settings_manager.settings["theme"] = str(theme).lower()
+        self.theme_combo.blockSignals(True)
+        try:
+            self._set_combo_by_value(self.theme_combo, self._theme_values, theme)
+        finally:
+            self.theme_combo.blockSignals(False)
+
+    def _choose_mcp_workspace(self):
         directory = QFileDialog.getExistingDirectory(
             self,
             tr("settings.mcp.workspace"),
-            self.settings_manager.get_output_root(),
+            self.mcp_workspace_edit.text() or self.settings_manager.get_output_root(),
         )
-        if not directory:
-            return
-        configuration = json.dumps(animation_mcp_config(directory), ensure_ascii=False, indent=2)
+        if directory:
+            self.mcp_workspace_edit.setText(directory)
+            self._mcp_preferences_changed()
+
+    def _mcp_connection_options(self) -> dict:
+        return {
+            "workspace": self.mcp_workspace_edit.text().strip(),
+            "transport": self._current_combo_value(self.mcp_transport_combo, self._mcp_transport_values),
+            "port": self.mcp_port_spin.value(),
+        }
+
+    def _mcp_preferences_changed(self, *_args):
+        if not self._syncing_ui:
+            self.settings_manager.set("mcp", self._mcp_connection_options())
+            if self._mcp_process is None:
+                self._mcp_status_key = "settings.mcp.stopped"
+                self._mcp_status_error = ""
+        self._refresh_mcp_ui()
+
+    def _refresh_mcp_ui(self):
+        http = self._mcp_connection_options()["transport"] == "streamable-http"
+        busy = self._mcp_process is not None
+        self.mcp_http_options.setVisible(http)
+        self.mcp_endpoint_row.setVisible(http)
+        self.mcp_stdio_hint.setVisible(not http)
+        self.mcp_start_button.setVisible(http)
+        self.mcp_stop_button.setVisible(http)
+        self.mcp_log_toggle.setVisible(http)
+        if not http:
+            self.mcp_log.hide()
+        self.mcp_endpoint_edit.setText(animation_mcp_endpoint(self.mcp_port_spin.value()))
+        for widget in (self.mcp_transport_combo, self.mcp_port_spin, self.mcp_workspace_edit, self.mcp_workspace_button):
+            widget.setEnabled(not busy)
+        self.mcp_start_button.setEnabled(http and not busy)
+        self.mcp_stop_button.setEnabled(busy and not self._mcp_stopping)
+        self.mcp_status.setText(tr(self._mcp_status_key, error=self._mcp_status_error) if http or self._mcp_status_error else tr("settings.mcp.stdio_owned"))
+
+    def _mcp_error(self, error):
+        self._mcp_status_key = "settings.mcp.failed"
+        self._mcp_status_error = str(error)
+        self._refresh_mcp_ui()
+        self.mcp_log.appendPlainText(str(error))
+
+    def _show_mcp_text(self, title: str, text: str, explanation: str):
         dialog = QDialog(self)
-        dialog.setWindowTitle(tr("settings.mcp.dialog_title"))
-        dialog.resize(760, 460)
+        dialog.setWindowTitle(title)
+        dialog.resize(790, 540)
         layout = QVBoxLayout(dialog)
-        description = BodyLabel(
-            tr("settings.mcp.instructions"),
-            dialog,
-        )
+        description = BodyLabel(explanation, dialog)
         description.setWordWrap(True)
         layout.addWidget(description)
-        editor = QPlainTextEdit(dialog)
+        editor = PlainTextEdit(dialog)
         editor.setReadOnly(True)
-        editor.setPlainText(configuration)
+        editor.setPlainText(text)
         layout.addWidget(editor, 1)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, dialog)
-        copy_button = buttons.addButton(
-            tr("settings.mcp.copy"),
-            QDialogButtonBox.ButtonRole.ActionRole,
-        )
-        copy_button.clicked.connect(lambda: QApplication.clipboard().setText(configuration))
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        copy_button = PushButton(tr("settings.mcp.copy"), dialog)
+        close_button = PushButton(tr("common.close"), dialog)
+        copy_button.clicked.connect(lambda: QApplication.clipboard().setText(text))
+        close_button.clicked.connect(dialog.accept)
+        buttons.addWidget(copy_button)
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
         dialog.exec()
+
+    def show_animation_mcp_config(self):
+        import json
+        try:
+            configuration = json.dumps(animation_mcp_config(**self._mcp_connection_options()), ensure_ascii=False, indent=2)
+        except (OSError, ValueError) as exc:
+            self._mcp_error(exc)
+            return
+        self._show_mcp_text(tr("settings.mcp.dialog_title"), configuration, tr("settings.mcp.instructions"))
+
+    def _animation_mcp_guide_text(self) -> str | None:
+        try:
+            return animation_mcp_guide(**self._mcp_connection_options())
+        except (OSError, ValueError) as exc:
+            self._mcp_error(exc)
+            return None
+
+    def show_animation_mcp_guide(self):
+        guide = self._animation_mcp_guide_text()
+        if guide is not None:
+            self._show_mcp_text(tr("settings.mcp.guide_title"), guide, tr("settings.mcp.guide_generated"))
+
+    def copy_animation_mcp_guide(self):
+        guide = self._animation_mcp_guide_text()
+        if guide is not None:
+            QApplication.clipboard().setText(guide)
+
+    def save_animation_mcp_guide(self):
+        guide = self._animation_mcp_guide_text()
+        if guide is None:
+            return
+        path, _filter = QFileDialog.getSaveFileName(
+            self, tr("settings.mcp.guide_save"),
+            str(Path(self.mcp_workspace_edit.text()) / "animation-ai-guide.md"),
+            tr("settings.mcp.guide_filter"),
+        )
+        if path:
+            try:
+                Path(path).write_bytes(guide.encode("utf-8"))
+            except OSError as exc:
+                self._mcp_error(exc)
+
+    def start_animation_mcp(self) -> bool:
+        if self._mcp_process is not None:
+            return False
+        options = self._mcp_connection_options()
+        if options["transport"] != "streamable-http":
+            return False
+        try:
+            launch = animation_mcp_launch(**options, managed=True)
+        except (OSError, ValueError) as exc:
+            self._mcp_error(exc)
+            return False
+        self._mcp_preferences_changed()
+        self.mcp_log.clear()
+        self._mcp_ready_buffer = ""
+        self._mcp_starting = True
+        self._mcp_stopping = False
+        self._mcp_status_key = "settings.mcp.starting"
+        self._mcp_status_error = ""
+        process = QProcess(self)
+        self._mcp_process = process
+        environment = QProcessEnvironment.systemEnvironment()
+        for key, value in launch.get("env", {}).items():
+            environment.insert(key, value)
+        environment.insert("PYTHONUNBUFFERED", "1")
+        process.setProcessEnvironment(environment)
+        process.setWorkingDirectory(options["workspace"])
+        process.readyReadStandardError.connect(lambda: self._read_mcp_output(process, False))
+        process.readyReadStandardOutput.connect(lambda: self._read_mcp_output(process, True))
+        process.errorOccurred.connect(lambda _error: self._on_mcp_process_error(process))
+        process.finished.connect(lambda code, _status: self._on_mcp_process_finished(process, code))
+        self._refresh_mcp_ui()
+        process.start(launch["command"], launch["args"])
+        return True
+
+    def _read_mcp_output(self, process, stdout: bool):
+        if process is not self._mcp_process:
+            return
+        raw = process.readAllStandardOutput() if stdout else process.readAllStandardError()
+        text = bytes(raw).decode("utf-8", errors="replace")
+        if text:
+            self.mcp_log.appendPlainText(text.rstrip())
+            self._mcp_ready_buffer = (self._mcp_ready_buffer + text)[-4096:]
+            if "LPK_MCP_READY " in self._mcp_ready_buffer and not self._mcp_stopping:
+                self._mcp_starting = False
+                self._mcp_status_key = "settings.mcp.running"
+                self._refresh_mcp_ui()
+
+    def _on_mcp_process_error(self, process):
+        if process is not self._mcp_process:
+            return
+        error = process.errorString()
+        if process.state() == QProcess.ProcessState.NotRunning:
+            self._mcp_process = None
+            self._mcp_starting = False
+            process.deleteLater()
+        self._mcp_error(error)
+
+    def _on_mcp_process_finished(self, process, exit_code: int):
+        if process is not self._mcp_process:
+            return
+        self._read_mcp_output(process, False)
+        self._read_mcp_output(process, True)
+        self._mcp_process = None
+        self._mcp_starting = False
+        if exit_code and not self._mcp_stopping:
+            self._mcp_status_key = "settings.mcp.failed"
+            self._mcp_status_error = self.mcp_log.toPlainText().strip()[-1000:] or str(exit_code)
+        else:
+            self._mcp_status_key = "settings.mcp.stopped"
+            self._mcp_status_error = ""
+        process.deleteLater()
+        self._refresh_mcp_ui()
+
+    def shutdown_animation_mcp(self) -> bool:
+        process = self._mcp_process
+        if process is None:
+            return True
+        self._mcp_stopping = True
+        self._mcp_status_key = "settings.mcp.stopping"
+        self._refresh_mcp_ui()
+        if process.state() == QProcess.ProcessState.Starting:
+            process.waitForStarted(1000)
+        if self._mcp_process is not process:
+            self._mcp_stopping = False
+            return True
+        process.write(b"stop\n")
+        process.closeWriteChannel()
+        if not process.waitForFinished(2000):
+            process.terminate()
+            if not process.waitForFinished(1000):
+                process.kill()
+                process.waitForFinished(1000)
+        finished = self._mcp_process is not process or process.state() == QProcess.ProcessState.NotRunning
+        self._mcp_stopping = False
+        self._refresh_mcp_ui()
+        return finished
+
+    def closeEvent(self, event):
+        if not self.shutdown_animation_mcp():
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def load_current_settings(self):
         self._syncing_ui = True
         try:
+            transport = str(self.settings_manager.get("mcp.transport", "streamable-http"))
+            self._set_combo_by_value(self.mcp_transport_combo, self._mcp_transport_values, transport)
+            self.mcp_workspace_edit.setText(str(self.settings_manager.get("mcp.workspace", self.settings_manager.get_output_dir("animations"))))
+            port = self.settings_manager.get("mcp.port", DEFAULT_MCP_PORT)
+            self.mcp_port_spin.setValue(port if isinstance(port, int) and not isinstance(port, bool) and 1 <= port <= 65535 else DEFAULT_MCP_PORT)
             language = normalize_language_code(self.settings_manager.get("language", "en_US"))
             self._set_combo_by_value(self.language_combo, self._language_codes, language)
 
@@ -993,6 +1330,7 @@ class SettingsPage(QFrame):
             self._update_spine_runtime_selection_ui()
         finally:
             self._syncing_ui = False
+        self._refresh_mcp_ui()
 
     def _set_spine_runtime_advanced_visible(self, visible: bool) -> None:
         for widget in (
@@ -1185,10 +1523,38 @@ class SettingsPage(QFrame):
     def retranslate_ui(self):
         self._syncing_ui = True
         try:
-            self.title_label.setText(tr("settings.title"))
+            for row, (key, _cards) in enumerate(self._settings_categories):
+                self.category_list.item(row).setText(tr(f"settings.category.{key}"))
+            row = max(0, self.category_list.currentRow())
+            self.title_label.setText(tr(f"settings.category.{self._settings_categories[row][0]}"))
             self.mcp_title.setText(tr("settings.mcp.title"))
             self.mcp_description.setText(tr("settings.mcp.description"))
             self.mcp_config_button.setText(tr("settings.mcp.button"))
+            self.mcp_transport_label.setText(tr("settings.mcp.transport_label"))
+            current_transport = self._current_combo_value(self.mcp_transport_combo, self._mcp_transport_values)
+            self.mcp_transport_combo.clear()
+            self.mcp_transport_combo.addItems([tr("settings.mcp.http_transport"), tr("settings.mcp.stdio_transport")])
+            self._set_combo_by_value(self.mcp_transport_combo, self._mcp_transport_values, current_transport)
+            for widget, key in (
+                (self.mcp_workspace_label, "workspace_label"),
+                (self.mcp_workspace_description, "workspace_description"),
+                (self.mcp_workspace_button, "choose_workspace"),
+                (self.mcp_port_label, "port_label"),
+                (self.mcp_port_hint, "port_hint"),
+                (self.mcp_connection_title, "connection_title"),
+                (self.mcp_copy_endpoint_button, "copy_endpoint"),
+                (self.mcp_stdio_hint, "stdio_owned"),
+                (self.mcp_start_button, "start"),
+                (self.mcp_stop_button, "stop"),
+                (self.mcp_log_toggle, "log"),
+                (self.mcp_guide_title, "guide_title"),
+                (self.mcp_guide_hint, "guide_hint"),
+                (self.mcp_view_guide_button, "guide_view"),
+                (self.mcp_copy_guide_button, "guide_copy"),
+                (self.mcp_save_guide_button, "guide_save"),
+            ):
+                widget.setText(tr(f"settings.mcp.{key}"))
+            self._refresh_mcp_ui()
 
             self.language_section_title.setText(tr("settings.section.language"))
             self.language_label.setText(tr("settings.language_label"))

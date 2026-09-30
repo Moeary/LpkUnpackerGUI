@@ -105,6 +105,7 @@ def build_nuitka_args(compiler: str, *, require_native: bool = False) -> list[st
         "--include-package=OpenGL_accelerate",
         "--include-package=psd_tools",
         "--include-package=mcp",
+        "--include-package=uvicorn",
         "--windows-icon-from-ico=assets/app/icon.ico",
         "--nofollow-import-to=matplotlib,scipy,pandas,tkinter",
         "--python-flag=no_site",

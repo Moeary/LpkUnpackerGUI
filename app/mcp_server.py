@@ -1,4 +1,4 @@
-"""Local stdio MCP tools for editing independent animation packages."""
+"""Local stdio / loopback HTTP MCP for independent animation packages."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import os
 import sys
 import threading
 import uuid
+import socket
 from pathlib import Path
 from typing import Annotated, Any, Iterator, Literal, Sequence, TextIO
 
@@ -16,8 +17,13 @@ import anyio
 from mcp.server.stdio import stdio_server
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
-from mcp.types import ToolAnnotations
+from mcp.types import Annotations, ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field
+
+from app.core.mcp_launch import (
+    ANIMATION_GUIDE_URI, DEFAULT_MCP_PORT, MCP_HOST,
+    animation_mcp_endpoint, animation_mcp_guide, bind_animation_mcp_port, validate_mcp_port,
+)
 
 
 JsonObject = dict[str, Any]
@@ -95,8 +101,11 @@ def _tool_annotations(*, read_only: bool = False, idempotent: bool = False) -> T
     )
 
 
-def create_server(workspace: str | Path, *, log_level: str = "WARNING") -> FastMCP:
-    """Build the tools; main() runs them with a protected local stdio transport."""
+def create_server(
+    workspace: str | Path, *, log_level: str = "WARNING",
+    transport: Literal["stdio", "streamable-http"] = "stdio", port: int = DEFAULT_MCP_PORT,
+) -> FastMCP:
+    """Build the same tools and guide for both local transports."""
     from app.core.animation_editing import (
         AnimationEditingError,
         create_animation_project,
@@ -104,6 +113,9 @@ def create_server(workspace: str | Path, *, log_level: str = "WARNING") -> FastM
     )
 
     service = AnimationMCPService(workspace)
+    if transport not in ("stdio", "streamable-http"):
+        raise ValueError("MCP transport must be stdio or streamable-http")
+    validate_mcp_port(port)
     server = FastMCP(
         "LpkUnpacker Animation",
         instructions=(
@@ -112,9 +124,15 @@ def create_server(workspace: str | Path, *, log_level: str = "WARNING") -> FastM
             "keyframes, and save an independent package. Source files are not modified. "
             "All outputs must be new directories inside the configured workspace. "
             "Relative input and output paths are resolved from that workspace. "
-            "Project IDs are valid only for this server session."
+            "Project IDs are valid only for this server process. "
+            f"Read the Markdown resource {ANIMATION_GUIDE_URI} for the current connection and schemas."
         ),
         log_level=log_level,
+        host=MCP_HOST,
+        port=port,
+        streamable_http_path="/mcp",
+        json_response=True,
+        stateless_http=False,
     )
 
     def invoke(operation: Any, *args: Any, **kwargs: Any) -> Any:
@@ -296,6 +314,18 @@ def create_server(workspace: str | Path, *, log_level: str = "WARNING") -> FastM
             del service._projects[project_id]
             return {"project_id": project_id, "closed": True}
 
+    @server.resource(
+        ANIMATION_GUIDE_URI,
+        name="animation-ai-guide",
+        title="Live2D / Spine animation editing guide",
+        description="Current connection, output workspace boundary, workflows, runtime limits and live tool schemas.",
+        mime_type="text/markdown",
+        annotations=Annotations(audience=["assistant"], priority=1.0),
+    )
+    async def animation_ai_guide() -> str:
+        tools = [tool.model_dump(mode="json", exclude_none=True) for tool in await server.list_tools()]
+        return animation_mcp_guide(service.workspace, transport=transport, port=port, tool_schemas=tools)
+
     return server
 
 
@@ -337,20 +367,87 @@ async def _run_stdio(server: FastMCP, protocol_output: TextIO) -> None:
         )
 
 
+async def _run_http(server: FastMCP, listener: socket.socket, managed: bool) -> None:
+    """Serve the SDK ASGI app using one reserved IPv4 loopback listener."""
+    import uvicorn
+
+    configuration = uvicorn.Config(
+        server.streamable_http_app(), host=MCP_HOST, port=server.settings.port,
+        log_level=server.settings.log_level.lower(), access_log=False,
+        loop="asyncio", http="h11", ws="none", lifespan="on",
+        timeout_graceful_shutdown=2,
+    )
+    http_server = uvicorn.Server(configuration)
+    if managed:
+        # The GUI owns this stdin pipe. EOF also stops the child when its
+        # parent exits unexpectedly; raw reads avoid buffered-I/O daemon locks.
+        stdin_fd = sys.stdin.fileno()
+
+        def control() -> None:
+            pending = b""
+            try:
+                while not http_server.should_exit:
+                    chunk = os.read(stdin_fd, 256)
+                    if not chunk:
+                        break
+                    pending = (pending + chunk)[-512:]
+                    if any(line.strip().lower() == b"stop" for line in pending.split(b"\n")):
+                        break
+                http_server.should_exit = True
+            except OSError:
+                http_server.should_exit = True
+
+        threading.Thread(target=control, name="mcp-parent-control", daemon=True).start()
+
+    async def announce_ready() -> None:
+        while not http_server.started and not http_server.should_exit:
+            await anyio.sleep(0.025)
+        if http_server.started:
+            print(f"LPK_MCP_READY {animation_mcp_endpoint(server.settings.port)}", file=sys.stderr, flush=True)
+
+    async with anyio.create_task_group() as group:
+        group.start_soon(announce_ready)
+        try:
+            await http_server.serve(sockets=[listener])
+        finally:
+            group.cancel_scope.cancel()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Local Live2D/Spine animation MCP server (stdio only; no listening port).",
+        description="Local Live2D/Spine animation MCP (stdio or Streamable HTTP on 127.0.0.1).",
     )
     parser.add_argument("--workspace", required=True, help="Existing writable directory containing all saved animation packages.")
     parser.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="WARNING", help="Diagnostic logging on stderr (default: WARNING).")
+    parser.add_argument("--transport", choices=("stdio", "streamable-http"), default="stdio", help="stdio (client-owned, default) or local Streamable HTTP.")
+    parser.add_argument("--port", type=int, default=DEFAULT_MCP_PORT, help=f"Loopback HTTP port, 1..65535 (default: {DEFAULT_MCP_PORT}); unused for stdio.")
+    parser.add_argument("--managed", action="store_true", help="HTTP child process stops on stdin 'stop' or EOF; used by the GUI.")
     args = parser.parse_args(argv)
+    try:
+        validate_mcp_port(args.port)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.managed and args.transport != "streamable-http":
+        parser.error("--managed requires --transport streamable-http")
     logging.basicConfig(level=args.log_level, format="%(levelname)s %(name)s: %(message)s", stream=sys.stderr)
     with _protocol_stdout() as protocol_output:
         try:
-            server = create_server(args.workspace, log_level=args.log_level)
+            server = create_server(args.workspace, log_level=args.log_level, transport=args.transport, port=args.port)
         except (OSError, ValueError) as exc:
             parser.error(str(exc))
-        anyio.run(_run_stdio, server, protocol_output)
+        if args.transport == "stdio":
+            anyio.run(_run_stdio, server, protocol_output)
+        else:
+            try:
+                listener = bind_animation_mcp_port(args.port)
+            except ValueError as exc:
+                parser.error(str(exc))
+            try:
+                anyio.run(_run_http, server, listener, args.managed)
+            except KeyboardInterrupt:
+                return 0
+            finally:
+                listener.close()
     return 0
 
 

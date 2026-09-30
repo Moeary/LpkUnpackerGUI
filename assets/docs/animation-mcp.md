@@ -6,7 +6,24 @@ AI 客户端可通过本地 MCP 工具检查模型、新建或克隆动作、读
 
 ## 启动和连接
 
-程序设置页的“AI 动画编辑 · MCP → 生成 MCP 客户端配置…”会让用户选择一个已有的可写工作目录，并生成客户端启动配置。配置中的解释器或可执行文件是当前正在运行程序的路径；源码模式附带绝对 `PYTHONPATH`，无需客户端从项目目录启动。生成配置不会自动修改 AI 客户端的设置。
+打开“工具设置 → AI / MCP”。此分类按传输方式、连接与服务、AI 指南分为三张卡片。选择与源模型目录分开的“输出工作目录”；输入模型可以在其他目录，生成的新模型包必须保存到输出工作目录内。
+
+默认使用本地 Streamable HTTP：端口默认 `8765`，可改为 `1..65535` 的可用端口。点击“启动服务”，等待“运行中”，再复制地址或生成客户端配置。服务实际仅监听 `127.0.0.1`，路径固定为 `/mcp`。端口占用会显示具体地址和错误，可查看日志；更改端口前先停止服务。停止服务或正常退出程序会关闭子进程；应用意外退出时，父进程管道的 EOF 也会令服务停止。未保存的内存项目会随服务停止而丢失。
+
+HTTP 客户端配置示例（不同客户端的传输名称与格式可能不同）：
+
+```json
+{
+  "mcpServers": {
+    "live2d-spine-animation": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp"
+    }
+  }
+}
+```
+
+选择 stdio 时，端口和应用内启动按钮隐藏；AI 客户端负责启动与停止进程。配置中的解释器或可执行文件是当前程序的路径；源码模式附带绝对 `PYTHONPATH`，无需客户端从项目目录启动。生成配置不会自动修改客户端设置。
 
 配置采用常见的 `mcpServers` JSON 格式，各客户端使用自己的配置格式。下面的 JSON 适用于支持此格式的客户端，需要替换为本机路径；它不是 Codex `config.toml` 内容。
 
@@ -31,11 +48,21 @@ pixi install
 New-Item -ItemType Directory -Force D:\AnimationEdits
 pixi run mcp-animation --help
 pixi run mcp-animation --workspace D:\AnimationEdits
+# HTTP 手动启动；Ctrl+C 停止
+pixi run mcp-animation --workspace D:\AnimationEdits --transport streamable-http --port 8765
 ```
 
 也可使用统一入口 `pixi run python -m app.main --mcp-animation --workspace D:\AnimationEdits`。打包程序的入口为 `LpkUnpackerGUI.exe --mcp-animation --workspace D:\AnimationEdits`；本次未构建并实测新的打包程序。
 
-服务仅提供 stdio，客户端按需启动并管理进程，不监听端口。直接在终端启动后会等待 MCP 请求，属于正常行为。诊断写入 stderr；协议 stdout 具有独立管道，Python 输出、原生 DLL 输出均转入 stderr。`--log-level DEBUG|INFO|WARNING|ERROR` 控制诊断级别，默认为 `WARNING`。
+CLI 默认仍为 stdio；直接在终端启动后会等待 MCP 请求。`--transport streamable-http --port 8765` 启用本地 HTTP；`--managed` 专用于应用内子进程，收到 stdin 的 `stop` 或 EOF 就退出。诊断写入 stderr；stdio 协议 stdout 具有独立管道，Python 输出、原生 DLL 输出均转入 stderr。`--log-level DEBUG|INFO|WARNING|ERROR` 控制诊断级别，默认为 `WARNING`。
+
+## AI Markdown 指南
+
+“查看指南 / 复制 Markdown / 另存指南”生成可直接交给 AI 的完整 Markdown，其中填入当前传输、实际端口与地址、绝对输出目录、当前解释器或打包程序路径、通用客户端配置，以及从已注册工具生成的完整 JSON schema。复制和另存保留同一份 UTF-8 Markdown 内容；需要换电脑或目录时，应重新生成配置与指南。
+
+连接 MCP 后，客户端也可以通过 `resources/list` 找到 `lpk-animation://guide`，再用 `resources/read` 读取 `text/markdown` 指南。它提供相同的连接信息、文件边界、工作流和运行时限制；`tools/list` 仍是工具 schema 的权威来源。
+
+仓库内 [animation-ai-guide.md](animation-ai-guide.md) 是含占位符的模板，不能直接作为本机配置。设置页和 MCP resource 返回的是已填入实际路径与实时 schema 的版本。输入读取并不局限于 workspace；仅输出路径受该目录约束，指南对此有明确说明。
 
 ## 工具与数据
 
@@ -61,7 +88,7 @@ pixi run mcp-animation --workspace D:\AnimationEdits
 
 ## Live2D
 
-支持 Cubism Version 3 的 `.model3.json`。参数 ID、最小值、最大值与默认值由本机 Cubism Core 从 `.moc3` 读取；使用已有 `.cdi3.json` 补充参数名称。若原生 Core 不可用，需要与 MOC SHA256 匹配的参数清单文件，此时结果会注明 `inventory_source="sidecar"` 和警告。保存的副本自动包含该清单，便于重新打开。
+支持含 `FileReferences` 的 Cubism Version 3 模型 JSON，常见名称为 `.model3.json`，也可以是 `.model0.json`。参数 ID、最小值、最大值与默认值由本机 Cubism Core 从 `.moc3` 读取；使用已有 `.cdi3.json` 补充参数名称。若原生 Core 不可用，需要与 MOC SHA256 匹配的参数清单文件，此时结果会注明 `inventory_source="sidecar"` 和警告。保存的副本自动包含该清单，便于重新打开。
 
 清单格式如下；范围应来自该模型的实际参数检查，哈希仅确认它对应相同的 MOC 文件。
 
@@ -131,10 +158,10 @@ MCP 只能驱动模型已经具备的参数。模型没有腿部或蹲姿参数�
 ## 验证
 
 ```powershell
-pixi run python -m unittest discover -s tests -p test_animation_mcp.py -v
+pixi run python -m unittest tests.test_mcp_launch tests.test_animation_mcp tests.test_animation_mcp_http tests.test_mcp_settings tests.test_settings_page_layout tests.test_editor_navigation tests.test_build_nuitka -v
 pixi run check
 ```
 
-测试使用官方 `stdio_client` / `ClientSession` 启动实际子进程，执行 initialize、list_tools、call_tool，检查 Live2D/Spine 导出、克隆、合并、源文件保留、目录越界与 junction 拒绝，以及 Python/原生 stdout 隔离。
+测试使用官方 `stdio_client` / `streamable_http_client` / `ClientSession` 启动实际子进程，执行 initialize、list_tools、resources/list、resources/read、call_tool，检查 Live2D/Spine 导出、克隆、合并、源文件保留、目录越界与 junction 拒绝，以及 Python/原生 stdout 隔离。HTTP 验证实际端口、端口占用错误、父管道 EOF 与停止命令、监听端口释放、非本地 Host/Origin 拒绝；Qt 验证真实子进程关闭回收、端口偏好保存、stdio 隐藏端口，以及指南查看/复制/另存内容一致。
 
 真实模型可再通过 `scripts/verify_animation_mcp.py --workspace <新工作目录> --spine <Spine模型> --reference-spine <参考Spine模型> --live2d <Live2D模型>` 走协议验收，报告保存为 `acceptance.json`。指定的模型须具有脚本使用的骨骼或参数；该脚本针对项目当前 Belfast、Spineboy、Diana 样本。自动测试中的 Live2D 清单 fixture 不调用无效 MOC 的原生 DLL。

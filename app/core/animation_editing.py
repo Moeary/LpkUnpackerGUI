@@ -20,6 +20,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Mapping, Sequence
@@ -32,6 +33,24 @@ class AnimationEditingError(ValueError):
 INVENTORY_FORMAT = "LpkUnpacker.Live2DParameterInventory"
 PROJECT_FORMAT = "LpkUnpacker.AnimationEditingProject"
 _MANIFEST = "lpk_animation_project.json"
+
+
+def _rename_directory(source: Path, output: Path) -> None:
+    """Publish a new package, tolerating brief Windows antivirus locks.
+
+    A target that appeared meanwhile is never replaced. All other failures
+    remain visible, including a persistent PermissionError after one second.
+    """
+    for attempt in range(6):
+        if output.exists():
+            raise AnimationEditingError("Output appeared during export; refusing to overwrite it.")
+        try:
+            source.rename(output)
+            return
+        except PermissionError:
+            if os.name != "nt" or attempt == 5 or output.exists():
+                raise
+            time.sleep(0.2)
 
 
 def _number(value: Any, label: str) -> float:
@@ -533,7 +552,7 @@ class AnimationEditingProject:
                 target.write_text(json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
             if output.exists():
                 raise AnimationEditingError("Output appeared during export; refusing to overwrite it.")
-            stage.rename(output)
+            _rename_directory(stage, output)
         return {"output_dir": str(output), "model_path": str(output / model_rel),
                 "skeleton_path": str(output / skeleton_rel) if self.kind == "spine" else None,
                 "manifest_path": str(output / _MANIFEST),

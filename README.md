@@ -1,20 +1,21 @@
 # LpkUnpackerGUI
 
-面向 Live2D 资源处理的桌面工具箱。
+面向 Live2D、Spine 与图片资源处理的桌面工具箱。
 
-它最初用于解包 Live2DViewerEX 的 LPK 文件，如今已经扩展为一套覆盖“资源提取与预览 → PSD 分层编辑与贴图回写 → Live2DViewerEX MOD 制作”的完整工作流。无论来源是 LPK、WPK、Unity 资源、压缩包还是已经解包的模型目录，都可以从同一个程序开始处理。
+它最初用于解包 Live2DViewerEX 的 LPK 文件，如今支持资源提取与预览、Live2D / Spine 轻编辑、PSD 分层编辑与贴图回写，以及 Live2DViewerEX MOD 制作。无论来源是 LPK、WPK、Unity 资源、压缩包还是已经解包的模型目录，都可以从同一个程序开始处理。
 
 > 当前主要面向 Windows。少部分早期 LPK 可能使用未知的密钥生成或加密方式，仍然无法解包。
 
 遇到问题时，请先搜索或提交 [Issues](https://github.com/ihopenot/LpkUnpacker/issues)。
 
-## 三大核心模块
+## 主要模块
 
 | 模块 | 解决的问题 | 主要产物 |
 | --- | --- | --- |
-| 资源提取与预览 | 从 LPK、WPK、Unity、压缩包及文件夹中发现、提取并查看 Live2D、图片等资源 | 完整解包目录、贴图目录、可预览模型 |
+| 资源提取与预览 | 从 LPK、WPK、Unity、压缩包及文件夹中发现、提取并查看 Live2D、Spine 和图片 | 完整解包目录、贴图目录、可预览模型 |
+| Live2D 编辑器 | 调整已有参数、动作关键帧与贴图；右侧“MOD 管理”保留原工程工作流 | 模型与动作完整副本、Live2DViewerEX MOD |
+| Spine 编辑器 | 编辑骨骼姿态、动作、slot / attachment、图层顺序与图集部件 | 骨骼 JSON、atlas、贴图及编辑记录的独立副本 |
 | Live2D PSD 工程 | 把运行时 Live2D 转成可编辑 PSD，并将修改后的图层重新写回贴图 PNG | PSD、`.lpkpsd.json`、回写贴图和版本记录 |
-| Live2DViewerEX MOD 工程 | 把主模型和多个贴图版本整理成可点击换装的 MOD | 可继续上传创意工坊的 Live2DViewerEX 文件夹 |
 
 ```text
 游戏资源 / MOD 包
@@ -24,7 +25,9 @@
         │
         ├──────────────► PSD 工程 ──► 编辑 PSD ──► 回写贴图
         │
-        └──────────────► MOD 工程 ──► 多皮肤与 ArtMesh 换装 ──► 创意工坊目录
+        ├──────────────► Live2D 编辑器 ──► 动作 / 贴图副本 ──► MOD 管理
+        │
+        └──────────────► Spine 编辑器 ──► 骨骼 / 动画 / 图集副本
 ```
 
 ## 快速开始
@@ -33,9 +36,9 @@
 
 1. 从 [Releases](https://github.com/ihopenot/LpkUnpacker/releases) 下载最新的 `LpkUnpackerGUI.exe`。
 2. 运行程序。
-3. 根据任务进入“资源解包”“资源预览”“PSD 工作台”或“Live2DViewerEX MOD 工程”。
+3. 先在“资源预览”打开来源；发现有效 Live2D / Spine 模型后，点击“打开 Live2D 编辑器”或“打开 Spine 编辑器”。也可直接从主侧栏进入编辑器、资源解包或 PSD 工作台。
 4. 大部分来源都可以直接拖入对应页面；输出目录可在设置中统一修改。
-5. 设置页可选择已安装的界面字体、调整字号或恢复默认；自动字体优先选择支持中日韩字符的字体，图标字体保持独立。
+5. 设置左侧按“通用 / Live2D 工具 / Spine 工具 / 资源与工具下载 / AI / MCP / 其他”分类，右侧滚动显示配置。字体、语言与输出路径在“通用”；明暗主题按钮位于主侧栏“工具设置”正上方，切换后自动保存。
 
 ### 从源码运行
 
@@ -54,15 +57,16 @@ pixi run check
 
 ### AI 动画编辑（MCP）
 
-设置页的“AI 动画编辑 · MCP”可生成客户端配置。服务通过本地 stdio 通信，由 MCP 客户端按需启动，也可从源码运行：
+设置页“AI / MCP”可选本地 Streamable HTTP 或 stdio。HTTP 仅监听 `127.0.0.1`，端口默认 `8765` 并可修改；在应用内启动/停止服务，复制地址或客户端配置。stdio 由 MCP 客户端按配置启动。CLI 默认 stdio，也可启用 HTTP：
 
 ```powershell
 pixi run mcp-animation --workspace "D:\AnimationWorkspace"
+pixi run mcp-animation --workspace "D:\AnimationWorkspace" --transport streamable-http --port 8765
 ```
 
 可读取 Live2D 参数范围或 Spine 骨骼结构，新建动作、修改关键帧，再将模型与动作另存为工作目录内的独立副本。Live2D 使用 `.motion3.json`，Spine 使用骨骼 JSON 动画；原模型不被覆盖。新动作只能使用模型已有的绑定，缺少腿部参数的 Live2D 模型不能凭空生成屈膝形变。
 
-连接方式、工具调用顺序和限制见 [动画 MCP 使用说明](assets/docs/animation-mcp.md)。
+“查看 / 复制 / 另存指南”会生成包含实际连接、输出目录与完整工具 schema 的 Markdown，AI 也可读取 MCP resource `lpk-animation://guide`。输入模型可在其他目录；保存仅限输出工作目录内的新副本，不覆盖原模型。连接示例、工具调用顺序和限制见 [动画 MCP 使用说明](assets/docs/animation-mcp.md)；仓库 [AI 指南](assets/docs/animation-ai-guide.md) 是模板，应用生成的是本机实际配置。
 
 ## 一、资源提取与预览
 
@@ -75,9 +79,9 @@ pixi run mcp-animation --workspace "D:\AnimationWorkspace"
 | `.lpk` | 识别包内容并解包；需要时自动匹配同目录的 `config.json` |
 | `.wpk` | 先拆出内部 LPK 和配置，再继续处理其中的 LPK |
 | Unity 资源 | 支持 `.assets`、`.sharedassets`、`.bundle`、`.unity3d` 等来源 |
-| Spine 图集 | 统一预览支持 Spine 来源；atlas 解析与副本回写 core 保留供后续编辑器和图像工作流复用 |
+| Spine 骨骼与图集 | 预览 JSON / SKEL / `model0.json`；进入 Spine 编辑器后可编辑已有骨骼、动画和图集部件 |
 | 文件夹 | 递归扫描其中的 LPK、WPK、Unity 资源和已解包 Live2D 模型 |
-| `.zip` / `.7z` / `.rar` | 在统一预览中临时解压，再查找 Live2D 模型和图片 |
+| `.zip` / `.7z` / `.rar` | 在统一预览中临时解压，再查找 Live2D、Spine 模型和图片 |
 | 已解包模型 | 支持 `model3.json`、`.moc3`、模型目录和常见贴图文件 |
 
 LPK 已支持 `STD_1_0` 及更早的常见格式。Steam 创意工坊中的 LPK 通常需要对应的 `config.json` 才能正确解密。
@@ -113,13 +117,24 @@ LPK 解包演示：
 - 临时提取 Unity 图片进行查看，不污染正式输出目录。
 - 从 ZIP/7Z/RAR 中寻找可预览内容。
 - 将当前预览资源另行导出。
-- 调整 Live2D 参数并保存为 PSD 工程可使用的姿态参数方案。
+- 发现有效模型后打开对应编辑器；图片预览不显示编辑器按钮。
 
-统一 Spine 预览默认将非 `3.8.75` 骨骼转换到缓存副本后再加载，因此只需准备匹配的 Spine `3.8.75` native runtime。预览需要随项目构建的 Spine converter DLL；转换缓存会按骨骼、atlas、贴图和 converter 内容复用，源文件始终保持不变。设置中的“统一 Spine 预览”开关可以关闭这一行为，改为使用源版本运行时；该开关与正式解包/导出的自动转换设置相互独立。跨版本转换可能改变动画、约束或曲线效果，界面会显示源版本到 `3.8.75` 的提示。
+默认启用的“Spine 兼容模式”统一使用 `3.8.75`：预览把其他版本转换到缓存副本，正式提取也使用兼容版本，并在官方 CLI 可用时独立生成 `.spine` 编辑工程。可在“Spine 工具”关闭兼容模式，使用与来源匹配的已验证原生运行时。跨版本转换可能改变动画、约束或曲线效果，界面会显示源版本到 `3.8.75` 的提示；从预览进入编辑器时使用当前实际预览的模型与依赖资源。
+
+### 从预览进入编辑器
+
+统一预览保留模型播放、图片浏览与资源导出。参数、骨骼和关键帧编辑集中在各自编辑页，切换页面会暂停隐藏页播放。
+
+- **Live2D 编辑器**：参数列表实时驱动模型，动作时间线支持关键帧与线性、阶梯、反向阶梯、贝塞尔曲线；贴图标签可调用外部图片编辑器，保存工作贴图后自动重载。右侧“MOD 管理”保留原 MOD 工程；“将当前编辑用于 MOD”先保存完整副本再导入。
+- **Spine 编辑器**：骨骼树、图层与图集选择联动原生预览，可编辑设置姿态、骨骼动画、slot / attachment 与部件 PNG。支持的数值轨道使用同一时间线与曲线工具，不支持编辑的运行时数据会保留。
+
+两页都先复制模型与依赖到独立工作会话，修改不会覆盖原文件；另存到新目录后，可重新打开副本继续编辑。程序编辑已有运行时绑定，不会还原官方 `.cmo3` / `.spine` 创作工程，Live2D 也不能凭空增加原模型没有的形变参数。简短操作步骤见 [编辑器工作流](assets/docs/editor-workflow.md)。
+
+两编辑器使用 Fluent 控件，可拖动左右与上下分隔条调整预览、编辑面板和时间轴，分别收起或恢复各面板，并记住布局；“重置布局”可恢复默认视图。MOD 管理保留“工程 / 模型与皮肤 / 换装与导出”三个工作页及完整导入、配置和导出入口。
 
 ### Spine 图集能力
 
-应用已移除独立的 Spine 图集工作台入口。统一预览仍可查看支持的 Spine 来源；`app/core/spine_atlas.py` 保留 atlas 解析、区域导出和副本回写能力，供后续编辑器与图像工作流接入，原始 atlas、骨骼文件和源贴图不会被隐式覆盖。
+Spine 图集部件已并入 Spine 编辑器。选择部件可查看原始尺寸、导出 PNG 或用同尺寸 PNG 替换；旋转、裁边与预乘 Alpha 由共享 atlas core 处理。另存时写入独立副本，原始 atlas、骨骼文件和源贴图保持不变。
 
 ### Spine 版本转换
 
@@ -150,7 +165,7 @@ runtime/output/psd_projects/<工程名>/
 ### 建议工作流
 
 1. 拖入 `model3.json`、`.moc3` 或完整模型文件夹并创建 PSD 工程。
-2. 选择默认初始姿态，或先在统一预览中调整模型并保存一套参数方案。
+2. 选择默认初始姿态，或使用 PSD 工程中已有的参数预设与姿态方案。
 3. 根据编辑目标导出 PSD。
 4. 在 Photoshop 或其他兼容软件中修改图层。
 5. 保留配套的 `.lpkpsd.json` 元数据，通过“PSD 回写”生成新的贴图 PNG。
@@ -202,7 +217,7 @@ PSD 工作台中的“ArtMesh 静态检查器”可从导出的 metadata 打开�
 
 ## 三、Live2DViewerEX MOD 工程
 
-MOD 工程用于把同一模型的多个贴图或模型版本整理成皮肤，并在主模型上绑定一个 ArtMesh/HitArea 作为换装入口。工程使用 `project.live2dviewer_mod.json` 保存，不修改原始来源。
+MOD 工程位于 Live2D 编辑器右侧“MOD 管理”标签，用于把同一模型的多个贴图或模型版本整理成皮肤，并在主模型上绑定一个 ArtMesh/HitArea 作为换装入口。工程使用 `project.live2dviewer_mod.json` 保存，不修改原始来源。
 
 Live2DViewerEX MOD 预览图:
 
@@ -339,6 +354,7 @@ AssetStudio/AssetStudioModCLI 作为外部命令行工具随包提供，采用 M
 - [x] Unity 图片及 Live2D 候选资源提取
 - [x] ZIP/7Z/RAR、Live2D、图片和 Unity 资源统一预览
 - [x] 原生 Live2D / Spine 预览与高 DPI 抗锯齿
+- [x] Live2D / Spine 编辑器、关键帧时间线与曲线、独立副本另存
 - [x] Live2D PSD 工程、参数姿态、PSD 导出与贴图回写
 - [x] 多 PSD 优先级合成和回写版本预览
 - [x] Live2DViewerEX 多皮肤 MOD 工程

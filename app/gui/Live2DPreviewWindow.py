@@ -87,6 +87,7 @@ class Live2DPreviewWindow(QWidget):
         super().__init__(parent)
         self.model_path = model_path
         self._embedded = bool(embedded)
+        self._editor_mode = False
         self.i18n = get_i18n()
         self.live2d_canvas = None
         self.live2d_container = None
@@ -537,6 +538,10 @@ class Live2DPreviewWindow(QWidget):
         return {"id": hit_id or label, "name": label, "rect": rect, "words": words}
 
     def eventFilter(self, obj, event):
+        if self._editor_mode and obj is self.live2d_canvas and event.type() in (
+            QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease,
+        ):
+            return False
         if obj in {self.quick_motion_panel, self.quick_motion_title} and self.quick_motion_panel:
             try:
                 if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
@@ -907,6 +912,19 @@ class Live2DPreviewWindow(QWidget):
         if not self.live2d_canvas:
             return {}
         return self.live2d_canvas.setMotionTime(motion, float(seconds))
+
+    def set_editor_mode(self, enabled: bool = True):
+        self._editor_mode = bool(enabled)
+        if self.live2d_canvas:
+            self.live2d_canvas.setEditorInteraction(enabled)
+
+    def set_rendering_active(self, active: bool):
+        if self.live2d_canvas:
+            self.live2d_canvas.setRenderingActive(active)
+
+    def set_part_opacity_overrides(self, values: dict[str, float], defaults: dict[str, float] | None = None):
+        if self.live2d_canvas:
+            self.live2d_canvas.setPartOpacityOverrides(values, defaults)
 
     def toggle_control_panel(self):
         """切换控制面板显示/隐藏"""

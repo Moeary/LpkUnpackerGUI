@@ -101,7 +101,8 @@ with _protocol_stdout() as protocol:
                     capture_output=True, text=True, encoding="utf-8", timeout=15,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn("stdio only", result.stdout)
+                self.assertIn("Streamable HTTP", result.stdout)
+                self.assertIn("--port", result.stdout)
                 self.assertNotIn("QFluent", result.stdout + result.stderr)
                 self.assertNotIn("Runtime log:", result.stdout)
                 invalid = subprocess.run(
@@ -162,6 +163,13 @@ class AnimationMCPProtocolTests(unittest.IsolatedAsyncioTestCase):
         model.write_text(json.dumps(original), encoding="utf-8")
         before = model.read_bytes()
         async with self._client(application_entry=True) as client:
+            resources = (await client.list_resources()).resources
+            self.assertEqual([str(resource.uri) for resource in resources], ["lpk-animation://guide"])
+            guide = (await client.read_resource("lpk-animation://guide")).contents[0].text
+            self.assertIn(str(self.workspace).replace("\\", "\\\\"), guide)
+            self.assertIn('"transport": "stdio"', guide)
+            self.assertIn('"endpoint": null', guide)
+            self.assertNotIn("{{", guide)
             tools = (await client.list_tools()).tools
             self.assertEqual({tool.name for tool in tools}, {
                 "inspect_model", "create_project", "inspect_project", "create_animation",

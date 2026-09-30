@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import uuid
 import zipfile
 from pathlib import Path
 
@@ -1701,6 +1702,7 @@ class SpineAnimationControls(CardWidget):
 
 class PreviewPage(QFrame):
     poseSchemeRequested = Signal(dict)
+    editorRequested = Signal(str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1716,6 +1718,14 @@ class PreviewPage(QFrame):
         self.preview_stage_layout = None
         self.preview_stage_close_btn = None
         self.export_preview_btn = None
+        self.open_editor_btn = None
+        self._editor_source = None
+        self._editor_source_leases = {}
+        self._editor_leased_dirs = {}
+        self._deferred_preview_temp_dirs = set()
+        self._preview_page_active = None
+        self._native_playback_suspended = False
+        self._resume_spine_paused = False
         self.preview_dock_area = None
         self.preview_dock_layout = None
         self.preview_placeholder = None
@@ -1994,16 +2004,26 @@ class PreviewPage(QFrame):
         self.preview_stage_layout.setContentsMargins(12, 10, 12, 12)
         self.preview_stage_layout.setSpacing(8)
 
-        stage_toolbar = QHBoxLayout()
+        stage_toolbar = QVBoxLayout()
         stage_toolbar.setContentsMargins(0, 0, 0, 0)
         stage_toolbar.setSpacing(8)
-        stage_toolbar.addStretch(1)
+        editor_toolbar = QHBoxLayout()
+        self.open_editor_btn = PushButton("", self.preview_stage)
+        self.open_editor_btn.setIcon(FluentIcon.EDIT)
+        self.open_editor_btn.clicked.connect(self._request_model_editor)
+        self.open_editor_btn.hide()
+        editor_toolbar.addWidget(self.open_editor_btn)
+        editor_toolbar.addStretch(1)
+        stage_toolbar.addLayout(editor_toolbar)
+        resource_toolbar = QHBoxLayout()
+        resource_toolbar.setSpacing(8)
+        resource_toolbar.addStretch(1)
 
         self.export_preview_btn = PushButton("", self.preview_stage)
         self.export_preview_btn.setIcon(FluentIcon.DOWNLOAD)
         self.export_preview_btn.setEnabled(False)
         self.export_preview_btn.clicked.connect(self.export_preview_resources)
-        stage_toolbar.addWidget(self.export_preview_btn, 0, Qt.AlignRight)
+        resource_toolbar.addWidget(self.export_preview_btn)
 
         self.preview_stage_close_btn = PushButton("", self.preview_stage)
         self.preview_stage_close_btn.setText("X")
@@ -2024,7 +2044,8 @@ class PreviewPage(QFrame):
             }
         """)
         self.preview_stage_close_btn.clicked.connect(self.close_preview_window)
-        stage_toolbar.addWidget(self.preview_stage_close_btn, 0, Qt.AlignRight)
+        resource_toolbar.addWidget(self.preview_stage_close_btn)
+        stage_toolbar.addLayout(resource_toolbar)
         self.preview_stage_layout.addLayout(stage_toolbar)
 
         self.preview_dock_area = QFrame(self.preview_stage)
@@ -2042,6 +2063,7 @@ class PreviewPage(QFrame):
 
         self.preview_placeholder = BodyLabel("", self.preview_dock_area)
         self.preview_placeholder.setAlignment(Qt.AlignCenter)
+        self.preview_placeholder.setWordWrap(True)
         self.preview_placeholder.setStyleSheet("color: palette(placeholder-text);")
         self.preview_dock_layout.addWidget(self.preview_placeholder, 1)
 
@@ -2095,7 +2117,7 @@ class PreviewPage(QFrame):
         motion_button_row.addWidget(self.play_motion_btn, 1)
         motion_layout.addLayout(motion_button_row)
 
-        motion_option_row = QHBoxLayout()
+        motion_option_row = QVBoxLayout()
         self.loop_motion_check = CheckBox("", self.motion_group)
         self.loop_motion_check.toggled.connect(self.on_motion_loop_changed)
         motion_option_row.addWidget(self.loop_motion_check)
@@ -2175,6 +2197,11 @@ class PreviewPage(QFrame):
         pose_layout.addWidget(self.save_pose_scheme_btn)
         action_layout.addWidget(self.pose_controls_card)
         action_layout.addWidget(self.advanced_panel, 1)
+        # Parameter authoring belongs to the dedicated Live2D editor. Keep
+        # compatibility controls for existing pose callbacks without showing
+        # a second editing surface in the unified preview.
+        self.pose_controls_card.hide()
+        self.advanced_panel.hide()
 
         # 添加到分割器
         splitter.addWidget(left_widget)
@@ -2271,6 +2298,7 @@ class PreviewPage(QFrame):
         if self.spine_controls:
             self.spine_controls.retranslate_ui()
         self._update_sidebar_button_text()
+        self._update_editor_button()
 
         if not self.current_model_path and not (
             self.image_preview_panel and self.image_preview_panel.isVisible()
@@ -2281,6 +2309,136 @@ class PreviewPage(QFrame):
             self.motion_combo.addItem(tr("preview.motion_none"))
             self.motion_combo.setEnabled(False)
             self.play_motion_btn.setEnabled(False)
+
+    def _set_editor_source(self, kind: str | None = None, path: str | None = None):
+        self._editor_source = (kind, os.path.abspath(path)) if kind and path and os.path.isfile(path) else None
+        self._update_editor_button()
+
+    def _update_editor_button(self):
+        button = self.open_editor_btn
+        if button is None:
+            return
+        valid = self._editor_source is not None and os.path.isfile(self._editor_source[1])
+        button.setVisible(valid)
+        button.setEnabled(valid)
+        if valid:
+            button.setText(tr(f"preview.open_{self._editor_source[0]}_editor"))
+
+    def current_editor_source(self):
+        if self._editor_source and os.path.isfile(self._editor_source[1]):
+            return self._editor_source
+        return None
+
+    def _request_model_editor(self):
+        source = self.current_editor_source()
+        if source is not None:
+            self.editorRequested.emit(*source)
+        else:
+            self._update_editor_button()
+
+    def acquire_editor_source(self, model_path: str):
+        """Lease preview workspaces while an editor copies its own session."""
+        source = Path(model_path).resolve()
+        roots = set()
+        for name in ("_model_preview_temp_dirs", "_spine_preview_temp_dirs", "_archive_preview_temp_dirs", "_folder_preview_temp_dirs"):
+            for directory in getattr(self, name, ()):
+                root = str(Path(directory).resolve())
+                if source.is_relative_to(Path(root)):
+                    roots.add(root)
+        if not roots:
+            return None
+        token = uuid.uuid4().hex
+        self._editor_source_leases[token] = roots
+        for root in roots:
+            self._editor_leased_dirs[root] = self._editor_leased_dirs.get(root, 0) + 1
+        return token
+
+    def release_editor_source(self, token):
+        for root in self._editor_source_leases.pop(token, ()):
+            count = self._editor_leased_dirs.get(root, 0) - 1
+            if count > 0:
+                self._editor_leased_dirs[root] = count
+                continue
+            self._editor_leased_dirs.pop(root, None)
+            if root in self._deferred_preview_temp_dirs:
+                self._deferred_preview_temp_dirs.discard(root)
+                self._dispose_preview_temp_dir(root)
+
+    def _dispose_preview_temp_dir(self, directory):
+        root = str(Path(directory).resolve())
+        if self._editor_leased_dirs.get(root, 0):
+            self._deferred_preview_temp_dirs.add(root)
+            return
+        if os.path.isdir(root):
+            shutil.rmtree(root, ignore_errors=True)
+
+    def set_active(self, active: bool):
+        active = bool(active)
+        spine = self.spine_preview
+        if spine is not None:
+            timer = getattr(spine, "_status_timer", None)
+            if not active:
+                if not self._native_playback_suspended:
+                    self._resume_spine_paused = bool(getattr(spine, "_last_state", {}).get("paused", False))
+                spine.set_paused(True)
+                if timer is not None:
+                    timer.stop()
+            elif self._native_playback_suspended:
+                spine.set_paused(self._resume_spine_paused)
+                if timer is not None and getattr(spine, "_model", None) is not None:
+                    timer.start()
+        canvas = getattr(self.live2d_preview, "live2d_canvas", None)
+        activate_rendering = getattr(self.live2d_preview, "set_rendering_active", None)
+        if callable(activate_rendering):
+            activate_rendering(active)
+        elif canvas is not None:
+            timer_id = getattr(canvas, "_render_timer_id", None)
+            if not active and timer_id is not None:
+                canvas.killTimer(timer_id)
+                canvas._render_timer_id = None
+            elif active and timer_id is None:
+                canvas._render_timer_id = canvas.startTimer(int(1000 / 60))
+        if not active:
+            for timer in (self._parameter_sync_timer, self._preview_dock_timer):
+                if timer is not None:
+                    timer.stop()
+        self._native_playback_suspended = not active
+        self._preview_page_active = active
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.set_active(True)
+
+    def hideEvent(self, event):
+        self.set_active(False)
+        super().hideEvent(event)
+
+    def prepare_shutdown(self):
+        """Finish or cancel import workers before any page is destroyed."""
+        workers = []
+        for name in ("_model_preview_thread", "_image_preview_thread", "_archive_preview_thread", "_folder_preview_thread", "_preview_export_thread"):
+            worker = getattr(self, name, None)
+            if worker is not None and _is_qt_object_valid(worker) and worker.isRunning():
+                workers.append(worker)
+        workers.extend(worker for worker in self._spine_preview_workers if worker is not None and _is_qt_object_valid(worker) and worker.isRunning() and worker not in workers)
+        for worker in workers:
+            worker.requestInterruption()
+        if any(not worker.wait(1500) for worker in workers):
+            return False
+        return True
+
+    def shutdown(self):
+        if not self.prepare_shutdown():
+            return False
+        self.set_active(False)
+        self._terminate_preview_process()
+        self._destroy_embedded_live2d()
+        self._destroy_embedded_spine()
+        # MainWindow releases editor leases after editor shutdown. A copying
+        # editor may still need the source even after this view is destroyed.
+        for cleanup in (self._cleanup_model_preview_temp_dirs, self._cleanup_spine_preview_temp_dirs, self._cleanup_image_preview_temp_dirs, self._cleanup_archive_preview_temp_dirs, self._cleanup_folder_preview_temp_dirs):
+            cleanup()
+        return True
 
     def _toggle_sidebar(self, side: str):
         widget = self.left_sidebar if side == "left" else self.right_sidebar
@@ -2329,7 +2487,7 @@ class PreviewPage(QFrame):
             self.auto_play_motion_check.setChecked(bool(state.get("motion_auto_play", False)))
             self.auto_play_motion_check.blockSignals(False)
         if self.freeze_motion_check:
-            freeze_pose = bool(state.get("freeze_pose", False))
+            freeze_pose = False
             self.freeze_motion_check.blockSignals(True)
             self.freeze_motion_check.setChecked(freeze_pose)
             self.freeze_motion_check.blockSignals(False)
@@ -2826,7 +2984,7 @@ class PreviewPage(QFrame):
             (self.advanced_panel, "advanced"),
         ):
             if widget:
-                widget.setVisible(bool(state.get(key, True)))
+                widget.setVisible(key == "motion" and bool(state.get(key, True)))
         self._spine_sidebar_state = None
         self._spine_mode = False
         self._update_sidebar_button_text()
@@ -2851,6 +3009,7 @@ class PreviewPage(QFrame):
         self._set_motion_debug_visible(False)
 
     def _show_stage_placeholder(self, text: str | None = None):
+        self._set_editor_source()
         if self.live2d_preview:
             self.live2d_preview.setVisible(False)
         if self.spine_preview:
@@ -2862,6 +3021,7 @@ class PreviewPage(QFrame):
             self.preview_placeholder.setVisible(True)
 
     def _show_image_stage(self):
+        self._set_editor_source()
         if self.live2d_preview:
             self.live2d_preview.setVisible(False)
         if self.spine_preview:
@@ -2999,7 +3159,7 @@ class PreviewPage(QFrame):
         if self.advanced_panel:
             self.advanced_panel.setEnabled(bool(visible))
         if self._parameter_sync_timer:
-            if visible:
+            if visible and self.advanced_panel and not self.advanced_panel.isHidden():
                 self._parameter_sync_timer.start()
             else:
                 self._parameter_sync_timer.stop()
@@ -3171,18 +3331,16 @@ class PreviewPage(QFrame):
         self.advanced_panel.sync_advanced_param_values(meta)
 
     def _cleanup_temp_model_json(self):
-        """删除上一次创建的临时美化 model json（若存在）。"""
-        try:
-            if self._temp_model_json_path and os.path.isfile(self._temp_model_json_path):
-                os.remove(self._temp_model_json_path)
-        except Exception:
-            pass
+        """Forget the model reference; owned temporary directories clean it up."""
+        # current_model_path can point to a user's original model or a MOD
+        # export. Only directories tracked by the importer may be deleted.
+        self._temp_model_json_path = None
 
     def _cleanup_image_preview_temp_dirs(self):
         for temp_dir in list(self._image_preview_temp_dirs):
             try:
                 if temp_dir and os.path.isdir(temp_dir):
-                    shutil.rmtree(temp_dir)
+                    self._dispose_preview_temp_dir(temp_dir)
             except Exception:
                 pass
         self._image_preview_temp_dirs = []
@@ -3193,7 +3351,7 @@ class PreviewPage(QFrame):
         for temp_dir in list(self._model_preview_temp_dirs):
             try:
                 if temp_dir and os.path.isdir(temp_dir):
-                    shutil.rmtree(temp_dir)
+                    self._dispose_preview_temp_dir(temp_dir)
             except Exception:
                 pass
         self._model_preview_temp_dirs = []
@@ -3226,7 +3384,7 @@ class PreviewPage(QFrame):
                 result = getattr(thread, "result", None)
                 temp_dir = getattr(result, "temp_dir", None)
                 if temp_dir:
-                    shutil.rmtree(str(temp_dir), ignore_errors=True)
+                    self._dispose_preview_temp_dir(temp_dir)
                 if thread is self._spine_preview_thread:
                     self._spine_preview_thread = None
                 thread.deleteLater()
@@ -3244,7 +3402,7 @@ class PreviewPage(QFrame):
                 result = getattr(current, "result", None)
                 temp_dir = getattr(result, "temp_dir", None)
                 if temp_dir:
-                    shutil.rmtree(str(temp_dir), ignore_errors=True)
+                    self._dispose_preview_temp_dir(temp_dir)
                 current.deleteLater()
                 self._spine_preview_thread = None
 
@@ -3255,7 +3413,7 @@ class PreviewPage(QFrame):
         for temp_dir in list(self._spine_preview_temp_dirs):
             try:
                 if temp_dir and os.path.isdir(temp_dir):
-                    shutil.rmtree(temp_dir)
+                    self._dispose_preview_temp_dir(temp_dir)
             except Exception:
                 pass
         self._spine_preview_temp_dirs = []
@@ -3285,7 +3443,7 @@ class PreviewPage(QFrame):
                     if temp_dir not in self._spine_preview_temp_dirs:
                         self._spine_preview_temp_dirs.append(temp_dir)
                 else:
-                    shutil.rmtree(temp_dir, ignore_errors=True)
+                    self._dispose_preview_temp_dir(temp_dir)
                     try:
                         self._spine_preview_temp_dirs.remove(temp_dir)
                     except ValueError:
@@ -3305,7 +3463,7 @@ class PreviewPage(QFrame):
         for temp_dir in list(self._archive_preview_temp_dirs):
             try:
                 if temp_dir and os.path.isdir(temp_dir):
-                    shutil.rmtree(temp_dir)
+                    self._dispose_preview_temp_dir(temp_dir)
             except Exception:
                 pass
         self._archive_preview_temp_dirs = []
@@ -3314,7 +3472,7 @@ class PreviewPage(QFrame):
         for temp_dir in list(self._folder_preview_temp_dirs):
             try:
                 if temp_dir and os.path.isdir(temp_dir):
-                    shutil.rmtree(temp_dir)
+                    self._dispose_preview_temp_dir(temp_dir)
             except Exception:
                 pass
         self._folder_preview_temp_dirs = []
@@ -3832,6 +3990,10 @@ class PreviewPage(QFrame):
             )
         )
         self.spine_preview.open_plan(plan)
+        editable_path = plan.asset.model_config_path or plan.asset.skeleton_path
+        self._set_editor_source("spine", str(editable_path) if editable_path else None)
+        if self._preview_page_active is False:
+            self.set_active(False)
 
     def _on_spine_preview_document_loaded(self, url: str):
         if not self._active_spine_preview_key or str(url) != self._active_spine_preview_key:
@@ -4161,6 +4323,7 @@ class PreviewPage(QFrame):
         if self.save_pose_scheme_btn:
             self.save_pose_scheme_btn.setVisible(bool(self._psd_project_context))
         self.current_model_path = os.path.abspath(model_json_path)
+        self._set_editor_source("live2d", self.current_model_path)
         self._temp_model_json_path = self.current_model_path
         self._cleanup_image_preview_temp_dirs()
 
@@ -4284,7 +4447,7 @@ class PreviewPage(QFrame):
 
     def on_unity_image_preview_ready(self, image_paths: list[str], temp_dir: str):
         if not image_paths:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            self._dispose_preview_temp_dir(temp_dir)
             self.show_error(
                 tr("preview.no_images_title"),
                 tr("preview.no_images_content"),
@@ -4296,7 +4459,7 @@ class PreviewPage(QFrame):
 
     def on_unity_image_preview_failed(self, error: str, temp_dir: str):
         self._pending_unity_preview_source_path = None
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        self._dispose_preview_temp_dir(temp_dir)
         self.show_error(
             tr("preview.unity_preview_failed_title"),
             tr("preview.unity_preview_failed_content", error=error),

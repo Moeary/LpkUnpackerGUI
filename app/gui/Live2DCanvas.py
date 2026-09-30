@@ -3,7 +3,7 @@ import numpy as np
 from typing import Optional, List, Dict, Any
 
 from PySide6.QtOpenGL import QOpenGLWindow
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QGuiApplication, QPalette
 import OpenGL.GL as GL
 from abc import abstractmethod
@@ -384,6 +384,21 @@ class ADPOpenGLCanvas(QOpenGLWindow):
         )
         self.update()
 
+    def windowPointToModel(self, x: float, y: float) -> tuple[float, float]:
+        """Map a host click through contain/zoom/rotation to Cubism pixels."""
+        width, height = max(1, self.width()), max(1, self.height())
+        canvas_width, canvas_height = max(1, self._fbo_width), max(1, self._fbo_height)
+        viewport_aspect, canvas_aspect = width / height, canvas_width / canvas_height
+        sx, sy = ((viewport_aspect / canvas_aspect, 1.0) if viewport_aspect >= canvas_aspect
+                  else (1.0, canvas_aspect / viewport_aspect))
+        cx = ((float(x) / width - .5) * sx - self.__model_offset[0]) / self.__model_scale
+        cy = ((.5 - float(y) / height) * sy - self.__model_offset[1]) / self.__model_scale
+        angle = math.radians(self.__rotation_angle)
+        cosine, sine = math.cos(angle), math.sin(angle)
+        source_x = cosine * cx + sine * cy + .5
+        source_y = -sine * cx + cosine * cy + .5
+        return source_x * canvas_width, (1 - source_y) * canvas_height
+
     def setAntialias(self, enabled: bool):
         self._antialias = bool(enabled)
         self.update()
@@ -438,6 +453,9 @@ class ADPOpenGLCanvas(QOpenGLWindow):
 
 
 class Live2DCanvas(ADPOpenGLCanvas):
+    modelLoaded = Signal()
+    drawableClicked = Signal(str)
+    modelPointClicked = Signal(float, float)
     def __init__(self, model_path=None, embedded: bool = False):
         super().__init__()
         self.model_path = model_path
@@ -464,6 +482,11 @@ class Live2DCanvas(ADPOpenGLCanvas):
         self._motion_loop_enabled = False
         self._last_played_motion: tuple[str, int] | None = None
         self._render_timer_id = None
+        self._rendering_active = True
+        self._editor_interaction = False
+        self._part_opacity_overrides = {}
+        self._part_opacity_defaults = {}
+        self._part_indices = {}
         self._gl_initialized = False
         # Cached motions metadata
         self._motions: List[Dict[str, Any]] = []
@@ -475,7 +498,8 @@ class Live2DCanvas(ADPOpenGLCanvas):
         self._gl_initialized = True
         if self.model_path:
             self._load_model_with_current_context(self.model_path)
-        self._render_timer_id = self.startTimer(int(1000 / 60))
+        if self._rendering_active and self._render_timer_id is None:
+            self._render_timer_id = self.startTimer(int(1000 / 60))
 
     def _load_model_with_current_context(self, model_path: str):
         model = live2d.LAppModel()
@@ -507,10 +531,17 @@ class Live2DCanvas(ADPOpenGLCanvas):
         self._motion_frozen = False
         self._last_played_motion = None
         self._advanced_params = {}
+        self._part_opacity_overrides = {}
+        self._part_opacity_defaults = {}
+        try:
+            self._part_indices = {str(part_id): index for index, part_id in enumerate(model.GetPartIds())}
+        except Exception:
+            self._part_indices = {}
         try:
             self._motions = self._load_motions_from_model_json(model_path)
         except Exception:
             self._motions = []
+        self.modelLoaded.emit()
 
     def loadModel(self, model_path: str):
         """Load a model into the already-created OpenGL widget."""
@@ -543,6 +574,9 @@ class Live2DCanvas(ADPOpenGLCanvas):
         self._last_played_motion = None
         self._motion_frozen = False
         self._advanced_params = {}
+        self._part_opacity_overrides = {}
+        self._part_opacity_defaults = {}
+        self._part_indices = {}
         self.update()
 
     def timerEvent(self, a0):
@@ -561,6 +595,18 @@ class Live2DCanvas(ADPOpenGLCanvas):
                 self._apply_advanced_params()
             except Exception:
                 pass
+        if self._part_opacity_overrides:
+            for part_id, value in self._part_opacity_overrides.items():
+                index = self._part_indices.get(part_id)
+                if index is not None:
+                    self.model.SetPartOpacity(index, float(value))
+        if self._motion_frozen or self._advanced_enabled or self._part_opacity_overrides:
+            # Parameter setters update Core values; vertices are recomputed by
+            # Cubism's zero-delta update before drawing the frozen/editor pose.
+            native_model = getattr(self.model, "_model", None)
+            update = getattr(native_model, "Update", None)
+            if callable(update):
+                update(0.0)
         self.model.Draw()
 
     def on_resize(self, width: int, height: int):
@@ -589,6 +635,17 @@ class Live2DCanvas(ADPOpenGLCanvas):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            if self._editor_interaction:
+                if self.model is not None:
+                    try:
+                        x, y = self.windowPointToModel(event.position().x(), event.position().y())
+                        self.modelPointClicked.emit(x / max(1, self._fbo_width), y / max(1, self._fbo_height))
+                        hits = self.model.HitPart(x, y, True)
+                        if hits:
+                            self.drawableClicked.emit(str(hits[0]))
+                    except Exception:
+                        pass
+                return super().mousePressEvent(event)
             try:
                 self.playDefaultTapMotion()
             except Exception:
@@ -736,6 +793,32 @@ class Live2DCanvas(ADPOpenGLCanvas):
     def setMotionFrozen(self, frozen: bool):
         """Pause model updates while keeping rendering and parameter editing active."""
         self._motion_frozen = bool(frozen)
+        self.update()
+
+    def setRenderingActive(self, active: bool):
+        """Suspend the frame timer for an editor tab that is not visible."""
+        self._rendering_active = bool(active)
+        if not self._rendering_active and self._render_timer_id is not None:
+            self.killTimer(self._render_timer_id)
+            self._render_timer_id = None
+        elif self._rendering_active and self._gl_initialized and self._render_timer_id is None:
+            self._render_timer_id = self.startTimer(int(1000 / 60))
+            self.update()
+
+    def setEditorInteraction(self, enabled: bool):
+        self._editor_interaction = bool(enabled)
+        if enabled:
+            self.setMouseTracking(False)
+
+    def setPartOpacityOverrides(self, values: dict[str, float], defaults: dict[str, float] | None = None):
+        if defaults is not None:
+            self._part_opacity_defaults = dict(defaults)
+        for key in values:
+            self._part_opacity_defaults.setdefault(str(key), 1.0)
+        effective = dict(self._part_opacity_defaults)
+        effective.update(values)
+        self._part_opacity_overrides = {str(key): max(0.0, min(1.0, float(value)))
+                                        for key, value in effective.items()}
         self.update()
 
     def isMotionFrozen(self) -> bool:
