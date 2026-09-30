@@ -21,6 +21,13 @@ from app.core.toolchain import detect_toolchain_paths
 logger = logging.getLogger("SettingsManager")
 
 DEFAULT_SPINE_TARGET_VERSION = "3.8.75"
+DEFAULT_FONT_FAMILY = ""
+DEFAULT_FONT_SIZE = 10
+MIN_FONT_SIZE = 8
+MAX_FONT_SIZE = 32
+# Naming aliases for callers that describe the preference as application-wide.
+DEFAULT_APPLICATION_FONT_FAMILY = DEFAULT_FONT_FAMILY
+DEFAULT_APPLICATION_FONT_SIZE = DEFAULT_FONT_SIZE
 _SPINE_TARGET_VERSION_RE = re.compile(r"^(?:3\.(?:5|6|7|8)|4\.(?:0|1|2))\.\d+$")
 _SETTINGS_WRITE_LOCK = threading.RLock()
 
@@ -61,6 +68,13 @@ class SettingsManager:
             "remember_paths": True,
             "theme": "auto",
             "language": "en_US",
+            # An empty family means automatic selection.  The GUI resolves it
+            # to the first installed CJK-capable family and falls back to the
+            # platform system font when none is available.
+            "font": {
+                "family": DEFAULT_FONT_FAMILY,
+                "size": DEFAULT_FONT_SIZE,
+            },
             "tools": {
                 "archive_extractor_path": "",
                 "assetstudio_cli_path": "",
@@ -277,6 +291,52 @@ class SettingsManager:
 
     def get_output_root(self) -> str:
         return str(Path(self.get("runtime.output_root", str(RUNTIME_OUTPUT_DIR))).resolve())
+
+    def get_font_family(self) -> str:
+        """Return the configured application font family.
+
+        An empty string intentionally selects the automatic CJK-aware default
+        in :mod:`app.core.font_helper`.
+        """
+
+        return str(self.get("font.family", DEFAULT_FONT_FAMILY) or "").strip()
+
+    def set_font_family(self, family: Optional[str]) -> None:
+        self.set("font.family", str(family or "").strip())
+
+    @staticmethod
+    def _normalize_font_size(value: Any) -> int:
+        try:
+            size = int(float(value))
+        except (TypeError, ValueError, OverflowError):
+            size = DEFAULT_FONT_SIZE
+        return max(MIN_FONT_SIZE, min(MAX_FONT_SIZE, size))
+
+    def get_font_size(self) -> int:
+        """Return the persisted application font size in points."""
+
+        return self._normalize_font_size(self.get("font.size", DEFAULT_FONT_SIZE))
+
+    def set_font_size(self, size: Any) -> None:
+        self.set("font.size", self._normalize_font_size(size))
+
+    def set_font_preferences(self, family: Optional[str], size: Any) -> None:
+        """Persist family and size as one user-facing preference operation."""
+
+        self.set_font_family(family)
+        self.set_font_size(size)
+
+    def reset_font_preferences(self) -> None:
+        """Restore automatic CJK-aware family selection and the base size."""
+
+        self.set_font_preferences(DEFAULT_FONT_FAMILY, DEFAULT_FONT_SIZE)
+
+    # Explicit aliases make the setting API easy to discover for integrations
+    # that use “application font” terminology.
+    get_application_font_family = get_font_family
+    set_application_font_family = set_font_family
+    get_application_font_size = get_font_size
+    set_application_font_size = set_font_size
 
     def set_output_root(self, path: str):
         output_root = str(Path(path).resolve())

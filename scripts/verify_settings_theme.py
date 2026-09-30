@@ -34,6 +34,19 @@ def main():
     window.switchTo(window.settingsPage)
     report = {}
     try:
+        if hasattr(window.settingsPage, "font_size_spin"):
+            font_sizes = []
+            for size in (12, 16, 10):
+                window.settingsPage.font_size_spin.setValue(size)
+                until = time.monotonic() + .25
+                while time.monotonic() < until:
+                    app.processEvents()
+                    time.sleep(.01)
+                assert app.font().pointSize() == size
+                assert DiagnosticSettings().get_font_size() == size
+                font_sizes.append(size)
+            report["font_sizes_applied"] = font_sizes
+            report["font_family"] = app.font().family()
         for theme in ("light", "dark", "light"):
             window.settings_manager.set("theme", theme)
             window.apply_theme()
@@ -52,6 +65,13 @@ def main():
             report[theme] = {"window": [window.width(), window.height()],
                              "dpr": window.devicePixelRatioF(),
                              "screenshot": str(root / f"settings-{theme}.png")}
+            window.switchTo(window.spineConverterPage)
+            until = time.monotonic() + .3
+            while time.monotonic() < until:
+                app.processEvents()
+                time.sleep(.01)
+            window.spineConverterPage.grab().save(str(root / f"converter-{theme}.png"))
+            window.switchTo(window.settingsPage)
         assert not hasattr(window, "spineAtlasPage")
         report["ok"] = True
     finally:

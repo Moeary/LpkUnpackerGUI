@@ -35,6 +35,7 @@
 2. 运行程序。
 3. 根据任务进入“资源解包”“资源预览”“PSD 工作台”或“Live2DViewerEX MOD 工程”。
 4. 大部分来源都可以直接拖入对应页面；输出目录可在设置中统一修改。
+5. 设置页可选择已安装的界面字体、调整字号或恢复默认；自动字体优先选择支持中日韩字符的字体，图标字体保持独立。
 
 ### 从源码运行
 
@@ -108,6 +109,8 @@ LPK 解包演示：
 
 ### Spine 版本转换
 
+页面按左右两栏组织输入选项与结果。勾选生成编辑工程后，可调用设置中的 Spine 3.8.75 编辑器创建 `.spine` 和配套图片。选中部件、外部改图、刷新与重新导出的完整步骤，以及拆图夹带邻图的原因，见 [Spine 部件改图流程](assets/docs/spine-part-editing.md)。
+
 “Spine 版本转换”入口直接调用随项目源码构建的 native DLL，不需要外部 EXE 或网页运行时。它支持 `.json`、`.skel` 和只包含唯一骨骼的目录，输出可选 JSON 或 SKEL，默认目标为完整版本 `3.8.75`；转换结果始终写入独立副本，可直接送入资源预览检查。默认转换曲线，必要时可选择移除曲线。跨版本转换可能丢失或改变动画、约束及曲线效果，不能保证无损或还原 `.spine` 工程。固定上游提交、PolyForm 许可证和构建方法见 [`assets/docs/spine-converter.md`](assets/docs/spine-converter.md)。
 
 软件渲染预览：
@@ -159,6 +162,8 @@ runtime/output/psd_projects/<工程名>/
 - 每个 Cubism ArtMesh 都按 UV 三角形覆盖提取为独立图层，包括隐藏、透明和细碎区域，不依据当前姿态透明度过滤。
 - 元数据记录 `texture_index`、UV、indices 和 atlas 像素区域；重叠覆盖会写入 `shared_regions` 报告。
 - 具备 Cubism Core DLL 时优先读取真实 drawable 数据；没有 Core 时可使用同目录的 `*.drawables.json` 侧车数据。
+
+真实模型的导出、无修改往返、改色、擦除与新增覆盖层验收，见 [ArtMesh UV 工作流与验收](assets/docs/artmesh-uv-workflow.md)。
 
 PSD 工作台中的“ArtMesh 静态检查器”可从导出的 metadata 打开。它把导出姿态三角形、ArtMesh 列表和 atlas UV 区域联动起来：点击姿态或图集三角形会选中实际绘制顺序最上层的部件，列表选择会反向高亮对应区域，并显示持久 `layer_id`、单元绑定和共享区域影响。检查器只读取当前导出快照，不运行动态动画；缺少姿态顶点时会明确退化为图集检查。
 

@@ -2245,8 +2245,29 @@ def _build_atlas_artmesh_layers(
         for second in footprints[index + 1 :]:
             if first["texture_index"] != second["texture_index"]:
                 continue
-            first_mask = first["mask"]
-            second_mask = second["mask"]
+            # Each footprint mask has the full atlas shape because it is also
+            # used below to crop the corresponding layer.  Do not perform a
+            # full-atlas boolean AND for every pair: a model with many
+            # drawables turns that into O(drawables² * atlas_pixels) work and
+            # can retain/allocate gigabytes of temporary arrays.  The bboxes
+            # are exact bounds of the non-zero masks, so only their
+            # intersection can contain a shared pixel.
+            first_left, first_top, first_width, first_height = first["bbox"]
+            second_left, second_top, second_width, second_height = second["bbox"]
+            left = max(int(first_left), int(second_left))
+            top = max(int(first_top), int(second_top))
+            right = min(
+                int(first_left) + int(first_width),
+                int(second_left) + int(second_width),
+            )
+            bottom = min(
+                int(first_top) + int(first_height),
+                int(second_top) + int(second_height),
+            )
+            if right <= left or bottom <= top:
+                continue
+            first_mask = first["mask"][top:bottom, left:right]
+            second_mask = second["mask"][top:bottom, left:right]
             overlap = (first_mask > 0) & (second_mask > 0)
             region = _mask_region(
                 overlap,
@@ -2254,6 +2275,8 @@ def _build_atlas_artmesh_layers(
                 f"{first['drawable']['id']}|{second['drawable']['id']}",
             )
             if region:
+                region["bbox"][0] += left
+                region["bbox"][1] += top
                 region["kind"] = "shared-atlas-region"
                 region["drawables"] = [
                     str(first["drawable"]["id"]),

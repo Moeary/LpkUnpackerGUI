@@ -5,6 +5,7 @@ from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout
 from qfluentwidgets import FluentIcon as FIF
 from qfluentwidgets import FluentWindow, NavigationItemPosition
 
+from app.core.font_helper import apply_application_font
 from app.core.settings_manager import SettingsManager
 from app.gui.theme import apply_application_theme
 from app.i18n import get_i18n, normalize_language_code, tr
@@ -142,6 +143,7 @@ except Exception as e:
     class SettingsPage(QFrame):
         languageChanged = None
         themeChanged = None
+        fontChanged = None
 
         def __init__(self, parent=None):
             super().__init__(parent)
@@ -158,6 +160,7 @@ class MainWindow(FluentWindow):
 
         self.settings_manager = SettingsManager()
         self.i18n = get_i18n()
+        self._applied_font_preferences = None
         self.i18n.set_language(
             normalize_language_code(self.settings_manager.get("language", "en_US"))
         )
@@ -213,10 +216,13 @@ class MainWindow(FluentWindow):
 
         language_changed = getattr(self.settingsPage, "languageChanged", None)
         theme_changed = getattr(self.settingsPage, "themeChanged", None)
+        font_changed = getattr(self.settingsPage, "fontChanged", None)
         if language_changed is not None and hasattr(language_changed, "connect"):
             language_changed.connect(self.on_language_changed)
         if theme_changed is not None and hasattr(theme_changed, "connect"):
             theme_changed.connect(self.on_theme_changed)
+        if font_changed is not None and hasattr(font_changed, "connect"):
+            font_changed.connect(self.on_font_changed)
 
         self.initWindow()
         self.initNavigation()
@@ -341,22 +347,17 @@ class MainWindow(FluentWindow):
         return super().eventFilter(obj, event)
 
     def updateFontSize(self):
-        width = self.width()
-
-        base_size = 9
-        if width > 1600:
-            font_size = base_size + 3
-        elif width > 1200:
-            font_size = base_size + 2
-        elif width > 800:
-            font_size = base_size + 1
-        else:
-            font_size = base_size
-
-        app = QApplication.instance()
-        font = app.font()
-        font.setPointSize(font_size)
-        app.setFont(font)
+        # Keep the user's chosen point size stable while retaining the
+        # existing page-level resize hooks below.  The old width heuristic
+        # silently overwrote a persisted custom size on every resize.
+        get_family = getattr(self.settings_manager, "get_font_family", None)
+        get_size = getattr(self.settings_manager, "get_font_size", None)
+        family = get_family() if callable(get_family) else ""
+        size = get_size() if callable(get_size) else 10
+        preferences = (str(family or ""), int(size))
+        if preferences != self._applied_font_preferences:
+            apply_application_font(QApplication.instance(), family, size, root=self)
+            self._applied_font_preferences = preferences
 
         pages = [
             self.extractorPage,
@@ -410,6 +411,38 @@ class MainWindow(FluentWindow):
     def on_theme_changed(self, theme: str):
         self.settings_manager.set("theme", str(theme).lower())
         self.apply_theme()
+
+    def on_font_changed(self, family: str, size: int):
+        """Apply a settings-page font change to every existing text widget."""
+
+        setter = getattr(self.settings_manager, "set_font_preferences", None)
+        if callable(setter):
+            setter(family, size)
+        apply_application_font(
+            QApplication.instance(),
+            family,
+            size,
+            # Include preview/dialog top-level windows that are not children
+            # of the Fluent main window when a preference changes live.
+            root=None,
+        )
+        self._applied_font_preferences = (str(family or ""), int(size))
+        for page in (
+            self.extractorPage,
+            self.unityExtractorPage,
+            self.previewPage,
+            self.encryptionPage,
+            self.steamWorkshopPage,
+            self.live2dModPage,
+            self.psdReconstructionPage,
+            self.spineConverterPage,
+            self.settingsPage,
+        ):
+            if page is not None and hasattr(page, "updateUIScale"):
+                try:
+                    page.updateUIScale(self.width(), self.height())
+                except Exception as exc:
+                    print(f"Error refreshing {page.objectName()} after font change: {exc}")
 
     def open_psd_preview(self, model_json_path: str, project_file: str):
         self.switchTo(self.previewPage)

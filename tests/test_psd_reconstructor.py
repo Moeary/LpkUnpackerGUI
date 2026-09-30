@@ -75,6 +75,10 @@ class PsdReconstructorTests(unittest.TestCase):
             self.assertEqual(result.mode, "atlas-artmesh")
             self.assertEqual(len(metadata["layers"]), 2)
             self.assertEqual(len(result.shared_regions), 1)
+            # The overlap is away from the atlas origin.  This guards the
+            # bbox-sliced shared-region calculation against returning a local
+            # crop coordinate instead of the atlas coordinate.
+            self.assertEqual(result.shared_regions[0]["bbox"][:2], [3, 3])
             self.assertEqual(metadata["textures"][0]["relative_path"], "nested/atlas.png")
             self.assertTrue((root / "export" / "demo_atlas_artmesh.baseline").is_dir())
 

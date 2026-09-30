@@ -13,11 +13,13 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPlainTextEdit,
+    QSizePolicy,
     QVBoxLayout,
 )
 from qfluentwidgets import (
     BodyLabel,
     CaptionLabel,
+    CardWidget,
     CheckBox,
     ComboBox,
     EditableComboBox,
@@ -191,126 +193,355 @@ class SpineConverterPage(_SpineConverterDropFrame):
     def _build_ui(self):
         self.main_layout = QVBoxLayout(self)
         self.main_layout.setContentsMargins(20, 18, 20, 20)
-        self.main_layout.setSpacing(12)
+        self.main_layout.setSpacing(14)
 
         self.title_label = SubtitleLabel(self)
+        self.title_label.setWordWrap(True)
+        self.title_label.setMinimumWidth(0)
+        self.title_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.main_layout.addWidget(self.title_label)
         self.description_label = CaptionLabel(self)
         self.description_label.setWordWrap(True)
+        self.description_label.setMinimumWidth(0)
+        self.description_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
         self.main_layout.addWidget(self.description_label)
 
-        source_row = QHBoxLayout()
-        self.source_label = BodyLabel(self)
-        self.source_edit = LineEdit(self)
+        # Keep the work surface balanced at high DPI: paths and options live
+        # in the left column, while detection, status, and the result occupy
+        # the right.  Cards are allowed to shrink to zero so translated text
+        # cannot force a horizontal scrollbar when the window is narrowed.
+        self.columns_layout = QHBoxLayout()
+        self.columns_layout.setSpacing(14)
+        self.left_column = QVBoxLayout()
+        self.right_column = QVBoxLayout()
+        self.left_column.setSpacing(14)
+        self.right_column.setSpacing(14)
+        self.columns_layout.addLayout(self.left_column, 1)
+        self.columns_layout.addLayout(self.right_column, 1)
+        self.main_layout.addLayout(self.columns_layout)
+
+        self.input_card, input_layout = self._new_card(
+            self, "spineConverterInputCard"
+        )
+        # Stable handles for visual smoke tests and callers that want to
+        # highlight the main controls/result surfaces.
+        self.controls_card = self.input_card
+        self.source_card_title = SubtitleLabel(self.input_card)
+        input_layout.addWidget(self.source_card_title)
+
+        self.source_label = BodyLabel(self.input_card)
+        self.source_label.setWordWrap(True)
+        self.source_label.setMinimumWidth(0)
+        self.source_edit = LineEdit(self.input_card)
         self.source_edit.setReadOnly(True)
         self.source_edit.setPlaceholderText(".json / .skel / folder")
-        self.source_browse_button = PushButton(self)
+        self._make_compact(self.source_edit)
+        self.source_browse_button = PushButton(self.input_card)
         self.source_browse_button.setIcon(FluentIcon.FOLDER)
         self.source_browse_button.clicked.connect(self.browse_source_file)
-        self.source_folder_button = PushButton(self)
+        self.source_folder_button = PushButton(self.input_card)
         self.source_folder_button.setIcon(FluentIcon.FOLDER_ADD)
         self.source_folder_button.clicked.connect(self.browse_source_folder)
-        source_row.addWidget(self.source_label)
-        source_row.addWidget(self.source_edit, 1)
-        source_row.addWidget(self.source_browse_button)
-        source_row.addWidget(self.source_folder_button)
-        self.main_layout.addLayout(source_row)
+        for button in (self.source_browse_button, self.source_folder_button):
+            self._make_compact(button)
 
-        output_row = QHBoxLayout()
-        self.output_label = BodyLabel(self)
-        self.output_edit = LineEdit(self)
+        input_layout.addWidget(self.source_label)
+        input_layout.addWidget(self.source_edit)
+        source_actions = QHBoxLayout()
+        source_actions.setSpacing(8)
+        source_actions.addWidget(self.source_browse_button, 1)
+        source_actions.addWidget(self.source_folder_button, 1)
+        input_layout.addLayout(source_actions)
+
+        self.output_label = BodyLabel(self.input_card)
+        self.output_label.setWordWrap(True)
+        self.output_label.setMinimumWidth(0)
+        self.output_edit = LineEdit(self.input_card)
         self.output_edit.setReadOnly(True)
         self.output_edit.setPlaceholderText(tr("spine_converter.output_default"))
-        self.output_browse_button = PushButton(self)
+        self._make_compact(self.output_edit)
+        self.output_browse_button = PushButton(self.input_card)
         self.output_browse_button.setIcon(FluentIcon.FOLDER)
         self.output_browse_button.clicked.connect(self.browse_output)
-        output_row.addWidget(self.output_label)
-        output_row.addWidget(self.output_edit, 1)
-        output_row.addWidget(self.output_browse_button)
-        self.main_layout.addLayout(output_row)
+        self._make_compact(self.output_browse_button)
+        input_layout.addWidget(self.output_label)
+        input_layout.addWidget(self.output_edit)
+        input_layout.addWidget(self.output_browse_button)
+        self.left_column.addWidget(self.input_card)
 
-        options_row = QHBoxLayout()
-        self.target_version_label = BodyLabel(self)
-        self.target_version_combo = EditableComboBox(self)
+        self.options_card, options_layout = self._new_card(
+            self, "spineConverterOptionsCard"
+        )
+        self.options_card_title = SubtitleLabel(self.options_card)
+        options_layout.addWidget(self.options_card_title)
+
+        self.target_version_label = BodyLabel(self.options_card)
+        self.target_version_label.setWordWrap(True)
+        self.target_version_label.setMinimumWidth(0)
+        self.target_version_combo = EditableComboBox(self.options_card)
         self.target_version_combo.addItems(list(self.TARGET_PRESETS))
         self.target_version_combo.setCurrentText(self.TARGET_PRESETS[0])
-        self.target_version_combo.setMinimumWidth(150)
-        self.output_format_label = BodyLabel(self)
-        self.output_format_combo = ComboBox(self)
+        self._make_compact(self.target_version_combo)
+        self.output_format_label = BodyLabel(self.options_card)
+        self.output_format_label.setWordWrap(True)
+        self.output_format_label.setMinimumWidth(0)
+        self.output_format_combo = ComboBox(self.options_card)
         self.output_format_combo.addItems(list(self.OUTPUT_FORMATS))
         self.output_format_combo.setCurrentIndex(0)
-        self.remove_curve_checkbox = CheckBox(self)
+        self._make_compact(self.output_format_combo)
+        self.remove_curve_checkbox = CheckBox(self.options_card)
         self.remove_curve_checkbox.setChecked(False)
-        self.create_project_checkbox = CheckBox(self)
+        self._make_compact(self.remove_curve_checkbox)
+        self.create_project_checkbox = CheckBox(self.options_card)
         self.create_project_checkbox.setChecked(True)
+        self._make_compact(self.create_project_checkbox)
         self.target_version_combo.currentTextChanged.connect(
             self._update_editor_project_availability
         )
         self.output_format_combo.currentTextChanged.connect(
             self._update_editor_project_availability
         )
-        options_row.addWidget(self.target_version_label)
-        options_row.addWidget(self.target_version_combo)
-        options_row.addWidget(self.output_format_label)
-        options_row.addWidget(self.output_format_combo)
-        options_row.addWidget(self.remove_curve_checkbox)
-        options_row.addWidget(self.create_project_checkbox)
-        options_row.addStretch(1)
-        self.main_layout.addLayout(options_row)
+        options_layout.addWidget(self.target_version_label)
+        options_layout.addWidget(self.target_version_combo)
+        options_layout.addWidget(self.output_format_label)
+        options_layout.addWidget(self.output_format_combo)
+        options_layout.addWidget(self.remove_curve_checkbox)
+        options_layout.addWidget(self.create_project_checkbox)
+        self.left_column.addWidget(self.options_card)
 
-        self.converter_status_label = CaptionLabel(self)
-        self.converter_status_label.setWordWrap(True)
-        self.main_layout.addWidget(self.converter_status_label)
-        self.editor_status_label = CaptionLabel(self)
-        self.editor_status_label.setWordWrap(True)
-        self.main_layout.addWidget(self.editor_status_label)
-
-        self.warning_label = QLabel(self)
-        self.warning_label.setWordWrap(True)
-        self.warning_label.setStyleSheet("color: #8A5A00;")
-        self.main_layout.addWidget(self.warning_label)
+        self.action_card, action_layout = self._new_card(
+            self, "spineConverterActionCard"
+        )
+        self.action_card_title = SubtitleLabel(self.action_card)
+        action_layout.addWidget(self.action_card_title)
 
         actions = QHBoxLayout()
-        self.convert_button = PrimaryPushButton(self)
+        actions.setSpacing(10)
+        self.convert_button = PrimaryPushButton(self.action_card)
         self.convert_button.setIcon(FluentIcon.SYNC)
         self.convert_button.clicked.connect(self.start_conversion)
-        self.progress_bar = ProgressBar(self)
+        self._make_compact(self.convert_button)
+        self.progress_bar = ProgressBar(self.action_card)
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setVisible(False)
-        actions.addWidget(self.convert_button)
+        self.progress_bar.setMinimumWidth(0)
+        self.progress_bar.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        actions.addWidget(self.convert_button, 0)
         actions.addWidget(self.progress_bar, 1)
-        self.main_layout.addLayout(actions)
+        action_layout.addLayout(actions)
+        self.left_column.addWidget(self.action_card)
+        self.left_column.addStretch(1)
 
-        self.status_label = BodyLabel(self)
+        self.dependencies_card, dependencies_layout = self._new_card(
+            self, "spineConverterDependenciesCard"
+        )
+        self.dependencies_card_title = SubtitleLabel(self.dependencies_card)
+        dependencies_layout.addWidget(self.dependencies_card_title)
+        self.converter_status_label = CaptionLabel(self.dependencies_card)
+        self.converter_status_label.setWordWrap(True)
+        self.converter_status_label.setMinimumWidth(0)
+        self.converter_status_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        dependencies_layout.addWidget(self.converter_status_label)
+        self.editor_status_label = CaptionLabel(self.dependencies_card)
+        self.editor_status_label.setWordWrap(True)
+        self.editor_status_label.setMinimumWidth(0)
+        self.editor_status_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        dependencies_layout.addWidget(self.editor_status_label)
+        self.right_column.addWidget(self.dependencies_card)
+
+        self.status_card, status_layout = self._new_card(
+            self, "spineConverterStatusCard"
+        )
+        self.status_card_title = SubtitleLabel(self.status_card)
+        status_layout.addWidget(self.status_card_title)
+        self.status_label = BodyLabel(self.status_card)
         self.status_label.setWordWrap(True)
-        self.main_layout.addWidget(self.status_label)
-        self.result_text = QPlainTextEdit(self)
+        self.status_label.setMinimumWidth(0)
+        self.status_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        status_layout.addWidget(self.status_label)
+        self.warning_label = QLabel(self.status_card)
+        self.warning_label.setWordWrap(True)
+        self.warning_label.setMinimumWidth(0)
+        self.warning_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        # palette(link) stays legible in both bundled light and dark themes.
+        self.warning_label.setStyleSheet("color: palette(link);")
+        status_layout.addWidget(self.warning_label)
+        self.right_column.addWidget(self.status_card)
+
+        self.result_card, result_layout = self._new_card(
+            self, "spineConverterResultCard"
+        )
+        self.results_card = self.result_card
+        self.result_card_title = SubtitleLabel(self.result_card)
+        result_layout.addWidget(self.result_card_title)
+        self.result_text = QPlainTextEdit(self.result_card)
         self.result_text.setReadOnly(True)
-        self.result_text.setMinimumHeight(160)
+        # Keep the empty log useful but compact; the full report remains
+        # copyable and scrollable inside this bounded result surface.
+        self.result_text.setMinimumHeight(104)
+        self.result_text.setMaximumHeight(160)
+        self.result_text.setMinimumWidth(0)
+        self.result_text.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
         self.result_text.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         # Keep the old attribute name for callers that only inspect the result
         # widget, while exposing a real text editor for copy/scroll support.
         self.result_label = self.result_text
-        self.main_layout.addWidget(self.result_text, 1)
+        result_layout.addWidget(self.result_text)
 
         result_actions = QHBoxLayout()
-        self.open_output_button = PushButton(self)
+        result_actions.setSpacing(8)
+        self.open_output_button = PushButton(self.result_card)
         self.open_output_button.setIcon(FluentIcon.FOLDER)
         self.open_output_button.setEnabled(False)
         self.open_output_button.clicked.connect(self.open_output_directory)
-        self.preview_button = PushButton(self)
+        self._make_compact(self.open_output_button)
+        self.preview_button = PushButton(self.result_card)
         self.preview_button.setIcon(FluentIcon.VIEW)
         self.preview_button.setEnabled(False)
         self.preview_button.clicked.connect(self.preview_result)
-        result_actions.addWidget(self.open_output_button)
-        result_actions.addWidget(self.preview_button)
-        result_actions.addStretch(1)
-        self.main_layout.addLayout(result_actions)
-        self.main_layout.addStretch(1)
+        self._make_compact(self.preview_button)
+        result_actions.addWidget(self.open_output_button, 1)
+        result_actions.addWidget(self.preview_button, 1)
+        result_layout.addLayout(result_actions)
+        self.right_column.addWidget(self.result_card)
+
+        self.flow_card, flow_layout = self._new_card(
+            self, "spineConverterFlowCard"
+        )
+        self.flow_card_title = SubtitleLabel(self.flow_card)
+        flow_layout.addWidget(self.flow_card_title)
+        self.flow_source_label = self._new_flow_step(
+            flow_layout, "1", self.flow_card
+        )
+        self.flow_target_label = self._new_flow_step(
+            flow_layout, "2", self.flow_card
+        )
+        self.flow_review_label = self._new_flow_step(
+            flow_layout, "3", self.flow_card
+        )
+        self.right_column.addWidget(self.flow_card)
+        self.right_column.addStretch(1)
+        self.setStyleSheet(
+            """
+            QFrame#spineConverterPage {
+                background: palette(window);
+            }
+            CardWidget#spineConverterInputCard,
+            CardWidget#spineConverterOptionsCard,
+            CardWidget#spineConverterActionCard,
+            CardWidget#spineConverterDependenciesCard,
+            CardWidget#spineConverterStatusCard,
+            CardWidget#spineConverterResultCard,
+            CardWidget#spineConverterFlowCard {
+                background: palette(base);
+                border: 1px solid palette(mid);
+                border-radius: 10px;
+            }
+            QPlainTextEdit#spineConverterResultText {
+                background: palette(alternate-base);
+                border: 1px solid palette(mid);
+                border-radius: 7px;
+            }
+            """
+        )
+        self.result_text.setObjectName("spineConverterResultText")
+
+    @staticmethod
+    def _make_compact(widget):
+        """Let controls yield to their card at high DPI and narrow widths."""
+
+        widget.setMinimumWidth(0)
+        widget.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        return widget
+
+    @staticmethod
+    def _new_card(parent, object_name):
+        card = CardWidget(parent)
+        card.setObjectName(object_name)
+        card.setBorderRadius(10)
+        card.setMinimumWidth(0)
+        card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(16, 15, 16, 15)
+        layout.setSpacing(10)
+        return card, layout
+
+    @staticmethod
+    def _new_flow_step(layout, number, parent):
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        badge = BodyLabel(parent)
+        badge.setText(number)
+        badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        badge.setFixedWidth(22)
+        badge.setStyleSheet(
+            "color: palette(highlight); font-weight: 700;"
+        )
+        detail = CaptionLabel(parent)
+        detail.setWordWrap(True)
+        detail.setMinimumWidth(0)
+        detail.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        row.addWidget(badge)
+        row.addWidget(detail, 1)
+        layout.addLayout(row)
+        return detail
 
     def retranslate_ui(self):
         self.title_label.setText(tr("spine_converter.title"))
         self.description_label.setText(tr("spine_converter.description"))
+        self.source_card_title.setText(
+            tr("spine_converter.input_card_title", default="Input & output")
+        )
+        self.options_card_title.setText(
+            tr("spine_converter.options_card_title", default="Conversion options")
+        )
+        self.action_card_title.setText(
+            tr("spine_converter.action_card_title", default="Run conversion")
+        )
+        self.dependencies_card_title.setText(
+            tr("spine_converter.dependencies_card_title", default="Dependencies")
+        )
+        self.status_card_title.setText(
+            tr("spine_converter.status_card_title", default="Status")
+        )
+        self.result_card_title.setText(
+            tr("spine_converter.result_card_title", default="Result")
+        )
+        self.flow_card_title.setText(
+            tr("spine_converter.flow_card_title", default="Conversion flow")
+        )
+        self.flow_source_label.setText(
+            tr(
+                "spine_converter.flow_source",
+                default="Choose a skeleton source file or folder.",
+            )
+        )
+        self.flow_target_label.setText(
+            tr(
+                "spine_converter.flow_target",
+                default="Set the target Spine version and output format.",
+            )
+        )
+        self.flow_review_label.setText(
+            tr(
+                "spine_converter.flow_review",
+                default="Review the report, then open or preview the converted copy.",
+            )
+        )
         self.source_label.setText(tr("spine_converter.source"))
         self.source_browse_button.setText(tr("spine_converter.browse_file"))
         self.source_folder_button.setText(tr("spine_converter.browse_folder"))
@@ -332,7 +563,13 @@ class SpineConverterPage(_SpineConverterDropFrame):
         self._update_editor_project_availability()
 
     def updateUIScale(self, width: int, height: int):
-        del width, height
+        del height
+        # The columns remain side by side on the normal 1858 logical-pixel
+        # work area.  Tightening the gutter below that width gives translated
+        # labels a little more room without imposing a page-wide minimum.
+        self.columns_layout.setSpacing(10 if width < 1200 else 14)
+        self.left_column.setSpacing(10 if width < 1200 else 14)
+        self.right_column.setSpacing(10 if width < 1200 else 14)
 
     def showEvent(self, event):
         """Refresh saved converter defaults whenever this page is shown."""

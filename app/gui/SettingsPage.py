@@ -23,8 +23,15 @@ from qfluentwidgets import (
     PrimaryPushButton,
     ProgressBar,
     PushButton,
+    SpinBox,
 )
 
+from app.core.font_helper import (
+    DEFAULT_FONT_SIZE,
+    MAX_FONT_SIZE,
+    MIN_FONT_SIZE,
+    installed_font_families,
+)
 from app.core.settings_manager import SettingsManager
 from app.core.toolchain import (
     build_spine_native_runtime,
@@ -85,6 +92,7 @@ class SettingsPage(QFrame):
 
     languageChanged = Signal(str)
     themeChanged = Signal(str)
+    fontChanged = Signal(str, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -95,6 +103,7 @@ class SettingsPage(QFrame):
 
         self._language_codes = ["en_US", "zh_CN", "ja_JP"]
         self._theme_values = ["auto", "light", "dark"]
+        self._font_family_values = [""]
         self._texture_viewer_values = ["internal", "system", "custom"]
         self._spine_native_family_values = ["3.8.75", "4.0"]
         self._syncing_ui = False
@@ -110,6 +119,15 @@ class SettingsPage(QFrame):
         self.theme_label = None
         self.theme_desc = None
         self.theme_combo = None
+        self.font_label = None
+        self.font_desc = None
+        self.font_family_label = None
+        self.font_family_desc = None
+        self.font_family_combo = None
+        self.font_size_label = None
+        self.font_size_desc = None
+        self.font_size_spin = None
+        self.font_reset_button = None
 
         self.runtime_section_title = None
         self.output_root_label = None
@@ -364,6 +382,47 @@ class SettingsPage(QFrame):
             self.theme_desc,
             self.theme_combo,
         )
+
+        # Application font ---------------------------------------------------
+        # QFluentWidgets assigns explicit fonts to its labels and controls,
+        # so this preference is applied live by MainWindow after persistence.
+        self.font_label = BodyLabel("", general_card)
+        self.font_desc = CaptionLabel("", general_card)
+        self.font_desc.setWordWrap(True)
+        self._add_text_block(general_layout, self.font_label, self.font_desc)
+
+        self.font_family_label = BodyLabel("", general_card)
+        self.font_family_desc = CaptionLabel("", general_card)
+        self.font_family_desc.setWordWrap(True)
+        self.font_family_combo = ComboBox(general_card)
+        self.font_family_combo.currentIndexChanged.connect(
+            self.on_font_family_combo_changed
+        )
+        self._add_choice_block(
+            general_layout,
+            self.font_family_label,
+            self.font_family_desc,
+            self.font_family_combo,
+        )
+
+        self.font_size_label = BodyLabel("", general_card)
+        self.font_size_desc = CaptionLabel("", general_card)
+        self.font_size_desc.setWordWrap(True)
+        self.font_size_spin = SpinBox(general_card)
+        self.font_size_spin.setRange(MIN_FONT_SIZE, MAX_FONT_SIZE)
+        self.font_size_spin.setSingleStep(1)
+        self.font_size_spin.valueChanged.connect(self.on_font_size_changed)
+        self._add_choice_block(
+            general_layout,
+            self.font_size_label,
+            self.font_size_desc,
+            self.font_size_spin,
+        )
+
+        self.font_reset_button = PushButton("", general_card)
+        self.font_reset_button.clicked.connect(self.reset_font_preferences)
+        self._configure_expanding(self.font_reset_button)
+        general_layout.addWidget(self.font_reset_button)
 
         # Output and archive settings ----------------------------------------
         runtime_card, runtime_layout = self._new_settings_card(
@@ -707,6 +766,13 @@ class SettingsPage(QFrame):
                 theme = "auto"
             self._set_combo_by_value(self.theme_combo, self._theme_values, theme)
 
+            if self.font_family_combo:
+                self._refresh_font_family_combo(
+                    self.settings_manager.get_font_family()
+                )
+            if self.font_size_spin:
+                self.font_size_spin.setValue(self.settings_manager.get_font_size())
+
             if self.output_root_edit:
                 self.output_root_edit.setText(self.settings_manager.get_output_root())
             if self.archive_tool_edit:
@@ -792,6 +858,20 @@ class SettingsPage(QFrame):
                     label = tr("settings.theme.dark")
                 self.theme_combo.addItem(label)
             self._set_combo_by_value(self.theme_combo, self._theme_values, current_theme)
+
+            self.font_label.setText(tr("settings.font_label"))
+            self.font_desc.setText(tr("settings.font_desc"))
+            self.font_family_label.setText(tr("settings.font_family_label"))
+            self.font_family_desc.setText(tr("settings.font_family_desc"))
+            self.font_size_label.setText(tr("settings.font_size_label"))
+            self.font_size_desc.setText(tr("settings.font_size_desc"))
+            self.font_size_spin.setSuffix(
+                f" {tr('settings.font_size_unit', 'pt')}"
+            )
+            self.font_reset_button.setText(tr("settings.font_reset_button"))
+            self._refresh_font_family_combo(
+                self.settings_manager.get_font_family()
+            )
 
             self.runtime_section_title.setText(tr("settings.section.runtime"))
             self.output_root_label.setText(tr("settings.output_root_label"))
@@ -981,6 +1061,86 @@ class SettingsPage(QFrame):
             parent=self
         )
 
+    def _refresh_font_family_combo(self, current_family: str = ""):
+        """Rebuild the installed-family picker while retaining its value."""
+
+        if self.font_family_combo is None:
+            return
+
+        current = str(current_family or "").strip()
+        families = installed_font_families()
+        # Keep a stale persisted value visible for diagnosis, while all
+        # selectable values discovered here still come from Qt's font database.
+        if current and current.casefold() not in {
+            family.casefold() for family in families
+        }:
+            families.insert(0, current)
+
+        self._font_family_values = [""] + families
+        self.font_family_combo.clear()
+        self.font_family_combo.addItem(tr("settings.font_default"), userData="")
+        for family in families:
+            self.font_family_combo.addItem(family, userData=family)
+
+        target = current.casefold()
+        for index, family in enumerate(self._font_family_values):
+            if family.casefold() == target:
+                self.font_family_combo.setCurrentIndex(index)
+                return
+        self.font_family_combo.setCurrentIndex(0)
+
+    def _current_font_family(self) -> str:
+        if self.font_family_combo is None:
+            return ""
+        data = self.font_family_combo.currentData()
+        if data is not None:
+            return str(data or "").strip()
+        index = self.font_family_combo.currentIndex()
+        if 0 <= index < len(self._font_family_values):
+            return str(self._font_family_values[index] or "").strip()
+        return ""
+
+    def _persist_font_preference(self):
+        if self._syncing_ui:
+            return
+        family = self._current_font_family()
+        size = self.font_size_spin.value() if self.font_size_spin else DEFAULT_FONT_SIZE
+        self.settings_manager.set_font_preferences(family, size)
+        self.fontChanged.emit(family, int(size))
+
+    def on_font_family_combo_changed(self, index: int):
+        if self._syncing_ui or index < 0:
+            return
+        self._persist_font_preference()
+
+    def on_font_size_changed(self, value: int):
+        if self._syncing_ui:
+            return
+        self._persist_font_preference()
+
+    def reset_font_preferences(self):
+        """Restore automatic CJK-aware selection and the default size."""
+
+        self.settings_manager.reset_font_preferences()
+        self._syncing_ui = True
+        try:
+            self._refresh_font_family_combo("")
+            if self.font_size_spin:
+                self.font_size_spin.setValue(DEFAULT_FONT_SIZE)
+        finally:
+            self._syncing_ui = False
+
+        self.fontChanged.emit("", DEFAULT_FONT_SIZE)
+        InfoBar.success(
+            title=tr("common.success"),
+            content=tr("settings.font_saved"),
+            orient=Qt.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP,
+            duration=2500,
+            parent=self,
+        )
+
     def browse_output_root(self):
         path = QFileDialog.getExistingDirectory(
             self,
@@ -1077,6 +1237,10 @@ class SettingsPage(QFrame):
         )
         self.settings_manager.set_image_viewer_path(
             self.image_viewer_edit.text() if self.image_viewer_edit else ""
+        )
+        self.settings_manager.set_font_preferences(
+            self._current_font_family(),
+            self.font_size_spin.value() if self.font_size_spin else DEFAULT_FONT_SIZE,
         )
         self.load_current_settings()
         InfoBar.success(

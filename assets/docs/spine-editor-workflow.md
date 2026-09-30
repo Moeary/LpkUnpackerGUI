@@ -10,7 +10,7 @@
 
 官方拆图会恢复旋转与裁边留白；PMA 需正确解除预乘。导入骨骼应使用对应版本，运行时文件缺失的编辑器信息不能凭空恢复。来源：[官方导入教程](https://esotericsoftware.com/blog/Importing-skeleton-data)、[Texture Unpacker](https://en.esotericsoftware.com/spine-texture-packer#Texture-Unpacker)。
 
-本机 `D:/Programs/Spine pro 3.8.75/Spine.com --help` 已确认提供 `--import` 和 `--unpack` 参数；本次只核对帮助，没有自动操作编辑器或声称编辑器导入已验收。
+本机 `D:/Programs/Spine pro 3.8.75/Spine.com` 已实际生成并重新读取样本工程。图片路径与网格外邻图的调查、逐部件修改及导出步骤见 [Spine 部件改图完整流程](spine-part-editing.md)。CLI 重开成功不等于所有动画均已在编辑器中目视验收。
 
 ## 与本程序的差别
 
@@ -25,4 +25,4 @@
 
 多边形打包尤其需要注意：官方 CLI 支持以项目网格为上下文清理轮廓外像素；缺少项目上下文时，拆出的矩形图片可能包含相邻图片片段。不能把只按 atlas 矩形裁切理解为完整无损还原。[官方 CLI](https://en.esotericsoftware.com/spine-command-line-interface#Unpack)
 
-后续若整合编辑器，建议独立提供“发送到 Spine”流程，检测编辑器路径与版本，先拆图再导入骨骼，并复用保留的 atlas core；不把跨版本转换当作无损恢复作者工程。
+版本转换页现已提供“生成 .spine 编辑工程”，通过本机 3.8.75 编辑器导入拆图后的骨骼；它复用保留的 atlas core，不把跨版本转换当作无损恢复作者工程。
