@@ -78,6 +78,11 @@ class SpineEmbedTests(unittest.TestCase):
             self.assertTrue(installed.is_file())
             self.assertFalse(build.exists())
             self.assertEqual(len(commands), 2)
+            configure = commands[0]
+            self.assertEqual(
+                configure[configure.index("-S") + 1],
+                str(spine_embed.PROJECT_ROOT / "app" / "native" / "spine_bridge"),
+            )
 
 
 if __name__ == "__main__":

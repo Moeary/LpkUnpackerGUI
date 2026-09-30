@@ -557,6 +557,10 @@ class SpinePreviewImportThread(QThread):
         self.source_path = source_path
         self.temp_root = temp_root
         self.runtime_root = runtime_root or None
+        # Captured by PreviewPage on the GUI thread before ``start``.  Keeping
+        # this value on the worker avoids observing a settings-page edit while
+        # an import is already in progress.
+        self._unify_version = False
         self.result = None
 
     def run(self):
@@ -565,10 +569,12 @@ class SpinePreviewImportThread(QThread):
                 result = prepare_package_preview_import(
                     self.source_path, self.temp_root, self.runtime_root,
                     should_continue=lambda: not self.isInterruptionRequested(),
+                    unify_version=self._unify_version,
                 )
             else:
                 result = prepare_spine_preview_import(
                     self.source_path, self.temp_root, self.runtime_root,
+                    unify_version=self._unify_version,
                 )
             self.result = result
             self.previewReady.emit(result, self.source_path)
@@ -2408,6 +2414,20 @@ class PreviewPage(QFrame):
                 return str(preview.get("spine_runtime_dir") or "").strip()
         return str(manager.get("preview.spine_runtime_dir", "") or "").strip()
 
+    def _spine_preview_unify_for_import(self) -> bool:
+        """Capture the independent unified-preview switch on the GUI thread."""
+
+        manager = self.settings_manager
+        latest = self._load_latest_preview_settings()
+        if isinstance(latest, dict):
+            section = latest.get("spine_preview")
+            if isinstance(section, dict) and "unify_version" in section:
+                return bool(section.get("unify_version"))
+        getter = getattr(manager, "get_spine_preview_unify_version", None)
+        if callable(getter):
+            return bool(getter())
+        return bool(manager.get("spine_preview.unify_version", True))
+
     def _merge_latest_preview_settings(self, ui_state: dict):
         """Merge the current UI state into the newest persisted settings."""
 
@@ -3324,6 +3344,7 @@ class PreviewPage(QFrame):
             tr("preview.spine_import_loading", source=source_path)
         )
         runtime_root = self._spine_runtime_dir_for_import()
+        unify_version = self._spine_preview_unify_for_import()
         worker = SpinePreviewImportThread(
             source_path,
             self.settings_manager.get_temp_dir(),
@@ -3331,6 +3352,7 @@ class PreviewPage(QFrame):
             self,
         )
         worker._package_fallback = bool(package_fallback)
+        worker._unify_version = bool(unify_version)
         worker._preview_generation = generation
         worker.previewReady.connect(
             lambda result, source, w=worker, g=generation: self.on_spine_preview_ready(result, source, g, w)
@@ -3371,6 +3393,16 @@ class PreviewPage(QFrame):
             tr("preview.spine_import_failed_content", error=error),
         )
 
+    @staticmethod
+    def _spine_plan_reason(plan: SpinePreviewPlan) -> str:
+        """Render plan diagnostics, including any source-to-target warning."""
+
+        reason = str(plan.reason or "")
+        warnings = [str(item) for item in (plan.warnings or ()) if str(item)]
+        if warnings:
+            reason = "\n\n".join(part for part in (reason, "\n".join(f"- {item}" for item in warnings)) if part)
+        return reason
+
     def _open_spine_native_preview(self, plan: SpinePreviewPlan):
         if self.spine_preview is None:
             raise RuntimeError("Native Spine preview widget is unavailable.")
@@ -3383,7 +3415,7 @@ class PreviewPage(QFrame):
                 "preview.spine_preview_loading",
                 version=plan.asset.spine_version or "unknown",
                 mode=plan.mode,
-                reason=plan.reason,
+                reason=self._spine_plan_reason(plan),
             )
         )
         self.spine_preview.open_plan(plan)
@@ -3402,7 +3434,7 @@ class PreviewPage(QFrame):
                 "preview.spine_preview_loading",
                 version=plan.asset.spine_version or "unknown",
                 mode=plan.mode,
-                reason=plan.reason,
+                reason=self._spine_plan_reason(plan),
             )
         )
 
@@ -3418,7 +3450,7 @@ class PreviewPage(QFrame):
                 "preview.spine_preview_ready",
                 version=plan.asset.spine_version or "unknown",
                 mode=plan.mode,
-                reason=plan.reason,
+                reason=self._spine_plan_reason(plan),
             )
         )
 

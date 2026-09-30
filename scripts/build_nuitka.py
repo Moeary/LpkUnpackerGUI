@@ -127,9 +127,9 @@ def build_nuitka_args(compiler: str, *, require_native: bool = False) -> list[st
             if source.is_file():
                 target = f"tools/spine_native/{library.parent.name}/{name}"
                 args.insert(-1, f"--include-data-file={source}={target}")
-    bridge_source = ROOT / "native" / "spine_bridge"
+    bridge_source = ROOT / "app" / "native" / "spine_bridge"
     if bridge_source.is_dir():
-        args.insert(-1, f"--include-data-dir={bridge_source}=native/spine_bridge")
+        args.insert(-1, f"--include-data-dir={bridge_source}=app/native/spine_bridge")
     return args
 
 

@@ -70,7 +70,7 @@ jobs:
         path: |
           runtime/tools/spine_native
           runtime/build/native-source-cache
-        key: spine-native-${{ hashFiles('app/core/toolchain_manifest.py', 'native/spine_bridge/CMakeLists.txt') }}
+        key: spine-native-${{ hashFiles('app/core/toolchain_manifest.py', 'app/native/spine_bridge/CMakeLists.txt') }}
         restore-keys: |
           spine-native-
 

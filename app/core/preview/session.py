@@ -17,8 +17,12 @@ from app.core.spine_preview import (
     SpinePreviewAsset,
     SpinePreviewPlan,
     load_spine_asset,
-    make_spine_preview_plan,
     prepare_spine_preview_import as _prepare_spine_preview_import,
+)
+from app.core.spine_preview_conversion import (
+    PreparedSpinePreview,
+    SpinePreviewConversionInfo,
+    prepare_spine_preview,
 )
 
 
@@ -35,9 +39,20 @@ class SpinePreviewImportResult:
     asset: SpinePreviewAsset
     plan: SpinePreviewPlan
     temp_dir: Path | None = None
+    conversion: SpinePreviewConversionInfo | None = None
+    source_version: str | None = None
+    preview_version: str | None = None
+    warnings: tuple[str, ...] = ()
 
 
-def prepare_package_preview_import(source, temp_root, runtime_root=None, *, should_continue=None):
+def prepare_package_preview_import(
+    source,
+    temp_root,
+    runtime_root=None,
+    *,
+    should_continue=None,
+    unify_version: bool = False,
+):
     """Extract an LPK/WPK once, then select a model from the same workspace.
 
     Preview extraction deliberately leaves export conversion disabled. Both
@@ -62,7 +77,13 @@ def prepare_package_preview_import(source, temp_root, runtime_root=None, *, shou
             package = resolve_live2d_package(temp_dir)
             preview_json = prepare_model_json_for_preview(package.model_json)
             return PreviewImportResult(package, preview_json, temp_dir)
-        return SpinePreviewImportResult(asset, make_spine_preview_plan(asset, runtime_root), temp_dir)
+        return _finish_spine_preview_import(
+            asset,
+            temp_dir,
+            temp_root,
+            runtime_root,
+            unify_version=unify_version,
+        )
     except Exception:
         # Only our newly created disposable workspace is removed on failure.
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -129,10 +150,56 @@ def prepare_spine_preview_import(
     temp_root: str | Path,
     runtime_root: str | Path | None = None,
     log=None,
+    *,
+    unify_version: bool = False,
 ) -> SpinePreviewImportResult:
     result = _prepare_spine_preview_import(source, temp_root, runtime_root, log=log)
+    try:
+        return _finish_spine_preview_import(
+            result.asset,
+            result.temp_dir,
+            temp_root,
+            runtime_root,
+            unify_version=unify_version,
+        )
+    except Exception:
+        # The lower-level importer has already transferred ownership of its
+        # disposable extraction workspace to this wrapper.  If conversion
+        # fails, release only that workspace; never touch the source path or a
+        # persistent content-addressed cache.
+        if result.temp_dir:
+            shutil.rmtree(result.temp_dir, ignore_errors=True)
+        raise
+
+
+def _finish_spine_preview_import(
+    asset: SpinePreviewAsset,
+    temp_dir: Path | None,
+    temp_root: str | Path,
+    runtime_root: str | Path | None,
+    *,
+    unify_version: bool,
+) -> SpinePreviewImportResult:
+    """Apply the explicit preview conversion policy after source preparation."""
+
+    # Keep persistent conversion caches beside (rather than inside) each
+    # disposable extraction directory.  Preview cleanup can therefore remove
+    # only the extraction it owns without deleting a reusable cache.
+    cache_root = Path(temp_root).expanduser().resolve() / "spine_preview_cache"
+    prepared: PreparedSpinePreview = prepare_spine_preview(
+        asset,
+        cache_root,
+        runtime_root,
+        unify_version=bool(unify_version),
+    )
+    conversion = prepared.conversion
+    warnings = tuple(prepared.plan.warnings) + tuple(conversion.warnings)
     return SpinePreviewImportResult(
-        asset=result.asset,
-        plan=result.plan,
-        temp_dir=result.temp_dir,
+        asset=prepared.asset,
+        plan=prepared.plan,
+        temp_dir=temp_dir,
+        conversion=conversion,
+        source_version=conversion.source_version,
+        preview_version=prepared.asset.spine_version,
+        warnings=warnings,
     )

@@ -105,6 +105,12 @@ class SettingsManager:
                     "selected_motion": "",
                 },
             },
+            "spine_preview": {
+                # Preview normalization is independent from formal extraction
+                # conversion.  The GUI captures this explicit switch before a
+                # worker starts so a settings-page edit cannot race an import.
+                "unify_version": True,
+            },
             "spine_conversion": {
                 "enabled": False,
                 "target_version": DEFAULT_SPINE_TARGET_VERSION,
@@ -481,6 +487,16 @@ class SettingsManager:
         """Store the native runtime root used by the Spine preview backend."""
 
         self.set("preview.spine_runtime_dir", str(path or "").strip())
+
+    def get_spine_preview_unify_version(self) -> bool:
+        """Return whether Spine preview assets are normalized to 3.8.75."""
+
+        return bool(self.get("spine_preview.unify_version", True))
+
+    def set_spine_preview_unify_version(self, enabled: bool):
+        """Store the independent unified-version preview switch."""
+
+        self.set("spine_preview.unify_version", bool(enabled))
 
     def get_spine_auto_convert(self) -> bool:
         """Return whether formal Spine unpack/export may create a converted copy."""

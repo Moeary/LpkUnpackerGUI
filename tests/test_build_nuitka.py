@@ -60,6 +60,21 @@ class BuildNuitkaTests(unittest.TestCase):
                 self.assertIn(relative, joined)
             self.assertIn("THIRD_PARTY_NOTICES.md", joined)
 
+    def test_packaging_includes_bridge_source_under_app_native(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_required_native_inputs(root)
+            bridge_source = root / "app" / "native" / "spine_bridge"
+            bridge_source.mkdir(parents=True)
+            (bridge_source / "CMakeLists.txt").write_text("project(test)", encoding="utf-8")
+
+            with patch("scripts.build_nuitka.ROOT", root):
+                args = build_nuitka_args("msvc", require_native=True)
+
+            bridge_arg = f"--include-data-dir={bridge_source}=app/native/spine_bridge"
+            self.assertIn(bridge_arg, args)
+            self.assertNotIn("=native/spine_bridge", "\n".join(args))
+
     def test_msvc_build_uses_batch_file_without_escaped_vsdevcmd_quotes(self):
         captured: dict[str, object] = {}
 

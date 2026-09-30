@@ -38,6 +38,13 @@ official `spine-runtimes` commits for 3.8.75 and 4.0.  `native-build` validates
 the converter, both bridges, their metadata, and all three license files.
 `build` depends on that validation and passes `--require-native` to Nuitka.
 
+The CMake bridge source is kept in `app/native/spine_bridge/`.  Nuitka includes
+that source at `app/native/spine_bridge` in the standalone package so the
+settings/download build flow can still locate its CMake source when compiling
+a locally installed runtime.  The compiled runtime DLLs keep their separate
+locations under `runtime/tools/spine_native/<family>` and are packaged under
+`tools/spine_native/<family>`.
+
 The Spine task first checks for the exact, SHA-256 verified source ZIP retained
 beside each existing bridge.  It reuses that archive and extracts only the
 needed `spine-cpp` source to a temporary directory.  If no verified local

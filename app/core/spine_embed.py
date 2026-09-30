@@ -248,7 +248,7 @@ def build_native_runtime(
         raise RuntimeError("Native Spine bridge build cancelled before configuration")
 
     repo_root = PROJECT_ROOT
-    cmake_source = repo_root / "native" / "spine_bridge"
+    cmake_source = repo_root / "app" / "native" / "spine_bridge"
     if not (cmake_source / "CMakeLists.txt").is_file():
         raise FileNotFoundError(f"Bridge CMake source missing: {cmake_source}")
     temp_root, build_root = _safe_build_directory(family)

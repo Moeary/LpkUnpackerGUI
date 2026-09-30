@@ -179,6 +179,9 @@ class SettingsPage(QFrame):
         self.spine_target_version_label = None
         self.spine_target_version_desc = None
         self.spine_target_version_edit = None
+        self.spine_preview_unify_label = None
+        self.spine_preview_unify_desc = None
+        self.spine_preview_unify_checkbox = None
         self.tool_download_section_title = None
         self.tool_download_desc = None
         self.assetstudio_install_button = None
@@ -719,6 +722,18 @@ class SettingsPage(QFrame):
             self.spine_target_version_edit,
         )
 
+        self.spine_preview_unify_label = BodyLabel("", spine_card)
+        self.spine_preview_unify_desc = CaptionLabel("", spine_card)
+        self.spine_preview_unify_desc.setWordWrap(True)
+        self.spine_preview_unify_checkbox = CheckBox(spine_card)
+        self._add_text_block(
+            spine_layout,
+            self.spine_preview_unify_label,
+            self.spine_preview_unify_desc,
+        )
+        self._configure_expanding(self.spine_preview_unify_checkbox)
+        spine_layout.addWidget(self.spine_preview_unify_checkbox)
+
         # Texture preview settings -------------------------------------------
         texture_card, texture_layout = self._new_settings_card(
             content, "settingsTextureCard"
@@ -806,6 +821,13 @@ class SettingsPage(QFrame):
             if self.spine_target_version_edit:
                 self.spine_target_version_edit.setText(
                     self.settings_manager.get_spine_conversion_target_version()
+                )
+            if self.spine_preview_unify_checkbox:
+                get_unify_preview = getattr(
+                    self.settings_manager, "get_spine_preview_unify_version", None
+                )
+                self.spine_preview_unify_checkbox.setChecked(
+                    bool(get_unify_preview()) if callable(get_unify_preview) else True
                 )
             if self.texture_viewer_combo:
                 self._set_combo_by_value(
@@ -955,6 +977,15 @@ class SettingsPage(QFrame):
             self.spine_target_version_desc.setText(tr("settings.spine_target_version_desc"))
             self.spine_target_version_edit.setPlaceholderText(
                 tr("settings.spine_target_version_placeholder")
+            )
+            self.spine_preview_unify_label.setText(
+                tr("settings.spine_preview_unify_label")
+            )
+            self.spine_preview_unify_desc.setText(
+                tr("settings.spine_preview_unify_desc")
+            )
+            self.spine_preview_unify_checkbox.setText(
+                tr("settings.spine_preview_unify_checkbox")
             )
             self.tool_download_section_title.setText(
                 tr("settings.tool_download_section")
@@ -1229,6 +1260,15 @@ class SettingsPage(QFrame):
         self.settings_manager.set_spine_conversion_target_version(
             target_version
         )
+        set_unify_preview = getattr(
+            self.settings_manager, "set_spine_preview_unify_version", None
+        )
+        if callable(set_unify_preview):
+            set_unify_preview(
+                self.spine_preview_unify_checkbox.isChecked()
+                if self.spine_preview_unify_checkbox
+                else True
+            )
         self.settings_manager.set_texture_viewer_mode(
             self._current_combo_value(
                 self.texture_viewer_combo,

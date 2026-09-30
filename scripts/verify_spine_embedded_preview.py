@@ -21,6 +21,8 @@ QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, Tr
 from PySide6.QtWidgets import QApplication
 QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
 
+from app.core.spine_preview import load_spine_asset, read_spine_version
+
 
 def pump(app, seconds=.1):
     until = time.monotonic() + seconds
@@ -60,19 +62,75 @@ def pixels(canvas):
                       sha256=hashlib.sha256(raw).hexdigest())
 
 
+def source_original_spine_version(source):
+    """Read the source skeleton version before the preview worker prepares its plan."""
+
+    path = Path(source).resolve()
+    try:
+        asset = load_spine_asset(path)
+        skeleton = getattr(asset, "skeleton_path", None)
+        if skeleton:
+            version = read_spine_version(skeleton)
+            if version:
+                return version
+        return getattr(asset, "spine_version", None)
+    except Exception:
+        # Only a binary skeleton is safe to read directly after discovery
+        # fails.  A model0.json may contain unrelated ``version`` metadata;
+        # reading it directly would report that value as the Spine version.
+        if path.is_file() and path.name.lower().endswith((".skel", ".skel.bytes")):
+            return read_spine_version(path)
+        # Archives and unresolved model configurations are reported as
+        # unknown here; the prepared asset report remains authoritative.
+        return None
+
+
+def spine_plan_report(source, plan):
+    """Return version/provenance fields needed by the acceptance report."""
+
+    asset = getattr(plan, "asset", None)
+    runtime = getattr(plan, "runtime", None)
+    skeleton = getattr(asset, "skeleton_path", None)
+    library = getattr(runtime, "library_path", None)
+    root_dir = getattr(runtime, "root_dir", None)
+    return {
+        "source": {
+            "path": str(Path(source).resolve()),
+            "originalread_spine_version": source_original_spine_version(source),
+        },
+        "prepared": {
+            "spine_version": getattr(asset, "spine_version", None),
+            "skeleton_path": str(skeleton) if skeleton else None,
+        },
+        "plan": {
+            "mode": getattr(plan, "mode", None),
+            "reason": getattr(plan, "reason", ""),
+            "warnings": list(getattr(plan, "warnings", ()) or ()),
+        },
+        "runtime": {
+            "version": getattr(runtime, "version", None),
+            "family": getattr(runtime, "family", None),
+            "librarypath": str(library) if library else None,
+            "root_dir": str(root_dir) if root_dir else None,
+        },
+    }
+
+
 def main():
     p=argparse.ArgumentParser()
     p.add_argument('--source', required=True)
     p.add_argument('--runtime', default='runtime/tools/spine_native')
     p.add_argument('--switch-source')
     p.add_argument('--live2d-source')
+    p.add_argument('--expect-version', help='Assert every prepared plan.asset.spine_version equals this value')
     p.add_argument('--report', default='runtime/validation/spine_native_acceptance.json')
     p.add_argument('--screenshot', default='runtime/validation/spine_native_acceptance.png')
     p.add_argument('--width', type=int, default=1600)
     p.add_argument('--height', type=int, default=1000)
     p.add_argument('--timeout', type=float, default=45)
     args=p.parse_args()
-    report={'ok':False, 'source':args.source, 'runtime':args.runtime}
+    report={'ok':False, 'source':args.source, 'runtime':args.runtime,
+            'expect_version':args.expect_version, 'spine_plans':{}}
     output=Path(args.report).resolve();output.parent.mkdir(parents=True,exist_ok=True)
     sandbox=Path(tempfile.mkdtemp(prefix='native-qa-',dir=output.parent))
     import app.core.settings_manager as sm
@@ -111,10 +169,21 @@ def main():
             pump(app,.25)
             state=widget.last_state
             assert state.get('skeletonLoaded'),state
+            plan=getattr(page, '_active_spine_plan', None) or getattr(widget, '_plan', None)
+            if plan is None:
+                raise AssertionError('Spine preview did not expose its prepared plan')
+            plan_report = spine_plan_report(source, plan)
+            report['spine_plans'][label] = plan_report
+            if args.expect_version is not None:
+                assert plan.asset.spine_version == args.expect_version, (
+                    f"Prepared Spine version {plan.asset.spine_version!r} "
+                    f"does not match --expect-version {args.expect_version!r}"
+                )
             canvas=widget.canvas
             first_image,first_pixels=pixels(canvas)
             entry={'state':state,'pixels':first_pixels,'window':window_state(window),
                    'device_pixel_ratio':canvas.devicePixelRatio(), 'samples':canvas.format().samples()}
+            entry['spine'] = plan_report
             report[label]=entry
             assert entry['window']['hwnd']==baseline['hwnd'],'Preview replaced the top-level HWND'
             assert entry['window']['maximized'],'Preview restored the maximized window'
