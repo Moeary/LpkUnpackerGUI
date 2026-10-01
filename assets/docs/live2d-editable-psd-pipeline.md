@@ -38,13 +38,12 @@ For `mesh` mode:
 - If no sidecar exists, the tool tries the optional Cubism Core backend and exports one first.
 - Cubism UVs are converted to PNG pixel coordinates with the V axis flipped.
 - Drawable visibility, opacity, and clipping masks are applied before a layer is written.
-- Drawable layers are grouped into PSD folders using available Cubism runtime data:
-  first broad semantic rules such as background/effects/hit areas, then the
-  drawable parent Part ID. This is only an approximate runtime grouping, not
-  the original authoring PSD tree.
+- Drawable layers follow runtime draw order rather than inferred body-part names.
 - Each rendered ArtMesh layer is cropped to its alpha bounding box while keeping its PSD `left`/`top` offset, so Photoshop does not have to load hundreds of full-canvas pixel layers.
 - Full-character PSD output uses a simple RAW RGBA PSD writer to avoid slow `psd-tools` RLE encoding on large multi-layer models.
-- Mesh PSD output is the preferred editing view, but it is not treated as repackable yet.
+- Mesh PSD edits can be mapped back through the recorded posed triangles and UVs.
+  The selected-part variant additionally records immutable visibility and clipping
+  factors, keeps edits inside selected UVs, and checks shared-pixel effects.
 
 For `atlas-components` mode:
 
@@ -98,8 +97,13 @@ that PSD to the atlas requires inverse triangle warping:
 
 This is possible but not lossless. Overlapping drawables, clipping masks,
 semi-transparent effects, blend modes, antialiasing, and pixels that were
-hidden in the posed view all need policy decisions. The current implementation
-therefore only treats `atlas-components` PSD files as repackable.
+hidden in the posed view all need policy decisions. A selected-part PSD preserves
+the source PNG bytes on a no-op and applies only edited pixel deltas. Keep its
+canvas size and layer positions/dimensions unchanged. Shared pixels affecting
+unselected parts are rejected by default; explicit single-PSD consent permits
+those parts to change together and records the actual affected IDs. Conflicting
+selected-layer writes are still rejected. Repainted pixels are resampled by the
+inverse warp; this does not recover the original authoring document.
 
 Texture format note: official Cubism model setting documentation describes
 `.model3.json` as linking texture data with `.png`. Runtime integrations can

@@ -3,6 +3,7 @@ import hashlib
 import json
 import math
 import re
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
@@ -399,6 +400,10 @@ def reconstruct_live2d_psd(
     pose_name: str | None = None,
     output_name: str | None = None,
     resource_limits: PsdResourceLimits | Mapping[str, Any] | None = None,
+    *,
+    selected_drawable_ids: list[str] | None = None,
+    selection_region: Any = None,
+    mesh_data: Mapping[str, Any] | None = None,
 ) -> ReconstructionResult:
     mode = str(mode or "mesh").strip().lower()
     if mode not in {"mesh", "atlas-components", "atlas-artmesh"}:
@@ -412,6 +417,10 @@ def reconstruct_live2d_psd(
     _require_psd_tools()
 
     source_info = resolve_live2d_source(Path(source))
+    if mesh_data is not None:
+        source_info.mesh_data = dict(mesh_data)
+    if selected_drawable_ids is not None and mode != "mesh":
+        raise PsdReconstructionError("Drawable selection is available only for mesh pose PSD export.")
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -426,7 +435,7 @@ def reconstruct_live2d_psd(
     _emit(progress, 20, f"Loaded {len(textures)} texture atlas file(s)")
 
     if mode in {"mesh", "atlas-artmesh"} and (
-        not source_info.mesh_data or (mode == "mesh" and parameter_values)
+        not source_info.mesh_data or (mode == "mesh" and parameter_values and mesh_data is None)
     ):
         try:
             from app.core.cubism_core import CubismCoreError, export_drawables_sidecar
@@ -444,9 +453,38 @@ def reconstruct_live2d_psd(
         except CubismCoreError as exc:
             warnings.append(f"Cubism Core drawable export unavailable: {exc}")
 
+    selection = None
+    if selected_drawable_ids is not None:
+        if not source_info.mesh_data:
+            raise PsdReconstructionError("Selected pose PSD export requires Cubism drawable geometry.")
+        from app.core.psd_selection import PsdSelectionError, prepare_selection, selection_uv_constraints
+
+        all_drawables = [_normalize_drawable(item) for item in source_info.mesh_data.get("drawables", [])
+                         if isinstance(item, dict)]
+        all_drawables = [item for item in all_drawables if item is not None]
+        try:
+            source_size, source_offset = _resolve_canvas(source_info.mesh_data, all_drawables)
+            selected_mesh, selection = prepare_selection(
+                source_info.mesh_data, all_drawables, selected_drawable_ids,
+                source_size, source_offset, selection_region,
+            )
+            protected, shared = selection_uv_constraints(
+                cv2, all_drawables, selection["selected_ids"],
+                [(texture.shape[1], texture.shape[0]) for texture in textures],
+            )
+        except (PsdSelectionError, ValueError) as exc:
+            raise PsdReconstructionError(str(exc)) from exc
+        selection["protected_drawables"] = protected
+        selection["shared_regions"] = shared
+        if shared:
+            warnings.append("Selected UVs are shared with unselected ArtMeshes: "
+                            + ", ".join(item["unselected_id"] for item in shared)
+                            + ". Repack will reject edits affecting those shared texels.")
+        source_info.mesh_data = selected_mesh
+
     if mode == "mesh" and source_info.mesh_data:
         layers, size, layer_metadata = _render_mesh_layers(
-            cv2, source_info.mesh_data, textures, progress, limits, texture_pixels
+            cv2, source_info.mesh_data, textures, progress, limits, texture_pixels, selection
         )
         mode = "mesh"
     elif mode == "atlas-artmesh":
@@ -480,6 +518,8 @@ def reconstruct_live2d_psd(
         "atlas-components": "editable_atlas",
         "atlas-artmesh": "atlas_artmesh",
     }[mode]
+    if selection is not None:
+        suffix = "selected_pose"
     psd_path = output_path / f"{model_name}_{suffix}.psd"
     metadata_path = output_path / f"{model_name}_{suffix}.lpkpsd.json"
     _emit(progress, 90, f"Preparing PSD with {len(layers)} layer(s)")
@@ -493,7 +533,7 @@ def reconstruct_live2d_psd(
     )
     _save_psd(
         psd_path, size, layers, progress=progress, resource_limits=limits,
-        flat_layers=(mode == "mesh"),
+        flat_layers=(mode == "mesh" and selection is None),
     )
     _emit(progress, 98, "Writing metadata")
     _refresh_pixel_references_from_psd(psd_path, layer_metadata)
@@ -508,6 +548,9 @@ def reconstruct_live2d_psd(
     )
     if mode == "atlas-artmesh":
         metadata["shared_regions"] = shared_regions
+    if selection is not None:
+        selection["selected_ids"] = [item["drawable_id"] for item in layer_metadata]
+        metadata["selection"] = selection
     _write_layer_baselines(psd_path, metadata_path, layer_metadata)
     _write_json(metadata_path, metadata)
     export_report = {
@@ -515,9 +558,12 @@ def reconstruct_live2d_psd(
         "psd": str(psd_path),
         "metadata": str(metadata_path),
         "layer_count": len(layers),
-        "shared_regions": shared_regions if mode == "atlas-artmesh" else [],
+        "shared_regions": selection["shared_regions"] if selection is not None
+        else (shared_regions if mode == "atlas-artmesh" else []),
         "conflicts": [],
     }
+    if selection is not None:
+        export_report["selection"] = selection
     report_path = output_path / f"{model_name}_{suffix}.report.json"
     _write_json(report_path, export_report)
 
@@ -528,9 +574,34 @@ def reconstruct_live2d_psd(
         mode=mode,
         warnings=warnings,
         metadata_path=metadata_path,
-        shared_regions=shared_regions if mode == "atlas-artmesh" else [],
+        shared_regions=export_report["shared_regions"],
         report=export_report,
         report_path=report_path,
+    )
+
+
+def reconstruct_selected_live2d_psd(
+    source: str | Path,
+    output_dir: str | Path,
+    drawable_ids: list[str],
+    *,
+    parameter_values: dict[str, float] | None = None,
+    selection_region: Any = None,
+    mesh_data: Mapping[str, Any] | None = None,
+    progress: Optional[ProgressCallback] = None,
+    pose_name: str | None = None,
+    output_name: str | None = None,
+    resource_limits: PsdResourceLimits | Mapping[str, Any] | None = None,
+) -> ReconstructionResult:
+    """Export complete selected ArtMeshes arranged in the supplied current pose.
+
+    ``mesh_data`` is a complete canvas-pixels-y-down snapshot, including mask
+    dependencies.  The selection rectangle is provenance, not a pixel crop.
+    """
+    return reconstruct_live2d_psd(
+        source, output_dir, progress, mode="mesh", parameter_values=parameter_values,
+        pose_name=pose_name, output_name=output_name, resource_limits=resource_limits,
+        selected_drawable_ids=drawable_ids, selection_region=selection_region, mesh_data=mesh_data,
     )
 
 
@@ -541,6 +612,7 @@ def repack_atlas_png_from_psd(
     progress: Optional[ProgressCallback] = None,
     resource_limits: PsdResourceLimits | Mapping[str, Any] | None = None,
     input_texture_paths: Mapping[int, str | Path] | None = None,
+    allow_shared_uv: bool = False,
 ) -> ReconstructionResult:
     limits = _resolve_resource_limits(resource_limits)
     _require_psd_tools()
@@ -557,6 +629,10 @@ def repack_atlas_png_from_psd(
         raise PsdReconstructionError(f"Unsupported PSD metadata file: {metadata_file}")
     _validate_metadata_source_summaries(metadata, metadata_file)
     mode = str(metadata.get("mode") or "")
+    if not isinstance(allow_shared_uv, bool):
+        raise PsdReconstructionError("allow_shared_uv must be an explicit boolean.")
+    if allow_shared_uv and (mode != "mesh" or not metadata.get("selection")):
+        raise PsdReconstructionError("Shared UV consent is available only for a selected pose PSD.")
     if mode not in {"atlas-components", "atlas-artmesh", "mesh"}:
         raise PsdReconstructionError(
             "Only mesh, atlas-components, or atlas-artmesh PSD metadata can be repacked."
@@ -587,6 +663,14 @@ def repack_atlas_png_from_psd(
     _emit(progress, 10, f"Loaded PSD: {psd_file}")
 
     if mode == "mesh":
+        selection = metadata.get("selection")
+        if selection is not None and (
+            int(psd.width) != int(metadata.get("canvas", {}).get("width", 0))
+            or int(psd.height) != int(metadata.get("canvas", {}).get("height", 0))
+        ):
+            raise PsdReconstructionError(
+                "Selected pose PSD canvas size changed. Keep the original canvas and layer positions."
+            )
         return _repack_mesh_psd_layers(
             psd,
             psd_layers,
@@ -598,6 +682,8 @@ def repack_atlas_png_from_psd(
             limits,
             texture_pixels,
             input_texture_paths,
+            selection,
+            allow_shared_uv,
         )
 
     canvases, warnings = _load_atlas_repack_canvases(
@@ -722,7 +808,14 @@ def _repack_mesh_psd_layers(
     limits: PsdResourceLimits,
     texture_pixels: int,
     input_texture_paths: Mapping[int, str | Path] | None = None,
+    selection: Mapping[str, Any] | None = None,
+    allow_shared_uv: bool = False,
 ) -> ReconstructionResult:
+    if selection is not None:
+        return _repack_selected_mesh_psd_layers(
+            psd, psd_layers, textures, layers_metadata, output_path, progress,
+            metadata_file, limits, texture_pixels, input_texture_paths, selection, allow_shared_uv,
+        )
     cv2 = _require_cv2()
     _configure_opencv(cv2, limits)
     _validate_layer_budget(
@@ -910,6 +1003,135 @@ def _repack_mesh_psd_layers(
         report=report,
         report_path=report_path,
         region_masks=region_masks,
+    )
+
+
+def _repack_selected_mesh_psd_layers(
+    psd, psd_layers: dict[str, Any], textures: list[dict[str, Any]],
+    layers_metadata: list[dict[str, Any]], output_path: Path,
+    progress: Optional[ProgressCallback], metadata_file: Path, limits: PsdResourceLimits,
+    texture_pixels: int, input_texture_paths: Mapping[int, str | Path] | None,
+    selection: Mapping[str, Any],
+    allow_shared_uv: bool = False,
+) -> ReconstructionResult:
+    from app.core.psd_selection import (
+        PsdSelectionError, affected_unselected, apply_pose_delta, decode_visibility, uv_region,
+    )
+
+    if not isinstance(selection, Mapping) or selection.get("version") != 1:
+        raise PsdReconstructionError("Unsupported selected pose PSD metadata.")
+    cv2 = _require_cv2()
+    _configure_opencv(cv2, limits)
+    canvases, warnings = _load_mesh_repack_canvases(
+        textures, input_texture_paths, output_path=output_path, metadata_file=metadata_file,
+    )
+    original_canvases, _ = _load_mesh_repack_canvases(textures, None, metadata_file=metadata_file)
+    input_canvases = dict(canvases)
+    written = {index: np.zeros(canvas.shape[:2], dtype=bool) for index, canvas in canvases.items()}
+    written_ids: dict[int, list[str]] = {index: [] for index in canvases}
+    change_regions: list[dict[str, Any]] = []
+    region_masks: list[dict[str, Any]] = []
+    affected_shared_ids: set[str] = set()
+
+    def reject(message: str, affected: list[str]) -> None:
+        _write_json(output_path / "repack_report.json", {
+            "mode": "mesh-repack", "status": "rejected", "metadata": str(metadata_file),
+            "reason": message, "affected_unselected_ids": affected,
+            "selection": dict(selection), "output_paths": [],
+        })
+        raise PsdReconstructionError(message)
+
+    for index, info in enumerate(layers_metadata):
+        identifier = str(info.get("drawable_id") or info["name"])
+        texture_index = int(info["texture_index"])
+        layer = _find_bound_psd_layer(psd, psd_layers, info)
+        if layer is None or not _layer_effectively_visible(layer):
+            warnings.append(f"Selected ArtMesh is missing or hidden in PSD; its atlas pixels are unchanged: {identifier}")
+            continue
+        image = layer.composite(force=True)
+        if image is None:
+            continue
+        edited = np.asarray(image.convert("RGBA"), dtype=np.uint8)
+        left, top = int(info["left"]), int(info["top"])
+        expected_size = (int(info["bbox"][2]), int(info["bbox"][3]))
+        if (int(layer.left), int(layer.top)) != (left, top) or image.size != expected_size:
+            reject("Selected pose PSD layer was moved or resized: " + identifier
+                   + ". Keep the original layer positions and dimensions; edit pixels inside its Paint group.", [])
+        baseline = _load_layer_baseline(
+            metadata_file, info, image, left, top, edited.shape[:2], baseline_origin=(left, top),
+        )
+        try:
+            factor = decode_visibility(info.get("visibility_factor") or {}, edited.shape[:2])
+            if np.array_equal(edited, baseline):
+                continue
+            vertices = np.asarray(info["vertices"], dtype=np.float32) * _metadata_coordinate_scale(info)
+            vertices -= np.asarray([left, top], dtype=np.float32)
+            canvas = canvases[texture_index]
+            candidate = apply_pose_delta(
+                cv2, edited, baseline, factor, canvas, vertices, info["uvs"], info["indices"],
+                original_canvases[texture_index],
+            )
+            changed = np.any(candidate != canvas, axis=2)
+            uv_left, uv_top, allowed = uv_region(
+                cv2, info["uvs"], info["indices"], (canvas.shape[1], canvas.shape[0]),
+            )
+            outside = changed.copy()
+            outside[uv_top:uv_top + allowed.shape[0], uv_left:uv_left + allowed.shape[1]] &= ~allowed
+            if np.any(outside):
+                reject("Selection inverse mapping would affect pixels outside the selected ArtMesh UV: " + identifier, [])
+            affected = affected_unselected(cv2, changed, selection.get("protected_drawables") or [], texture_index)
+            if affected and not allow_shared_uv:
+                reject("Selected ArtMesh edits affect shared UV texels used by unselected ArtMeshes: "
+                       + ", ".join(affected)
+                       + ". To change those parts together, explicitly enable Update shared parts.", affected)
+            affected_shared_ids.update(affected)
+        except PsdSelectionError as exc:
+            raise PsdReconstructionError(str(exc)) from exc
+        intended = np.any(candidate != original_canvases[texture_index], axis=2)
+        if np.any(written[texture_index] & intended & changed):
+            reject("Selected ArtMeshes contain conflicting edits to shared UV texels: "
+                   + ", ".join(written_ids[texture_index] + [identifier]), [])
+        written[texture_index] |= intended
+        written_ids[texture_index].append(identifier)
+        canvases[texture_index] = candidate
+        region = _mask_region(changed, texture_index, identifier)
+        if region:
+            change_regions.append(region)
+            region_masks.append({"texture_index": texture_index, "layer": identifier, "mask": changed})
+        if np.any(np.any(edited != baseline, axis=2) & (factor <= 1 / 65535)):
+            warnings.append(f"Edits outside the visible clipping coverage were preserved in PSD but not written to atlas: {identifier}")
+        _emit(progress, 10 + int((index + 1) / max(1, len(layers_metadata)) * 80), f"Packed {identifier}")
+
+    outputs: list[Path] = []
+    for texture in textures:
+        texture_index = int(texture["index"])
+        canvas = canvases[texture_index]
+        target = output_path / _texture_output_name(texture)
+        if np.array_equal(canvas, input_canvases[texture_index]):
+            # Re-encoding identical RGBA may change compression chunks.  A
+            # no-edit pass keeps the complete original PNG bytes instead.
+            source = _resolve_repack_texture_path(texture, input_texture_paths, metadata_file)
+            if source != target.resolve():
+                shutil.copy2(source, target)
+        else:
+            Image.fromarray(canvas, "RGBA").save(target, format="PNG")
+        outputs.append(target)
+    report = {"mode": "mesh-repack", "status": "completed", "metadata": str(metadata_file),
+              "output_paths": [str(path) for path in outputs], "change_regions": change_regions,
+              "conflicts": [], "shared_regions": selection.get("shared_regions") or [],
+              "selection": dict(selection), "allow_shared_uv": allow_shared_uv,
+              "affected_unselected_ids": sorted(affected_shared_ids)}
+    if affected_shared_ids:
+        warnings.append("Shared atlas edits also affect these ArtMeshes: " + ", ".join(sorted(affected_shared_ids)))
+    report_path = output_path / "repack_report.json"
+    _write_json(report_path, report)
+    _emit(progress, 100, f"Atlas PNG written: {output_path}")
+    return ReconstructionResult(
+        psd_path=outputs[0], layer_count=len(layers_metadata), mode="mesh-repack", warnings=warnings,
+        metadata_path=metadata_file, output_paths=outputs,
+        texture_outputs={int(texture["index"]): output for texture, output in zip(textures, outputs)},
+        change_regions=change_regions, shared_regions=report["shared_regions"], report=report,
+        report_path=report_path, region_masks=region_masks,
     )
 
 
@@ -1913,6 +2135,7 @@ def _render_mesh_layers(
     progress: Optional[ProgressCallback],
     limits: PsdResourceLimits,
     texture_pixels: int,
+    selection: dict[str, Any] | None = None,
 ) -> tuple[list[PsdLayer], tuple[int, int], list[dict[str, Any]]]:
     drawables = mesh_data.get("drawables")
     if not isinstance(drawables, list) or not drawables:
@@ -1928,6 +2151,8 @@ def _render_mesh_layers(
             drawable_infos.append(normalized)
     if not drawable_infos:
         raise PsdReconstructionError("No usable drawable mesh entries were found.")
+    selected_ids = set(selection["selected_ids"]) if selection is not None else None
+    output_drawables = [item for item in drawable_infos if selected_ids is None or item["id"] in selected_ids]
 
     source_size, offset = _resolve_canvas(mesh_data, drawable_infos)
     size, coordinate_scale = _scaled_mesh_canvas(source_size, limits)
@@ -1938,7 +2163,7 @@ def _render_mesh_layers(
     # RGBA buffer.  A malformed sidecar can otherwise request a huge canvas.
     planned_layer_count = 0
     planned_layer_pixels = 0
-    for drawable in drawable_infos:
+    for drawable in output_drawables:
         texture_index = int(drawable.get("texture_index", 0))
         if (
             not drawable.get("visible", True)
@@ -1968,7 +2193,7 @@ def _render_mesh_layers(
 
     drawable_by_index = {int(item["source_index"]): item for item in drawable_infos}
     ordered = sorted(
-        drawable_infos,
+        output_drawables,
         key=lambda item: (item.get("render_order", item.get("draw_order", 0)), item["id"]),
     )
 
@@ -2028,6 +2253,18 @@ def _render_mesh_layers(
             np.asarray([layer_left, layer_top], dtype=np.float32),
             1.0,
         )
+        visibility = None
+        if selection is not None:
+            # Keep the actual masking/opacity factor separately from sampled
+            # texture alpha.  RGB edits must not bake this factor into atlas
+            # alpha for a second time when the runtime draws the new skin.
+            factor_layer = np.zeros_like(layer)
+            factor_layer[:, :, 3] = 255
+            _apply_drawable_masks(
+                cv2, factor_layer, drawable, drawable_by_index, textures, offset,
+                np.asarray([layer_left, layer_top], dtype=np.float32), 1.0,
+            )
+            visibility = factor_layer[:, :, 3].astype(np.float32) / 255 * opacity
 
         bbox = _alpha_bbox(layer)
         if bbox is None:
@@ -2045,7 +2282,7 @@ def _render_mesh_layers(
         output_height = max(1, bottom - top)
 
         layer_name = _safe_layer_name(drawable["id"])
-        group_name = _drawable_group_name(drawable)
+        group_name = _drawable_group_name(drawable) if selection is None else None
         source_image = Image.fromarray(
             layer[crop_top : crop_top + height, crop_left : crop_left + width],
             "RGBA",
@@ -2071,7 +2308,7 @@ def _render_mesh_layers(
                 "left": left,
                 "top": top,
                 "bbox": [left, top, output_width, output_height],
-                "vertices": drawable["vertices"],
+                "vertices": source_vertices.tolist() if selection is not None else drawable["vertices"],
                 "uvs": drawable["uvs"],
                 "indices": drawable["indices"],
                 "opacity": drawable.get("opacity", 1.0),
@@ -2082,6 +2319,13 @@ def _render_mesh_layers(
                 "coordinate_scale": coordinate_scale,
             }
         )
+        if visibility is not None:
+            from app.core.psd_selection import encode_visibility
+
+            factor_crop = visibility[crop_top:crop_top + height, crop_left:crop_left + width]
+            if factor_crop.shape != (output_height, output_width):
+                factor_crop = cv2.resize(factor_crop, (output_width, output_height), interpolation=cv2.INTER_AREA)
+            layer_metadata[-1]["visibility_factor"] = encode_visibility(factor_crop)
         _emit(progress, 20 + int((index + 1) / total * 70), f"Rendered {drawable['id']}")
 
     if not layers:

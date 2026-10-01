@@ -5,8 +5,8 @@ import copy
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QFileSystemWatcher, QPoint, QProcess, QSignalBlocker, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QImage, QKeySequence, QPixmap, QShortcut
+from PySide6.QtCore import QEvent, QFileSystemWatcher, QPoint, QProcess, QSignalBlocker, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QBrush, QColor, QDesktopServices, QImage, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QDialog, QFileDialog,
     QFrame, QHBoxLayout, QHeaderView, QLabel,
@@ -17,10 +17,12 @@ from qfluentwidgets import (
     FluentIcon, LineEdit, PrimaryPushButton,
     PushButton, RoundMenu, ScrollArea, Slider, SubtitleLabel, TableWidget,
     TransparentToolButton,
+    TransparentToggleToolButton,
 )
 
 from app.core.live2d_editor_session import Live2DEditorSession
 from app.gui.ArtMeshInspector import ArtMeshInspector
+from app.gui.ImagePreviewPanel import ImageZoomScrollArea
 from app.gui.live2d_editor_panels import ProjectBoundModPage
 from app.gui.live2d_skin_controls import SkinCatalogControls, SkinDropFrame, SkinNameDialog, TexturePreviewLabel, skin_text
 from app.gui.PsdReconstructionPage import PsdReconstructionPage
@@ -93,6 +95,14 @@ LIVE2D_EDITOR_TEXT = {
     "editor.live2d.return_failed": "当前编辑模型预览恢复失败，操作已停止。",
     "editor.live2d.open_short": "打开",
     "editor.live2d.save_short": "保存",
+    "editor.live2d.parameter_track_search": "搜索并选择参数轨道",
+    "editor.live2d.pick_point": "点选 ArtMesh（可在重叠候选中切换）",
+    "editor.live2d.pick_rectangle": "框选当前可见 ArtMesh",
+    "editor.live2d.pick_clear": "取消选区",
+    "editor.live2d.pick_psd": "选区 PSD",
+    "editor.live2d.pick_psd_hint": "将选中的完整 ArtMesh 按当前姿态导出为可回写 PSD",
+    "editor.live2d.pick_count": "已选 {count} 个",
+    "editor.live2d.local_preview_zoom": "放大查看所选 ArtMesh 贴图区域",
 }
 
 
@@ -102,6 +112,14 @@ def _text(key: str, **values) -> str:
 
 class _MotionDialog(ActionNameDialog):
     """Compatibility name for the shared owned native dialog."""
+
+
+class _ParameterComboBox(ActionComboBox):
+    def retranslate_ui(self):
+        text = _text("editor.live2d.parameter_track_search")
+        self.setPlaceholderText(text)
+        self.setToolTip(text)
+        self.setAccessibleName(text)
 
 
 class _ParameterValue:
@@ -148,6 +166,12 @@ class Live2DEditorPage(QFrame):
         self._selected_parameter = ""
         self._inspector_session = None
         self._parameter_spins: dict[str, _ParameterValue] = {}
+        self._parameter_rows: dict[str, int] = {}
+        self._parameter_dragging = False
+        self._parameter_edit_active = False
+        self._selection_cache = None
+        self._selected_drawable_ids: list[str] = []
+        self._selection_region = None
         self._mod_preview_model_id = ""
         self._external_editor = ""
         self.last_saved_copy: dict | None = None
@@ -164,6 +188,10 @@ class Live2DEditorPage(QFrame):
         self._mesh_timer.setSingleShot(True)
         self._mesh_timer.setInterval(200)
         self._mesh_timer.timeout.connect(self._refresh_mesh)
+        self._parameter_commit_timer = QTimer(self)
+        self._parameter_commit_timer.setSingleShot(True)
+        self._parameter_commit_timer.setInterval(250)
+        self._parameter_commit_timer.timeout.connect(self._flush_parameter_edit)
         self._build_ui()
         self.retranslate_ui()
         self.i18n.languageChanged.connect(self.retranslate_ui)
@@ -204,6 +232,28 @@ class Live2DEditorPage(QFrame):
         self.stage_layout = QVBoxLayout(self.stage)
         self.stage_layout.setContentsMargins(0, 0, 0, 0)
         self.stage_layout.setSpacing(0)
+        self.selection_toolbar = QWidget(self.stage)
+        self.selection_toolbar.setFixedHeight(32)
+        selection_layout = QHBoxLayout(self.selection_toolbar)
+        selection_layout.setContentsMargins(6, 0, 6, 0)
+        selection_layout.setSpacing(4)
+        self.point_select_button = TransparentToggleToolButton(FluentIcon.EDIT, self.selection_toolbar)
+        self.rect_select_button = TransparentToggleToolButton(FluentIcon.FULL_SCREEN, self.selection_toolbar)
+        self.clear_selection_button = TransparentToolButton(FluentIcon.CANCEL, self.selection_toolbar)
+        self.export_selection_button = PushButton(FluentIcon.SAVE, "", self.selection_toolbar)
+        self.selection_count = CaptionLabel(self.selection_toolbar)
+        self.selection_count.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        for button in (self.point_select_button, self.rect_select_button, self.clear_selection_button):
+            button.setFixedSize(28, 28)
+            selection_layout.addWidget(button)
+        selection_layout.addWidget(self.selection_count, 1)
+        selection_layout.addWidget(self.export_selection_button)
+        self.point_select_button.clicked.connect(lambda checked=False: self.set_artmesh_selection_mode("point" if checked else "none"))
+        self.rect_select_button.clicked.connect(lambda checked=False: self.set_artmesh_selection_mode("rectangle" if checked else "none"))
+        self.clear_selection_button.clicked.connect(self.clear_artmesh_selection)
+        self.export_selection_button.clicked.connect(self.export_selected_artmeshes)
+        self.selection_toolbar.hide()
+        self.stage_layout.addWidget(self.selection_toolbar)
         self.preview_toolbar = QWidget(self.stage)
         self.preview_toolbar.setFixedHeight(32)
         preview_toolbar_layout = QHBoxLayout(self.preview_toolbar)
@@ -278,6 +328,7 @@ class Live2DEditorPage(QFrame):
         self.mod_panel.previewModelRequested.connect(self._open_mod_preview)
         self.mod_panel.triggerSelectionChanged.connect(self._mod_trigger_selected)
         self.mod_panel.projectChanged.connect(self._mod_project_changed)
+        self.mod_panel.set_artmesh_pick_provider(self._mod_pick_scene)
         mod_layout.addWidget(self.mod_panel, 1)
         self.export_tabs.addTab(self.viewer_tab, "")
         self.export_tabs.currentChanged.connect(self._tab_changed)
@@ -307,7 +358,11 @@ class Live2DEditorPage(QFrame):
             row.addWidget(button)
         self.track_label = CaptionLabel(timeline_host)
         self.track_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        row.addWidget(self.track_label, 1)
+        self.track_label.hide()
+        self.parameter_combo = _ParameterComboBox(timeline_host)
+        self.parameter_combo.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.parameter_combo.currentIndexChanged.connect(self._timeline_parameter_changed)
+        row.addWidget(self.parameter_combo, 1)
         row.addWidget(self.key_pose_button)
         row.addSpacing(28)
         timeline_layout.addLayout(row)
@@ -390,12 +445,19 @@ class Live2DEditorPage(QFrame):
         self.parameter_slider = Slider(Qt.Horizontal, self.parameter_editor)
         self.parameter_slider.setRange(0, 1000)
         self.parameter_slider.valueChanged.connect(self._parameter_slider_changed)
+        self.parameter_slider.sliderPressed.connect(self._parameter_drag_started)
+        self.parameter_slider.sliderReleased.connect(self._parameter_drag_finished)
+        # Fluent forwards these signals only from its child handle; a click or
+        # drag on the groove uses custom mouse events without QSlider signals.
+        for widget in (self.parameter_slider, self.parameter_slider.handle):
+            widget.installEventFilter(self)
         controls.addWidget(self.parameter_slider, 1)
         self.parameter_spin = DoubleSpinBox(self.parameter_editor)
         self.parameter_spin.setDecimals(4)
         self.parameter_spin.setMinimumWidth(148)
         self.parameter_spin.setMaximumWidth(168)
         self.parameter_spin.valueChanged.connect(self._selected_parameter_value_changed)
+        self.parameter_spin.editingFinished.connect(self._flush_parameter_edit)
         controls.addWidget(self.parameter_spin)
         edit_layout.addLayout(controls)
         layout.addWidget(self.parameter_editor)
@@ -426,12 +488,19 @@ class Live2DEditorPage(QFrame):
         inspector.refresh_button.clicked.disconnect()
         inspector.refresh_button.clicked.connect(self._refresh_mesh)
         inspector.selectionChanged.connect(self._artmesh_selected)
+        inspector.selectionIdsChanged.connect(self._artmesh_selection_changed)
         layout.addWidget(inspector, 1)
         self.local_preview_label = CaptionLabel(self.artmesh_tab)
-        layout.addWidget(self.local_preview_label)
-        self.artmesh_image = QLabel(self.artmesh_tab)
+        local_row = QHBoxLayout()
+        local_row.addWidget(self.local_preview_label, 1)
+        self.local_preview_button = TransparentToolButton(FluentIcon.ZOOM, self.artmesh_tab)
+        self.local_preview_button.setFixedSize(28, 28)
+        self.local_preview_button.clicked.connect(self._show_local_artmesh_image)
+        local_row.addWidget(self.local_preview_button)
+        layout.addLayout(local_row)
+        self.artmesh_image = TexturePreviewLabel(self.artmesh_tab)
         self.artmesh_image.setObjectName("editorImage")
-        self.artmesh_image.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.artmesh_image.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Minimum)
         self.artmesh_image.setAlignment(Qt.AlignCenter)
         self.artmesh_image.setMinimumHeight(60)
         self.artmesh_image.setMaximumHeight(90)
@@ -560,6 +629,13 @@ class Live2DEditorPage(QFrame):
             button.setToolTip(action_text("editor.actions." + key))
             button.setAccessibleName(button.toolTip())
         self.motion_combo.retranslate_ui()
+        self.parameter_combo.retranslate_ui()
+        for button, key in ((self.point_select_button, "pick_point"), (self.rect_select_button, "pick_rectangle"),
+                            (self.clear_selection_button, "pick_clear"), (self.export_selection_button, "pick_psd_hint")):
+            button.setToolTip(_text("editor.live2d." + key))
+            button.setAccessibleName(button.toolTip())
+        self.export_selection_button.setText(_text("editor.live2d.pick_psd"))
+        self._update_selection_actions()
         self.use_for_mod_button.setToolTip(_text("editor.live2d.mod_hint"))
         self.parameter_name.setText(_text("editor.live2d.selected_parameter"))
         for index, key in enumerate(("parameters", "parts", "textures", "psd", "mod")):
@@ -573,6 +649,8 @@ class Live2DEditorPage(QFrame):
         self.parameter_table.setHorizontalHeaderLabels([_text("editor.live2d." + key) for key in ("parameter", "value", "range")])
         self.editor_label.setText(self._external_editor or _text("editor.live2d.default_editor"))
         self.part_opacity.setToolTip(_text("editor.live2d.opacity"))
+        self.local_preview_button.setToolTip(_text("editor.live2d.local_preview_zoom"))
+        self.local_preview_button.setAccessibleName(self.local_preview_button.toolTip())
         self.timeline.retranslate_ui()
         self.skin_controls.retranslate_ui()
         self.texture_hint.setText(skin_text("editor.skin.drop_hint"))
@@ -623,6 +701,7 @@ class Live2DEditorPage(QFrame):
             if not self.return_to_current_model():
                 raise RuntimeError(_text("editor.live2d.return_failed"))
             self.session = candidate
+            self.clear_artmesh_selection()
             if self.preview is None:
                 from app.gui.Live2DPreviewWindow import Live2DPreviewWindow
                 self.preview = Live2DPreviewWindow(str(candidate.model_path), self.stage, embedded=True)
@@ -633,6 +712,12 @@ class Live2DEditorPage(QFrame):
                 self.preview.live2d_canvas.modelLoaded.connect(self._native_model_ready)
                 self.preview.live2d_canvas.drawableClicked.connect(self._native_drawable_clicked)
                 self.preview.live2d_canvas.modelPointClicked.connect(self._native_model_point_clicked)
+                canvas = self.preview.live2d_canvas
+                if hasattr(canvas, "drawablesPicked"):
+                    canvas.drawablesPicked.connect(self._native_drawables_picked)
+                    canvas.regionPicked.connect(self._native_region_picked)
+                    canvas.selectionFailed.connect(self._error)
+                    canvas.selectionCancelled.connect(self.clear_artmesh_selection)
                 self.stage_layout.addWidget(self.preview, 1)
             else:
                 try:
@@ -794,6 +879,7 @@ class Live2DEditorPage(QFrame):
     def _psd_export_snapshot(self):
         if not self.session:
             raise RuntimeError(_text("editor.live2d.empty"))
+        self._flush_parameter_edit()
         project = self.session.ensure_psd_project()
         self.psd_panel.pending_skin_context = self._skin_context()
         target = project.project_dir / "snapshots" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -915,9 +1001,11 @@ class Live2DEditorPage(QFrame):
         candidate = None
         previous = self._preview_session
         try:
+            self._flush_parameter_edit()
             candidate = Live2DEditorSession(path)
             self.timeline.set_playing(False)
             self._preview_session = candidate
+            self.clear_artmesh_selection()
             self.preview.load_model(str(candidate.model_path))
             self._preview_context = label
             self.preview_context_label.setText(label)
@@ -942,6 +1030,7 @@ class Live2DEditorPage(QFrame):
             return True
         try:
             self._preview_session = None
+            self.clear_artmesh_selection()
             self._preview_context = ""
             if self.preview and self.session:
                 self.preview.load_model(str(self.session.model_path))
@@ -980,6 +1069,30 @@ class Live2DEditorPage(QFrame):
         if self.session and drawable_id:
             self.artmesh_inspector.select_entry(drawable_id)
 
+    def _mod_pick_scene(self, main_model_id: str):
+        model = self.mod_panel.model_by_id(main_model_id)
+        if not model or not self._preview_session or self._mod_preview_model_id != main_model_id:
+            return None
+        source = self.mod_panel.resolve_project_path(str(model.get("model_json") or "")).resolve()
+        if self._preview_session.source_path.resolve() != source:
+            return None
+        canvas = self.preview.live2d_canvas if self.preview else None
+        if canvas is None:
+            return None
+        self.timeline.set_playing(False)
+        self.preview.set_motion_frozen(True)
+        # Only a picker opening reads back GL pixels. Freeze first, then read
+        # the pose used by that draw so the background and hit geometry agree.
+        frame = canvas.grabFramebuffer()
+        if frame.isNull():
+            return None
+        scene = self._selection_scene()
+        polygon = [list(canvas.windowPointToCanvas(x, y, scene["snapshot"]))
+                   for x, y in ((0, 0), (canvas.width(), 0),
+                                (canvas.width(), canvas.height()), (0, canvas.height()))]
+        return dict(scene, model_id=main_model_id, model_path=str(source),
+                    pose_frame=frame, pose_frame_canvas_polygon=polygon)
+
     def _native_model_ready(self):
         if not self.preview or not self.session:
             return
@@ -988,6 +1101,11 @@ class Live2DEditorPage(QFrame):
                                      "auto_blink": False, "auto_breath": False,
                                      "transparent_bg": False, "antialias": True})
         self._apply_preview_pose()
+        self._selection_cache = None
+        canvas = self.preview.live2d_canvas
+        if hasattr(canvas, "setSelectionSceneProvider"):
+            canvas.setSelectionSceneProvider(self._selection_scene)
+        self._update_selection_actions()
         self.preview.set_rendering_active(self._active)
 
     def _current_motion(self) -> str | None:
@@ -998,7 +1116,7 @@ class Live2DEditorPage(QFrame):
             return {}
         return self.session.pose_at(self._current_motion(), self.timeline.current_time, overrides=self._manual_pose)
 
-    def _apply_preview_pose(self):
+    def _apply_preview_pose(self, *, light=False):
         if not self.session or not self.preview:
             return
         values = self._pose()
@@ -1006,15 +1124,19 @@ class Live2DEditorPage(QFrame):
         supported = {parameter["id"] for parameter in render_session.parameters}
         values = {key: value for key, value in values.items() if key in supported}
         self.preview.apply_settings({"advanced_enabled": True, "advanced_params": values})
-        defaults = {str(part["id"]): float(part.get("opacity", 1))
-                    for part in (render_session.mesh_data or {}).get("parts", [])}
-        self.preview.set_part_opacity_overrides({key: value for key, value in self.session.part_overrides.items() if key in defaults}, defaults)
-        self._sync_parameter_values(self._pose())
+        if not light:
+            defaults = {str(part["id"]): float(part.get("opacity", 1))
+                        for part in (render_session.mesh_data or {}).get("parts", [])}
+            self.preview.set_part_opacity_overrides({key: value for key, value in self.session.part_overrides.items() if key in defaults}, defaults)
+            self._sync_parameter_values(values)
+        elif self._selected_parameter in values:
+            self._sync_parameter_values({self._selected_parameter: values[self._selected_parameter]})
 
     def _populate_parameters(self):
         self._refreshing = True
         self.parameter_table.setRowCount(0)
         self._parameter_spins.clear()
+        self._parameter_rows.clear()
         for row, parameter in enumerate(self.session.parameters if self.session else []):
             self.parameter_table.insertRow(row)
             parameter_id = parameter["id"]
@@ -1025,11 +1147,13 @@ class Live2DEditorPage(QFrame):
             self.parameter_table.setItem(row, 0, item)
             self.parameter_table.setItem(row, 1, QTableWidgetItem(f"{parameter['default']:g}"))
             self._parameter_spins[parameter_id] = _ParameterValue(self, parameter)
+            self._parameter_rows[parameter_id] = row
             self.parameter_table.setItem(row, 2, QTableWidgetItem(f"{parameter['min']:g} … {parameter['max']:g}"))
             self.parameter_table.setRowHeight(row, 32)
         self._refreshing = False
         if self.parameter_table.rowCount():
-            self.parameter_table.setCurrentCell(0, 0)
+            self.parameter_table.setCurrentCell(self._parameter_rows.get(self._selected_parameter, 0), 0)
+        self._populate_parameter_selector()
         self._filter_parameters(self.parameter_search.text())
 
     def _sync_parameter_values(self, values: dict[str, float]):
@@ -1037,10 +1161,13 @@ class Live2DEditorPage(QFrame):
             spin = self._parameter_spins.get(parameter_id)
             if spin:
                 spin._value = float(value)
-        for row in range(self.parameter_table.rowCount()):
-            identifier = str(self.parameter_table.item(row, 0).data(Qt.UserRole))
-            if identifier in values:
-                self.parameter_table.item(row, 1).setText(f"{values[identifier]:.4g}")
+        for identifier, value in values.items():
+            row = self._parameter_rows.get(identifier)
+            if row is not None:
+                item = self.parameter_table.item(row, 1)
+                text = f"{value:.4g}"
+                if item.text() != text:
+                    item.setText(text)
         self._sync_parameter_editor()
 
     def _sync_parameter_editor(self):
@@ -1080,9 +1207,71 @@ class Live2DEditorPage(QFrame):
             return
         item = self.parameter_table.item(row, 0)
         if item:
+            if str(item.data(Qt.UserRole)) != self._selected_parameter:
+                self._flush_parameter_edit()
             self._selected_parameter = str(item.data(Qt.UserRole))
+            with QSignalBlocker(self.parameter_combo):
+                self.parameter_combo.setCurrentIndex(self.parameter_combo.findData(self._selected_parameter))
             self._sync_parameter_editor()
             self._refresh_track()
+
+    def _populate_parameter_selector(self):
+        if not hasattr(self, "parameter_combo"):
+            return
+        parameters = self.session.parameters if self.session else []
+        motion = self._current_motion()
+        curves = self.session.project.motions.get(motion, {}).get("Curves", []) if self.session else []
+        tracks = {curve["Id"] for curve in curves if curve.get("Target") == "Parameter"}
+        with QSignalBlocker(self.parameter_combo):
+            self.parameter_combo.clear()
+            for parameter in sorted(parameters, key=lambda item: item["id"] not in tracks):
+                identifier = parameter["id"]
+                name = str(parameter.get("name") or identifier)
+                label = identifier if name == identifier else f"{identifier} · {name}"
+                self.parameter_combo.addItem(label, userData=identifier)
+            self.parameter_combo.setCurrentIndex(self.parameter_combo.findData(self._selected_parameter))
+        self.parameter_combo.setEnabled(bool(parameters))
+
+    def _timeline_parameter_changed(self, *_args):
+        if self._refreshing:
+            return
+        identifier = self.parameter_combo.currentData()
+        row = self._parameter_rows.get(identifier)
+        if row is None:
+            return
+        self._flush_parameter_edit()
+        if self.parameter_table.isRowHidden(row):
+            self.parameter_search.clear()
+        self.parameter_table.setCurrentCell(row, 0)
+        # The current cell may already be the chosen parameter after filtering.
+        self._parameter_selected(row)
+
+    def _parameter_drag_started(self):
+        self._parameter_dragging = True
+        self._parameter_commit_timer.stop()
+
+    def eventFilter(self, watched, event):  # noqa: N802
+        slider = getattr(self, "parameter_slider", None)
+        if slider is not None and watched in (slider, slider.handle):
+            if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                self._parameter_drag_started()
+                slider.setFocus(Qt.MouseFocusReason)
+            elif event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+                self._parameter_drag_finished()
+        return super().eventFilter(watched, event)
+
+    def _parameter_drag_finished(self):
+        self._parameter_dragging = False
+        self._flush_parameter_edit()
+
+    def _flush_parameter_edit(self):
+        self._parameter_commit_timer.stop()
+        if self.session:
+            changed = self.session.commit_parameter_preview()
+            if changed or self._parameter_edit_active:
+                self._parameter_edit_active = False
+                self._schedule_mesh_refresh()
+                self._update_actions()
 
     def _parameter_value_changed(self, parameter_id: str, value: float):
         if not self.return_to_current_model():
@@ -1091,13 +1280,18 @@ class Live2DEditorPage(QFrame):
             return
         try:
             self.timeline.set_playing(False)
-            self.session.set_parameter(parameter_id, value)
+            self.session.preview_parameter(parameter_id, value)
+            self._parameter_edit_active = True
             self._manual_pose = True
             self._selected_parameter = parameter_id
-            self._apply_preview_pose()
-            self._refresh_track()
-            self._schedule_mesh_refresh()
-            self._update_actions()
+            self._apply_preview_pose(light=True)
+            self.undo_button.setEnabled(self.session.can_undo)
+            self.redo_button.setEnabled(self.session.can_redo)
+            dirty = self.session.dirty or self.psd_panel._project_dirty or self.mod_panel._dirty
+            self.title_label.setText(_text("editor.live2d.title") + (" *" if dirty else ""))
+            self.title_label.setToolTip(_text("editor.live2d.modified" if dirty else "editor.live2d.clean"))
+            if not self._parameter_dragging:
+                self._parameter_commit_timer.start()
         except Exception as exc:
             self._error(exc)
 
@@ -1110,13 +1304,23 @@ class Live2DEditorPage(QFrame):
             if not self.motion_combo.count():
                 self.motion_combo.addItem(_text("editor.live2d.no_motion"), userData=None)
             self.motion_combo.setCurrentIndex(max(0, self.motion_combo.findData(selected)))
+        self._populate_parameter_selector()
         self._refresh_track()
 
     def _motion_changed(self, *_args):
         if self._refreshing:
             return
+        self._flush_parameter_edit()
         self.timeline.set_playing(False)
         self._manual_pose = False
+        if self.session:
+            curves = self.session.project.motions.get(self._current_motion(), {}).get("Curves", [])
+            identifiers = [curve["Id"] for curve in curves if curve.get("Target") == "Parameter" and curve["Id"] in self._parameter_spins]
+            if identifiers and self._selected_parameter not in identifiers:
+                self._selected_parameter = identifiers[0]
+                with QSignalBlocker(self.parameter_table):
+                    self.parameter_table.setCurrentCell(self._parameter_rows[self._selected_parameter], 0)
+            self._populate_parameter_selector()
         self._refresh_track()
         self._apply_preview_pose()
         self._schedule_mesh_refresh()
@@ -1151,6 +1355,7 @@ class Live2DEditorPage(QFrame):
             self._error(exc)
 
     def _key_current_pose(self):
+        self._flush_parameter_edit()
         motion = self._current_motion()
         if not self.session or not motion or not self._selected_parameter:
             return
@@ -1169,12 +1374,14 @@ class Live2DEditorPage(QFrame):
             self._error(exc)
 
     def _seek(self, seconds: float):
+        self._flush_parameter_edit()
         self._manual_pose = False
         self._apply_preview_pose()
         self._schedule_mesh_refresh()
 
     def _play_state_changed(self, playing: bool):
         if playing:
+            self._flush_parameter_edit()
             self._manual_pose = False
         if self.preview:
             self.preview.set_motion_frozen(True)
@@ -1247,11 +1454,114 @@ class Live2DEditorPage(QFrame):
         if not self.session:
             return
         try:
-            path = (self._preview_session or self.session).write_inspector_metadata(self._pose())
-            self.artmesh_inspector.load_metadata(path)
+            scene = self._selection_scene()
+            self.artmesh_inspector.load_snapshot(scene["snapshot"], scene["texture_paths"],
+                                                 selected_ids=self._selected_drawable_ids)
             self._inspector_session = self._preview_session or self.session
         except Exception as exc:
             self._error(exc)
+
+    def _selection_scene(self):
+        render_session = self._preview_session or self.session
+        if not render_session:
+            return {"snapshot": {}, "texture_paths": [], "pose": {"parameters": {}, "parts": {}}}
+        canvas = self.preview.live2d_canvas if self.preview else None
+        pose = canvas.getSelectionPose() if canvas and hasattr(canvas, "getSelectionPose") else {}
+        parameters = dict(pose.get("parameters") or {})
+        if not parameters:
+            parameters = {parameter["id"]: float(parameter["default"]) for parameter in render_session.parameters}
+            parameters.update({key: value for key, value in self._pose().items() if key in parameters})
+        defaults = {str(part["id"]): float(part.get("opacity", 1))
+                    for part in (render_session.mesh_data or {}).get("parts", [])}
+        parts = dict(pose.get("parts") or defaults)
+        if not pose.get("parts"):
+            parts.update({key: value for key, value in self.session.part_overrides.items() if key in defaults})
+        key = (id(render_session), tuple(sorted(parameters.items())), tuple(sorted(parts.items())))
+        if self._selection_cache is None or self._selection_cache[0] != key:
+            snapshot = render_session.exact_pose_mesh(parameters, parts)
+            scene = {"snapshot": snapshot, "texture_paths": [str(path) for path in render_session.texture_paths],
+                     "pose": {"parameters": parameters, "parts": parts,
+                              "parts_complete": bool(pose.get("parts_complete", False))}}
+            self._selection_cache = key, scene
+        return self._selection_cache[1]
+
+    def set_artmesh_selection_mode(self, mode: str):
+        if mode not in ("none", "point", "rectangle"):
+            raise ValueError("Selection mode must be none, point or rectangle")
+        self._flush_parameter_edit()
+        self.timeline.set_playing(False)
+        canvas = self.preview.live2d_canvas if self.preview else None
+        if canvas and hasattr(canvas, "setSelectionMode"):
+            canvas.setSelectionMode(mode)
+        with QSignalBlocker(self.point_select_button), QSignalBlocker(self.rect_select_button):
+            self.point_select_button.setChecked(mode == "point")
+            self.rect_select_button.setChecked(mode == "rectangle")
+        if mode == "none":
+            self.clear_artmesh_selection()
+
+    def clear_artmesh_selection(self):
+        self._selection_region = None
+        self._selected_drawable_ids = []
+        self._selection_cache = None
+        with QSignalBlocker(self.point_select_button), QSignalBlocker(self.rect_select_button):
+            self.point_select_button.setChecked(False)
+            self.rect_select_button.setChecked(False)
+        canvas = self.preview.live2d_canvas if self.preview else None
+        if canvas and hasattr(canvas, "setSelectionMode"):
+            canvas.setSelectionMode("none")
+        self.artmesh_inspector.select_entries([])
+        self.artmesh_image.clear()
+        self.local_preview_button.setEnabled(False)
+        self.part_opacity.setEnabled(False)
+        self.part_visible.setEnabled(False)
+        self._update_selection_actions()
+
+    def _update_selection_actions(self):
+        available = bool(self.session and self.preview)
+        self.selection_toolbar.setVisible(available)
+        for button in (self.point_select_button, self.rect_select_button):
+            button.setEnabled(available)
+        self.clear_selection_button.setEnabled(bool(self._selected_drawable_ids or self._selection_region))
+        self.export_selection_button.setEnabled(bool(available and not self._preview_session
+                                                     and self._selected_drawable_ids and not self._projects_busy()))
+        self.selection_count.setText(_text("editor.live2d.pick_count", count=len(self._selected_drawable_ids)))
+
+    def _artmesh_selection_changed(self, identifiers: list):
+        self._selected_drawable_ids = list(dict.fromkeys(str(identifier) for identifier in identifiers))
+        self._update_selection_actions()
+
+    def _native_drawables_picked(self, identifiers: list):
+        self._selection_region = None
+        in_mod = self._in_viewer_workspace()
+        if not in_mod:
+            self.tabs.setCurrentWidget(self.artmesh_tab)
+        self._refresh_mesh()
+        self.artmesh_inspector.set_pick_candidates(identifiers)
+        if in_mod and identifiers and self._mod_preview_model_id:
+            self.mod_panel.select_trigger(identifiers[0])
+
+    def _native_region_picked(self, identifiers: list, region: dict):
+        self._selection_region = dict(region)
+        self.tabs.setCurrentWidget(self.artmesh_tab)
+        self._refresh_mesh()
+        self.artmesh_inspector.select_entries(identifiers)
+
+    def export_selected_artmeshes(self) -> bool:
+        if not self.session or self._preview_session or not self._selected_drawable_ids or self._projects_busy():
+            return False
+        try:
+            self._flush_parameter_edit()
+            self.timeline.set_playing(False)
+            scene = self._selection_scene()
+            identifiers = list(self._selected_drawable_ids)
+            region = dict(self._selection_region) if self._selection_region else None
+            if not self.open_psd_workspace():
+                return False
+            return self.psd_panel.export_selected_artmeshes(identifiers, scene["pose"], region,
+                                                          mesh_data=scene["snapshot"])
+        except Exception as exc:
+            self._error(exc)
+            return False
 
     def _native_drawable_clicked(self, drawable_id: str):
         # Some wrappers return a Part ID from HitPart. Only an actual drawable
@@ -1294,6 +1604,10 @@ class Live2DEditorPage(QFrame):
 
     def _artmesh_selected(self, entry):
         if not self.session or not entry:
+            self.artmesh_image.clear()
+            self.part_opacity.setEnabled(False)
+            self.part_visible.setEnabled(False)
+            self.local_preview_button.setEnabled(False)
             return
         render_session = self._preview_session or self.session
         image = render_session.local_artmesh_image(entry.raw)
@@ -1301,9 +1615,10 @@ class Live2DEditorPage(QFrame):
             data = image.tobytes("raw", "RGBA")
             qimage = QImage(data, image.width, image.height, image.width * 4, QImage.Format_RGBA8888).copy()
             pixmap = QPixmap.fromImage(qimage)
-            self.artmesh_image.setPixmap(pixmap.scaled(290, 88, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            self.artmesh_image.setPixmap(self._checker_pixmap(pixmap))
         else:
             self.artmesh_image.clear()
+        self.local_preview_button.setEnabled(bool(image))
         part_id = str(entry.raw.get("parent_part_id") or "")
         available = bool(not self._preview_session and part_id and int(entry.raw.get("parent_part_index", -1)) >= 0)
         self.part_opacity.setEnabled(available)
@@ -1314,6 +1629,77 @@ class Live2DEditorPage(QFrame):
             self.part_visible.setChecked(opacity > 0)
         count = sum(str(item.get("parent_part_id") or "") == part_id for item in (self.session.mesh_data or {}).get("drawables", []))
         self.part_hint.setText(_text("editor.live2d.part_hint", part=part_id, count=count) if available else _text("editor.live2d.part_unavailable"))
+
+    @staticmethod
+    def _checker_pixmap(source: QPixmap) -> QPixmap:
+        tile = QPixmap(16, 16)
+        tile.fill(QColor("#dddddd"))
+        painter = QPainter(tile)
+        painter.fillRect(0, 0, 8, 8, QColor("#aaaaaa"))
+        painter.fillRect(8, 8, 8, 8, QColor("#aaaaaa"))
+        painter.end()
+        result = QPixmap(source.size())
+        painter = QPainter(result)
+        painter.fillRect(result.rect(), QBrush(tile))
+        painter.drawPixmap(0, 0, source)
+        painter.end()
+        return result
+
+    def _show_local_artmesh_image(self):
+        entry = self.artmesh_inspector.current_entry()
+        render_session = self._preview_session or self.session
+        if not entry or not render_session:
+            return
+        image = render_session.local_artmesh_image(entry.raw, max_size=None)
+        if image is None:
+            return
+        raw = image.tobytes("raw", "RGBA")
+        qimage = QImage(raw, image.width, image.height, image.width * 4, QImage.Format_RGBA8888).copy()
+        source = self._checker_pixmap(QPixmap.fromImage(qimage))
+        dialog = MessageBoxBase(self.window())
+        dialog.setWindowTitle(entry.drawable_id)
+        dialog.setMaximumWidth(900)
+        dialog.resize(720, 560)
+        area = ImageZoomScrollArea(dialog)
+        area.setFrameShape(QFrame.NoFrame)
+        area.setMinimumSize(260, 220)
+        area.setAlignment(Qt.AlignCenter)
+        label = QLabel(area)
+        label.setAlignment(Qt.AlignCenter)
+        area.setWidget(label)
+        dialog.viewLayout.addWidget(area, 1)
+        toolbar = QHBoxLayout()
+        zoom_label = CaptionLabel(dialog)
+        zoom = [1.0]
+        def set_zoom(value):
+            zoom[0] = max(.01, min(8.0, value))
+            pixmap = source.scaled(max(1, round(source.width() * zoom[0])), max(1, round(source.height() * zoom[0])),
+                                   Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            label.setPixmap(pixmap)
+            label.setFixedSize(pixmap.size())
+            zoom_label.setText(f"{round(zoom[0] * 100)}% · {image.width} × {image.height}")
+        def fit():
+            set_zoom(min(area.viewport().width() / source.width(), area.viewport().height() / source.height()))
+        for icon, tooltip, callback in (
+                (FluentIcon.FIT_PAGE, tr("preview.image_fit"), fit),
+                (FluentIcon.ZOOM, tr("preview.image_actual"), lambda: set_zoom(1)),
+                (FluentIcon.ZOOM_OUT, tr("preview.image_zoom_out_tooltip"), lambda: set_zoom(zoom[0] / 1.25)),
+                (FluentIcon.ZOOM_IN, tr("preview.image_zoom_in_tooltip"), lambda: set_zoom(zoom[0] * 1.25))):
+            button = TransparentToolButton(icon, dialog)
+            button.setFixedSize(28, 28)
+            button.setToolTip(tooltip)
+            button.clicked.connect(callback)
+            toolbar.addWidget(button)
+        toolbar.addWidget(zoom_label, 1)
+        dialog.viewLayout.addLayout(toolbar)
+        area.zoomRequested.connect(lambda factor, _point: set_zoom(zoom[0] * factor))
+        dialog.hideCancelButton()
+        dialog.yesButton.setText(tr("common.close", default="关闭"))
+        QTimer.singleShot(0, fit)
+        try:
+            dialog.exec()
+        finally:
+            dialog.deleteLater()
 
     def _part_visibility_changed(self, visible: bool):
         self._part_opacity_changed(self.part_opacity.value() or 1 if visible else 0)
@@ -1328,6 +1714,7 @@ class Live2DEditorPage(QFrame):
         try:
             self.session.set_part_opacity(part_id, value)
             self._apply_preview_pose()
+            self._schedule_mesh_refresh()
             self._artmesh_selected(entry)
             self._update_actions()
         except Exception as exc:
@@ -1627,6 +2014,7 @@ class Live2DEditorPage(QFrame):
                 "time": self.timeline.current_time, "texture": self.texture_combo.currentIndex(),
                 "mesh_texture": self.artmesh_inspector.texture_combo.currentIndex(),
                 "mesh": entry.drawable_id if entry else None,
+                "meshes": list(self._selected_drawable_ids),
                 "scrolls": [(bar, bar.value()) for bar in (
                     self.parameter_table.verticalScrollBar(), self.parameter_table.horizontalScrollBar(),
                     self.artmesh_inspector.entry_list.verticalScrollBar(), self.texture_scroll.verticalScrollBar())]}
@@ -1642,7 +2030,9 @@ class Live2DEditorPage(QFrame):
             if 0 <= state["texture"] < self.texture_combo.count():
                 self.texture_combo.setCurrentIndex(state["texture"])
         self.timeline.set_time(state["time"])
-        if state["mesh"]:
+        if state.get("meshes"):
+            self.artmesh_inspector.select_entries(state["meshes"], primary_id=state["mesh"])
+        elif state["mesh"]:
             self.artmesh_inspector.select_entry(state["mesh"])
         if 0 <= state["mesh_texture"] < self.artmesh_inspector.texture_combo.count():
             self.artmesh_inspector.texture_combo.setCurrentIndex(state["mesh_texture"])
@@ -1654,15 +2044,23 @@ class Live2DEditorPage(QFrame):
 
     def _history_step(self, redo=False):
         try:
+            self._flush_parameter_edit()
             if not self.return_to_current_model():
                 return
             state = self._capture_editor_view()
+            textures = tuple(self.session._texture_data) if self.session else ()
             if self.session and (self.session.redo() if redo else self.session.undo()):
                 self.timeline.set_playing(False)
                 self._manual_pose = bool(self.session.parameter_overrides)
                 self._populate_motions(state["motion"])
-                self._reload_preview_textures()
+                self._selection_cache = None
+                if textures != tuple(self.session._texture_data):
+                    self._reload_preview_textures()
+                else:
+                    self._apply_preview_pose()
+                    self._refresh_mesh_if_visible()
                 self._restore_editor_view(state)
+                self._schedule_mesh_refresh()
                 self._update_actions()
         except Exception as exc:
             self._error(exc)
@@ -1700,6 +2098,7 @@ class Live2DEditorPage(QFrame):
         if not self.session:
             return None
         try:
+            self._flush_parameter_edit()
             if self._projects_busy():
                 raise RuntimeError(_text("editor.live2d.project_busy"))
             # An external editor may have saved immediately before this click.
@@ -1719,6 +2118,7 @@ class Live2DEditorPage(QFrame):
     def _confirm_session_changes(self) -> bool:
         if not self.session:
             return True
+        self._flush_parameter_edit()
         for index in range(len(self.session.texture_paths)):
             try:
                 self.session.accept_texture_change(index)
@@ -1742,6 +2142,8 @@ class Live2DEditorPage(QFrame):
     def set_active(self, active: bool):
         self._active = bool(active)
         if not active:
+            self._flush_parameter_edit()
+            self._parameter_dragging = False
             self.timeline.set_playing(False)
             self._mesh_timer.stop()
         if self.preview:
@@ -1751,6 +2153,7 @@ class Live2DEditorPage(QFrame):
         self.set_active(False)
         self._texture_timer.stop()
         self._mesh_timer.stop()
+        self._parameter_commit_timer.stop()
         self.mod_panel._project_search_timer.stop()
         if not self.psd_panel.shutdown():
             return False
@@ -1805,6 +2208,7 @@ class Live2DEditorPage(QFrame):
         self.psd_tab.setEnabled(bool(session))
         self.mod_tab.setEnabled(bool(session))
         self.motion_combo.setEnabled(bool(session and session.project.motions))
+        self._update_selection_actions()
         dirty = bool(session and (session.dirty or self.psd_panel._project_dirty or self.mod_panel._dirty))
         self.title_label.setText(_text("editor.live2d.title") + (" *" if dirty else ""))
         self.title_label.setToolTip(_text("editor.live2d.modified" if dirty else "editor.live2d.clean"))

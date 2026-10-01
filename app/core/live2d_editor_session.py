@@ -255,7 +255,10 @@ class Live2DEditorSession:
         self._project_revision = 0
         self._signature_revision = 0
         self._signature_cache = None
+        self._asset_signature_cache = None
         self._signature_changed = self._invalidate_signature
+        self._pose_changed = self._invalidate_pose_signature
+        self._parameter_preview: dict[str, float] = {}
         self._projects = Live2DEditorProjects(self)
         self.original_bindings: dict[tuple[str, int], int] = {}
         self._deleted_original_bindings: set[tuple[str, int]] = set()
@@ -308,6 +311,7 @@ class Live2DEditorSession:
             self._texture_data = [path.read_bytes() for path in self.texture_paths]
             self._skins = Live2DSkins(self)
             self.parameters = self.project.parameters
+            self._parameters_by_id = {parameter["id"]: parameter for parameter in self.parameters}
             self.parameter_overrides: dict[str, float] = {}
             self.part_overrides: dict[str, float] = {}
             self._core_model = None
@@ -408,6 +412,12 @@ class Live2DEditorSession:
     def _invalidate_signature(self):
         self._signature_revision += 1
         self._signature_cache = None
+        self._asset_signature_cache = None
+
+    def _invalidate_pose_signature(self):
+        # Pose edits do not alter any model, motion or texture bytes. Reuse
+        # their digest instead of hashing the entire project for every drag.
+        self._signature_cache = None
 
     def _observe_signature_values(self):
         # Also recognize direct attribute replacement by advanced editor code.
@@ -419,12 +429,18 @@ class Live2DEditorSession:
             if tracked is not value:
                 setattr(self.project, name, tracked)
                 self._invalidate_signature()
-        for name in ("parameter_overrides", "part_overrides", "_texture_data", "original_bindings"):
+        for name in ("_texture_data", "original_bindings"):
             value = getattr(self, name)
             tracked = _track_mutable(value, self._signature_changed)
             if tracked is not value:
                 setattr(self, name, tracked)
                 self._invalidate_signature()
+        for name in ("parameter_overrides", "part_overrides"):
+            value = getattr(self, name)
+            tracked = _track_mutable(value, self._pose_changed)
+            if tracked is not value:
+                setattr(self, name, tracked)
+                self._invalidate_pose_signature()
 
     def _signature(self) -> str:
         self._observe_signature_values()
@@ -432,17 +448,24 @@ class Live2DEditorSession:
                  frozenset(self.project.modified), frozenset(self._deleted_original_bindings))
         if self._signature_cache is not None and self._signature_cache[0] == token:
             return self._signature_cache[1]
-        snapshot = self._snapshot_values()
-        snapshot["modified"] = sorted(snapshot["modified"])
-        snapshot["textures"] = [hashlib.sha256(data).hexdigest() for data in snapshot["textures"]]
-        snapshot["original_bindings"] = sorted((group, index, original) for (group, index), original in self.original_bindings.items())
-        snapshot["deleted_original_bindings"] = sorted(self._deleted_original_bindings)
-        snapshot["project_revision"] = self._project_revision
-        signature = hashlib.sha256(json.dumps(snapshot, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        if self._asset_signature_cache is None or self._asset_signature_cache[0] != token:
+            snapshot = self._snapshot_values()
+            snapshot.pop("parameters")
+            snapshot.pop("parts")
+            snapshot["modified"] = sorted(snapshot["modified"])
+            snapshot["textures"] = [hashlib.sha256(data).hexdigest() for data in snapshot["textures"]]
+            snapshot["original_bindings"] = sorted((group, index, original) for (group, index), original in self.original_bindings.items())
+            snapshot["deleted_original_bindings"] = sorted(self._deleted_original_bindings)
+            snapshot["project_revision"] = self._project_revision
+            asset_signature = hashlib.sha256(json.dumps(snapshot, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+            self._asset_signature_cache = token, asset_signature
+        pose = json.dumps([self.parameter_overrides, self.part_overrides], sort_keys=True, allow_nan=False)
+        signature = hashlib.sha256((self._asset_signature_cache[1] + pose).encode()).hexdigest()
         self._signature_cache = token, signature
         return signature
 
     def _record(self, action) -> Any:
+        self.commit_parameter_preview()
         previous = self._snapshot()
         try:
             result = action()
@@ -458,7 +481,58 @@ class Live2DEditorSession:
 
     @property
     def dirty(self) -> bool:
-        return self._signature() != self._saved_signature
+        return self.parameter_preview_pending or self._signature() != self._saved_signature
+
+    def _pose_history(self) -> dict:
+        return {"_history_kind": "pose", "parameters": dict(self.parameter_overrides),
+                "parts": dict(self.part_overrides)}
+
+    def _restore_pose(self, state: dict) -> None:
+        self.parameter_overrides = _track_mutable(dict(state["parameters"]), self._pose_changed)
+        self.part_overrides = _track_mutable(dict(state["parts"]), self._pose_changed)
+        self._invalidate_pose_signature()
+
+    def _record_pose(self, action) -> Any:
+        previous = self._pose_history()
+        try:
+            result = action()
+        except Exception:
+            self._restore_pose(previous)
+            raise
+        if previous != self._pose_history():
+            self._invalidate_pose_signature()
+            self._undo.append(previous)
+            del self._undo[:-32]
+            self._redo.clear()
+        return result
+
+    def _parameter_number(self, parameter_id: str, value: float) -> float:
+        parameter = self._parameters_by_id.get(parameter_id)
+        number = _number(value, "parameter value")
+        if parameter is None or not parameter["min"] <= number <= parameter["max"]:
+            raise AnimationEditingError("Parameter value is outside the model range.")
+        return number
+
+    @property
+    def parameter_preview_pending(self) -> bool:
+        return bool(self._parameter_preview)
+
+    def preview_parameter(self, parameter_id: str, value: float) -> None:
+        """Stage a validated drag value without a snapshot or asset digest."""
+        number = self._parameter_number(parameter_id, value)
+        if self.parameter_overrides.get(parameter_id) == number:
+            self._parameter_preview.pop(parameter_id, None)
+        else:
+            self._parameter_preview[parameter_id] = number
+
+    def commit_parameter_preview(self) -> bool:
+        """Commit the final values of one parameter gesture as one undo step."""
+        if not self._parameter_preview:
+            return False
+        pending = dict(self._parameter_preview)
+        self._record_pose(lambda: self.parameter_overrides.update(pending))
+        self._parameter_preview.clear()
+        return True
 
     @property
     def active_skin_id(self):
@@ -559,26 +633,32 @@ class Live2DEditorSession:
 
     @property
     def can_undo(self) -> bool:
-        return bool(self._undo)
+        return self.parameter_preview_pending or bool(self._undo)
 
     @property
     def can_redo(self) -> bool:
-        return bool(self._redo)
+        return not self.parameter_preview_pending and bool(self._redo)
 
     def undo(self) -> bool:
+        self.commit_parameter_preview()
         if not self._undo:
             return False
-        current = self._snapshot()
-        self._restore(self._undo[-1])
+        state = self._undo[-1]
+        pose = state.get("_history_kind") == "pose"
+        current = self._pose_history() if pose else self._snapshot()
+        (self._restore_pose if pose else self._restore)(state)
         self._undo.pop()
         self._redo.append(current)
         return True
 
     def redo(self) -> bool:
+        self.commit_parameter_preview()
         if not self._redo:
             return False
-        current = self._snapshot()
-        self._restore(self._redo[-1])
+        state = self._redo[-1]
+        pose = state.get("_history_kind") == "pose"
+        current = self._pose_history() if pose else self._snapshot()
+        (self._restore_pose if pose else self._restore)(state)
         self._redo.pop()
         self._undo.append(current)
         return True
@@ -668,17 +748,16 @@ class Live2DEditorSession:
         self._record(apply)
 
     def set_parameter(self, parameter_id: str, value: float) -> None:
-        parameter = next((p for p in self.parameters if p["id"] == parameter_id), None)
-        number = _number(value, "parameter value")
-        if parameter is None or not parameter["min"] <= number <= parameter["max"]:
-            raise AnimationEditingError("Parameter value is outside the model range.")
-        self._record(lambda: self.parameter_overrides.__setitem__(parameter_id, number))
+        number = self._parameter_number(parameter_id, value)
+        self.commit_parameter_preview()
+        self._record_pose(lambda: self.parameter_overrides.__setitem__(parameter_id, number))
 
     def set_part_opacity(self, part_id: str, value: float) -> None:
         number = _number(value, "part opacity")
         if not 0 <= number <= 1:
             raise AnimationEditingError("Part opacity must be between zero and one.")
-        self._record(lambda: self.part_overrides.__setitem__(part_id, number))
+        self.commit_parameter_preview()
+        self._record_pose(lambda: self.part_overrides.__setitem__(part_id, number))
 
     def pose_at(self, motion: str | None, seconds: float, *, overrides: bool = False) -> dict[str, float]:
         values = {p["id"]: float(p["default"]) for p in self.parameters}
@@ -690,12 +769,67 @@ class Live2DEditorSession:
                         values[curve["Id"]] = value
         if overrides:
             values.update(self.parameter_overrides)
+            values.update(self._parameter_preview)
         return values
 
     def snapshot_mesh(self, parameters: dict[str, float]) -> dict:
         if self._core_model:
             self.mesh_data = self._core_model.drawable_snapshot(parameters)
         return self.mesh_data or {}
+
+    def exact_pose_mesh(self, parameters: Mapping[str, float], parts: Mapping[str, float] | None = None) -> dict:
+        """Read geometry from a displayed pose without clamping physics values.
+
+        The renderer supplies actual parameter values. Cubism Core's ordinary
+        authoring helper clamps requested values, so copy them directly into
+        its arrays before the pure Core update (without SDK Physics/Pose).
+        Part values are only those the renderer can read or explicitly apply.
+        All drawables remain in the snapshot to keep mask indices meaningful.
+        """
+        parameters = {str(key): _number(value, "displayed parameter") for key, value in parameters.items()}
+        parts = {str(key): _number(value, "displayed part opacity") for key, value in (parts or {}).items()}
+        model = self._core_model
+        if model:
+            core, pointer = model.core, model.model_pointer
+            dll = core.dll
+            ids = dll.csmGetParameterIds(pointer)
+            values = dll.csmGetParameterValues(pointer)
+            identifiers = [ids[index].decode("utf-8", errors="replace")
+                           for index in range(max(0, int(dll.csmGetParameterCount(pointer))))]
+            if any(identifier not in parameters for identifier in identifiers):
+                raise AnimationEditingError("Selection requires the complete displayed parameter pose.")
+            previous_values = [float(values[index]) for index in range(len(identifiers))]
+            part_ids, part_values = core.get_part_ids(pointer), core.get_part_opacities(pointer)
+            previous_parts = [float(part_values[index]) for index in range(core.get_part_count(pointer))] if part_values else []
+            try:
+                for index, identifier in enumerate(identifiers):
+                    values[index] = parameters[identifier]
+                if part_ids and part_values:
+                    for index in range(len(previous_parts)):
+                        identifier = part_ids[index].decode("utf-8", errors="replace")
+                        if identifier in parts:
+                            part_values[index] = parts[identifier]
+                snapshot = model.drawable_snapshot()
+            finally:
+                for index, value in enumerate(previous_values):
+                    values[index] = value
+                for index, value in enumerate(previous_parts):
+                    part_values[index] = value
+                dll.csmUpdateModel(pointer)
+        else:
+            snapshot = copy.deepcopy(self.mesh_data or {})
+            snapshot["parameters"] = parameters
+            for part in snapshot.get("parts", []):
+                if part["id"] in parts:
+                    part["opacity"] = parts[part["id"]]
+        # The SDK renderer also suppresses drawables belonging to hidden parts.
+        # Explicit zero overrides must remain hidden for picking and PSD export,
+        # even with a sidecar or a Core build that reports raw drawable opacity.
+        hidden = {key for key, value in parts.items() if value <= .001}
+        for drawable in snapshot.get("drawables", []):
+            if drawable.get("parent_part_id") in hidden:
+                drawable["opacity"] = 0.0
+        return snapshot
 
     @staticmethod
     def _write_texture(path: Path, data: bytes) -> None:
@@ -775,7 +909,7 @@ class Live2DEditorSession:
         """Restore the last accepted version after a failed/partial external save."""
         self._write_texture(self.texture_paths[index], self._texture_data[index])
 
-    def local_artmesh_image(self, drawable: Mapping[str, Any]) -> Image.Image | None:
+    def local_artmesh_image(self, drawable: Mapping[str, Any], *, max_size=(480, 360)) -> Image.Image | None:
         """Extract the selected ArtMesh footprint, using its actual UV triangles."""
         index = int(drawable.get("texture_index", -1))
         if not 0 <= index < len(self.texture_paths):
@@ -797,7 +931,8 @@ class Live2DEditorSession:
         from PIL import ImageChops
         image.putalpha(ImageChops.multiply(image.getchannel("A"), mask))
         result = image.crop(mask.getbbox())
-        result.thumbnail((480, 360))
+        if max_size is not None:
+            result.thumbnail(max_size)
         return result
 
     def write_inspector_metadata(self, parameters: dict[str, float]) -> Path:
@@ -838,6 +973,7 @@ class Live2DEditorSession:
         output = Path(output_dir).expanduser().resolve()
         if output.exists() or output.is_relative_to(self.source_root) or self.source_root.is_relative_to(output):
             raise AnimationEditingError("Save to a new folder outside the source package.")
+        self.commit_parameter_preview()
         output.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix=".lpk-live2d-copy-", dir=output.parent) as temporary:
             stage = Path(temporary) / "package"

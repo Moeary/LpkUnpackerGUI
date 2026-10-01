@@ -548,6 +548,8 @@ def record_repack(
     scheme_id: str = "",
     display_name: str = "",
     texture_outputs: Mapping[int, str | Path] | None = None,
+    allow_shared_uv: bool = False,
+    affected_unselected_ids: list[str] | None = None,
 ) -> Live2DPSDProject:
     data = normalize_project_data(project.data, project.project_name)
     entry = {
@@ -566,6 +568,9 @@ def record_repack(
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "scheme_id": str(scheme_id or ""),
     }
+    if allow_shared_uv:
+        entry["allow_shared_uv"] = True
+        entry["affected_unselected_ids"] = sorted(set(affected_unselected_ids or []))
     data.setdefault("repack_history", []).append(entry)
     data["selected_repack"] = version_id
     if scheme_id:

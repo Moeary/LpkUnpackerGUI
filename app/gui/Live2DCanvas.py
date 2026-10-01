@@ -7,7 +7,7 @@ import numpy as np
 from typing import Optional, List, Dict, Any
 
 from PySide6.QtOpenGL import QOpenGLWindow
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QPointF, Qt, Signal
 from PySide6.QtGui import QGuiApplication, QPalette
 import OpenGL.GL as GL
 from abc import abstractmethod
@@ -16,6 +16,7 @@ import live2d.v3 as live2d
 from live2d.utils.canvas import Canvas
 
 from app.core.model.motions import evaluate_motion_parameters, load_live2d_motions
+from app.gui.live2d_selection import ModelCoordinates, PreviewTransform, SelectionScene
 
 live2d.init()
 
@@ -364,6 +365,11 @@ class ADPOpenGLCanvas(QOpenGLWindow):
 
         GL.glBindVertexArray(0)
 
+        self.draw_overlay(vp_w, vp_h, dpr)
+
+    def draw_overlay(self, _width, _height, _dpr):
+        """Native-window overlays must be painted after the composition pass."""
+
     def setCanvasOpacity(self, value):
         self.__canvas_opacity = value
         self.update()
@@ -382,7 +388,7 @@ class ADPOpenGLCanvas(QOpenGLWindow):
         self.update()
 
     def windowPointToModel(self, x: float, y: float) -> tuple[float, float]:
-        """Map a host click through contain/zoom/rotation to Cubism pixels."""
+        """Legacy screen-to-FBO mapping; these are not Cubism canvas pixels."""
         width, height = max(1, self.width()), max(1, self.height())
         canvas_width, canvas_height = max(1, self._fbo_width), max(1, self._fbo_height)
         viewport_aspect, canvas_aspect = width / height, canvas_width / canvas_height
@@ -395,6 +401,10 @@ class ADPOpenGLCanvas(QOpenGLWindow):
         source_x = cosine * cx + sine * cy + .5
         source_y = -sine * cx + cosine * cy + .5
         return source_x * canvas_width, (1 - source_y) * canvas_height
+
+    def previewTransform(self) -> PreviewTransform:
+        return PreviewTransform(self.width(), self.height(), self._fbo_width, self._fbo_height,
+                                self.__model_scale, *self.__model_offset, self.__rotation_angle)
 
     def setAntialias(self, enabled: bool):
         self._antialias = bool(enabled)
@@ -453,6 +463,10 @@ class Live2DCanvas(ADPOpenGLCanvas):
     modelLoaded = Signal()
     drawableClicked = Signal(str)
     modelPointClicked = Signal(float, float)
+    drawablesPicked = Signal(list)
+    regionPicked = Signal(list, dict)
+    selectionFailed = Signal(str)
+    selectionCancelled = Signal()
     def __init__(self, model_path=None, embedded: bool = False):
         super().__init__()
         self.model_path = model_path
@@ -486,6 +500,12 @@ class Live2DCanvas(ADPOpenGLCanvas):
         self._render_timer_id = None
         self._rendering_active = True
         self._editor_interaction = False
+        self._selection_mode = "none"
+        self._selection_scene_provider = None
+        self._selection_alpha_cache = {}
+        self._selection_drag = None
+        self._last_selection_region = None
+        self._selection_region_canvas = None
         self._part_opacity_overrides = {}
         self._part_opacity_defaults = {}
         self._part_indices = {}
@@ -525,6 +545,9 @@ class Live2DCanvas(ADPOpenGLCanvas):
             model.Resize(self._fbo_width, self._fbo_height)
         self.model = model
         self.model_path = model_path
+        self._selection_alpha_cache.clear()
+        self._selection_drag = None
+        self._last_selection_region = None
         try:
             model.SetAutoBlinkEnable(self._auto_blink_enabled)
             model.SetAutoBreathEnable(self._auto_breath_enabled)
@@ -581,6 +604,9 @@ class Live2DCanvas(ADPOpenGLCanvas):
         self._part_opacity_overrides = {}
         self._part_opacity_defaults = {}
         self._part_indices = {}
+        self._selection_alpha_cache.clear()
+        self._selection_drag = None
+        self._last_selection_region = None
         self.update()
 
     def timerEvent(self, a0):
@@ -621,6 +647,12 @@ class Live2DCanvas(ADPOpenGLCanvas):
         self._mouse_follow_enabled = bool(enable)
 
     def mouseMoveEvent(self, event):
+        if self._selection_mode != "none":
+            if self._selection_drag is not None:
+                self._selection_drag[1] = event.position()
+                self.update()
+            event.accept()
+            return
         if not self._mouse_follow_enabled or self.model is None:
             return super().mouseMoveEvent(event)
         w = max(1, self.width())
@@ -636,26 +668,55 @@ class Live2DCanvas(ADPOpenGLCanvas):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            if self._editor_interaction:
+            if self._selection_mode != "none":
                 if self.model is not None:
                     try:
-                        x, y = self.windowPointToModel(event.position().x(), event.position().y())
-                        self.modelPointClicked.emit(x / max(1, self._fbo_width), y / max(1, self._fbo_height))
-                        hits = self.model.HitPart(x, y, True)
-                        if hits:
-                            self.drawableClicked.emit(str(hits[0]))
-                    except Exception:
-                        pass
-                return super().mousePressEvent(event)
+                        if self._selection_mode == "rectangle":
+                            self._selection_drag = [QPointF(event.position()), QPointF(event.position())]
+                            self._last_selection_region = None
+                            self.update()
+                        else:
+                            self.pickDrawablesAt(event.position().x(), event.position().y())
+                    except Exception as exc:
+                        self.selectionFailed.emit(str(exc))
+                event.accept()
+                return
             try:
                 self.playDefaultTapMotion()
             except Exception:
                 pass
         return super().mousePressEvent(event)
 
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._selection_drag is not None:
+            first, _ = self._selection_drag
+            last = QPointF(event.position())
+            self._selection_drag = None
+            try:
+                if (last - first).manhattanLength() < 4:
+                    self.pickDrawablesAt(last.x(), last.y())
+                else:
+                    self.pickDrawablesInRect(first, last)
+            except Exception as exc:
+                self.selectionFailed.emit(str(exc))
+            self.update()
+            event.accept()
+            return
+        return super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape and self._selection_mode != "none":
+            self._selection_drag = None
+            self._last_selection_region = None
+            self.update()
+            self.selectionCancelled.emit()
+            event.accept()
+            return
+        return super().keyPressEvent(event)
+
     def leaveEvent(self, event):
         # Reset follow when cursor leaves
-        if self._mouse_follow_enabled and self.model is not None:
+        if self._selection_mode == "none" and self._mouse_follow_enabled and self.model is not None:
             try:
                 self._apply_mouse_follow(0.0, 0.0)
             except Exception:
@@ -818,9 +879,125 @@ class Live2DCanvas(ADPOpenGLCanvas):
 
     def setEditorInteraction(self, enabled: bool):
         self._editor_interaction = bool(enabled)
+        self.setSelectionMode("point" if enabled else "none")
         if enabled:
             self.setMouseTracking(False)
 
+    def setSelectionMode(self, mode: str):
+        if mode not in ("none", "point", "rectangle"):
+            raise ValueError("Selection mode must be none, point or rectangle")
+        self._selection_mode = mode
+        self._selection_drag = None
+        self._last_selection_region = None
+        self.setCursor(Qt.CursorShape.CrossCursor if mode != "none" else Qt.CursorShape.ArrowCursor)
+        self.update()
+
+    def selectionMode(self) -> str:
+        return self._selection_mode
+
+    def setSelectionSceneProvider(self, provider):
+        """Set an on-demand read-only provider returning snapshot/texture_paths.
+
+        A provider returns ``{'snapshot': full_snapshot, 'texture_paths': paths}``.
+        It may cache by getSelectionPose(); no metadata file is needed for picks.
+        """
+        self._selection_scene_provider = provider
+        self._selection_alpha_cache.clear()
+
+    def getSelectionPose(self) -> dict:
+        if self.model is None:
+            return {"parameters": {}, "parts": {}, "parts_complete": False}
+        parameter_ids = self.model.GetParamIds()
+        parameters = {str(parameter_id): float(self.model.GetParameterValue(i))
+                      for i, parameter_id in enumerate(parameter_ids)}
+        parts = dict(self._part_opacity_defaults)
+        parts.update(self._part_opacity_overrides)
+        # live2d-py exposes SetPartOpacity but no opacity getter. Do not invent
+        # SDK Pose-controller values; only the overrides actually applied here.
+        return {"parameters": parameters, "parts": parts, "parts_complete": False}
+
+    def getSelectionScene(self) -> SelectionScene:
+        if self._selection_scene_provider is None:
+            raise RuntimeError("A current-pose ArtMesh selection provider is required")
+        result = self._selection_scene_provider()
+        if isinstance(result, SelectionScene):
+            return result
+        snapshot = result.get("snapshot", result)
+        return SelectionScene(snapshot, result.get("texture_paths", []), alpha_cache=self._selection_alpha_cache)
+
+    def _selection_coordinates(self, snapshot):
+        if self.model is None:
+            raise RuntimeError("No Live2D model is loaded")
+        native = getattr(self.model, "_model", self.model)
+        return ModelCoordinates(self.previewTransform(), native.GetMvp(), snapshot["canvas"])
+
+    def windowPointToCanvas(self, x: float, y: float, snapshot=None):
+        snapshot = snapshot if snapshot is not None else self.getSelectionScene().snapshot
+        return self._selection_coordinates(snapshot).window_to_canvas((x, y))
+
+    def canvasPointToWindow(self, x: float, y: float, snapshot=None):
+        snapshot = snapshot if snapshot is not None else self.getSelectionScene().snapshot
+        return self._selection_coordinates(snapshot).canvas_to_window((x, y))
+
+    def pickDrawablesAt(self, x: float, y: float) -> list[str]:
+        if self._selection_scene_provider is not None:
+            scene = self.getSelectionScene()
+            point = self._selection_coordinates(scene.snapshot).window_to_canvas((x, y))
+            hits = scene.hit_point(point)
+            self.drawablesPicked.emit(hits)
+            return hits
+        # Compatibility for callers without a Core snapshot: the SDK's real
+        # drawable IDs, never HitPart's distinct Part IDs. No legacy normalized
+        # FBO point signal is emitted alongside the new selection workflow.
+        fbo_x, fbo_y = self.windowPointToModel(x, y)
+        native = getattr(self.model, "_model", self.model)
+        hits = list(native.HitDrawable(fbo_x, fbo_y, False))
+        self.drawablesPicked.emit(hits)
+        if hits:
+            self.drawableClicked.emit(str(hits[0]))
+        return hits
+
+    def pickDrawablesInRect(self, first, last) -> list[str]:
+        scene = self.getSelectionScene()
+        coordinates = self._selection_coordinates(scene.snapshot)
+        point = lambda p: (p.x(), p.y()) if hasattr(p, "x") else tuple(p)
+        region = coordinates.window_rect(point(first), point(last))
+        hits = scene.hit_region(region)
+        self._last_selection_region = region
+        self._selection_region_canvas = scene.snapshot["canvas"]
+        self.regionPicked.emit(hits, region)
+        return hits
+
+    def draw_overlay(self, width, height, dpr):
+        if self._selection_drag is not None:
+            first, last = self._selection_drag
+            points = [(first.x(), first.y()), (last.x(), first.y()),
+                      (last.x(), last.y()), (first.x(), last.y())]
+        elif self._last_selection_region and self._selection_region_canvas:
+            coordinates = self._selection_coordinates({"canvas": self._selection_region_canvas})
+            points = [coordinates.canvas_to_window(p) for p in self._last_selection_region["polygon"]]
+        else:
+            return
+        # Paint an outline on the final native framebuffer; a QWidget overlay
+        # would be behind createWindowContainer on Windows. Preserve GL state.
+        scissor_enabled = GL.glIsEnabled(GL.GL_SCISSOR_TEST)
+        scissor_box = GL.glGetIntegerv(GL.GL_SCISSOR_BOX)
+        clear_color = GL.glGetFloatv(GL.GL_COLOR_CLEAR_VALUE)
+        GL.glEnable(GL.GL_SCISSOR_TEST)
+        GL.glClearColor(.15, .67, 1., 1.)
+        try:
+            for a, b in zip(points, points[1:] + points[:1]):
+                steps = max(1, math.ceil(max(abs(b[0] - a[0]), abs(b[1] - a[1])) * dpr / 4))
+                for index in range(steps + 1):
+                    x = int(round((a[0] + (b[0] - a[0]) * index / steps) * dpr))
+                    y = height - int(round((a[1] + (b[1] - a[1]) * index / steps) * dpr))
+                    GL.glScissor(max(0, x - 1), max(0, y - 1), 3, 3)
+                    GL.glClear(GL.GL_COLOR_BUFFER_BIT)
+        finally:
+            GL.glScissor(*scissor_box)
+            GL.glClearColor(*clear_color)
+            if not scissor_enabled:
+                GL.glDisable(GL.GL_SCISSOR_TEST)
     def setPartOpacityOverrides(self, values: dict[str, float], defaults: dict[str, float] | None = None):
         if defaults is not None:
             self._part_opacity_defaults = dict(defaults)

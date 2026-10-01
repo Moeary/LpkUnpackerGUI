@@ -90,6 +90,7 @@ from app.core.live2d_editor_mod_preview import mapped_mod_skin_preview
 from app.gui.editor_workspace import EditorViewportLayout, FluentEditorTabs
 from app.i18n import get_i18n, tr
 from app.gui.editor_dialogs import EditorMessageBox as QMessageBox, ThemedEditorDialog as MessageBoxBase
+from app.gui.ArtMeshInspector import ArtMeshPickDialog, ARTMESH_TEXT
 
 
 MODEL_DRAG_MIME = "application/x-live2d-mod-model"
@@ -113,6 +114,7 @@ MOD_WORKSPACE_TEXT = {
     "mod.workspace.trigger_unavailable": "{id} 已绑定事件或不是主模型可用的触发区。",
     "mod.workspace.preview_main": "预览主模型",
     "mod.workspace.import_options": "导入选项",
+    "mod.workspace.pick_trigger": "选择触发部件…",
 }
 
 
@@ -1035,6 +1037,7 @@ class Live2DModPage(QFrame):
         self._models_refreshing = False
         self._loading_ui = False
         self._dirty = False
+        self._artmesh_pick_provider = None
         self.setup_ui()
         self.retranslate_ui()
         self.i18n.languageChanged.connect(self.retranslate_ui)
@@ -1110,6 +1113,10 @@ class Live2DModPage(QFrame):
         self.artmesh_combo.currentIndexChanged.connect(self.on_artmesh_combo_changed)
         artmesh_layout.addWidget(self.artmesh_title)
         artmesh_layout.addWidget(self.artmesh_combo)
+        self.pick_trigger_button = PushButton(FluentIcon.VIEW, "", self.artmesh_card)
+        self.pick_trigger_button.clicked.connect(self.open_artmesh_picker)
+        self.pick_trigger_button.setEnabled(False)
+        artmesh_layout.addWidget(self.pick_trigger_button)
         self.left_layout.addWidget(self.artmesh_card)
 
         self.export_card = CardWidget(left)
@@ -1336,6 +1343,7 @@ class Live2DModPage(QFrame):
                 default="搜索并选择未绑定事件的 ArtMesh…",
             )
         )
+        self.pick_trigger_button.setText(_workspace_text("mod.workspace.pick_trigger"))
         self.export_title.setText(
             tr("mod.v2.export_title", default="4 · 最终导出")
         )
@@ -1899,6 +1907,37 @@ class Live2DModPage(QFrame):
             self.workflow_tabs.setCurrentIndex(2)
         self.append_log(_workspace_text("mod.workspace.trigger_selected", id=drawable_id))
         return True
+
+    def set_artmesh_pick_provider(self, provider):
+        """The editor supplies geometry for this project's exact main model.
+
+        callback(main_model_id) returns snapshot, texture_paths, model_id and
+        model_path. Matching both ID and source path prevents accidental use of
+        an unrelated open model with coincidentally identical drawable names.
+        """
+        self._artmesh_pick_provider = provider
+        self.pick_trigger_button.setEnabled(callable(provider))
+
+    def open_artmesh_picker(self):
+        if not self.current_project or not self.current_project.models:
+            return False
+        main = self.current_project.models[0]
+        model_id = str(main.get("id") or "")
+        model_path = self.resolve_project_path(str(main.get("model_json") or "")).resolve()
+        payload = self._artmesh_pick_provider(model_id) if callable(self._artmesh_pick_provider) else None
+        if (not payload or str(payload.get("model_id")) != model_id
+                or Path(str(payload.get("model_path") or "")).resolve() != model_path):
+            self.show_warning(tr("artmesh.inspector.no_trigger", default=ARTMESH_TEXT["artmesh.inspector.no_trigger"]))
+            return False
+        eligible = {str(item.get("id")) for item in self.current_project.data.get("artmesh_areas", [])
+                    if isinstance(item, dict) and item.get("id") and not str(item.get("motion") or "").strip()}
+        dialog = ArtMeshPickDialog(payload["snapshot"], payload["texture_paths"], eligible,
+                                   self.window(), self.artmesh_combo.currentData(),
+                                   pose_frame=payload.get("pose_frame"),
+                                   pose_frame_canvas_polygon=payload.get("pose_frame_canvas_polygon"))
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return False
+        return self.select_trigger(dialog.selected_id)
 
     def review_export_configuration(self):
         if not self.current_project:

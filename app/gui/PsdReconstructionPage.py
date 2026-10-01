@@ -1,4 +1,6 @@
+import copy
 import json
+import math
 import os
 import re
 import shutil
@@ -31,6 +33,7 @@ from qfluentwidgets import (
     BodyLabel,
     CardWidget,
     CaptionLabel,
+    CheckBox,
     ComboBox,
     EditableComboBox,
     InfoBar,
@@ -104,9 +107,20 @@ PSD_WORKSPACE_TEXT = {
     "psd.workspace.single_repack": "回写选中 PSD",
     "psd.workspace.multi_repack": "多 PSD 按顺序回写",
     "psd.workspace.apply_version": "应用版本贴图到当前模型",
+    "psd.workspace.apply_skin_short": "存为皮肤",
     "psd.workspace.send_mod": "将版本贴图送入 MOD",
     "psd.workspace.version_hint": "原始项是 PSD 工程的导出源快照。回写版本仅提供贴图；应用后可撤销，当前动作保持不变。",
     "psd.workspace.empty": "先打开 Live2D 工程，再创建或导入 PSD 子工程。",
+    "psd.selection.export": "导出选中部件 PSD",
+    "psd.selection.default_name": "选中部件",
+    "psd.selection.hint": "按当前姿态导出框选命中的完整部件，保持相对位置。请在原画布与原图层位置绘制；回写会生成新皮肤。",
+    "psd.selection.empty": "先在模型预览中框选可见部件。",
+    "psd.selection.busy": "PSD 工作正在进行，请完成后再导出选区。",
+    "psd.selection.no_project": "先打开当前模型的 PSD 子工程。",
+    "psd.selection.shared_hint": "选区与未选部件共用贴图像素；默认拒绝影响这些部件的修改：",
+    "psd.selection.shared_enable": "同步修改共享部件",
+    "psd.selection.shared_effect": "这些贴图像素由 {count} 个未选部件共用。勾选后，它们也会随新皮肤一起改变；不修改原模型。",
+    "psd.selection.shared_actual": "本次修改同时影响 {count} 个共享部件：",
 }
 
 
@@ -135,6 +149,10 @@ class PsdReconstructionThread(QThread):
         output_name: str | None = None,
         resource_limits: dict[str, int] | None = None,
         multi_psd_paths: list[str] | None = None,
+        selected_drawable_ids: list[str] | None = None,
+        selection_region=None,
+        mesh_data: dict | None = None,
+        allow_shared_uv: bool = False,
     ):
         super().__init__()
         self.source_path = source_path
@@ -146,6 +164,10 @@ class PsdReconstructionThread(QThread):
         self.output_name = output_name
         self.resource_limits = dict(resource_limits or {})
         self.multi_psd_paths = list(multi_psd_paths or [])
+        self.selected_drawable_ids = list(selected_drawable_ids) if selected_drawable_ids is not None else None
+        self.selection_region = copy.deepcopy(selection_region)
+        self.mesh_data = copy.deepcopy(mesh_data)
+        self.allow_shared_uv = bool(allow_shared_uv)
 
     def run(self):
         try:
@@ -163,6 +185,7 @@ class PsdReconstructionThread(QThread):
                     metadata_path=self.metadata_path or None,
                     progress=lambda value, message: self.progressUpdated.emit(value, message),
                     resource_limits=self.resource_limits,
+                    allow_shared_uv=self.allow_shared_uv,
                 )
             else:
                 result = reconstruct_live2d_psd(
@@ -174,6 +197,9 @@ class PsdReconstructionThread(QThread):
                     pose_name=self.pose_name,
                     output_name=self.output_name,
                     resource_limits=self.resource_limits,
+                    selected_drawable_ids=self.selected_drawable_ids,
+                    selection_region=self.selection_region,
+                    mesh_data=self.mesh_data,
                 )
             self.reconstructionFinished.emit(result)
         except Exception as exc:
@@ -354,6 +380,9 @@ class PsdReconstructionPage(QFrame):
         self.pending_skin_context = None
         self.preview_command_handler = None
         self._export_snapshot = ""
+        self._shared_uv_context = None
+        self._shared_uv_available = False
+        self._shared_uv_multimode = False
         self._bound_project_files: list[str] = []
         self.setObjectName("psdReconstructionPage")
         self.setAcceptDrops(True)
@@ -778,6 +807,15 @@ class PsdReconstructionPage(QFrame):
         self.metadata_layout.addLayout(self.metadata_button_layout)
         self.repack_card_layout.addWidget(self.metadata_frame)
         self.metadata_frame.setVisible(False)
+        self.shared_uv_checkbox = CheckBox(_workspace_text("psd.selection.shared_enable"), self.repack_card)
+        self.shared_uv_hint = CaptionLabel(self.repack_card)
+        self.shared_uv_hint.setWordWrap(True)
+        self.shared_uv_hint.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.repack_card_layout.addWidget(self.shared_uv_checkbox)
+        self.repack_card_layout.addWidget(self.shared_uv_hint)
+        self.shared_uv_checkbox.hide()
+        self.shared_uv_hint.hide()
+        self.metadata_edit.textChanged.connect(self._refresh_shared_uv_option)
 
         self.texture_name_layout = QVBoxLayout()
         self.texture_name_label = BodyLabel("", self.repack_card)
@@ -1036,7 +1074,8 @@ class PsdReconstructionPage(QFrame):
         self.repack_card_layout.addWidget(self.multi_repack_button)
         self.multi_repack_button.show()
         self.metadata_frame.show()
-        self.apply_version_button = PrimaryPushButton(_workspace_text("psd.workspace.apply_version"), self.preview_control_frame)
+        self.apply_version_button = PrimaryPushButton(_workspace_text("psd.workspace.apply_skin_short"), self.preview_control_frame)
+        self.apply_version_button.setToolTip(skin_text("editor.skin.psd_save"))
         self.apply_version_button.clicked.connect(lambda: self.repackApplyRequested.emit(self.preview_source_token()))
         self.send_mod_button = PushButton(_workspace_text("psd.workspace.send_mod"), self.preview_control_frame)
         self.send_mod_button.clicked.connect(lambda: self.repackModRequested.emit(self.preview_source_token()))
@@ -1094,7 +1133,9 @@ class PsdReconstructionPage(QFrame):
             label = skin_text("editor.skin.psd_current", name=context.get("name", ""))
             self.skin_context_label.setText(label)
             self.skin_context_label.setToolTip(label + "\n" + skin_text("editor.skin.psd_hint"))
-        self.apply_version_button.setText(skin_text("editor.skin.psd_save"))
+        self.apply_version_button.setText(_workspace_text("psd.workspace.apply_skin_short"))
+        self.apply_version_button.setToolTip(skin_text("editor.skin.psd_save"))
+        self.apply_version_button.setMinimumWidth(max(74, self.apply_version_button.fontMetrics().horizontalAdvance(self.apply_version_button.text()) + 28))
         self.send_mod_button.setText(skin_text("editor.skin.psd_viewer"))
 
     def _refresh_skin_labels(self):
@@ -1204,6 +1245,7 @@ class PsdReconstructionPage(QFrame):
                 widget.setText(_workspace_text("psd.workspace." + key))
             self._update_project_header()
             self._refresh_skin_labels()
+        self._refresh_shared_uv_option()
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -1527,6 +1569,87 @@ class PsdReconstructionPage(QFrame):
             )
         )
 
+    def export_selected_artmeshes(self, drawable_ids, pose, region=None, *, mesh_data=None) -> bool:
+        """Start the existing PSD/skin workflow with a frozen current selection.
+
+        ``pose`` accepts a parameter dictionary or ``{parameters, parts}``.
+        An exact full drawable snapshot supplied by the editor takes precedence
+        over Cubism Core parameter reconstruction, including physics values.
+        """
+        if self.is_busy():
+            self.append_log(_workspace_text("psd.selection.busy"))
+            return False
+        ids = list(dict.fromkeys(str(value) for value in drawable_ids or []))
+        if not ids:
+            self.append_log(_workspace_text("psd.selection.empty"))
+            return False
+        if not self.current_project:
+            self.append_log(_workspace_text("psd.selection.no_project"))
+            return False
+        try:
+            values = dict(pose or {})
+            parameters = {str(key): float(value) for key, value in
+                          dict(values.get("parameters", {} if "parts" in values else values)).items()}
+            parts = {str(key): float(value) for key, value in dict(values.get("parts") or {}).items()}
+            if not all(math.isfinite(value) for value in [*parameters.values(), *parts.values()]):
+                raise ValueError("Pose parameters and part opacities must be finite.")
+            if parts and mesh_data is None:
+                raise ValueError("Current part opacities require the editor's exact drawable pose snapshot.")
+            exact_mesh = copy.deepcopy(mesh_data)
+            if exact_mesh is not None:
+                exact_mesh["selection_pose"] = {"parameters": parameters, "parts": parts}
+            name = self._prompt_non_empty_name(
+                "psd.project.new_dialog_title", "psd.export.name", _workspace_text("psd.selection.default_name"),
+            )
+            if not name:
+                return False
+            source = str(self.export_snapshot_provider()) if self.export_snapshot_provider else str(self.current_project.base_model_json)
+            self._export_snapshot = source
+            scheme_id = "selection-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            project, scheme, scheme_dir = create_pose_scheme(
+                self.current_project, name, 0, parameters, pose_source="preview", parameter_preset_id=scheme_id,
+            )
+            package = resolve_live2d_package(source)
+            for index, target in enumerate(scheme.get("source_textures") or []):
+                shutil.copy2(package.texture_paths[index], resolve_project_path(project, target))
+            scheme["selection"] = {"drawable_ids": ids, "region": copy.deepcopy(region), "parts": parts}
+            if self.export_snapshot_provider:
+                scheme["editor_snapshot"] = Path(source).resolve().relative_to(project.project_dir.resolve()).as_posix()
+            for stored in project.data.get("pose_schemes") or []:
+                if stored.get("id") == scheme["id"]:
+                    stored.update(scheme)
+            save_project(project.project_dir, project.data)
+            self.current_project = project
+            self.projectChanged.emit(project)
+            self.pending_repack_id = ""
+            self.pending_multi_psd_paths = []
+            self.pending_pose_scheme_id = scheme["id"]
+            self.pending_skin_context = copy.deepcopy(self.skin_context)
+            self.set_workflow("export")
+            self.last_output_dir = str(scheme_dir.resolve())
+            self.output_edit.setText(self.last_output_dir)
+            self.set_busy(True)
+            self.progress_bar.setValue(0)
+            self.stage_label.setText(tr("psd.stage.starting"))
+            self.log_text.clear()
+            self.append_log(_workspace_text("psd.selection.hint"))
+            self.worker = PsdReconstructionThread(
+                source, self.last_output_dir, "mesh", parameter_values=parameters, pose_name=name,
+                output_name=scheme["id"], resource_limits=self.settings_manager.get("psd.resource_limits", {}),
+                selected_drawable_ids=ids, selection_region=region, mesh_data=exact_mesh,
+            )
+            self.worker.progressUpdated.connect(self.on_progress_updated)
+            self.worker.reconstructionFinished.connect(self.on_reconstruction_finished)
+            self.worker.reconstructionError.connect(self.on_reconstruction_error)
+            self.worker.start()
+            return True
+        except Exception as exc:
+            self.set_busy(False)
+            self.append_log(tr("psd.error_log", error=str(exc)), expand=True)
+            InfoBar.error(title=tr("common.error"), content=str(exc), parent=self,
+                          position=InfoBarPosition.TOP, duration=5000)
+            return False
+
     def start_reconstruction(self, direct_psd_path: str = ""):
         if self._is_busy or (self._compact and not self.current_project):
             return
@@ -1542,6 +1665,7 @@ class PsdReconstructionPage(QFrame):
         parameter_values = None
         pose_name = None
         output_name = None
+        allow_shared_uv = False
 
         if self.workflow == "repack" and not direct_psd_path:
             self.start_multi_repack()
@@ -1550,6 +1674,9 @@ class PsdReconstructionPage(QFrame):
         if self.workflow == "repack":
             metadata_path = self.metadata_edit.text().strip() or None
             source = direct_psd_path or self.selected_repack_psd_path()
+            self._shared_uv_multimode = False
+            self._refresh_shared_uv_option(source=source, metadata_path=metadata_path)
+            allow_shared_uv = self._shared_uv_available and self.shared_uv_checkbox.isChecked()
             if not source:
                 InfoBar.warning(
                     title=tr("common.warning"),
@@ -1694,6 +1821,7 @@ class PsdReconstructionPage(QFrame):
             pose_name=pose_name,
             output_name=output_name,
             resource_limits=self.settings_manager.get("psd.resource_limits", {}),
+            allow_shared_uv=allow_shared_uv,
         )
         self.worker.progressUpdated.connect(self.on_progress_updated)
         self.worker.reconstructionFinished.connect(self.on_reconstruction_finished)
@@ -1701,6 +1829,9 @@ class PsdReconstructionPage(QFrame):
         self.worker.start()
 
     def start_multi_repack(self):
+        self.shared_uv_checkbox.setChecked(False)
+        self._shared_uv_multimode = True
+        self.shared_uv_checkbox.setEnabled(False)
         initial_psd = self.selected_repack_psd_path()
         project_psds = self.project_psd_choices()
         if not project_psds:
@@ -1782,6 +1913,13 @@ class PsdReconstructionPage(QFrame):
             self.append_log(tr("psd.output_count_log", count=len(result.output_paths)))
         if result.shared_regions:
             self.append_log(tr("psd.report.shared_regions", count=len(result.shared_regions)))
+            if result.report.get("selection"):
+                ids = sorted({item["unselected_id"] for item in result.shared_regions if item.get("unselected_id")})
+                self.append_log(_workspace_text("psd.selection.shared_hint") + ", ".join(ids))
+        affected = result.report.get("affected_unselected_ids") or []
+        if affected:
+            self.append_log(tr("psd.selection.shared_actual", default=PSD_WORKSPACE_TEXT["psd.selection.shared_actual"],
+                               count=len(affected)) + ", ".join(affected))
         if result.change_regions:
             self.append_log(tr("psd.report.change_regions", count=len(result.change_regions)))
         if result.conflicts:
@@ -1858,6 +1996,7 @@ class PsdReconstructionPage(QFrame):
             self.multi_repack_button.setEnabled(not busy and bool(self.project_psd_choices()))
             self.import_project_button.setEnabled(not busy)
             self.capture_pose_button.setEnabled(not busy and self.current_project is not None)
+        self.shared_uv_checkbox.setEnabled(not busy and self._shared_uv_available and not self._shared_uv_multimode)
 
     def set_workflow(self, workflow: str):
         self.workflow = "repack" if workflow == "repack" else "export"
@@ -2093,6 +2232,7 @@ class PsdReconstructionPage(QFrame):
             self.selected_metadata = ""
             self.metadata_edit.clear()
             self._update_artmesh_inspector_button()
+            self._refresh_shared_uv_option()
             return
         scheme = self.selected_pose_scheme()
         scheme_metadata = str((scheme or {}).get("metadata") or "")
@@ -2107,6 +2247,44 @@ class PsdReconstructionPage(QFrame):
             self.selected_metadata = ""
             self.metadata_edit.clear()
         self._update_artmesh_inspector_button()
+        self._refresh_shared_uv_option()
+
+    def _refresh_shared_uv_option(self, *_args, source=None, metadata_path=None):
+        if not hasattr(self, "shared_uv_checkbox"):
+            return
+        source = source or self.selected_repack_psd_path()
+        value = metadata_path or self.metadata_edit.text().strip()
+        path = Path(value) if value else (Path(source).with_suffix(".lpkpsd.json") if source else None)
+        try:
+            stamp = (path.stat().st_mtime_ns, path.stat().st_size) if path and path.is_file() else None
+        except OSError:
+            stamp = None
+        context = (str(Path(source).resolve()) if source else "", str(path.resolve()) if path else "", stamp)
+        if context != self._shared_uv_context:
+            self.shared_uv_checkbox.setChecked(False)
+            self._shared_uv_context = context
+            self._shared_uv_multimode = False
+            ids = []
+            if stamp:
+                try:
+                    metadata = json.loads(path.read_text(encoding="utf-8"))
+                    if metadata.get("mode") == "mesh" and isinstance(metadata.get("selection"), dict):
+                        ids = sorted({str(item["unselected_id"]) for item in metadata["selection"].get("shared_regions", [])
+                                      if isinstance(item, dict) and item.get("unselected_id")})
+                except (OSError, ValueError, TypeError):
+                    pass
+            self._shared_uv_ids = ids
+            self._shared_uv_available = bool(ids)
+        ids = getattr(self, "_shared_uv_ids", [])
+        self.shared_uv_checkbox.setText(_workspace_text("psd.selection.shared_enable"))
+        text = tr("psd.selection.shared_effect", default=PSD_WORKSPACE_TEXT["psd.selection.shared_effect"], count=len(ids))
+        detail = text + "\n" + ", ".join(ids)
+        self.shared_uv_checkbox.setToolTip(detail)
+        self.shared_uv_hint.setText(text)
+        self.shared_uv_hint.setToolTip(detail)
+        self.shared_uv_checkbox.setVisible(bool(ids))
+        self.shared_uv_hint.setVisible(bool(ids))
+        self.shared_uv_checkbox.setEnabled(bool(ids) and not self._is_busy and not self._shared_uv_multimode)
 
     def _sync_repack_output_dir(self):
         source = self.selected_repack_psd_path()
@@ -2989,6 +3167,8 @@ class PsdReconstructionPage(QFrame):
                     scheme_id=self.pending_pose_scheme_id,
                     display_name=self.pending_repack_name,
                     texture_outputs=result.texture_outputs,
+                    allow_shared_uv=bool(result.report.get("allow_shared_uv")),
+                    affected_unselected_ids=result.report.get("affected_unselected_ids"),
                 )
             if result.mode in {"mesh", "atlas-components", "atlas-artmesh"} and self.pending_skin_context:
                 exports = self.current_project.data.get("psd_exports") or []

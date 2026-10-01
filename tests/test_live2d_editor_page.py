@@ -24,6 +24,20 @@ class _Canvas(QObject):
     modelLoaded = Signal()
     drawableClicked = Signal(str)
     modelPointClicked = Signal(float, float)
+    drawablesPicked = Signal(list)
+    regionPicked = Signal(list, dict)
+    selectionFailed = Signal(str)
+    selectionCancelled = Signal()
+
+    def setSelectionMode(self, mode):
+        self.mode = mode
+
+    def setSelectionSceneProvider(self, provider):
+        self.provider = provider
+
+    def getSelectionPose(self):
+        owner = self.parent()
+        return {"parameters": dict(owner.values), "parts": dict(getattr(owner, "parts", {})), "parts_complete": False}
 
 
 class _EditorTestSettings(_TestSettings):
@@ -140,6 +154,211 @@ class Live2DEditorPageTests(unittest.TestCase):
         self.assertIs(self.page.session, session)
         self.assertTrue(self.page.open_source(result["model_path"]))
         self.assertEqual(self.page._current_motion(), "Move[0]")
+
+    def _add_second_parameter(self):
+        inventory = self.model.parent / "live2d_parameter_inventory.json"
+        data = json.loads(inventory.read_text(encoding="utf-8"))
+        data["parameters"].append({"id": "ParamAngleX", "name": "水平角度", "min": -30, "max": 30, "default": 0})
+        inventory.write_text(json.dumps(data), encoding="utf-8")
+
+    def test_searchable_timeline_parameter_selector_syncs_table_and_motion_curves(self):
+        self._add_second_parameter()
+        self.open()
+        page, session = self.page, self.page.session
+        session.create_motion("Vertical", 2)
+        session.set_keyframes("Vertical", "ParamAngleY", [{"time": 0, "value": -10}, {"time": 2, "value": 10}])
+        session.create_motion("Horizontal", 2)
+        session.set_keyframes("Horizontal", "ParamAngleX", [{"time": 0, "value": -20}, {"time": 2, "value": 20}])
+        page._populate_motions("Vertical")
+        page.timeline.set_time(.75)
+        before = session._signature()
+        index = page.parameter_combo.currentIndex()
+        page.parameter_combo.setText("AngleX")
+        self.assertEqual(page.parameter_combo.currentIndex(), index)
+        self.assertEqual(page._selected_parameter, "ParamAngleY")
+        page.parameter_search.setText("Vertical no match")
+        QTest.keyClick(page.parameter_combo, Qt.Key_Return)
+        self.assertEqual(page._selected_parameter, "ParamAngleX")
+        self.assertEqual(page.parameter_table.currentRow(), page._parameter_rows["ParamAngleX"])
+        self.assertEqual(page.parameter_search.text(), "")
+        self.assertEqual(page.timeline.current_time, .75)
+        self.assertEqual(session._signature(), before)
+        page.parameter_table.setCurrentCell(page._parameter_rows["ParamAngleY"], 0)
+        self.assertEqual(page.parameter_combo.currentData(), "ParamAngleY")
+        page.motion_combo.setCurrentIndex(page.motion_combo.findData("Horizontal"))
+        self.assertEqual(page.parameter_combo.currentData(), "ParamAngleX")
+        self.assertEqual(page._selected_parameter, "ParamAngleX")
+        self.assertEqual(page.timeline.frames[0]["value"], -20)
+        session.create_motion("Empty", 2)
+        page._populate_motions("Empty")
+        self.assertEqual(page.parameter_combo.currentData(), "ParamAngleX")
+        self.assertEqual(page.timeline.frames, [])
+
+    def test_parameter_slider_gesture_has_one_history_and_spin_boundaries_keep_final_values(self):
+        self._add_second_parameter()
+        self.open()
+        page, session = self.page, self.page.session
+        page.resize(1040, 760)
+        page.show()
+        self.app.processEvents()
+        page._parameter_drag_started()
+        with patch.object(page, "_refresh_track", side_effect=AssertionError("drag rebuilt the timeline")), \
+                patch.object(page, "_refresh_skin_controls", side_effect=AssertionError("drag rebuilt skins")), \
+                patch.object(session, "_snapshot", side_effect=AssertionError("drag copied motions")):
+            for value in (250, 300, 400, 600, 700):
+                page.parameter_slider.setValue(value)
+            self.assertEqual(page.preview.values["ParamAngleY"], 12)
+            self.assertTrue(session.dirty)
+            self.assertEqual(len(session._undo), 0)
+        page._parameter_drag_finished()
+        self.assertEqual(len(session._undo), 1)
+        self.assertEqual(session.parameter_overrides["ParamAngleY"], 12)
+        reloads = page.preview.reloads
+        page.undo()
+        self.assertFalse(session.dirty)
+        self.assertEqual(page.preview.reloads, reloads)
+        page.redo()
+        self.assertEqual(page.preview.values["ParamAngleY"], 12)
+        page.parameter_spin.setFocus()
+        QTest.keyClick(page.parameter_spin, Qt.Key_Up)
+        final = page.parameter_spin.value()
+        page.parameter_combo.setCurrentIndex(page.parameter_combo.findData("ParamAngleX"))
+        self.assertFalse(session.parameter_preview_pending)
+        self.assertEqual(session.parameter_overrides["ParamAngleY"], final)
+        page.parameter_spin.setValue(-11)
+        page.set_active(False)
+        self.assertEqual(session.parameter_overrides["ParamAngleX"], -11)
+        self.assertFalse(session.parameter_preview_pending)
+        result = page.save_copy(str(self.root / "gesture-copy"))
+        self.assertIsNotNone(result)
+        from app.core.live2d_editor_session import Live2DEditorSession
+        reopened = Live2DEditorSession(result["model_path"])
+        self.addCleanup(reopened.close)
+        self.assertEqual(reopened.parameter_overrides, session.parameter_overrides)
+
+    def test_fluent_groove_and_handle_mouse_release_commit_one_parameter_gesture(self):
+        self.open()
+        self.page.resize(1040, 760)
+        self.page.show()
+        self.app.processEvents()
+        slider, session = self.page.parameter_slider, self.page.session
+        for target, final_slider_value in ((slider, 750), (slider.handle, 600)):
+            count = len(session._undo)
+            self.page._parameter_dragging = False
+            QTest.mousePress(target, Qt.LeftButton, pos=target.rect().center())
+            for value in (300, 400, 550, final_slider_value):
+                slider.setValue(value)
+            self.assertTrue(self.page._parameter_dragging)
+            self.assertTrue(session.parameter_preview_pending)
+            QTest.mouseRelease(target, Qt.LeftButton, pos=target.rect().center())
+            self.assertFalse(self.page._parameter_dragging)
+            self.assertFalse(session.parameter_preview_pending)
+            self.assertEqual(session.parameter_overrides["ParamAngleY"], -30 + .06 * final_slider_value)
+            self.assertEqual(len(session._undo), count + 1)
+
+    def test_current_pose_selection_and_region_psd_share_effective_snapshot_without_dirty(self):
+        self.open()
+        page, session = self.page, self.page.session
+        original = session._signature()
+        page.set_artmesh_selection_mode("rectangle")
+        self.assertEqual(page.preview.live2d_canvas.mode, "rectangle")
+        region = {"x": 10, "y": 10, "width": 80, "height": 80,
+                  "polygon": [[10, 10], [90, 10], [90, 90], [10, 90]]}
+        page.preview.live2d_canvas.regionPicked.emit(["ArtMeshFace"], region)
+        self.assertEqual(page.artmesh_inspector.selected_drawable_ids(), ["ArtMeshFace"])
+        self.assertEqual(session._signature(), original)
+        with patch.object(page.psd_panel, "export_selected_artmeshes", return_value=True) as export:
+            self.assertTrue(page.export_selected_artmeshes())
+        args, kwargs = export.call_args
+        self.assertEqual(args[0], ["ArtMeshFace"])
+        self.assertEqual(args[2], region)
+        self.assertEqual(args[1]["parameters"], page.preview.values)
+        self.assertEqual(args[1]["parts"]["PartFace"], .7)
+        self.assertEqual(len(kwargs["mesh_data"]["drawables"]), 1)
+        session.set_part_opacity("PartFace", 0)
+        page._apply_preview_pose()
+        scene = page._selection_scene()
+        self.assertEqual(scene["snapshot"]["drawables"][0]["opacity"], 0)
+        page.clear_artmesh_selection()
+        self.assertEqual(page.artmesh_inspector.selected_drawable_ids(), [])
+        self.assertFalse(page.export_selection_button.isEnabled())
+        self.assertEqual(page.preview.live2d_canvas.mode, "none")
+        page.preview.live2d_canvas.drawablesPicked.emit(["ArtMeshFace"])
+        self.assertEqual(page.artmesh_inspector.current_entry().drawable_id, "ArtMeshFace")
+
+    def test_local_artmesh_thumbnail_geometry_never_overlaps_part_controls(self):
+        from PIL import Image
+        self.open()
+        self.page.resize(1040, 760)
+        self.page.show()
+        self.page.tabs.setCurrentWidget(self.page.artmesh_tab)
+        self.page.artmesh_inspector.select_entry("ArtMeshFace")
+        entry = self.page.artmesh_inspector.current_entry()
+        for size in ((2000, 3), (3, 2000), (300, 300)):
+            with patch.object(self.page.session, "local_artmesh_image", return_value=Image.new("RGBA", size)):
+                self.page._artmesh_selected(entry)
+                self.app.processEvents()
+                label = self.page.artmesh_image
+                self.assertLessEqual(label.frameGeometry().bottom(), self.page.part_visible.frameGeometry().top())
+                self.assertLessEqual(label.frameGeometry().bottom(), self.page.part_opacity.frameGeometry().top())
+                self.assertLessEqual(label.height(), 90)
+        with patch.object(self.page.session, "local_artmesh_image", return_value=None):
+            self.page._artmesh_selected(entry)
+            self.assertTrue(self.page.artmesh_image.pixmap().isNull())
+
+    def test_local_artmesh_zoom_dialog_is_owned_scrollable_and_keeps_full_crop(self):
+        from app.gui.ImagePreviewPanel import ImageZoomScrollArea
+        self.open()
+        self.page.tabs.setCurrentWidget(self.page.artmesh_tab)
+        self.page.artmesh_inspector.select_entry("ArtMeshFace")
+        seen = []
+        def inspect_dialog():
+            dialog = self.app.activeModalWidget()
+            seen.append(bool(dialog and dialog.isWindow() and dialog.parentWidget() is self.page))
+            area = dialog.findChild(ImageZoomScrollArea)
+            self.assertIsNotNone(area)
+            area.zoomRequested.emit(2, area.rect().center())
+            self.assertGreater(area.widget().width(), 0)
+            self.assertFalse(area.widget().pixmap().isNull())
+            dialog.accept()
+        QTimer.singleShot(30, inspect_dialog)
+        QTest.mouseClick(self.page.local_preview_button, Qt.LeftButton)
+        self.assertEqual(seen, [True])
+        self.assertIsNone(self.app.activeModalWidget())
+
+    def test_mod_picker_background_is_frozen_and_uses_matching_viewport_geometry(self):
+        from PySide6.QtGui import QImage
+        self.open()
+        page = self.page
+        canvas = page.preview.live2d_canvas
+        frame = QImage(400, 200, QImage.Format_RGBA8888)
+        frame.fill(Qt.red)
+        calls = []
+        canvas.grabFramebuffer = lambda: calls.append("frame") or frame
+        canvas.width = lambda: 200
+        canvas.height = lambda: 100
+        canvas.windowPointToCanvas = lambda x, y, snapshot: (x * 2 - 100, y * 2 - 50)
+        scene = {"snapshot": {"canvas": {"width": 400, "height": 200}}, "texture_paths": []}
+        page._preview_session = SimpleNamespace(source_path=self.model)
+        page._mod_preview_model_id = "main"
+        try:
+            with patch.object(page.mod_panel, "model_by_id", return_value={"model_json": "main.json"}), \
+                    patch.object(page.mod_panel, "resolve_project_path", return_value=self.model), \
+                    patch.object(page.preview, "set_motion_frozen", side_effect=lambda frozen: calls.append(("frozen", frozen))), \
+                    patch.object(page, "_selection_scene", side_effect=lambda: calls.append("scene") or scene):
+                result = page._mod_pick_scene("main")
+                self.assertEqual(calls, [("frozen", True), "frame", "scene"])
+                self.assertIs(result["pose_frame"], frame)
+                self.assertEqual(result["pose_frame_canvas_polygon"], [[-100, -50], [300, -50], [300, 150], [-100, 150]])
+                self.assertEqual(result["model_path"], str(self.model.resolve()))
+                self.assertEqual(result["model_id"], "main")
+                self.assertFalse(page.session.dirty)
+                calls.clear()
+                self.assertIsNone(page._mod_pick_scene("other"))
+                self.assertEqual(calls, [])
+        finally:
+            page._preview_session = None
+            page._mod_preview_model_id = ""
 
     def test_watcher_external_save_reload_and_history(self):
         from PIL import Image

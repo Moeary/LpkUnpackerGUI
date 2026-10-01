@@ -49,6 +49,119 @@ class Live2DEditorSessionTests(unittest.TestCase):
         return {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
                 for path in self.model.parent.iterdir() if path.is_file()}
 
+    def test_parameter_gesture_is_pending_dirty_and_commits_one_small_history_entry(self):
+        original = self.hashes()
+        with patch.object(self.session, "_snapshot", side_effect=AssertionError("pose copied the whole project")):
+            for value in (-20, -10, 5, 15):
+                self.session.preview_parameter("ParamAngleY", value)
+                self.assertTrue(self.session.dirty)
+                self.assertTrue(self.session.can_undo)
+                self.assertEqual(self.session.pose_at(None, 0, overrides=True)["ParamAngleY"], value)
+                self.assertEqual(len(self.session._undo), 0)
+            self.assertTrue(self.session.commit_parameter_preview())
+            self.assertEqual(len(self.session._undo), 1)
+            self.assertEqual(set(self.session._undo[0]), {"_history_kind", "parameters", "parts"})
+            self.assertFalse(self.session.parameter_preview_pending)
+            self.assertTrue(self.session.undo())
+            self.assertFalse(self.session.dirty)
+            self.assertTrue(self.session.redo())
+            self.assertEqual(self.session.parameter_overrides["ParamAngleY"], 15)
+        self.assertEqual(original, self.hashes())
+
+    def test_pose_digests_reuse_assets_and_invalid_or_reverted_preview_has_no_history(self):
+        self.session.set_parameter("ParamAngleY", 5)
+        self.session._saved_signature = self.session._signature()
+        with patch("app.core.live2d_editor_session.json.dumps", wraps=json.dumps) as serialize:
+            self.session.preview_parameter("ParamAngleY", 10)
+            self.session.commit_parameter_preview()
+            self.assertTrue(self.session.dirty)
+            payload = serialize.call_args_list[-1].args[0]
+            self.assertEqual(payload, [{"ParamAngleY": 10}, {}])
+            self.assertEqual(serialize.call_count, 1)
+        count = len(self.session._undo)
+        self.session.preview_parameter("ParamAngleY", 12)
+        self.session.preview_parameter("ParamAngleY", 10)
+        self.assertFalse(self.session.parameter_preview_pending)
+        self.assertFalse(self.session.commit_parameter_preview())
+        self.assertEqual(count, len(self.session._undo))
+        with self.assertRaises(AnimationEditingError):
+            self.session.preview_parameter("ParamAngleY", 31)
+        self.assertFalse(self.session.parameter_preview_pending)
+
+    def test_pose_motion_skin_and_part_history_interoperate_without_mutable_aliases(self):
+        self.session.preview_parameter("ParamAngleY", -12)
+        self.session.create_motion("Move", 2)  # flushes the staged pose first
+        self.assertEqual(len(self.session._undo), 2)
+        self.session.set_keyframes("Move", "ParamAngleY", [{"time": 0, "value": -10}])
+        skin = self.session.capture_skin("Pose skin")
+        self.session.set_part_opacity("PartFace", .25)
+        self.assertEqual(len(self.session._undo), 5)
+        self.assertTrue(self.session.undo())
+        self.assertEqual(self.session.part_overrides, {})
+        self.assertTrue(self.session.undo())
+        self.assertNotIn(skin["id"], [item["id"] for item in self.session.list_skins()])
+        self.assertTrue(self.session.undo())
+        self.assertEqual(self.session.keyframes("Move", "ParamAngleY"), [])
+        self.assertTrue(self.session.undo())
+        self.assertEqual(self.session.project.motions, {})
+        self.assertTrue(self.session.undo())
+        self.assertFalse(self.session.dirty)
+        for _ in range(5):
+            self.assertTrue(self.session.redo())
+        self.assertEqual(self.session.parameter_overrides, {"ParamAngleY": -12})
+        self.assertEqual(self.session.part_overrides, {"PartFace": .25})
+        self.assertEqual(self.session.keyframes("Move", "ParamAngleY")[0]["value"], -10)
+        self.assertEqual(self.session.active_skin_id, skin["id"])
+        result = self.session.save_copy(self.root / "interleaved")
+        self.assertFalse(self.session.dirty)
+        reopened = Live2DEditorSession(result["model_path"])
+        self.addCleanup(reopened.close)
+        self.assertEqual(reopened.parameter_overrides, self.session.parameter_overrides)
+        self.assertEqual(reopened.part_overrides, self.session.part_overrides)
+
+    def test_saving_pending_parameter_pose_flushes_final_value_once(self):
+        for value in (1, 8, -14):
+            self.session.preview_parameter("ParamAngleY", value)
+        result = self.session.save_copy(self.root / "pending-pose")
+        self.assertEqual(len(self.session._undo), 1)
+        self.assertFalse(self.session.dirty)
+        reopened = Live2DEditorSession(result["model_path"])
+        self.addCleanup(reopened.close)
+        self.assertEqual(reopened.parameter_overrides, {"ParamAngleY": -14})
+        self.assertTrue(self.session.undo())
+        self.assertTrue(self.session.dirty)
+        self.assertTrue(self.session.redo())
+        self.assertFalse(self.session.dirty)
+
+    def test_exact_selection_pose_preserves_out_of_range_values_and_restores_core_arrays(self):
+        from types import SimpleNamespace
+        values, parts = [2.0], [.7]
+        dll = SimpleNamespace(csmGetParameterIds=lambda _: [b"ParamAngleY"],
+                              csmGetParameterValues=lambda _: values,
+                              csmGetParameterCount=lambda _: 1,
+                              csmUpdateModel=lambda _: None)
+        core = SimpleNamespace(dll=dll, get_part_ids=lambda _: [b"PartFace"],
+                               get_part_opacities=lambda _: parts, get_part_count=lambda _: 1)
+        def snapshot():
+            return {"parameters": {"ParamAngleY": values[0]}, "parts": [{"id": "PartFace", "opacity": parts[0]}],
+                    "drawables": [{"id": "ArtMeshFace", "opacity": 1, "parent_part_id": "PartFace", "masks": [0]}]}
+        self.session._core_model = SimpleNamespace(core=core, model_pointer=1, drawable_snapshot=snapshot)
+        result = self.session.exact_pose_mesh({"ParamAngleY": 38}, {"PartFace": 0})
+        self.assertEqual(result["parameters"], {"ParamAngleY": 38})
+        self.assertEqual(result["drawables"][0]["opacity"], 0)
+        self.assertEqual(result["drawables"][0]["masks"], [0])
+        self.assertEqual(values, [2])
+        self.assertEqual(parts, [.7])
+        self.session.exact_pose_mesh({"ParamAngleY": 35}, {"PartFace": .5})
+        self.assertEqual(snapshot()["parts"][0]["opacity"], .7)
+        with self.assertRaises(AnimationEditingError):
+            self.session.exact_pose_mesh({}, {"PartFace": 0})
+        with patch.object(self.session._core_model, "drawable_snapshot", side_effect=RuntimeError("failed core read")):
+            with self.assertRaises(RuntimeError):
+                self.session.exact_pose_mesh({"ParamAngleY": 40}, {"PartFace": 0})
+        self.assertEqual(values, [2])
+        self.assertEqual(parts, [.7])
+
     def test_bezier_and_inverse_stepped_roundtrip_including_flat_handles(self):
         parameter = self.session.parameters[0]
         segments = [0, 2, 1, .2, 8, .7, -5, 1, 2, 3, 2, 4]
