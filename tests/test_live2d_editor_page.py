@@ -442,10 +442,73 @@ class Live2DEditorPageTests(unittest.TestCase):
                 label = self.page.artmesh_image
                 self.assertLessEqual(label.frameGeometry().bottom(), self.page.part_visible.frameGeometry().top())
                 self.assertLessEqual(label.frameGeometry().bottom(), self.page.part_opacity.frameGeometry().top())
-                self.assertLessEqual(label.height(), 90)
+                self.assertLessEqual(label.height(), 160)
         with patch.object(self.page.session, "local_artmesh_image", return_value=None):
             self.page._artmesh_selected(entry)
             self.assertTrue(self.page.artmesh_image.pixmap().isNull())
+
+    def test_artmesh_editor_two_columns_keep_local_controls_inside_at_three_language_sizes(self):
+        from app.i18n import get_i18n
+        self._add_atlas_meshes()
+        self.open()
+        page, inspector = self.page, self.page.artmesh_inspector
+        page.tabs.setCurrentWidget(page.artmesh_tab)
+        inspector.select_entry("ArtMeshFace")
+        page.show()
+        i18n, before = get_i18n(), get_i18n().language
+        try:
+            for language in ("zh_CN", "en_US", "ja_JP"):
+                i18n.set_language(language)
+                previous_width = 0
+                for size in ((1040, 760), (1640, 1000), (1040, 760)):
+                    with self.subTest(language=language, size=size):
+                        page.resize(*size)
+                        for _ in range(4):
+                            self.app.processEvents()
+                        self.assertEqual((page.width(), page.height()), size)
+                        self.assertFalse(page.hasHeightForWidth())
+                        self.assertEqual(inspector.layout_mode, "editor")
+                        self.assertGreater(inspector.entry_list.height(), inspector.height() * .65)
+                        self.assertLess(inspector.list_panel.width(), inspector.view_splitter.width())
+                        self.assertIs(inspector.editor_details_scroll.widget(), page.artmesh_details_widget)
+                        for widget in (page.local_preview_label, page.artmesh_image, page.part_visible,
+                                       page.part_opacity, page.part_hint, page.artmesh_export_button):
+                            self.assertTrue(inspector.isAncestorOf(widget))
+                        self.assertEqual(page.artmesh_scroll.horizontalScrollBar().maximum(), 0)
+                        self.assertLessEqual(page.artmesh_image.frameGeometry().bottom(), page.part_visible.frameGeometry().top())
+                        self.assertLessEqual(page.part_opacity.frameGeometry().bottom(), page.artmesh_export_button.frameGeometry().top())
+                        self.assertTrue(page.artmesh_export_button.isEnabled())
+                        if size[0] > 1040:
+                            self.assertGreater(inspector.atlas_frame.width(), previous_width)
+                        previous_width = inspector.atlas_frame.width()
+        finally:
+            i18n.set_language(before)
+
+    def test_artmesh_long_parent_id_keeps_full_hint_and_unavailable_part_remains_explained(self):
+        path = self.model.parent / "drawables.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        identifier = "Part_" + "very_long_parent_name_" * 10
+        data["parts"][0]["id"] = identifier
+        data["drawables"][0]["parent_part_id"] = identifier
+        path.write_text(json.dumps(data), encoding="utf-8")
+        self.open()
+        page = self.page
+        page.resize(1040, 760)
+        page.show()
+        page.tabs.setCurrentWidget(page.artmesh_tab)
+        page.artmesh_inspector.select_entry("ArtMeshFace")
+        self.app.processEvents()
+        self.assertEqual((page.width(), page.height()), (1040, 760))
+        self.assertIn(identifier, page.part_hint.toolTip())
+        self.assertIn(identifier, page.part_opacity.toolTip())
+        entry = page.artmesh_inspector.current_entry()
+        entry.raw["parent_part_id"] = ""
+        entry.raw["parent_part_index"] = -1
+        page._artmesh_selected(entry)
+        self.assertFalse(page.part_visible.isEnabled())
+        self.assertFalse(page.part_opacity.isEnabled())
+        self.assertTrue(page.part_hint.toolTip())
+        self.assertEqual(page.part_hint.toolTip(), page.artmesh_image.toolTip())
 
     def test_local_artmesh_zoom_dialog_is_owned_scrollable_and_keeps_full_crop(self):
         from app.gui.ImagePreviewPanel import ImageZoomScrollArea

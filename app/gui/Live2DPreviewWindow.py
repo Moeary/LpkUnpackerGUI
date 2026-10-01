@@ -1,4 +1,5 @@
 import os
+import math
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QApplication, QLabel, QSizeGrip, QFrame, QSizePolicy)
 from PySide6.QtCore import Signal, QPoint, QRect, Qt, QEvent, QTimer, QUrl
 from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QCursor
@@ -82,6 +83,9 @@ class Live2DPreviewWindow(QWidget):
     """无边框的Live2D模型预览窗口"""
 
     closed = Signal()  # 窗口关闭信号
+    modelReady = Signal(str, int)
+    fitModeChanged = Signal(bool)
+    contentFitApplied = Signal(dict)
 
     def __init__(self, model_path=None, parent=None, embedded: bool = False):
         super().__init__(parent)
@@ -102,6 +106,8 @@ class Live2DPreviewWindow(QWidget):
         self._motion_items = []
         self._dock_rect = None
         self._fit_to_dock = False
+        self._display_transform = {"model_scale": 1.0, "model_offset_x": 0.0,
+                                   "model_offset_y": 0.0, "model_rotation": 0.0}
         self._requested_canvas_size = (400, 300)
         self._show_hit_areas = False
         self._resize_margin = 12
@@ -203,6 +209,9 @@ class Live2DPreviewWindow(QWidget):
         # Keep left-click model interaction; context menus are disabled.
         self.live2d_canvas.setMouseTracking(True)
         self.live2d_canvas.installEventFilter(self)
+        self.live2d_canvas.modelFrameReady.connect(self._on_model_frame_ready)
+        self.live2d_canvas.fitModeChanged.connect(self.fitModeChanged.emit)
+        self.live2d_canvas.contentFitApplied.connect(self._on_content_fit_applied)
         self.live2d_container.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         layout.addWidget(self.live2d_container)
         self.hit_area_overlay = HitAreaOverlay(self)
@@ -230,6 +239,33 @@ class Live2DPreviewWindow(QWidget):
             self.hit_area_overlay.set_regions(self._load_hit_regions())
             self.hit_area_overlay.set_active_region(None)
         return True
+
+    def _on_model_frame_ready(self, model_path: str, generation: int):
+        # First-frame readiness can occur inside paintGL. Defer UI playback
+        # until that draw has completed, retaining this exact load identity.
+        QTimer.singleShot(0, self, lambda: self._emit_model_ready(model_path, generation))
+
+    def _emit_model_ready(self, model_path: str, generation: int):
+        if (not self._released and self.model_path
+                and os.path.normcase(os.path.abspath(model_path)) == os.path.normcase(self.model_path)
+                and generation == self.model_load_generation()):
+            self.modelReady.emit(model_path, generation)
+
+    def model_load_generation(self) -> int:
+        return self.live2d_canvas.modelLoadGeneration() if self.live2d_canvas else 0
+
+    def fit_model(self) -> bool:
+        return bool(self.live2d_canvas and self.live2d_canvas.fitToContent(auto_resize=True))
+
+    def get_content_fit_state(self) -> dict:
+        return self.live2d_canvas.getContentFitState() if self.live2d_canvas else {}
+
+    def _on_content_fit_applied(self, state: dict):
+        self._display_transform.update({"model_scale": float(state["scale"]),
+                                        "model_offset_x": float(state["offset_x"]),
+                                        "model_offset_y": float(state["offset_y"]),
+                                        "model_rotation": float(state["rotation"])})
+        self.contentFitApplied.emit(state)
 
     def unload_model(self):
         self.model_path = None
@@ -855,18 +891,24 @@ class Live2DPreviewWindow(QWidget):
         if 'antialias' in settings and self.live2d_canvas:
             self.live2d_canvas.setAntialias(settings['antialias'])
 
-        # 模型旋转
-        if 'model_rotation' in settings and self.live2d_canvas:
-            self.live2d_canvas.setRotationAngle(settings['model_rotation'])
-
-        if self.live2d_canvas and any(
-            key in settings for key in ('model_scale', 'model_offset_x', 'model_offset_y')
-        ):
-            self.live2d_canvas.setModelTransform(
-                float(settings.get('model_scale', 1.0)),
-                float(settings.get('model_offset_x', 0.0)),
-                float(settings.get('model_offset_y', 0.0)),
-            )
+        if self.live2d_canvas:
+            was_fitted = bool(self.get_content_fit_state().get("enabled"))
+            transform = {**self._display_transform,
+                         **{key: float(settings[key]) for key in self._display_transform if key in settings}}
+            changed = {key for key, value in transform.items()
+                       if not math.isclose(value, self._display_transform[key], rel_tol=0,
+                                           abs_tol=.5 if key == "model_rotation" else .005)}
+            if "model_rotation" in changed:
+                self.live2d_canvas.setRotationAngle(transform["model_rotation"])
+            if changed - {"model_rotation"}:
+                self.live2d_canvas.setModelTransform(transform["model_scale"], transform["model_offset_x"],
+                                                     transform["model_offset_y"])
+            if changed:
+                self._display_transform = transform
+            if "content_fit_enabled" in settings and not (was_fitted and changed):
+                enabled = bool(settings["content_fit_enabled"])
+                if enabled != bool(self.get_content_fit_state().get("enabled")):
+                    self.live2d_canvas.setContentFitEnabled(enabled)
 
         # 背景透明/颜色
         if self.live2d_canvas and ('transparent_bg' in settings or 'bg_color' in settings):

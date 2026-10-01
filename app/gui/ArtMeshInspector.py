@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (
 from qfluentwidgets import (
     ComboBox as QComboBox, LineEdit as QLineEdit, ListWidget as QListWidget,
     PushButton as QPushButton, TextEdit as QTextEdit,
-    ScrollArea, LineEdit, BodyLabel,
+    ScrollArea, LineEdit, BodyLabel, FluentIcon, TransparentToolButton,
 )
 
 from app.i18n import get_i18n, tr
@@ -504,6 +504,8 @@ class ArtMeshInspector(QWidget):
         self._candidate_selection_mode = "replace"
         self._multi_selection = True
         self._selection_mode = "rectangle"
+        self._layout_mode = "inspection"
+        self._editor_details_widget = None
         self._loading = False
         self.i18n = get_i18n()
         self._build_ui()
@@ -599,9 +601,108 @@ class ArtMeshInspector(QWidget):
         self.status_label.setWordWrap(True)
         self.main_layout.addWidget(self.status_label)
 
+    @property
+    def layout_mode(self) -> str:
+        return self._layout_mode
+
+    def set_editor_layout(self, details_widget: QWidget | None = None) -> None:
+        """Mount editor controls beneath the UV view, without changing static inspectors.
+
+        The editor owns the controls and their behavior. The inspector owns the
+        two-column layout and its splitters, so the list, atlas and details can
+        use the available viewport instead of growing a single scrolling page.
+        Calling this again only replaces the mounted detail widget.
+        """
+        if self._layout_mode != "editor":
+            self._layout_mode = "editor"
+            self.main_layout.setContentsMargins(0, 0, 0, 0)
+            self.main_layout.setSpacing(0)
+            for widget in (self.metadata_edit, self.open_button, self.mode_label,
+                           self.shared_label, self.details, self.status_label,
+                           self.texture_label, self.texture_combo):
+                widget.hide()
+            self.details.textChanged.connect(lambda: self.setToolTip(self.details.toPlainText()))
+
+            self.list_panel = QWidget(self.splitter)
+            self.list_panel.setMinimumWidth(100)
+            self.list_panel.setMaximumWidth(270)
+            self.list_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+            list_layout = QVBoxLayout(self.list_panel)
+            list_layout.setContentsMargins(0, 0, 0, 0)
+            list_layout.setSpacing(6)
+            search_row = QHBoxLayout()
+            search_row.setSpacing(4)
+            self.search_edit.setParent(self.list_panel)
+            self.search_edit.setMinimumWidth(0)
+            self.search_edit.setToolTip(_text("artmesh.inspector.search"))
+            search_row.addWidget(self.search_edit, 1)
+            self._inspection_refresh_button = self.refresh_button
+            self._inspection_refresh_button.hide()
+            self.refresh_button = TransparentToolButton(FluentIcon.SYNC, self.list_panel)
+            self.refresh_button.clicked.connect(self.refresh)
+            self.refresh_button.setFixedSize(28, 32)
+            self.refresh_button.setToolTip(tr("psd.inspector.refresh"))
+            search_row.addWidget(self.refresh_button)
+            list_layout.addLayout(search_row)
+            self.candidate_combo.setParent(self.list_panel)
+            list_layout.addWidget(self.candidate_combo)
+            self.entry_list.setParent(self.list_panel)
+            self.entry_list.setMinimumSize(0, 90)
+            self.entry_list.setMaximumHeight(16777215)
+            self.entry_list.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
+            self.entry_list.setTextElideMode(Qt.TextElideMode.ElideRight)
+            self.entry_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            list_layout.addWidget(self.entry_list, 1)
+
+            pose_frame = self.pose_canvas.parentWidget()
+            pose_frame.setParent(self)
+            pose_frame.hide()
+            self.editor_details_scroll = ScrollArea(self.view_splitter)
+            self.editor_details_scroll.setWidgetResizable(True)
+            self.editor_details_scroll.setFrameShape(QFrame.Shape.NoFrame)
+            self.editor_details_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            self.editor_details_scroll.setMinimumSize(0, 116)
+            self.editor_details_scroll.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+            self.editor_details_scroll.enableTransparentBackground()
+            self.view_splitter.addWidget(self.editor_details_scroll)
+            self.view_splitter.setChildrenCollapsible(False)
+            self.view_splitter.setStretchFactor(0, 3)
+            self.view_splitter.setStretchFactor(1, 2)
+            self.view_splitter.setSizes([290, 195])
+            self.splitter.insertWidget(0, self.list_panel)
+            self.splitter.setChildrenCollapsible(False)
+            self.splitter.setHandleWidth(6)
+            self.splitter.setStretchFactor(0, 0)
+            self.splitter.setStretchFactor(1, 1)
+            self.splitter.setSizes([132, 310])
+            self.atlas_frame.setMinimumSize(100, 120)
+            self.atlas_title_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+            self._atlas_layout.insertWidget(0, self.atlas_title_label)
+            self.atlas_title_label.show()
+            while self.main_layout.count():
+                self.main_layout.takeAt(0)
+            self.main_layout.addWidget(self.splitter, 1)
+            if self._atlas_indices is not None:
+                self._atlas_indices = None
+                self._rebuild_atlas_pages()
+                self._update_views()
+        if details_widget is not None and details_widget is not self._editor_details_widget:
+            old = self.editor_details_scroll.takeWidget()
+            if old is not None:
+                old.hide()
+                old.setParent(self)
+            self._editor_details_widget = details_widget
+            self.editor_details_scroll.setWidget(details_widget)
+            details_widget.show()
+
     def retranslate_ui(self, *_args) -> None:
         self.open_button.setText(tr("psd.inspector.open_metadata"))
-        self.refresh_button.setText(tr("psd.inspector.refresh"))
+        if self._layout_mode == "editor":
+            self.refresh_button.setText("")
+            self.refresh_button.setToolTip(tr("psd.inspector.refresh"))
+            self.search_edit.setToolTip(_text("artmesh.inspector.search"))
+        else:
+            self.refresh_button.setText(tr("psd.inspector.refresh"))
         self.texture_label.setText(tr("psd.inspector.texture"))
         self.pose_title_label.setText(tr("psd.inspector.pose"))
         self.atlas_title_label.setText(tr("psd.inspector.atlas"))
@@ -1081,6 +1182,25 @@ class ArtMeshInspector(QWidget):
             self.atlas_tabs.blockSignals(True)
             self._atlas_layout.removeWidget(self.atlas_tabs)
             self.atlas_tabs.deleteLater()
+        self.atlas_canvases = {}
+        self.overview_canvases = {}
+        self._overview_cards = []
+        self._overview_columns = 0
+        if self._layout_mode == "editor" and len(indices) <= 1:
+            # A single texture has no meaningful overview. Give its only
+            # canvas all the UV area, keeping zoom and selection identical.
+            self.atlas_tabs = None
+            self.atlas_canvas = old_canvas
+            old_canvas.setMinimumSize(100, 100)
+            if indices:
+                texture_index = indices[0]
+                self._connect_atlas_canvas(old_canvas, texture_index)
+                self.atlas_canvases[texture_index] = old_canvas
+                old_canvas.setToolTip(str(self.texture_paths.get(texture_index, "")) + "\n" +
+                                      _text("artmesh.inspector.zoom_hint"))
+            self._atlas_layout.addWidget(old_canvas, 1)
+            old_canvas.show()
+            return
         self.atlas_tabs = FluentEditorTabs(self.atlas_frame)
         self.atlas_tabs.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         self.atlas_tabs.setMinimumSize(0, 0)
@@ -1097,21 +1217,9 @@ class ArtMeshInspector(QWidget):
         self.overview_scroll.setWidget(self.overview_body)
         self.overview_scroll.viewport().installEventFilter(self)
         self.atlas_tabs.addTab(self.overview_scroll, _text("artmesh.inspector.overview"))
-        self.atlas_canvases = {}
-        self.overview_canvases = {}
-        self._overview_cards = []
-        self._overview_columns = 0
         for position, texture_index in enumerate(indices):
             canvas = old_canvas if position == 0 else _MeshCanvas("atlas", self.atlas_frame)
-            if hasattr(canvas, "_inspector_hit_callback"):
-                canvas.selectionRequested.disconnect(canvas._inspector_hit_callback)
-                canvas.regionRequested.disconnect(canvas._inspector_region_callback)
-            canvas._inspector_hit_callback = lambda x, y, mode, i=texture_index: self._atlas_hit_texture(i, x, y, mode)
-            canvas._inspector_region_callback = lambda region, mode, i=texture_index: self._atlas_region(i, region, mode)
-            canvas.selectionRequested.connect(canvas._inspector_hit_callback)
-            canvas.regionRequested.connect(canvas._inspector_region_callback)
-            canvas.setSelectionMode(self._selection_mode if self._multi_selection else "point")
-            canvas.setToolTip(_text("artmesh.inspector.zoom_hint"))
+            self._connect_atlas_canvas(canvas, texture_index)
             self.atlas_canvases[texture_index] = canvas
             self.atlas_tabs.addTab(canvas, str(texture_index))
             card = QFrame(self.overview_body)
@@ -1143,6 +1251,17 @@ class ArtMeshInspector(QWidget):
         self.atlas_tabs.currentChanged.connect(self._atlas_page_changed)
         self._atlas_layout.addWidget(self.atlas_tabs, 1)
         self._arrange_overview()
+
+    def _connect_atlas_canvas(self, canvas, texture_index):
+        if hasattr(canvas, "_inspector_hit_callback"):
+            canvas.selectionRequested.disconnect(canvas._inspector_hit_callback)
+            canvas.regionRequested.disconnect(canvas._inspector_region_callback)
+        canvas._inspector_hit_callback = lambda x, y, mode, i=texture_index: self._atlas_hit_texture(i, x, y, mode)
+        canvas._inspector_region_callback = lambda region, mode, i=texture_index: self._atlas_region(i, region, mode)
+        canvas.selectionRequested.connect(canvas._inspector_hit_callback)
+        canvas.regionRequested.connect(canvas._inspector_region_callback)
+        canvas.setSelectionMode(self._selection_mode if self._multi_selection else "point")
+        canvas.setToolTip(_text("artmesh.inspector.zoom_hint"))
 
     def _arrange_overview(self):
         if not self.atlas_tabs:

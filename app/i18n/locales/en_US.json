@@ -1345,5 +1345,10 @@
   "editor.live2d.pick_hidden_export": "Parent Parts are hidden: {parts}. Restore visibility only in the export copy and export the selected ArtMeshes. The current preview and edit history stay unchanged. Continue?",
   "editor.live2d.pick_restore_export": "Show and export",
   "editor.live2d.pick_invisible": "These selected ArtMeshes have no visible content in the current pose. Adjust the pose before exporting: {ids}",
-  "artmesh.inspector.selection_hint": "Click to select; Shift+click to add/remove; drag to select a region; Shift+drag to merge."
+  "artmesh.inspector.selection_hint": "Click to select; Shift+click to add/remove; drag to select a region; Shift+drag to merge.",
+  "preview.content_fit": "Auto-fit visible content",
+  "preview.content_fit_hint": "Fit the complete visible content on first load and resize. Manual zoom, pan, or rotation disables auto-fit.",
+  "preview.auto_play_hint": "Play the first valid motion after initial loading, and play when switching motions. Initial autoplay preserves a frozen pose.",
+  "editor.live2d.part_summary": "Parent Part {part} · {count} ArtMeshes",
+  "editor.live2d.part_opacity": "Part opacity"
 }

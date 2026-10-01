@@ -16,6 +16,7 @@ import live2d.v3 as live2d
 from live2d.utils.canvas import Canvas
 
 from app.core.model.motions import evaluate_motion_parameters, load_live2d_motions
+from app.gui.live2d_content_fit import alpha_content_bounds, content_fit_transform
 from app.gui.live2d_selection import ModelCoordinates, PreviewTransform, SelectionScene
 
 live2d.init()
@@ -119,6 +120,8 @@ def create_canvas_framebuffer(width, height):
 
 
 class ADPOpenGLCanvas(QOpenGLWindow):
+    fitModeChanged = Signal(bool)
+    contentFitApplied = Signal(dict)
 
     def __init__(self):
         super().__init__()
@@ -141,6 +144,20 @@ class ADPOpenGLCanvas(QOpenGLWindow):
         self._fbo_height = 0
         self._source_aspect_ratio = 1.0
         self._antialias = True
+        # Fitting is opt-in: resource preview enables it, editor cameras retain
+        # their existing interaction. Only explicit requests read native pixels.
+        self._content_fit_enabled = False
+        self._content_fit_pending = False
+        self._content_fit_bounds = None
+        self._content_fit_fill = .96
+        self._content_fit_source_aspect = 1.
+        self._content_fit_viewport = None
+        self._content_fit_readbacks = 0
+        self._content_fit_attempts = 0
+        self._content_fit_sample_size = None
+        self._content_fit_empty = False
+        self._content_fit_status = "manual"
+        self._content_fit_range_limited = False
 
     def __create_program(self):
         vertex_shader = """#version 330 core
@@ -261,6 +278,8 @@ class ADPOpenGLCanvas(QOpenGLWindow):
         if math.isclose(aspect, self._source_aspect_ratio, rel_tol=1e-4):
             return
         self._source_aspect_ratio = aspect
+        if getattr(self, "_content_fit_bounds", None) is not None:
+            self._invalidate_content_fit()
         # Model-ready signals run outside paintGL and may arrive while a
         # different editor's GL context is current. Allocate lazily in paintGL.
         self.update()
@@ -300,8 +319,11 @@ class ADPOpenGLCanvas(QOpenGLWindow):
         # Keep FBO transparent so compositing in second pass works
         GL.glClearColor(0.0, 0.0, 0.0, 0.0)
         GL.glClear(GL.GL_COLOR_BUFFER_BIT)
-        self.on_draw()
-        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, old_fbo)
+        try:
+            if self.on_draw():
+                self.on_canvas_rendered()
+        finally:
+            GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, old_fbo)
 
     def initializeGL(self):
         self.__create_program()
@@ -319,6 +341,10 @@ class ADPOpenGLCanvas(QOpenGLWindow):
 
     def paintGL(self):
         # Only allocate/delete GL resources while this window's context is current.
+        if self._content_fit_enabled and self._content_fit_bounds is not None:
+            viewport = (self.width(), self.height())
+            if viewport != self._content_fit_viewport:
+                self._apply_cached_content_fit()
         wanted = self._desired_canvas_size()
         if wanted != (self._fbo_width, self._fbo_height):
             self.__create_canvas_framebuffer()
@@ -370,16 +396,143 @@ class ADPOpenGLCanvas(QOpenGLWindow):
     def draw_overlay(self, _width, _height, _dpr):
         """Native-window overlays must be painted after the composition pass."""
 
+    def on_canvas_rendered(self):
+        """Runs with this canvas's transparent native FBO current after Draw."""
+        if not self._content_fit_pending:
+            return
+        self._content_fit_readbacks += 1
+        self._content_fit_attempts += 1
+        try:
+            pixels = self._read_content_fit_pixels()
+            bounds = alpha_content_bounds(pixels)
+        except Exception as error:
+            self._content_fit_pending = False
+            self._content_fit_status = "readback-error"
+            state = self.getContentFitState()
+            state["error"] = str(error)
+            self.contentFitApplied.emit(state)
+            return
+        if bounds is None and self._content_fit_attempts < 3:
+            # A newly initialized model can have an empty first pose. Retry at
+            # most twice; an invisible model must never cause a readback loop.
+            self._content_fit_status = "pending-empty-frame"
+            self.update()
+            return
+        self._content_fit_bounds = bounds or (0., 0., 1., 1.)
+        self._content_fit_sample_size = (self._fbo_width, self._fbo_height)
+        self._content_fit_source_aspect = self._fbo_width / max(1, self._fbo_height)
+        self._content_fit_pending = False
+        self._content_fit_empty = bounds is None
+        self._content_fit_status = "fit" if bounds is not None else "empty-fallback"
+        self._apply_cached_content_fit()
+
+    def _read_content_fit_pixels(self):
+        """Read the transparent source, never the background-composited screen."""
+        old_read_fbo = _gl_object_id(GL.glGetIntegerv(GL.GL_READ_FRAMEBUFFER_BINDING))
+        old_alignment = int(GL.glGetIntegerv(GL.GL_PACK_ALIGNMENT))
+        GL.glBindFramebuffer(GL.GL_READ_FRAMEBUFFER, _gl_object_id(self._canvas_framebuffer))
+        GL.glPixelStorei(GL.GL_PACK_ALIGNMENT, 1)
+        try:
+            raw = GL.glReadPixels(0, 0, self._fbo_width, self._fbo_height,
+                                  GL.GL_RGBA, GL.GL_UNSIGNED_BYTE)
+            pixels = np.frombuffer(raw, dtype=np.uint8) if isinstance(raw, (bytes, bytearray, memoryview)) else np.asarray(raw, dtype=np.uint8)
+            return pixels.reshape(self._fbo_height, self._fbo_width, 4)
+        finally:
+            GL.glPixelStorei(GL.GL_PACK_ALIGNMENT, old_alignment)
+            GL.glBindFramebuffer(GL.GL_READ_FRAMEBUFFER, old_read_fbo)
+
+    def _apply_cached_content_fit(self):
+        if self._content_fit_bounds is None or self.width() < 1 or self.height() < 1:
+            return
+        fitted = content_fit_transform(self._content_fit_bounds, (self.width(), self.height()),
+                                       self._content_fit_source_aspect, self._content_fit_fill)
+        self.__model_scale = fitted.scale
+        self.__model_offset = (fitted.offset_x, fitted.offset_y)
+        self.__rotation_angle = 0.
+        self._content_fit_range_limited = fitted.range_limited
+        self._content_fit_viewport = (self.width(), self.height())
+        if not self._content_fit_pending:
+            self._content_fit_status = "empty-fallback" if self._content_fit_empty else "fit"
+        self.contentFitApplied.emit(self.getContentFitState())
+        self.update()
+
+    def _invalidate_content_fit(self):
+        self._content_fit_bounds = None
+        self._content_fit_viewport = None
+        self._content_fit_readbacks = 0
+        self._content_fit_attempts = 0
+        self._content_fit_sample_size = None
+        self._content_fit_empty = False
+        self._content_fit_range_limited = False
+        self._content_fit_pending = self._content_fit_enabled or self._content_fit_pending
+        self._content_fit_status = "pending" if self._content_fit_pending else "manual"
+
+    def fitToContent(self, fill: float = .96, *, auto_resize: bool = True, refresh: bool = True) -> bool:
+        """Queue a one-shot native-alpha fit; no GL read occurs in this setter.
+
+        With auto_resize, future viewport resizes only recompute the cached
+        bounds. Explicit fitting also resets rotation, like a camera reset.
+        """
+        fill = float(fill)
+        if not math.isfinite(fill) or not 0 < fill <= 1:
+            raise ValueError("Content fill must be between 0 and 1")
+        if getattr(self, "model", None) is None and not getattr(self, "model_path", None):
+            return False
+        was_enabled = self._content_fit_enabled
+        self._content_fit_enabled = bool(auto_resize)
+        if was_enabled != self._content_fit_enabled:
+            self.fitModeChanged.emit(self._content_fit_enabled)
+        self._content_fit_fill = fill
+        self.__rotation_angle = 0.
+        if refresh or self._content_fit_bounds is None:
+            self._content_fit_pending = True
+            self._content_fit_attempts = 0
+            self._content_fit_status = "pending"
+        else:
+            self._apply_cached_content_fit()
+        self.update()
+        return True
+
+    def setContentFitEnabled(self, enabled: bool):
+        enabled = bool(enabled)
+        changed = enabled != self._content_fit_enabled
+        self._content_fit_enabled = enabled
+        if not enabled:
+            self._content_fit_pending = False
+            self._content_fit_status = "manual"
+        elif self._content_fit_bounds is not None:
+            self._apply_cached_content_fit()
+        else:
+            self._content_fit_pending = True
+            self._content_fit_attempts = 0
+            self._content_fit_status = "pending"
+        if changed:
+            self.fitModeChanged.emit(enabled)
+        self.update()
+
+    def getContentFitState(self) -> dict:
+        return {"enabled": self._content_fit_enabled, "pending": self._content_fit_pending,
+                "status": self._content_fit_status,
+                "bounds": list(self._content_fit_bounds) if self._content_fit_bounds is not None else None,
+                "fill": self._content_fit_fill, "scale": self.__model_scale,
+                "offset_x": self.__model_offset[0], "offset_y": -self.__model_offset[1],
+                "rotation": self.__rotation_angle, "range_limited": self._content_fit_range_limited,
+                "readback_count": self._content_fit_readbacks,
+                "sample_size": list(self._content_fit_sample_size) if self._content_fit_sample_size else None,
+                "model_generation": getattr(self, "_model_load_generation", 0)}
+
     def setCanvasOpacity(self, value):
         self.__canvas_opacity = value
         self.update()
 
     def setRotationAngle(self, angle):
+        self.setContentFitEnabled(False)
         self.__rotation_angle = float(angle)
         self.update()
 
     def setModelTransform(self, scale: float, offset_x: float, offset_y: float):
         """Apply responsive model scale and offsets at the final composition pass."""
+        self.setContentFitEnabled(False)
         self.__model_scale = max(0.25, min(4.0, float(scale)))
         self.__model_offset = (
             max(-1.0, min(1.0, float(offset_x))),
@@ -461,6 +614,7 @@ class ADPOpenGLCanvas(QOpenGLWindow):
 
 class Live2DCanvas(ADPOpenGLCanvas):
     modelLoaded = Signal()
+    modelFrameReady = Signal(str, int)
     drawableClicked = Signal(str)
     modelPointClicked = Signal(float, float)
     drawablesPicked = Signal(list)
@@ -516,6 +670,10 @@ class Live2DCanvas(ADPOpenGLCanvas):
         self._part_opacity_defaults = {}
         self._part_indices = {}
         self._gl_initialized = False
+        self._model_load_generation = 1 if model_path else 0
+        self._active_model_generation = 0
+        self._model_frame_ready_generation = -1
+        self._active_model_path = None
         # Cached motions metadata
         self._motions: List[Dict[str, Any]] = []
 
@@ -550,6 +708,10 @@ class Live2DCanvas(ADPOpenGLCanvas):
         if self._fbo_width > 0 and self._fbo_height > 0:
             model.Resize(self._fbo_width, self._fbo_height)
         self.model = model
+        self._active_model_generation = self._model_load_generation
+        self._model_frame_ready_generation = -1
+        self._active_model_path = str(model_path)
+        self._invalidate_content_fit()
         self._parameter_value_model_id = None
         self._parameter_value_indices.clear()
         self.model_path = model_path
@@ -581,6 +743,7 @@ class Live2DCanvas(ADPOpenGLCanvas):
         """Load a model into the already-created OpenGL widget."""
         if not model_path:
             raise ValueError("A Live2D model path is required.")
+        self._model_load_generation += 1
         self.model_path = str(model_path)
         if not self._gl_initialized or self.context() is None or not self.isValid():
             self.update()
@@ -606,6 +769,10 @@ class Live2DCanvas(ADPOpenGLCanvas):
             if context_current:
                 self.doneCurrent()
         self.model_path = None
+        self._model_load_generation += 1
+        self._active_model_path = None
+        self._model_frame_ready_generation = -1
+        self._invalidate_content_fit()
         self._motions = []
         self._last_played_motion = None
         self._motion_frozen = False
@@ -625,7 +792,7 @@ class Live2DCanvas(ADPOpenGLCanvas):
     def on_draw(self):
         live2d.clearBuffer()
         if self.model is None:
-            return
+            return False
         if not self._motion_frozen:
             self._update_model_motion()
             self._restart_loop_motion_if_finished()
@@ -645,6 +812,20 @@ class Live2DCanvas(ADPOpenGLCanvas):
         # an otherwise frozen frame and unrelated parameters during edits.
         # https://github.com/EasyLive2D/live2d-py/blob/v0.7.0.2/Live2D/V3/Main/src/Model.cpp#L1018
         self.model.Draw()
+        return True
+
+    def modelLoadGeneration(self) -> int:
+        """Identity of the latest load request, including deferred native loads."""
+        return self._model_load_generation
+
+    def on_canvas_rendered(self):
+        if self.model is None:
+            return
+        if self._model_frame_ready_generation != self._active_model_generation:
+            self._model_frame_ready_generation = self._active_model_generation
+            self.modelFrameReady.emit(str(self._active_model_path or self.model_path or ""),
+                                      self._active_model_generation)
+        super().on_canvas_rendered()
 
     def on_resize(self, width: int, height: int):
         if self.model is not None:

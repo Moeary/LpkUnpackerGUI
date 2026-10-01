@@ -69,6 +69,8 @@ LIVE2D_EDITOR_TEXT = {
     "editor.live2d.visible": "所属部件可见",
     "editor.live2d.opacity": "所属部件透明度（预览）",
     "editor.live2d.part_hint": "所属部件 {part} · 影响 {count} 个 ArtMesh；预览状态保存在副本清单中，不修改 MOC。",
+    "editor.live2d.part_summary": "所属部件 {part} · {count} 个 ArtMesh",
+    "editor.live2d.part_opacity": "部件不透明度",
     "editor.live2d.part_unavailable": "此 ArtMesh 未关联可设置透明度的 Part；主模型透明度控制不可用。",
     "editor.live2d.local_preview": "选中 ArtMesh 的贴图区域",
     "editor.live2d.save_parent": "选择完整副本的父目录",
@@ -475,50 +477,40 @@ class Live2DEditorPage(QFrame):
 
     def _build_artmesh_tab(self):
         self.artmesh_tab = QWidget(self.tabs)
-        layout = QVBoxLayout(self.artmesh_tab)
+        layout = EditorViewportLayout(self.artmesh_tab)
         layout.setContentsMargins(4, 4, 4, 4)
         self.artmesh_inspector = ArtMeshInspector(parent=self.artmesh_tab)
         inspector = self.artmesh_inspector
-        for widget in (inspector.metadata_edit, inspector.open_button, inspector.mode_label, inspector.shared_label):
-            widget.hide()
-        inspector.pose_canvas.parentWidget().hide()
-        inspector.splitter.setOrientation(Qt.Vertical)
-        inspector.entry_list.setMinimumHeight(75)
-        inspector.entry_list.setMaximumHeight(135)
-        inspector.atlas_canvas.setMinimumSize(220, 135)
-        inspector.details.setMaximumHeight(64)
-        inspector.main_layout.setContentsMargins(4, 4, 4, 4)
-        inspector.details.hide()
-        inspector.status_label.hide()
-        inspector.details.textChanged.connect(lambda: inspector.setToolTip(inspector.details.toPlainText()))
-        inspector.refresh_button.clicked.disconnect()
-        inspector.refresh_button.clicked.connect(lambda: self._refresh_mesh(force=True))
         inspector.selectionChanged.connect(self._artmesh_selected)
         inspector.selectionIdsChanged.connect(self._artmesh_selection_changed)
-        layout.addWidget(inspector, 1)
-        self.local_preview_label = CaptionLabel(self.artmesh_tab)
+        self.artmesh_details_widget = QWidget(inspector)
+        details_layout = EditorViewportLayout(self.artmesh_details_widget)
+        details_layout.setContentsMargins(0, 4, 0, 0)
+        details_layout.setSpacing(6)
+        self.local_preview_label = CaptionLabel(self.artmesh_details_widget)
         self.local_preview_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         local_row = QHBoxLayout()
         local_row.addWidget(self.local_preview_label, 1)
-        self.artmesh_export_button = PushButton(FluentIcon.SAVE, "", self.artmesh_tab)
-        self.artmesh_export_button.clicked.connect(self.export_selected_artmeshes)
-        local_row.addWidget(self.artmesh_export_button)
-        self.local_preview_button = TransparentToolButton(FluentIcon.ZOOM, self.artmesh_tab)
+        self.local_preview_button = TransparentToolButton(FluentIcon.ZOOM, self.artmesh_details_widget)
         self.local_preview_button.setFixedSize(28, 28)
         self.local_preview_button.clicked.connect(self._show_local_artmesh_image)
         local_row.addWidget(self.local_preview_button)
-        layout.addLayout(local_row)
-        self.artmesh_image = TexturePreviewLabel(self.artmesh_tab)
+        details_layout.addLayout(local_row)
+        self.artmesh_image = TexturePreviewLabel(self.artmesh_details_widget)
         self.artmesh_image.setObjectName("editorImage")
         self.artmesh_image.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Minimum)
         self.artmesh_image.setAlignment(Qt.AlignCenter)
         self.artmesh_image.setMinimumHeight(60)
-        self.artmesh_image.setMaximumHeight(90)
-        layout.addWidget(self.artmesh_image)
+        self.artmesh_image.setMaximumHeight(160)
+        details_layout.addWidget(self.artmesh_image, 1)
+        self.part_visible = CheckBox(self.artmesh_details_widget)
+        self.part_visible.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        details_layout.addWidget(self.part_visible)
         opacity_row = QHBoxLayout()
-        self.part_visible = CheckBox(self.artmesh_tab)
-        self.part_opacity = DoubleSpinBox(self.artmesh_tab)
-        self.part_opacity.setMaximumWidth(120)
+        self.part_opacity_label = CaptionLabel(self.artmesh_details_widget)
+        self.part_opacity_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.part_opacity = DoubleSpinBox(self.artmesh_details_widget)
+        self.part_opacity.setFixedWidth(140)
         self.part_opacity.setRange(0, 1)
         self.part_opacity.setSingleStep(.05)
         self.part_opacity.setDecimals(2)
@@ -526,32 +518,20 @@ class Live2DEditorPage(QFrame):
         self.part_visible.setChecked(True)
         self.part_visible.toggled.connect(self._part_visibility_changed)
         self.part_opacity.valueChanged.connect(self._part_opacity_changed)
-        opacity_row.addWidget(self.part_visible, 1)
+        opacity_row.addWidget(self.part_opacity_label, 1)
         opacity_row.addWidget(self.part_opacity)
-        layout.addLayout(opacity_row)
-        self.part_hint = CaptionLabel(self.artmesh_tab)
-        self.part_hint.setWordWrap(True)
-        layout.addWidget(self.part_hint)
-        # The inspector retains a real atlas and local preview. Its content can
-        # scroll independently so small windows do not inherit its full height.
-        content = QWidget(self.artmesh_tab)
-        content_layout = QVBoxLayout(content)
-        content_layout.setContentsMargins(0, 0, 0, 0)
-        while layout.count():
-            item = layout.takeAt(0)
-            if item.widget():
-                content_layout.addWidget(item.widget())
-            elif item.layout():
-                content_layout.addLayout(item.layout())
-            else:
-                content_layout.addItem(item)
-        self.artmesh_scroll = ScrollArea(self.artmesh_tab)
-        self.artmesh_scroll.setWidgetResizable(True)
-        self.artmesh_scroll.setFrameShape(QFrame.NoFrame)
-        self.artmesh_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.artmesh_scroll.setWidget(content)
-        self.artmesh_scroll.enableTransparentBackground()
-        layout.addWidget(self.artmesh_scroll)
+        details_layout.addLayout(opacity_row)
+        self.part_hint = CaptionLabel(self.artmesh_details_widget)
+        self.part_hint.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        details_layout.addWidget(self.part_hint)
+        self.artmesh_export_button = PushButton(FluentIcon.SAVE, "", self.artmesh_details_widget)
+        self.artmesh_export_button.clicked.connect(self.export_selected_artmeshes)
+        details_layout.addWidget(self.artmesh_export_button)
+        inspector.set_editor_layout(self.artmesh_details_widget)
+        inspector.refresh_button.clicked.disconnect()
+        inspector.refresh_button.clicked.connect(lambda: self._refresh_mesh(force=True))
+        self.artmesh_scroll = inspector.editor_details_scroll
+        layout.addWidget(inspector, 1)
         self.tabs.addTab(self.artmesh_tab, "")
 
     def _build_texture_tab(self):
@@ -661,6 +641,9 @@ class Live2DEditorPage(QFrame):
         self.parameter_table.setHorizontalHeaderLabels([_text("editor.live2d." + key) for key in ("parameter", "value", "range")])
         self.editor_label.setText(self._external_editor or _text("editor.live2d.default_editor"))
         self.part_opacity.setToolTip(_text("editor.live2d.opacity"))
+        self.part_opacity_label.setText(_text("editor.live2d.part_opacity"))
+        self.part_opacity_label.setToolTip(_text("editor.live2d.opacity"))
+        self.local_preview_label.setToolTip(_text("editor.live2d.local_preview"))
         self.local_preview_button.setToolTip(_text("editor.live2d.local_preview_zoom"))
         self.local_preview_button.setAccessibleName(self.local_preview_button.toolTip())
         self.timeline.retranslate_ui()
@@ -681,6 +664,8 @@ class Live2DEditorPage(QFrame):
         self.mod_panel.retranslate_ui()
         self.psd_panel.retranslate_ui()
         self._update_actions()
+        if self.artmesh_inspector.current_entry() is not None:
+            self._artmesh_selected(self.artmesh_inspector.current_entry())
 
     def _choose_source(self):
         path, _ = QFileDialog.getOpenFileName(self, _text("editor.live2d.project_open"), "", "Live2D (*.json *.moc3 *.lpk)")
@@ -1695,7 +1680,12 @@ class Live2DEditorPage(QFrame):
             self.part_opacity.setValue(opacity)
             self.part_visible.setChecked(opacity > 0)
         count = sum(str(item.get("parent_part_id") or "") == part_id for item in (self.session.mesh_data or {}).get("drawables", []))
-        self.part_hint.setText(_text("editor.live2d.part_hint", part=part_id, count=count) if available else _text("editor.live2d.part_unavailable"))
+        hint = _text("editor.live2d.part_hint", part=part_id, count=count) if available else _text("editor.live2d.part_unavailable")
+        self.part_hint.setText(_text("editor.live2d.part_summary", part=part_id, count=count) if available else "")
+        self.part_hint.setToolTip(hint)
+        self.part_visible.setToolTip(hint)
+        self.part_opacity.setToolTip(_text("editor.live2d.opacity") + "\n" + hint)
+        self.artmesh_image.setToolTip(hint)
 
     @staticmethod
     def _checker_pixmap(source: QPixmap) -> QPixmap:

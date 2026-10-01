@@ -14,7 +14,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PIL import Image
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QPoint, Qt, Signal, QTimer
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QWidget
 
@@ -24,6 +24,10 @@ from tests.test_editor_navigation import DummySpinePreview
 
 
 class FakeNativePreview(QWidget):
+    modelReady = Signal(str, int)
+    fitModeChanged = Signal(bool)
+    contentFitApplied = Signal(dict)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.live2d_canvas = SimpleNamespace()
@@ -36,17 +40,46 @@ class FakeNativePreview(QWidget):
         self.playback = None
         self.meta_reads = 0
         self.value_reads = []
+        self.generation = 0
+        self.auto_finish = True
+        self.play_calls = []
+        self.fit_calls = 0
+        self.fit_state = {"enabled": False, "scale": 1.0, "offset_x": 0.0,
+                          "offset_y": 0.0, "rotation": 0.0, "model_generation": 0}
 
     def load_model(self, path):
         if self.failure:
             raise self.failure
         self.loaded = path
+        self.generation += 1
+        generation = self.generation
+        if self.auto_finish:
+            QTimer.singleShot(0, self, lambda: self.modelReady.emit(path, generation))
+
+    def finish_load(self, path=None, generation=None):
+        self.modelReady.emit(path or self.loaded, self.generation if generation is None else generation)
+
+    def model_load_generation(self):
+        return self.generation
+
+    def play_motion(self, group, index):
+        self.play_calls.append((group, index))
+
+    def fit_model(self):
+        self.fit_calls += 1
+        self.fit_state.update(enabled=True, scale=1.75, offset_x=-.15,
+                              offset_y=.1, model_generation=self.generation)
+        self.fitModeChanged.emit(True)
+        self.contentFitApplied.emit(dict(self.fit_state))
+        return True
 
     def unload_model(self):
         pass
 
     def apply_settings(self, settings):
         self.settings.update(settings)
+        if "content_fit_enabled" in settings:
+            self.fit_state["enabled"] = settings["content_fit_enabled"]
 
     def get_parameter_meta_list(self):
         self.meta_reads += 1
@@ -344,6 +377,97 @@ class PreviewControlsTests(unittest.TestCase):
         self.assertLess(page.preview_btn.mapTo(page, QPoint()).y(), page.model_info_text_box.mapTo(page, QPoint()).y())
         layout = page.left_sidebar.layout()
         self.assertIs(layout.itemAt(layout.count() - 1).widget(), page.model_info_text_box)
+
+    def start_pending_source(self, motions, model=None):
+        with patch.object(self.module.InfoBar, "success"), \
+                patch.object(self.page, "_load_motions_from_model_json", return_value=motions):
+            self.page.load_model_preview(str(model or self.model))
+            self.page._live2d_load_timer.stop()
+            self.assertTrue(self.page.preview_current_model())
+
+    def test_initial_autoplay_waits_for_first_frame_chooses_first_available_and_runs_once(self):
+        self.native.auto_finish = False
+        self.page.auto_play_motion_check.setChecked(True)
+        self.page.loop_motion_check.setChecked(True)
+        absent = dict(self.motion, group="Missing", file=str(self.root / "missing.motion3.json"))
+        later = dict(self.motion, group="Later", index=2)
+        self.page.settings_manager.set("preview.ui_state.selected_motion", "Later::2")
+        self.start_pending_source([absent, self.motion, later])
+        self.assertFalse(self.native.play_calls)
+        self.native.finish_load()
+        self.assertEqual(self.native.play_calls, [("Idle", 0)])
+        self.assertEqual(self.page.motion_combo.currentIndex(), 1)
+        self.assertTrue(self.native.loop)
+        self.native.finish_load()
+        with patch.object(self.page, "_load_motions_from_model_json", return_value=[absent, self.motion, later]):
+            self.page.on_request_refresh_params()
+        self.assertEqual(self.native.play_calls, [("Idle", 0)])
+        self.page.motion_combo.setCurrentIndex(2)
+        self.page.motion_combo.currentIndexChanged.emit(2)
+        self.assertEqual(self.native.play_calls[-1], ("Later", 2))
+        self.page.auto_play_motion_check.setChecked(False)
+        self.page.motion_combo.setCurrentIndex(1)
+        self.page.motion_combo.currentIndexChanged.emit(1)
+        self.assertEqual(len(self.native.play_calls), 2)
+
+    def test_initial_autoplay_off_empty_missing_or_frozen_do_not_play(self):
+        self.native.auto_finish = False
+        cases = [(False, [self.motion], False), (True, [], False),
+                 (True, [dict(self.motion, file=str(self.root / "absent.json"))], False),
+                 (True, [self.motion], True)]
+        for enabled, motions, frozen in cases:
+            with self.subTest(enabled=enabled, count=len(motions), frozen=frozen):
+                self.page.auto_play_motion_check.setChecked(enabled)
+                self.start_pending_source(motions)
+                self.page.freeze_motion_check.setChecked(frozen)
+                self.native.finish_load()
+                self.assertFalse(self.native.play_calls)
+                self.assertEqual(self.native.frozen, frozen)
+
+    def test_model_switch_retry_and_stale_generations_cannot_start_old_motion(self):
+        self.native.auto_finish = False
+        self.page.auto_play_motion_check.setChecked(True)
+        self.start_pending_source([self.motion])
+        old_generation = self.native.generation
+        other_model = self.root / "other.model3.json"
+        other_model.write_bytes(self.model.read_bytes())
+        other_motion = dict(self.motion, group="Other", index=3)
+        self.start_pending_source([other_motion], other_model)
+        current_generation = self.native.generation
+        self.native.finish_load(str(self.model), old_generation)
+        self.assertFalse(self.native.play_calls)
+        self.native.finish_load()
+        self.assertEqual(self.native.play_calls, [("Other", 3)])
+        with patch.object(self.page, "_load_motions_from_model_json", return_value=[other_motion]):
+            self.assertTrue(self.page.preview_current_model())
+        self.native.finish_load(str(other_model), current_generation)
+        self.native.finish_load()
+        self.assertEqual(self.native.play_calls, [("Other", 3)])
+        self.page._show_image_stage()
+        self.native.finish_load()
+        self.assertEqual(self.native.play_calls, [("Other", 3)])
+
+    def test_fit_button_uses_native_content_fit_and_synchronizes_view_settings(self):
+        self.load_live()
+        self.page.live2d_details.setCurrentIndex(1)
+        self.page.freeze_motion_check.setChecked(True)
+        pose = dict(self.page._frozen_parameter_values)
+        self.page.settings_panel.fit_model_btn.click()
+        self.assertEqual(self.native.fit_calls, 1)
+        panel = self.page.settings_panel
+        self.assertTrue(panel.content_fit_check.isChecked())
+        self.assertEqual(panel.scale_slider.value(), 175)
+        self.assertEqual(panel.position_x_spinbox.value(), -15)
+        self.assertEqual(panel.position_y_spinbox.value(), 10)
+        self.assertTrue(self.page.freeze_motion_check.isChecked())
+        self.assertEqual(self.page._frozen_parameter_values, pose)
+        self.assertTrue(self.page.settings_manager.get("preview.ui_state.content_fit"))
+        panel.content_fit_check.setChecked(False)
+        self.assertFalse(self.native.settings["content_fit_enabled"])
+        self.assertFalse(self.page.settings_manager.get("preview.ui_state.content_fit"))
+        self.page._show_spine_stage()
+        self.assertTrue(panel.content_fit_check.isHidden())
+        self.assertNotIn("content_fit_enabled", panel.get_settings())
 
     def test_images_keep_large_center_vertical_thumbnails_and_navigation(self):
         page = self.page

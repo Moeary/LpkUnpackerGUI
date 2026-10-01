@@ -1345,5 +1345,10 @@
   "editor.live2d.pick_hidden_export": "所属 Part 已隐藏：{parts}。仅在导出副本中恢复这些 Part 可见，并导出所选 ArtMesh；当前预览与编辑记录保持不变。继续？",
   "editor.live2d.pick_restore_export": "恢复可见并导出",
   "editor.live2d.pick_invisible": "以下选中 ArtMesh 在当前参数姿态中没有可见内容，请调整姿态后再导出：{ids}",
-  "artmesh.inspector.selection_hint": "单击选择；Shift+单击增减；拖动框选；Shift+框选合并。"
+  "artmesh.inspector.selection_hint": "单击选择；Shift+单击增减；拖动框选；Shift+框选合并。",
+  "preview.content_fit": "自动适配完整内容",
+  "preview.content_fit_hint": "首次载入与窗口变化时适配实际内容；手动缩放、平移或旋转后停止自动适配。",
+  "preview.auto_play_hint": "首次载入完成后播放第一个有效动作；切换动作时自动播放。冻结状态不会被初始自动播放解除。",
+  "editor.live2d.part_summary": "所属部件 {part} · {count} 个 ArtMesh",
+  "editor.live2d.part_opacity": "部件不透明度"
 }

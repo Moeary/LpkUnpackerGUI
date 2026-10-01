@@ -1345,5 +1345,10 @@
   "editor.live2d.pick_hidden_export": "親 Part が非表示です：{parts}。書き出し用のコピーでのみ表示を戻し、選択した ArtMesh を書き出します。現在のプレビューと編集履歴は変わりません。続行しますか？",
   "editor.live2d.pick_restore_export": "表示して書き出す",
   "editor.live2d.pick_invisible": "選択した ArtMesh は現在の姿勢で表示内容がありません。姿勢を調整してから書き出してください：{ids}",
-  "artmesh.inspector.selection_hint": "クリックで選択、Shift+クリックで追加・解除、ドラッグで範囲選択、Shift+ドラッグで統合。"
+  "artmesh.inspector.selection_hint": "クリックで選択、Shift+クリックで追加・解除、ドラッグで範囲選択、Shift+ドラッグで統合。",
+  "preview.content_fit": "内容全体に自動フィット",
+  "preview.content_fit_hint": "初回読み込みとサイズ変更時に表示内容全体を収めます。手動で拡大縮小・移動・回転すると自動フィットを解除します。",
+  "preview.auto_play_hint": "初回読み込み後に最初の有効なモーションを再生し、選択を切り替えた際も再生します。初回の自動再生は姿勢の固定を解除しません。",
+  "editor.live2d.part_summary": "親 Part {part} · ArtMesh {count} 個",
+  "editor.live2d.part_opacity": "Part の不透明度"
 }

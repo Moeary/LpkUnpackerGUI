@@ -82,6 +82,9 @@ PREVIEW_LAYOUT_TEXT = {
     "preview.layout.display": "显示",
     "preview.parameter_search": "搜索动画参数 ID",
     "preview.parameter_count": "显示 {shown} / {total} 个参数",
+    "preview.content_fit": "自动适配完整内容",
+    "preview.content_fit_hint": "首次载入与窗口变化时适配实际内容；手动缩放、平移或旋转后停止自动适配。",
+    "preview.auto_play_hint": "首次载入完成后播放第一个有效动作；切换动作时自动播放。冻结状态不会被初始自动播放解除。",
     "preview.layout.empty": "载入资源后显示对应的预览控制。",
     "preview.motion_freeze_hint": "冻结保留当前动画时刻；拖动时间修改姿态后，取消冻结将从头重新播放该动作。",
     "preview.motion_playback_position": "{motion} · {current:.2f} / {total:.2f} 秒",
@@ -853,12 +856,14 @@ class Live2DSettingsPanel(QFrame):
 
     settingsChanged = Signal(dict)
     requestRefreshParams = Signal()
+    fitRequested = Signal()
 
     def __init__(self, parent=None, mode: str = "display"):
         super().__init__(parent)
 
         self.mode = mode if mode in {"display", "parameters"} else "display"
         self.preview_window = None
+        self._spine_mode = False
 
         self.width_spinbox = None
         self.height_spinbox = None
@@ -873,6 +878,7 @@ class Live2DSettingsPanel(QFrame):
         self.scale_slider = None
         self.antialias_check = None
         self.fit_model_btn = None
+        self.content_fit_check = None
         self.offset_text_label = None
         self.position_x_label = None
         self.position_y_label = None
@@ -1102,6 +1108,10 @@ class Live2DSettingsPanel(QFrame):
         self.antialias_check.setChecked(True)
         self.antialias_check.toggled.connect(lambda _: self._emit_settings())
         layout.addWidget(self.antialias_check)
+        self.content_fit_check = CheckBox("", group)
+        self.content_fit_check.setChecked(True)
+        self.content_fit_check.toggled.connect(lambda _: self._emit_settings())
+        layout.addWidget(self.content_fit_check)
         self.fit_model_btn = PushButton("", group)
         self.fit_model_btn.clicked.connect(self.fit_model_to_view)
         layout.addWidget(self.fit_model_btn)
@@ -1169,7 +1179,7 @@ class Live2DSettingsPanel(QFrame):
         return group
 
     def fit_model_to_view(self):
-        """Reset only the viewport transform, retaining animation and pose."""
+        """Fit native content, retaining animation and pose."""
         for control, value in ((self.scale_slider, 100), (self.rotation_slider, 0),
                                (self.position_x_spinbox, 0), (self.position_y_spinbox, 0)):
             control.blockSignals(True)
@@ -1177,7 +1187,21 @@ class Live2DSettingsPanel(QFrame):
             control.blockSignals(False)
         self.scale_value_label.setText("100%")
         self.rotation_label.setText("0°")
+        if not self._spine_mode:
+            with QSignalBlocker(self.content_fit_check):
+                self.content_fit_check.setChecked(True)
         self._emit_settings()
+        self.fitRequested.emit()
+
+    def sync_view_transform(self, state: dict):
+        for control, value in ((self.scale_slider, round(float(state["scale"]) * 100)),
+                               (self.rotation_slider, round(float(state["rotation"]))),
+                               (self.position_x_spinbox, round(float(state["offset_x"]) * 100)),
+                               (self.position_y_spinbox, round(float(state["offset_y"]) * 100))):
+            with QSignalBlocker(control):
+                control.setValue(value)
+        self.scale_value_label.setText(f"{self.scale_slider.value()}%")
+        self.rotation_label.setText(f"{self.rotation_slider.value()}°")
 
     def create_interaction_settings_group(self):
         """创建交互设置组"""
@@ -1275,6 +1299,9 @@ class Live2DSettingsPanel(QFrame):
             self.antialias_check.setText(tr("preview.antialias"))
         if self.fit_model_btn:
             self.fit_model_btn.setText(tr("preview.fit_model"))
+        if self.content_fit_check:
+            self.content_fit_check.setText(_layout_text("preview.content_fit"))
+            self.content_fit_check.setToolTip(_layout_text("preview.content_fit_hint"))
         if self.scale_text_label:
             self.scale_text_label.setText(tr("preview.model_scale"))
         if self.offset_text_label:
@@ -1311,6 +1338,7 @@ class Live2DSettingsPanel(QFrame):
         """Show only display settings that have a meaning for Spine."""
 
         active = bool(active)
+        self._spine_mode = active
         if self.mode != "display":
             return
         if self.window_group:
@@ -1321,6 +1349,8 @@ class Live2DSettingsPanel(QFrame):
             self.model_group.setVisible(True)
         if self.interaction_group:
             self.interaction_group.setVisible(not active)
+        if self.content_fit_check:
+            self.content_fit_check.setVisible(not active)
 
     def _emit_settings(self):
         try:
@@ -1527,6 +1557,8 @@ class Live2DSettingsPanel(QFrame):
             'auto_blink': self.auto_blink_check.isChecked(),
             'auto_breath': self.auto_breath_check.isChecked(),
         }
+        if self.content_fit_check is not None and not self._spine_mode:
+            settings["content_fit_enabled"] = self.content_fit_check.isChecked()
         # 高级参数
         adv_enabled = bool(self.advanced_enable_check.isChecked()) if self.advanced_enable_check else False
         settings['advanced_enabled'] = adv_enabled
@@ -1834,6 +1866,11 @@ class PreviewPage(QFrame):
         self.left_sidebar = None
         self.right_sidebar = None
         self._motion_items = []
+        self._live2d_source_generation = 0
+        self._live2d_ready_generation = None
+        self._live2d_initial_play_generation = None
+        self._pending_live2d_ready = None
+        self._live2d_load_in_progress = False
         self.drag_drop_area = None
         self.source_label = None
         self.source_edit = None
@@ -2048,6 +2085,7 @@ class PreviewPage(QFrame):
         # Display and interaction controls move into the format-aware right tabs.
         self.settings_panel = Live2DSettingsPanel(self, mode="display")
         self.settings_panel.settingsChanged.connect(self.on_settings_changed)
+        self.settings_panel.fitRequested.connect(self._fit_preview_model)
         self.settings_panel.requestRefreshParams.connect(self.on_request_refresh_params)
         left_layout.addStretch(1)
         left_layout.addWidget(self.model_info_text_box)
@@ -2388,6 +2426,7 @@ class PreviewPage(QFrame):
             self.loop_motion_check.setText(tr("preview.loop_motion"))
         if self.auto_play_motion_check:
             self.auto_play_motion_check.setText(tr("preview.auto_play_motion"))
+            self.auto_play_motion_check.setToolTip(_layout_text("preview.auto_play_hint"))
         if self.save_pose_scheme_btn:
             self.save_pose_scheme_btn.setText(tr("preview.save_psd_pose_scheme"))
         if self.pose_controls_title:
@@ -2451,6 +2490,9 @@ class PreviewPage(QFrame):
         self.image_limit_spinbox.setVisible(mode != "spine")
 
     def _clear_live2d_controls(self):
+        self._live2d_source_generation += 1
+        self._live2d_ready_generation = None
+        self._pending_live2d_ready = None
         self._live2d_load_timer.stop()
         self._parameter_refresh_timer.stop()
         if self._parameter_sync_timer:
@@ -2665,6 +2707,7 @@ class PreviewPage(QFrame):
                 (panel.rotation_slider, int(state.get("rotation", 0))),
                 (panel.scale_slider, int(state.get("scale", 100))),
                 (panel.antialias_check, bool(state.get("antialias", True))),
+                (panel.content_fit_check, bool(state.get("content_fit", True))),
                 (panel.position_x_spinbox, int(state.get("offset_x", 0))),
                 (panel.position_y_spinbox, int(state.get("offset_y", 0))),
                 (panel.bg_transparent_check, bool(state.get("transparent_bg", True))),
@@ -2713,6 +2756,7 @@ class PreviewPage(QFrame):
             "rotation": panel.rotation_slider.value(),
             "scale": panel.scale_slider.value(),
             "antialias": panel.antialias_check.isChecked(),
+            "content_fit": panel.content_fit_check.isChecked(),
             "offset_x": panel.position_x_spinbox.value(),
             "offset_y": panel.position_y_spinbox.value(),
             "transparent_bg": panel.bg_transparent_check.isChecked(),
@@ -3274,7 +3318,7 @@ class PreviewPage(QFrame):
             tr("preview.export_failed_content", error=error),
         )
 
-    def _populate_motion_controls(self, motions: list[dict]):
+    def _populate_motion_controls(self, motions: list[dict], *, autoplay: bool = True):
         previous = str(self.motion_combo.currentData() or "") if self.motion_combo else ""
         if not previous:
             previous = str(
@@ -3306,7 +3350,7 @@ class PreviewPage(QFrame):
         selected_index = self.motion_combo.findData(previous) if previous else -1
         self.motion_combo.setCurrentIndex(selected_index if selected_index >= 0 else 0)
         self.motion_combo.blockSignals(False)
-        self._on_motion_selection_changed(self.motion_combo.currentIndex())
+        self._on_motion_selection_changed(self.motion_combo.currentIndex(), autoplay=autoplay)
 
     def _set_motion_debug_visible(self, visible: bool):
         if self.motion_group:
@@ -3345,7 +3389,7 @@ class PreviewPage(QFrame):
                 int(motion.get("index", 0)),
             )
 
-    def _on_motion_selection_changed(self, index: int):
+    def _on_motion_selection_changed(self, index: int, *, autoplay: bool = True):
         if not self.live2d_preview or index < 0 or index >= len(self._motion_items):
             return
         motion = self._motion_items[index]
@@ -3353,9 +3397,68 @@ class PreviewPage(QFrame):
             str(motion.get("group", "")),
             int(motion.get("index", 0)),
         )
-        if self.auto_play_motion_check and self.auto_play_motion_check.isChecked():
+        if (autoplay and not self._live2d_load_in_progress
+                and self._live2d_ready_generation == self._live2d_source_generation
+                and self.auto_play_motion_check and self.auto_play_motion_check.isChecked()):
             self.play_selected_motion()
         self._update_motion_timeline_visibility()
+        self._save_preview_ui_state()
+
+    def _connect_live2d_preview_events(self, preview):
+        if getattr(preview, "_general_preview_events_connected", False):
+            return
+        for name, handler in (("modelReady", self._on_live2d_model_ready),
+                              ("fitModeChanged", self._on_content_fit_mode_changed),
+                              ("contentFitApplied", self._on_content_fit_applied)):
+            signal = getattr(preview, name, None)
+            if signal is not None:
+                signal.connect(handler)
+        preview._general_preview_events_connected = True
+
+    def _on_live2d_model_ready(self, model_path: str, native_generation: int):
+        request = self._pending_live2d_ready
+        if request is None or self._resource_mode != "live2d" or self._live2d_load_in_progress:
+            return
+        expected_path, expected_native, source_generation = request
+        if (source_generation != self._live2d_source_generation or native_generation != expected_native
+                or os.path.normcase(os.path.abspath(model_path)) != os.path.normcase(expected_path)
+                or (self.sender() is not None and self.sender() is not self.live2d_preview)):
+            return
+        self._pending_live2d_ready = None
+        self._live2d_ready_generation = source_generation
+        self.on_motion_loop_changed(self.loop_motion_check.isChecked())
+        self.on_motion_freeze_changed(self.freeze_motion_check.isChecked())
+        self._on_motion_selection_changed(self.motion_combo.currentIndex(), autoplay=False)
+        if self._live2d_initial_play_generation == source_generation:
+            return
+        self._live2d_initial_play_generation = source_generation
+        if not self.auto_play_motion_check.isChecked() or self.freeze_motion_check.isChecked():
+            return
+        first = next((index for index, motion in enumerate(self._motion_items)
+                      if Path(str(motion.get("file") or "")).is_file()), None)
+        if first is not None:
+            with QSignalBlocker(self.motion_combo):
+                self.motion_combo.setCurrentIndex(first)
+            self._on_motion_selection_changed(first, autoplay=False)
+            self.play_selected_motion()
+
+    def _fit_preview_model(self):
+        if self._resource_mode == "live2d" and self.live2d_preview:
+            self.live2d_preview.fit_model()
+
+    def _on_content_fit_mode_changed(self, enabled: bool):
+        if self._resource_mode != "live2d" or (self.sender() is not None and self.sender() is not self.live2d_preview):
+            return
+        with QSignalBlocker(self.settings_panel.content_fit_check):
+            self.settings_panel.content_fit_check.setChecked(enabled)
+        self._save_preview_ui_state()
+
+    def _on_content_fit_applied(self, state: dict):
+        if (self._resource_mode != "live2d" or self.live2d_preview is None
+                or (self.sender() is not None and self.sender() is not self.live2d_preview)
+                or state.get("model_generation") != self.live2d_preview.model_load_generation()):
+            return
+        self.settings_panel.sync_view_transform(state)
         self._save_preview_ui_state()
 
     def _on_pose_freeze_toggled(self, frozen: bool):
@@ -4696,9 +4799,12 @@ class PreviewPage(QFrame):
             return False
 
         try:
+            self._live2d_load_in_progress = True
+            self._pending_live2d_ready = None
+            self._live2d_ready_generation = None
             self._terminate_preview_process()
             motions = self._load_motions_from_model_json(self.current_model_path)
-            self._populate_motion_controls(motions)
+            self._populate_motion_controls(motions, autoplay=False)
             if self.preview_placeholder:
                 self.preview_placeholder.setVisible(False)
             if self.image_preview_panel:
@@ -4707,7 +4813,10 @@ class PreviewPage(QFrame):
             preview = self._ensure_embedded_live2d()
             if preview is None or preview.live2d_canvas is None:
                 raise RuntimeError("Live2D OpenGL canvas could not be created.")
+            self._connect_live2d_preview_events(preview)
             preview.load_model(self.current_model_path)
+            generation = getattr(preview, "model_load_generation", lambda: 0)()
+            self._pending_live2d_ready = (self.current_model_path, generation, self._live2d_source_generation)
             settings = self.settings_panel.get_settings()
             settings.update(self.advanced_panel.get_advanced_settings())
             settings.update({
@@ -4722,11 +4831,12 @@ class PreviewPage(QFrame):
             self._set_resource_mode("live2d")
             preview.show()
             self._set_motion_debug_visible(True)
-            self._on_motion_selection_changed(self.motion_combo.currentIndex())
+            self._on_motion_selection_changed(self.motion_combo.currentIndex(), autoplay=False)
             self._parameter_refresh_retries = 5
             self._parameter_refresh_timer.start()
             return True
         except Exception as exc:
+            self._pending_live2d_ready = None
             self._terminate_preview_process()
             self._set_motion_debug_visible(False)
             self._show_stage_placeholder(tr("preview.stage_empty"), keep_editor_source=True)
@@ -4735,6 +4845,8 @@ class PreviewPage(QFrame):
                 tr("preview_window.error_model_load_failed", error_type=type(exc).__name__, error=exc),
             )
             return False
+        finally:
+            self._live2d_load_in_progress = False
 
     def open_psd_project_preview(self, model_json_path: str, project_file: str):
         """Open a model with PSD provenance, enabling named pose export."""
@@ -4838,7 +4950,7 @@ class PreviewPage(QFrame):
     def on_request_refresh_params(self):
         """Refresh motions and parameter metadata from the embedded model."""
         if self.current_model_path:
-            self._populate_motion_controls(self._load_motions_from_model_json(self.current_model_path))
+            self._populate_motion_controls(self._load_motions_from_model_json(self.current_model_path), autoplay=False)
             self._refresh_parameter_controls(2)
         else:
             self._populate_motion_controls([])
