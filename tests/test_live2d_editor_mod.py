@@ -128,7 +128,7 @@ class Live2DEditorModTests(unittest.TestCase):
         # obtains the same data directly from Cubism Core.
         (self.mod.current_project.base_model_json.parent / "drawables.json").write_bytes(
             (self.model.parent / "drawables.json").read_bytes())
-        self.page.tabs.setCurrentWidget(self.page.mod_tab)
+        self.page.show_viewer_export()
         self.mod.preview_main_model()
         self.page.preview.live2d_canvas.modelPointClicked.emit(.5, .5)
         self.assertIs(self.page.tabs.currentWidget(), self.page.mod_tab)
@@ -230,7 +230,7 @@ class Live2DEditorModTests(unittest.TestCase):
                            for root in (first.project_dir, second.project_dir)
                            for path in root.rglob("*") if path.is_file()}
         self.settings.set("live2dviewer_mod.project_files", [str(first.project_file)])
-        self.page.tabs.setCurrentWidget(self.page.mod_tab)
+        self.page.show_viewer_export()
         self.page.resize(1040, 760)
         self.page.show()
         self.mod.workflow_tabs.setCurrentIndex(0)

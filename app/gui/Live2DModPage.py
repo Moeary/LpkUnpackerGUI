@@ -39,7 +39,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
-    QMessageBox,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -58,7 +57,6 @@ from qfluentwidgets import (
     InfoBar,
     InfoBarPosition,
     LineEdit,
-    MessageBoxBase,
     PrimaryPushButton,
     PushButton,
     ScrollArea,
@@ -91,6 +89,7 @@ from app.core.settings_manager import SettingsManager
 from app.core.live2d_editor_mod_preview import mapped_mod_skin_preview
 from app.gui.editor_workspace import EditorViewportLayout, FluentEditorTabs
 from app.i18n import get_i18n, tr
+from app.gui.editor_dialogs import EditorMessageBox as QMessageBox, ThemedEditorDialog as MessageBoxBase
 
 
 MODEL_DRAG_MIME = "application/x-live2d-mod-model"
@@ -230,19 +229,27 @@ class ProjectNameDialog(MessageBoxBase):
     def validate(self) -> bool:
         return bool(self.name_edit.text().strip())
 
+    def _on_confirm(self):
+        if self.validate():
+            self.accept()
+
     @property
     def project_name(self) -> str:
         return sanitize_project_name(self.name_edit.text())
 
 
-class DeleteProjectDialog(QDialog):
+class DeleteProjectDialog(MessageBoxBase):
     def __init__(self, project_name: str, project_dir: Path, parent=None):
         super().__init__(parent)
         self.setWindowTitle(
             tr("mod.project.delete_title", default="删除 MOD 工程")
         )
         self.setMinimumWidth(460)
-        layout = QVBoxLayout(self)
+        self.main_layout.setContentsMargins(0, 0, 0, 0)
+        self.title_label.hide()
+        self.yesButton.hide()
+        self.cancelButton.hide()
+        layout = self.content_layout
         layout.setContentsMargins(22, 20, 22, 18)
         layout.setSpacing(14)
 
@@ -295,7 +302,7 @@ class DeleteProjectDialog(QDialog):
         return self.delete_files_checkbox.isChecked()
 
 
-class TextureMappingDialog(QDialog):
+class TextureMappingDialog(MessageBoxBase):
     def __init__(
         self,
         skin_name: str,
@@ -303,9 +310,11 @@ class TextureMappingDialog(QDialog):
         source_textures: list[Path],
         current_mappings: list[tuple[int, Path]],
         parent=None,
+        *, hint_text: str | None = None,
     ):
         super().__init__(parent)
         self.setWindowTitle(tr("mod.mapping.dialog_title", default="编辑多贴图映射"))
+        self.setMaximumWidth(16777215)
         self.setMinimumSize(900, 560)
         self.main_textures = [
             path.resolve() for path in main_textures if path.is_file()
@@ -318,7 +327,11 @@ class TextureMappingDialog(QDialog):
             for target, source in current_mappings
         }
 
-        layout = QVBoxLayout(self)
+        self.main_layout.setContentsMargins(0, 0, 0, 0)
+        self.title_label.hide()
+        self.yesButton.hide()
+        self.cancelButton.hide()
+        layout = self.content_layout
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(10)
         title = SubtitleLabel(
@@ -330,7 +343,7 @@ class TextureMappingDialog(QDialog):
             self,
         )
         hint = CaptionLabel(
-            tr(
+            hint_text or tr(
                 "mod.mapping.hint",
                 default="每一行都是一张导入贴图。请选择它对应的主模型贴图；同名、同尺寸和同序号会优先自动匹配。",
             ),
@@ -442,15 +455,20 @@ class TextureMappingDialog(QDialog):
         self.accept()
 
 
-class TextureGalleryDialog(QDialog):
+class TextureGalleryDialog(MessageBoxBase):
     def __init__(self, title: str, textures: list[Path], parent=None):
         super().__init__(parent)
         self.setWindowTitle(title)
+        self.setMaximumWidth(16777215)
         self.setMinimumSize(860, 620)
         self.textures = [path.resolve() for path in textures if path.is_file()]
         self.current_index = 0
 
-        layout = QVBoxLayout(self)
+        self.main_layout.setContentsMargins(0, 0, 0, 0)
+        self.title_label.hide()
+        self.yesButton.hide()
+        self.cancelButton.hide()
+        layout = self.content_layout
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(10)
         header = QHBoxLayout()
@@ -1003,6 +1021,7 @@ class Live2DModPage(QFrame):
         self.worker: ModTaskThread | None = None
         self.worker_kind = ""
         self.pending_sources: list[str] = []
+        self._pending_skin_names: dict[str, str] = {}
         self.requested_preview_model_id = ""
         self.previewed_model_id = ""
         self._project_combo_refreshing = False
@@ -1439,7 +1458,7 @@ class Live2DModPage(QFrame):
             return
         self.queue_source_imports([source])
 
-    def queue_source_imports(self, sources: list[str]):
+    def queue_source_imports(self, sources: list[str], *, skin_names: dict[str, str] | None = None):
         normalized = [
             str(Path(source).resolve())
             for source in sources
@@ -1447,6 +1466,9 @@ class Live2DModPage(QFrame):
         ]
         if not normalized:
             return
+        if skin_names:
+            self._pending_skin_names.update({str(Path(path).resolve()): name
+                                             for path, name in skin_names.items()})
         if self.worker:
             self.pending_sources.extend(normalized)
             self.append_log(
@@ -1519,6 +1541,7 @@ class Live2DModPage(QFrame):
             "add",
             project=self.current_project,
             source=source,
+            skin_name=self._pending_skin_names.pop(source, None),
             temp_root=self.settings_manager.get_temp_dir(),
         )
 
@@ -1576,6 +1599,7 @@ class Live2DModPage(QFrame):
         )
         if self.worker_kind == "create":
             self.pending_sources.clear()
+            self._pending_skin_names.clear()
 
     def on_worker_finished(self):
         self.worker = None

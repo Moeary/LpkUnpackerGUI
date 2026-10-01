@@ -3,13 +3,14 @@ from __future__ import annotations
 
 from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QAction
-from PySide6.QtWidgets import QDialog, QHBoxLayout, QVBoxLayout, QApplication
+from PySide6.QtWidgets import QApplication
 from qfluentwidgets import (
     BodyLabel, CaptionLabel, DoubleSpinBox, EditableComboBox, LineEdit,
-    PrimaryPushButton, PushButton, RoundMenu, isDarkTheme,
+    RoundMenu,
 )
 
 from app.core.animation_editing import _name
+from app.gui.editor_dialogs import ThemedEditorDialog
 from app.i18n import tr
 
 
@@ -125,24 +126,22 @@ class ActionComboBox(EditableComboBox):
         self.setAccessibleName(action_text("editor.actions.search"))
 
 
-class ActionNameDialog(QDialog):
+class ActionNameDialog(ThemedEditorDialog):
     """An owned top-level window, above native QWindow render surfaces."""
 
     def __init__(self, title, parent, duration=True, existing_names=(), initial_name=""):
-        super().__init__(parent, Qt.WindowType.Dialog)
+        super().__init__(parent)
         self.setWindowTitle(title)
-        self.setWindowModality(Qt.WindowModality.WindowModal)
         self.existing_names = set(existing_names)
         self.setMinimumWidth(340)
         self.setMaximumWidth(480)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 18, 20, 18)
-        layout.setSpacing(10)
+        layout = self.viewLayout
         layout.addWidget(BodyLabel(action_text("editor.actions.name"), self))
         self.name_edit = LineEdit(self)
         self.name_edit.setText(initial_name)
         self.name_edit.selectAll()
         layout.addWidget(self.name_edit)
+        self.bind_submit_edit(self.name_edit)
         self.duration_spin = DoubleSpinBox(self)
         self.duration_spin.setRange(.01, 3600)
         self.duration_spin.setDecimals(3)
@@ -154,20 +153,13 @@ class ActionNameDialog(QDialog):
             self.duration_spin.hide()
         self.error_label = CaptionLabel(self)
         self.error_label.setWordWrap(True)
-        self.error_label.setStyleSheet("color: #e67d73;")
+        self.error_label.setTextColor("#b3261e", "#ffb4ac")
         self.error_label.hide()
         layout.addWidget(self.error_label)
-        buttons = QHBoxLayout()
-        buttons.addStretch(1)
-        self.cancelButton = PushButton(tr("common.cancel", default="取消"), self)
-        self.yesButton = PrimaryPushButton(tr("common.confirm", default="确定"), self)
-        buttons.addWidget(self.cancelButton)
-        buttons.addWidget(self.yesButton)
-        layout.addLayout(buttons)
-        self.cancelButton.clicked.connect(self.reject)
-        self.yesButton.clicked.connect(self._submit)
         self.name_edit.returnPressed.connect(self._submit)
-        self.setStyleSheet(f"ActionNameDialog {{ background: {'#242629' if isDarkTheme() else '#fafafa'}; }}")
+
+    def _on_confirm(self):
+        self._submit()
 
     def validate(self):
         name = self.name_edit.text().strip()
@@ -196,25 +188,19 @@ class ActionNameDialog(QDialog):
         self.name_edit.setFocus()
 
 
-class ActionDeleteDialog(QDialog):
+class ActionDeleteDialog(ThemedEditorDialog):
     def __init__(self, name, parent):
-        super().__init__(parent, Qt.WindowType.Dialog)
+        super().__init__(parent)
+        self._name = name
         self.setWindowTitle(action_text("editor.actions.delete_title"))
-        self.setWindowModality(Qt.WindowModality.WindowModal)
         self.setMinimumWidth(340)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 18, 20, 18)
+        layout = self.viewLayout
         label = BodyLabel(action_text("editor.actions.delete_message", name=name), self)
         label.setWordWrap(True)
         layout.addWidget(label)
-        row = QHBoxLayout()
-        row.addStretch(1)
-        self.cancelButton = PushButton(tr("common.cancel", default="取消"), self)
-        self.yesButton = PrimaryPushButton(action_text("editor.actions.delete"), self)
-        row.addWidget(self.cancelButton)
-        row.addWidget(self.yesButton)
-        layout.addLayout(row)
-        self.cancelButton.clicked.connect(self.reject)
-        self.yesButton.clicked.connect(self.accept)
+        self.yesButton.setText(action_text("editor.actions.delete"))
         self.cancelButton.setDefault(True)
-        self.setStyleSheet(f"ActionDeleteDialog {{ background: {'#242629' if isDarkTheme() else '#fafafa'}; }}")
+
+    def retranslate_ui(self, *_args):
+        super().retranslate_ui()
+        self.yesButton.setText(action_text("editor.actions.delete"))

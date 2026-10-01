@@ -68,8 +68,12 @@ class EditorActionControlsTests(unittest.TestCase):
                 self.app.processEvents()
                 self.assertTrue(dialog.isVisible())
                 self.assertTrue(dialog.error_label.isVisible())
+                QTest.keyClick(dialog.name_edit, Qt.Key_Return)
+                self.app.processEvents()
+                self.assertTrue(dialog.isVisible())
+                self.assertTrue(dialog.error_label.isVisible())
             dialog.name_edit.setText("NewPose")
-            QTest.mouseClick(dialog.yesButton, Qt.LeftButton)
+            QTest.keyClick(dialog.name_edit, Qt.Key_Return)
             self.assertEqual(dialog.result(), QDialog.Accepted)
             self.assertFalse(dialog.isVisible())
         finally:

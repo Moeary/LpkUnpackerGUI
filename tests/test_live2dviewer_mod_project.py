@@ -27,6 +27,7 @@ from app.core.live2dviewer_mod_project import (
     rename_model_skin,
     rename_project,
     save_project,
+    validate_switch_motion_groups,
 )
 
 
@@ -276,6 +277,45 @@ class Live2DViewerModProjectTests(unittest.TestCase):
             "already has an event",
         ):
             generate_live2dviewer_mod(project)
+
+    def test_reserved_user_motion_is_rejected_before_existing_build_is_touched(self):
+        project = create_project_from_base_source(self.main_source, output_root=self.root / "collision-projects")
+        document = json.loads(project.base_model_json.read_text(encoding="utf-8"))
+        document["FileReferences"]["Motions"] = {"SwitchSkin": [{"Name": "User animation", "File": "custom.motion3.json"}]}
+        project.base_model_json.write_text(json.dumps(document), encoding="utf-8")
+        sentinel = project.project_dir / BUILD_DIR / "existing-build.bin"
+        sentinel.parent.mkdir(parents=True)
+        sentinel.write_bytes(b"Preserve previous export on validation failure")
+        before = project.base_model_json.read_bytes()
+        with self.assertRaisesRegex(Live2DViewerModProjectError, "existing motion group: SwitchSkin"):
+            generate_live2dviewer_mod(project)
+        self.assertEqual(project.base_model_json.read_bytes(), before)
+        self.assertEqual(sentinel.read_bytes(), b"Preserve previous export on validation failure")
+        self.assertFalse((sentinel.parent / "model0.json").exists())
+
+    def test_generated_pair_can_be_imported_and_regenerated_but_custom_fields_cannot(self):
+        # Use the canonical Viewer input name, so no retained authoring model
+        # settings can take precedence over the selected generated model.
+        source = self.main_source.with_name("model0.json")
+        self.main_source.rename(source)
+        project = create_project_from_base_source(source, output_root=self.root / "first-generation")
+        project = add_model_to_project(project, self.skin_source, skin_name="Blue")
+        project.data["selected_artmesh_id"] = "ArtMeshBody"
+        project = generate_live2dviewer_mod(load_project(save_project(project.project_dir, project.data)))
+        generated = project.project_dir / BUILD_DIR / "model0.json"
+        original_generated = generated.read_bytes()
+        validate_switch_motion_groups(json.loads(original_generated))
+        imported = create_project_from_base_source(generated, output_root=self.root / "regenerated")
+        # The old generated trigger remains bound; choose the other unused area.
+        imported = add_model_to_project(imported, self.skin_source, skin_name="Another blue")
+        imported.data["selected_artmesh_id"] = "ArtMeshHead"
+        imported = generate_live2dviewer_mod(load_project(save_project(imported.project_dir, imported.data)))
+        result = json.loads((imported.project_dir / BUILD_DIR / "model0.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["FileReferences"]["Motions"]["TapSwitchSkin"][0]["Choices"][1]["Text"], "Another blue")
+        self.assertEqual(generated.read_bytes(), original_generated)
+        result["FileReferences"]["Motions"]["SwitchSkin"][0]["PostCommand"] = "custom operation must be preserved"
+        with self.assertRaisesRegex(Live2DViewerModProjectError, "existing motion group"):
+            validate_switch_motion_groups(result)
 
     def test_project_can_be_renamed_and_deleted_safely(self):
         project = create_project_from_base_source(

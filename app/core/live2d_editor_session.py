@@ -28,6 +28,7 @@ from app.core.model.motions import _evaluate_segments
 from app.core.psd_reconstructor import resolve_live2d_source
 from app.core.live2d_references import iter_live2d_asset_references
 from app.core.live2d_editor_project import Live2DEditorProjects
+from app.core.live2d_skins import Live2DSkins
 
 
 EDITOR_MANIFEST = "lpk_live2d_editor.json"
@@ -305,6 +306,7 @@ class Live2DEditorSession:
             self.texture_paths = [self.root / _relative(rel) for rel in document["FileReferences"].get("Textures", [])]
             self.texture_sizes = [self._image_size(path) for path in self.texture_paths]
             self._texture_data = [path.read_bytes() for path in self.texture_paths]
+            self._skins = Live2DSkins(self)
             self.parameters = self.project.parameters
             self.parameter_overrides: dict[str, float] = {}
             self.part_overrides: dict[str, float] = {}
@@ -327,6 +329,8 @@ class Live2DEditorSession:
                     self.part_overrides = {k: float(v) for k, v in state.get("preview_part_opacity", {}).items()
                                            if math.isfinite(float(v)) and 0 <= float(v) <= 1}
                     self._projects.restore(self.source_root, state)
+                    if state.get("skins") is not None:
+                        self._skins.restore(self.source_root, state["skins"])
             self._undo: list[dict] = []
             self._redo: list[dict] = []
             self._saved_signature = self._signature()
@@ -371,6 +375,7 @@ class Live2DEditorSession:
                 "bindings": project.bindings, "settings": project.settings,
                 "modified": project.modified, "parameters": self.parameter_overrides,
                 "parts": self.part_overrides, "textures": self._texture_data,
+                "skins": self._skins.state,
                 "original_bindings": self.original_bindings,
                 "deleted_original_bindings": self._deleted_original_bindings}
 
@@ -395,6 +400,7 @@ class Live2DEditorSession:
         self.parameter_overrides = state["parameters"]
         self.part_overrides = state["parts"]
         self._texture_data = state["textures"]
+        self._skins.state = state["skins"]
         self.original_bindings = state["original_bindings"]
         self._deleted_original_bindings = state["deleted_original_bindings"]
         self._invalidate_signature()
@@ -453,6 +459,52 @@ class Live2DEditorSession:
     @property
     def dirty(self) -> bool:
         return self._signature() != self._saved_signature
+
+    @property
+    def active_skin_id(self):
+        return self._skins.active_id
+
+    @property
+    def skin_modified(self):
+        return self._skins.modified
+
+    def list_skins(self):
+        return self._skins.list()
+
+    def inspect_skin_source(self, source):
+        return self._skins.inspect_source(source)
+
+    def skin_texture_paths(self, skin_id):
+        return self._skins.paths(skin_id)
+
+    def import_skin(self, source, name=None, *, mapping=None, source_kind="model",
+                    source_metadata=None, metadata=None, activate=False):
+        return self._skins.import_skin(source, name, mapping=mapping, source_kind=source_kind,
+                                       metadata=metadata if metadata is not None else source_metadata, activate=activate)
+
+    def capture_skin(self, name, *, source_kind="current", source_metadata=None, metadata=None):
+        return self._skins.capture(name, source_kind=source_kind,
+                                  metadata=metadata if metadata is not None else source_metadata)
+
+    def clone_skin(self, skin_id, name):
+        return self._skins.clone(skin_id, name)
+
+    def rename_skin(self, skin_id, name):
+        return self._skins.rename(skin_id, name)
+
+    def remove_skin(self, skin_id):
+        return self._skins.remove(skin_id)
+
+    delete_skin = remove_skin
+
+    def apply_skin(self, skin_id):
+        return self._skins.apply(skin_id)
+
+    def export_skin(self, skin_id, output_dir):
+        return self._skins.export_skin(skin_id, output_dir)
+
+    def export_viewerex(self, skin_ids, output_dir, *, trigger_id=None):
+        return self._skins.export_viewerex(skin_ids, output_dir, trigger_id=trigger_id)
 
     @property
     def psd_project(self):
@@ -764,14 +816,14 @@ class Live2DEditorSession:
     def export_snapshot(self, output_dir: str | Path) -> Path:
         output = Path(output_dir).expanduser().resolve()
         if not output.is_relative_to(self.root):
-            return Path(self.save_copy(output, include_projects=False, mark_saved=False)["model_path"])
+            return Path(self.save_copy(output, include_projects=False, include_skins=False, mark_saved=False)["model_path"])
         if output.exists() or output.is_relative_to(self.source_root):
             raise AnimationEditingError("Create a snapshot in a new editor workspace directory.")
         # The animation exporter forbids a destination inside its input root.
         # Export independently first, then publish the immutable snapshot into
         # a new managed directory without consuming the editor's dirty state.
         with tempfile.TemporaryDirectory(prefix="lpk-editor-export-") as temporary:
-            exported = self.save_copy(Path(temporary) / "model", include_projects=False, mark_saved=False)
+            exported = self.save_copy(Path(temporary) / "model", include_projects=False, include_skins=False, mark_saved=False)
             output.parent.mkdir(parents=True, exist_ok=True)
             with tempfile.TemporaryDirectory(prefix=".lpk-snapshot-", dir=output.parent) as publishing:
                 stage = Path(publishing) / "model"
@@ -781,7 +833,8 @@ class Live2DEditorSession:
 
     export_model_snapshot = export_snapshot
 
-    def save_copy(self, output_dir: str | Path, *, include_projects: bool = True, mark_saved: bool = True) -> dict[str, Any]:
+    def save_copy(self, output_dir: str | Path, *, include_projects: bool = True, include_skins: bool = True,
+                  include_editor_metadata: bool = True, mark_saved: bool = True) -> dict[str, Any]:
         output = Path(output_dir).expanduser().resolve()
         if output.exists() or output.is_relative_to(self.source_root) or self.source_root.is_relative_to(output):
             raise AnimationEditingError("Save to a new folder outside the source package.")
@@ -823,11 +876,19 @@ class Live2DEditorSession:
                     entries.pop(original_index)
             self._write_json(Path(result["model_path"]), document)
             projects = self._projects.export(stage) if include_projects else {}
-            self._write_json(stage / "model.drawables.json", self.snapshot_mesh(self.parameter_overrides))
-            self._write_json(stage / EDITOR_MANIFEST, {"format": "LpkUnpacker.Live2DEditor", "version": 2,
-                               "source_path": str(self.source_path), "pose_parameters": self.parameter_overrides,
-                               "preview_part_opacity": self.part_overrides, "warnings": self.warnings,
-                               "authoring_source": None, "model": "model.json", "projects": projects})
+            if include_editor_metadata:
+                state = {"format": "LpkUnpacker.Live2DEditor", "version": 2,
+                         "source_path": str(self.source_path), "pose_parameters": self.parameter_overrides,
+                         "preview_part_opacity": self.part_overrides, "warnings": self.warnings,
+                         "authoring_source": None, "model": "model.json", "projects": projects}
+                if include_skins:
+                    state["skins"] = self._skins.export_registry(stage)
+                else:
+                    active = self._skins.get(self.active_skin_id)
+                    state["skin_at_export"] = {"id": active["id"], "name": active["name"],
+                                                "working_modified": self.skin_modified}
+                self._write_json(stage / "model.drawables.json", self.snapshot_mesh(self.parameter_overrides))
+                self._write_json(stage / EDITOR_MANIFEST, state)
             manifest_path = Path(result["manifest_path"])
             manifest = _read_json(manifest_path)
             manifest["animations"] = [self.project._summary(name) for name in sorted(modified)]
@@ -841,7 +902,9 @@ class Live2DEditorSession:
             _rename_directory(stage, output)
         if mark_saved:
             self._saved_signature = self._signature()
-        return dict(result, editor_manifest_path=str(output / EDITOR_MANIFEST))
+        if include_editor_metadata:
+            result["editor_manifest_path"] = str(output / EDITOR_MANIFEST)
+        return result
 
     def close(self) -> None:
         self._core_model = None

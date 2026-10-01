@@ -238,6 +238,51 @@ class SpineEditorPageTests(unittest.TestCase):
         self.assertTrue(self.page.session.dirty)
         self.assertEqual(self.page.session.bone("hip")["y"], 10)
 
+    def test_real_ctrl_z_ctrl_y_preserve_selected_expanded_scrolled_filtered_structure(self):
+        document = json.loads(self.model.read_text(encoding="utf-8"))
+        for branch in range(16):
+            document["bones"].append({"name": f"branch-{branch}", "parent": "root"})
+            for leaf in range(5):
+                document["bones"].append({"name": f"leaf-{branch}-{leaf}", "parent": f"branch-{branch}"})
+        self.model.write_text(json.dumps(document), encoding="utf-8")
+        original = self.model.read_bytes()
+        self.open()
+        tree = self.page.tree
+        self.page.search_edit.setText("leaf")
+        tree.expandAll()
+        items = {item.data(0, Qt.UserRole): item for item in self.page._structure_items()}
+        items[("bone", "branch-2")].setExpanded(False)
+        target = items[("bone", "leaf-13-3")]
+        tree.setCurrentItem(target)
+        tree.scrollToItem(target)
+        tree.setFocus()
+        self.app.processEvents()
+        self.assertGreater(tree.verticalScrollBar().value(), 0)
+        expected = self.page._structure_view_state()
+        self.page._transform_edited("leaf-13-3", {"x": 25})
+        self.assertEqual(self.page.session.bone("leaf-13-3")["x"], 25)
+        for key, x in ((Qt.Key_Z, 0), (Qt.Key_Y, 25), (Qt.Key_Z, 0)):
+            with self.subTest(shortcut=key, x=x):
+                QTest.keyClick(tree, key, Qt.ControlModifier)
+                self.app.processEvents()
+                self.assertEqual(self.page.session.bone("leaf-13-3").get("x", 0), x)
+                self.assertEqual(self.page._structure_view_state(), expected)
+                self.assertEqual(self.page._selection, ("bone", "leaf-13-3"))
+                self.assertEqual(self.page.search_edit.text(), "leaf")
+                hidden = {item.data(0, Qt.UserRole) for item in self.page._structure_items() if item.isHidden()}
+                self.assertIn(("bone", "hip"), hidden)
+                self.assertNotIn(("bone", "leaf-13-3"), hidden)
+        self.assertEqual(self.model.read_bytes(), original)
+
+    def test_refresh_keeps_existing_nodes_and_falls_back_when_selection_was_removed(self):
+        self.open()
+        self.page.tree.setCurrentItem(self.page.tree.topLevelItem(0).child(0))
+        self.page.session.document["bones"] = [{"name": "root"}]
+        self.page.session.document["animations"] = {}
+        self.page._populate()
+        self.assertEqual(self.page._selection, ("bone", "root"))
+        self.assertEqual(self.page.tree.currentItem().data(0, Qt.UserRole), ("bone", "root"))
+
     def test_shutdown_waits_for_copy_worker_and_releases_private_source(self):
         real = SpineEditorSession.open
         def delayed(path):

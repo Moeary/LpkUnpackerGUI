@@ -10,11 +10,11 @@ from PySide6.QtGui import QDesktopServices, QImage, QKeySequence, QPixmap, QShor
 from PySide6.QtWidgets import (
     QAbstractItemView, QDialog, QFileDialog,
     QFrame, QHBoxLayout, QHeaderView, QLabel,
-    QMessageBox, QSizePolicy, QTableWidgetItem, QVBoxLayout, QWidget,
+    QSizePolicy, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 from qfluentwidgets import (
     BodyLabel, CaptionLabel, CardWidget, CheckBox, ComboBox, DoubleSpinBox,
-    FluentIcon, LineEdit, MessageBoxBase, PrimaryPushButton,
+    FluentIcon, LineEdit, PrimaryPushButton,
     PushButton, RoundMenu, ScrollArea, Slider, SubtitleLabel, TableWidget,
     TransparentToolButton,
 )
@@ -22,9 +22,11 @@ from qfluentwidgets import (
 from app.core.live2d_editor_session import Live2DEditorSession
 from app.gui.ArtMeshInspector import ArtMeshInspector
 from app.gui.live2d_editor_panels import ProjectBoundModPage
+from app.gui.live2d_skin_controls import SkinCatalogControls, SkinDropFrame, SkinNameDialog, TexturePreviewLabel, skin_text
 from app.gui.PsdReconstructionPage import PsdReconstructionPage
 from app.gui.editor_timeline import AnimationTimelineEditor
 from app.gui.editor_actions import ActionComboBox, ActionDeleteDialog, ActionNameDialog, action_text, close_editor_popup
+from app.gui.editor_dialogs import EditorMessageBox as QMessageBox, EditorTextDialog, ThemedEditorDialog as MessageBoxBase
 from app.gui.editor_workspace import EditorViewportLayout, EditorWorkspace, FluentEditorTabs
 from app.i18n import get_i18n, tr
 
@@ -237,26 +239,49 @@ class Live2DEditorPage(QFrame):
         self.psd_panel.repackApplyRequested.connect(self.apply_psd_version)
         self.psd_panel.repackModRequested.connect(self.send_psd_version_to_mod)
         self.psd_panel.projectChanged.connect(self._psd_project_changed)
+        self.psd_panel.repackSkinReady.connect(self._psd_skin_ready)
         self.psd_panel.unifiedPreviewRequested.connect(self._open_psd_preview)
         self.psd_panel.previewClosed.connect(self.return_to_current_model)
         self.psd_panel.export_snapshot_provider = self._psd_export_snapshot
         self.psd_panel.preview_command_handler = self._psd_preview_command
         psd_layout.addWidget(self.psd_panel)
         self.tabs.addTab(self.psd_tab, "")
-        self.mod_tab = QWidget(self.tabs)
-        mod_layout = QVBoxLayout(self.mod_tab)
+        self.export_tab = QWidget(self.tabs)
+        self.mod_tab = self.export_tab  # compatibility route; advanced page is nested below
+        export_layout = EditorViewportLayout(self.export_tab)
+        export_layout.setContentsMargins(4, 4, 4, 4)
+        self.export_tabs = FluentEditorTabs(self.export_tab)
+        export_layout.addWidget(self.export_tabs)
+        self.model_export_tab = QWidget(self.export_tabs)
+        ordinary_layout = EditorViewportLayout(self.model_export_tab)
+        ordinary_layout.setContentsMargins(8, 8, 8, 8)
+        self.export_skin_combo = ActionComboBox(self.model_export_tab)
+        self.export_skin_combo.setMaximumWidth(16777215)
+        ordinary_layout.addWidget(self.export_skin_combo)
+        self.model_export_hint = CaptionLabel(self.model_export_tab)
+        self.model_export_hint.setWordWrap(True)
+        ordinary_layout.addWidget(self.model_export_hint)
+        self.export_model_button = PrimaryPushButton(FluentIcon.SAVE, "", self.model_export_tab)
+        self.export_model_button.clicked.connect(self._choose_skin_export)
+        ordinary_layout.addWidget(self.export_model_button)
+        ordinary_layout.addStretch(1)
+        self.export_tabs.addTab(self.model_export_tab, "")
+        self.viewer_tab = QWidget(self.export_tabs)
+        mod_layout = EditorViewportLayout(self.viewer_tab)
         mod_layout.setContentsMargins(4, 4, 4, 4)
-        self.use_for_mod_button = PrimaryPushButton(self.mod_tab)
+        self.use_for_mod_button = PrimaryPushButton(self.viewer_tab)
         self.use_for_mod_button.clicked.connect(self._use_edited_for_mod)
         mod_layout.addWidget(self.use_for_mod_button)
-        self.mod_hint = CaptionLabel(self.mod_tab)
+        self.mod_hint = CaptionLabel(self.viewer_tab)
         self.mod_hint.hide()
-        self.mod_panel = ProjectBoundModPage(lambda: self.session, self.mod_tab)
+        self.mod_panel = ProjectBoundModPage(lambda: self.session, self.viewer_tab)
         self.mod_panel.previewModelRequested.connect(self._open_mod_preview)
         self.mod_panel.triggerSelectionChanged.connect(self._mod_trigger_selected)
         self.mod_panel.projectChanged.connect(self._mod_project_changed)
         mod_layout.addWidget(self.mod_panel, 1)
-        self.tabs.addTab(self.mod_tab, "")
+        self.export_tabs.addTab(self.viewer_tab, "")
+        self.export_tabs.currentChanged.connect(self._tab_changed)
+        self.tabs.addTab(self.export_tab, "")
         timeline_host = QWidget(self)
         timeline_layout = EditorViewportLayout(timeline_host)
         timeline_layout.setContentsMargins(0, 0, 0, 0)
@@ -451,20 +476,31 @@ class Live2DEditorPage(QFrame):
         self.tabs.addTab(self.artmesh_tab, "")
 
     def _build_texture_tab(self):
-        self.texture_tab = QWidget(self.tabs)
+        self.texture_tab = SkinDropFrame(self.tabs)
+        self.texture_tab.filesDropped.connect(self.import_skin_files)
         layout = QVBoxLayout(self.texture_tab)
         layout.setContentsMargins(8, 8, 8, 8)
+        self.skin_controls = SkinCatalogControls(self.texture_tab)
+        self.skin_controls.skinSelected.connect(self.apply_skin)
+        self.skin_controls.captureRequested.connect(self._capture_skin_dialog)
+        self.skin_controls.renameRequested.connect(self._rename_skin_dialog)
+        self.skin_controls.deleteRequested.connect(self._delete_skin_dialog)
+        self.skin_controls.importModelRequested.connect(self._import_skin_model_dialog)
+        self.skin_controls.importTexturesRequested.connect(self._import_skin_textures_dialog)
+        self.skin_controls.editPsdRequested.connect(self.open_psd_workspace)
+        self.texture_tab.watch_drop_surface(self.skin_controls)
+        layout.addWidget(self.skin_controls)
         self.texture_combo = ComboBox(self.texture_tab)
         self.texture_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.texture_combo.currentIndexChanged.connect(self._refresh_texture_image)
         layout.addWidget(self.texture_combo)
-        self.texture_image = QLabel(self.texture_tab)
+        self.texture_image = TexturePreviewLabel(self.texture_tab)
         self.texture_image.setObjectName("editorImage")
         self.texture_image.setAlignment(Qt.AlignCenter)
         self.texture_image.setMinimumSize(190, 150)
-        self.texture_image.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.texture_image.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Minimum)
         layout.addWidget(self.texture_image, 1)
-        actions = QHBoxLayout()
+        actions = QVBoxLayout()
         self.replace_texture_button = PushButton(self.texture_tab)
         self.choose_editor_button = PushButton(self.texture_tab)
         self.replace_texture_button.clicked.connect(self._choose_texture_replacement)
@@ -498,6 +534,8 @@ class Live2DEditorPage(QFrame):
         self.texture_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.texture_scroll.setWidget(content)
         self.texture_scroll.enableTransparentBackground()
+        self.texture_tab.watch_drop_surface(self.texture_scroll.viewport())
+        self.texture_tab.watch_drop_surface(self.texture_image)
         layout.addWidget(self.texture_scroll)
         self.tabs.addTab(self.texture_tab, "")
 
@@ -536,6 +574,19 @@ class Live2DEditorPage(QFrame):
         self.editor_label.setText(self._external_editor or _text("editor.live2d.default_editor"))
         self.part_opacity.setToolTip(_text("editor.live2d.opacity"))
         self.timeline.retranslate_ui()
+        self.skin_controls.retranslate_ui()
+        self.texture_hint.setText(skin_text("editor.skin.drop_hint"))
+        self.texture_hint.setToolTip(_text("editor.live2d.texture_hint"))
+        self.tabs.setTabText(2, skin_text("editor.skin.tab"))
+        self.tabs.setTabText(3, skin_text("editor.skin.psd_tab"))
+        self.tabs.setTabText(4, skin_text("editor.skin.export_tab"))
+        self.export_tabs.setTabText(0, skin_text("editor.skin.live2d_export"))
+        self.export_tabs.setTabText(1, skin_text("editor.skin.viewer_export"))
+        self.model_export_hint.setText(skin_text("editor.skin.live2d_hint"))
+        self.export_model_button.setText(skin_text("editor.skin.export_button"))
+        self.use_for_mod_button.setText(skin_text("editor.skin.viewer_add"))
+        self.use_for_mod_button.setToolTip(skin_text("editor.skin.viewer_hint"))
+        self._refresh_skin_controls()
         self.workspace.retranslate_ui()
         self.mod_panel.retranslate_ui()
         self.psd_panel.retranslate_ui()
@@ -744,6 +795,7 @@ class Live2DEditorPage(QFrame):
         if not self.session:
             raise RuntimeError(_text("editor.live2d.empty"))
         project = self.session.ensure_psd_project()
+        self.psd_panel.pending_skin_context = self._skin_context()
         target = project.project_dir / "snapshots" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         result = self.session.export_snapshot(target)
         return str(result["model_path"] if isinstance(result, dict) else result)
@@ -775,19 +827,59 @@ class Live2DEditorPage(QFrame):
         return prepare_repack_preview_workspace(self.psd_panel.current_project, token.split(":", 1)[1])
 
     def apply_psd_version(self, token: str) -> bool:
+        return bool(self.save_psd_version_as_skin(token))
+
+    def _psd_version_skin_context(self, token: str):
+        from app.core.psd_project import find_composite_entry, find_pose_scheme, find_repack_entry, resolve_project_path
+        project = self.psd_panel.current_project
+        kind, version_id = token.split(":", 1)
+        entry = find_repack_entry(project, version_id) if kind == "repack" else find_composite_entry(project, version_id)
+        if not entry:
+            return None
+        if "skin_source" in entry:
+            return copy.deepcopy(entry["skin_source"])
+        if kind == "composite":
+            return {"inputs": [{"version": item.get("version_id"),
+                                "skin": self._psd_version_skin_context("repack:" + item["version_id"])}
+                               for item in entry.get("inputs", []) if item.get("version_id")]}
+        scheme = find_pose_scheme(project, entry["scheme_id"]) if entry.get("scheme_id") else None
+        if scheme and scheme.get("skin_source"):
+            return copy.deepcopy(scheme["skin_source"])
+        source = resolve_project_path(project, entry["source_psd"]) if entry.get("source_psd") else None
+        for exported in project.data.get("psd_exports", []):
+            if source and exported.get("psd") and resolve_project_path(project, exported["psd"]) == source:
+                return copy.deepcopy(exported.get("skin_source"))
+        # Legacy history without provenance must not be attributed to the
+        # currently selected skin or the most recent unrelated PSD export.
+        return None
+
+    def save_psd_version_as_skin(self, token: str, name: str | None = None):
         try:
             if not self.session or self._projects_busy():
-                return False
+                return None
             if not self.return_to_current_model():
                 raise RuntimeError(_text("editor.live2d.return_failed"))
-            self.session.apply_texture_package(self._psd_version_workspace(token))
-            self._reload_preview_textures()
-            self._status(_text("editor.live2d.psd_applied"))
-            self._update_actions()
-            return True
+            model = self._psd_version_workspace(token)
+            self.session.validate_texture_package(model)
+            existing = {item["name"].casefold() for item in self.session.list_skins()}
+            base = name or "PSD " + token.split(":", 1)[1]
+            chosen = base
+            suffix = 2
+            while chosen.casefold() in existing:
+                chosen = f"{base} ({suffix})"
+                suffix += 1
+            metadata = {"project_file": self.psd_panel.current_project.project_file.relative_to(self.session.root).as_posix(),
+                        "version": token, "export_skin": self._psd_version_skin_context(token)}
+            record = self.import_skin(model, chosen, source_kind="psd", source_metadata=metadata)
+            if record:
+                self._status(skin_text("editor.skin.psd_result", name=record["name"]))
+            return record
         except Exception as exc:
             self._error(exc)
-            return False
+            return None
+
+    def _psd_skin_ready(self, token: str):
+        self.save_psd_version_as_skin(token)
 
     def send_psd_version_to_mod(self, token: str) -> bool:
         try:
@@ -807,8 +899,8 @@ class Live2DEditorPage(QFrame):
                 shutil.copy2(texture, package.texture_paths[index])
             if not self.mod_panel.current_project:
                 self.mod_panel.bind_project(self.session.ensure_mod_project())
-            self.mod_panel.queue_source_imports([model_path])
-            self.tabs.setCurrentWidget(self.mod_tab)
+            self.mod_panel.queue_source_imports([model_path], skin_names={model_path: "PSD " + token.split(":", 1)[1]})
+            self.show_viewer_export()
             return True
         except Exception as exc:
             self._error(exc)
@@ -1167,7 +1259,7 @@ class Live2DEditorPage(QFrame):
         if self._inspector_session is not (self._preview_session or self.session):
             self._refresh_mesh()
         if any(entry.drawable_id == drawable_id for entry in self.artmesh_inspector.entries):
-            in_mod = self.tabs.currentWidget() is self.mod_tab
+            in_mod = self._in_viewer_workspace()
             if not in_mod:
                 self.tabs.setCurrentWidget(self.artmesh_tab)
             self.artmesh_inspector.select_entry(drawable_id)
@@ -1177,7 +1269,7 @@ class Live2DEditorPage(QFrame):
     def _native_model_point_clicked(self, normalized_x: float, normalized_y: float):
         if not self.session:
             return
-        in_mod = self.tabs.currentWidget() is self.mod_tab
+        in_mod = self._in_viewer_workspace()
         if not in_mod:
             self.tabs.setCurrentWidget(self.artmesh_tab)
         # MOD keeps its own tab visible while picking a trigger in the stage.
@@ -1249,6 +1341,192 @@ class Live2DEditorPage(QFrame):
         self._refresh_texture_image()
         self._reset_texture_watcher()
 
+    def _skin_context(self):
+        if not self.session or not hasattr(self.session, "list_skins"):
+            return None
+        skin = next((item for item in self.session.list_skins() if item["id"] == self.session.active_skin_id), {})
+        name = skin_text("editor.skin.original") if skin.get("is_original") else skin.get("name", "")
+        return {"id": self.session.active_skin_id, "name": name, "modified": self.session.skin_modified}
+
+    def _refresh_skin_controls(self):
+        records = self.session.list_skins() if self.session and hasattr(self.session, "list_skins") else []
+        active = self.session.active_skin_id if records else None
+        modified = self.session.skin_modified if records else False
+        self.skin_controls.refresh(records, active, modified, enabled=bool(records and not self._projects_busy()))
+        with QSignalBlocker(self.export_skin_combo):
+            previous = self.export_skin_combo.currentData()
+            self.export_skin_combo.clear()
+            self.export_skin_combo.addItem(skin_text("editor.skin.current_working"), None)
+            for item in records:
+                name = skin_text("editor.skin.original") if item.get("is_original") else item["name"]
+                self.export_skin_combo.addItem(name, item["id"])
+            self.export_skin_combo.setCurrentIndex(max(0, self.export_skin_combo.findData(previous)))
+        self.export_model_button.setEnabled(bool(records and not self._projects_busy()))
+        self.psd_panel.set_skin_context(self._skin_context())
+
+    def _accept_working_textures(self):
+        for index in range(len(self.session.texture_paths)):
+            self.session.accept_texture_change(index)
+
+    def _skin_changed(self):
+        self._reload_preview_textures()
+        self._update_actions()
+        context = self._skin_context()
+        if context:
+            self._status(skin_text("editor.skin.applied", name=context["name"]))
+
+    def apply_skin(self, skin_id: str) -> bool:
+        if not self.session or self._projects_busy():
+            return False
+        try:
+            if not self.return_to_current_model():
+                return False
+            self.timeline.set_playing(False)
+            self._accept_working_textures()
+            if self.session.apply_skin(skin_id):
+                self._skin_changed()
+            else:
+                self._refresh_skin_controls()
+            return True
+        except Exception as exc:
+            self._refresh_skin_controls()
+            self._error(exc)
+            return False
+
+    def capture_skin(self, name: str):
+        if not self.session or self._projects_busy() or not self.return_to_current_model():
+            return None
+        try:
+            self._accept_working_textures()
+            record = self.session.capture_skin(name)
+            self._update_actions()
+            return record
+        except Exception as exc:
+            self._error(exc)
+            return None
+
+    def import_skin(self, source, name: str | None = None, *, mapping=None, source_kind="model", source_metadata=None):
+        if not self.session or self._projects_busy() or not self.return_to_current_model():
+            return None
+        try:
+            self._accept_working_textures()
+            record = self.session.import_skin(source, name, mapping=mapping, source_kind=source_kind,
+                                              source_metadata=source_metadata, activate=True)
+            self._skin_changed()
+            return record
+        except Exception as exc:
+            self._error(exc)
+            return None
+
+    def _skin_name_dialog(self, title, initial="", allow_name=None):
+        close_editor_popup()
+        existing = {item["name"] for item in self.session.list_skins()}
+        dialog = SkinNameDialog(title, self.window(), existing, initial, allow_name=allow_name)
+        result = dialog.exec()
+        name = dialog.name_edit.text().strip() if result == QDialog.Accepted else ""
+        dialog.deleteLater()
+        return name
+
+    def _capture_skin_dialog(self):
+        if self.session:
+            name = self._skin_name_dialog(skin_text("editor.skin.new_title"))
+            if name:
+                self.capture_skin(name)
+
+    def _rename_skin_dialog(self):
+        if not self.session:
+            return
+        skin = next(item for item in self.session.list_skins() if item["id"] == self.session.active_skin_id)
+        if skin.get("is_original"):
+            return
+        name = self._skin_name_dialog(skin_text("editor.skin.rename_title"), skin["name"], allow_name=skin["name"])
+        if name:
+            try:
+                self.session.rename_skin(skin["id"], name)
+                self._update_actions()
+            except Exception as exc:
+                self._error(exc)
+
+    def _delete_skin_dialog(self):
+        if not self.session:
+            return
+        skin = next(item for item in self.session.list_skins() if item["id"] == self.session.active_skin_id)
+        if skin.get("is_original"):
+            return
+        answer = QMessageBox.question(self, skin_text("editor.skin.delete_title"),
+                                      skin_text("editor.skin.delete_confirm", name=skin["name"]),
+                                      QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer == QMessageBox.Yes:
+            try:
+                self._accept_working_textures()
+                self.session.remove_skin(skin["id"])
+                self._skin_changed()
+            except Exception as exc:
+                self._error(exc)
+
+    def _import_skin_model_dialog(self):
+        path, _ = QFileDialog.getOpenFileName(self, skin_text("editor.skin.model_picker"), "", "Live2D (*.json *.moc3 *.lpk)")
+        if path:
+            self.import_skin_files([path])
+
+    def _import_skin_textures_dialog(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, skin_text("editor.skin.texture_picker"), "", "Images (*.png *.jpg *.jpeg *.webp *.bmp)")
+        if paths:
+            self.import_skin_files(paths)
+
+    def import_skin_files(self, paths):
+        if not self.session or not paths or self._projects_busy():
+            return None
+        from app.gui.Live2DModPage import TextureMappingDialog
+        images = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+        paths = [Path(path) for path in paths]
+        name = self._skin_name_dialog(skin_text("editor.skin.import_title"), paths[0].stem)
+        if not name:
+            return None
+        try:
+            if len(paths) == 1 and paths[0].suffix.lower() not in images:
+                info = self.session.inspect_skin_source(paths[0])
+                sources = [Path(texture["path"]) for texture in info["textures"]]
+                # A foreign MOC never replaces this model. Its atlas can still
+                # be explicitly mapped through the same mature mapping form.
+                if info["automatic_mapping"]:
+                    return self.import_skin(paths[0], name)
+            else:
+                sources = paths
+            dialog = TextureMappingDialog(name, self.session.texture_paths, sources, [], self.window(),
+                                          hint_text=skin_text("editor.skin.mapping_hint"))
+            try:
+                if dialog.exec() != QDialog.Accepted:
+                    return None
+                mapping = dict(dialog.mappings())
+            finally:
+                dialog.deleteLater()
+            return self.import_skin(None, name, mapping=mapping, source_kind="textures",
+                                    source_metadata={"source_files": [str(path) for path in sources]})
+        except Exception as exc:
+            self._error(exc)
+            return None
+
+    def export_current_skin(self, output_dir: str, skin_id=None):
+        if not self.session or self._projects_busy():
+            return None
+        try:
+            self._accept_working_textures()
+            result = self.session.export_skin(skin_id, output_dir)
+            self._status(skin_text("editor.skin.export_done", path=output_dir))
+            return result
+        except Exception as exc:
+            self._error(exc)
+            return None
+
+    def _choose_skin_export(self):
+        if not self.session:
+            return
+        parent = QFileDialog.getExistingDirectory(self, skin_text("editor.skin.export_parent"))
+        if parent:
+            target = Path(parent) / f"Live2D-{datetime.now():%Y%m%d-%H%M%S-%f}"
+            self.export_current_skin(str(target), self.export_skin_combo.currentData())
+
     def _reset_texture_watcher(self):
         watched = self.texture_watcher.files() + self.texture_watcher.directories()
         if watched:
@@ -1265,7 +1543,7 @@ class Live2DEditorPage(QFrame):
             return
         index = int(self.texture_combo.currentData() or 0)
         pixmap = QPixmap(str(self.session.texture_paths[index]))
-        self.texture_image.setPixmap(pixmap.scaled(max(190, self.texture_image.width() - 8), max(150, self.texture_image.height() - 8), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self.texture_image.setPixmap(pixmap)
 
     def _choose_texture_replacement(self):
         if not self.session:
@@ -1340,34 +1618,60 @@ class Live2DEditorPage(QFrame):
             self.preview.load_model(str(self.session.model_path))
             self._native_model_ready()
         self._refresh_texture_image()
-        self._refresh_mesh()
+        self._refresh_mesh_if_visible()
         self._reset_texture_watcher()
 
-    def undo(self):
+    def _capture_editor_view(self):
+        entry = self.artmesh_inspector.current_entry()
+        return {"motion": self._current_motion(), "parameter": self._selected_parameter,
+                "time": self.timeline.current_time, "texture": self.texture_combo.currentIndex(),
+                "mesh_texture": self.artmesh_inspector.texture_combo.currentIndex(),
+                "mesh": entry.drawable_id if entry else None,
+                "scrolls": [(bar, bar.value()) for bar in (
+                    self.parameter_table.verticalScrollBar(), self.parameter_table.horizontalScrollBar(),
+                    self.artmesh_inspector.entry_list.verticalScrollBar(), self.texture_scroll.verticalScrollBar())]}
+
+    def _restore_editor_view(self, state):
+        self._selected_parameter = state["parameter"]
+        self._populate_motions(state["motion"])
+        with QSignalBlocker(self.parameter_table), QSignalBlocker(self.texture_combo):
+            for row in range(self.parameter_table.rowCount()):
+                if self.parameter_table.item(row, 0).data(Qt.UserRole) == state["parameter"]:
+                    self.parameter_table.setCurrentCell(row, 0)
+                    break
+            if 0 <= state["texture"] < self.texture_combo.count():
+                self.texture_combo.setCurrentIndex(state["texture"])
+        self.timeline.set_time(state["time"])
+        if state["mesh"]:
+            self.artmesh_inspector.select_entry(state["mesh"])
+        if 0 <= state["mesh_texture"] < self.artmesh_inspector.texture_combo.count():
+            self.artmesh_inspector.texture_combo.setCurrentIndex(state["mesh_texture"])
+        self._apply_preview_pose()
+        self._sync_parameter_editor()
+        self._refresh_texture_image()
+        for bar, value in state["scrolls"]:
+            bar.setValue(value)
+
+    def _history_step(self, redo=False):
         try:
             if not self.return_to_current_model():
                 return
-            if self.session and self.session.undo():
+            state = self._capture_editor_view()
+            if self.session and (self.session.redo() if redo else self.session.undo()):
                 self.timeline.set_playing(False)
                 self._manual_pose = bool(self.session.parameter_overrides)
-                self._populate_motions()
+                self._populate_motions(state["motion"])
                 self._reload_preview_textures()
+                self._restore_editor_view(state)
                 self._update_actions()
         except Exception as exc:
             self._error(exc)
 
+    def undo(self):
+        self._history_step()
+
     def redo(self):
-        try:
-            if not self.return_to_current_model():
-                return
-            if self.session and self.session.redo():
-                self.timeline.set_playing(False)
-                self._manual_pose = bool(self.session.parameter_overrides)
-                self._populate_motions()
-                self._reload_preview_textures()
-                self._update_actions()
-        except Exception as exc:
-            self._error(exc)
+        self._history_step(redo=True)
 
     def _choose_save_copy(self) -> bool:
         if not self.session:
@@ -1382,10 +1686,13 @@ class Live2DEditorPage(QFrame):
         if not self.session or self._projects_busy():
             return
         try:
+            self._accept_working_textures()
             if not self.mod_panel.current_project:
                 self.mod_panel.bind_project(self.session.ensure_mod_project())
             target = self.session.root / "mod-inputs" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-            self.mod_panel.queue_source_imports([str(self.session.export_snapshot(target))])
+            model_path = str(self.session.export_snapshot(target))
+            context = self._skin_context()
+            self.mod_panel.queue_source_imports([model_path], skin_names={model_path: context["name"]})
         except Exception as exc:
             self._error(exc)
 
@@ -1476,7 +1783,7 @@ class Live2DEditorPage(QFrame):
             self._refresh_texture_image()
         elif self.tabs.currentWidget() is getattr(self, "psd_tab", None) and self.session and not self.psd_panel.current_project:
             self.open_psd_workspace()
-        elif self.tabs.currentWidget() is getattr(self, "mod_tab", None) and self.session and not self.mod_panel.current_project:
+        elif self._in_viewer_workspace() and self.session and not self.mod_panel.current_project:
             try:
                 self.mod_panel.bind_project(self.session.ensure_mod_project())
             except Exception as exc:
@@ -1502,6 +1809,16 @@ class Live2DEditorPage(QFrame):
         self.title_label.setText(_text("editor.live2d.title") + (" *" if dirty else ""))
         self.title_label.setToolTip(_text("editor.live2d.modified" if dirty else "editor.live2d.clean"))
         self.source_label.setVisible(bool(session))
+        self._refresh_skin_controls()
+
+    def _in_viewer_workspace(self):
+        return (hasattr(self, "export_tabs") and self.tabs.currentWidget() is self.export_tab
+                and self.export_tabs.currentWidget() is self.viewer_tab)
+
+    def show_viewer_export(self):
+        self.tabs.setCurrentWidget(self.export_tab)
+        self.export_tabs.setCurrentWidget(self.viewer_tab)
+        self.workspace.set_panel_visible("details", True)
 
     def _status(self, text: str):
         self.status_label.setText(text)

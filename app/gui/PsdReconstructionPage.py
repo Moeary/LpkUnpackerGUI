@@ -14,7 +14,6 @@ from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QHBoxLayout,
-    QInputDialog,
     QAbstractButton,
     QAbstractSpinBox,
     QComboBox,
@@ -86,6 +85,8 @@ from app.gui.Live2DPreviewWindow import Live2DPreviewWindow
 from app.gui.ArtMeshInspector import ArtMeshInspectorDialog
 from app.gui.PreviewPage import ImagePreviewPanel
 from app.gui.editor_workspace import EditorComboBox, EditorViewportLayout, FluentEditorTabs
+from app.gui.live2d_skin_controls import skin_text
+from app.gui.editor_dialogs import ThemedEditorDialog, get_editor_text
 from app.i18n import get_i18n, tr
 
 
@@ -179,7 +180,7 @@ class PsdReconstructionThread(QThread):
             self.reconstructionError.emit(str(exc))
 
 
-class PsdMultiRepackDialog(QDialog):
+class PsdMultiRepackDialog(ThemedEditorDialog):
     """Choose project PSDs and order only the stack being written back."""
 
     def __init__(
@@ -191,7 +192,11 @@ class PsdMultiRepackDialog(QDialog):
         super().__init__(parent)
         self.setMinimumWidth(560)
         self.setWindowTitle(tr("psd.multi.title"))
-        layout = QVBoxLayout(self)
+        self.main_layout.setContentsMargins(18, 18, 18, 18)
+        self.title_label.hide()
+        self.yesButton.hide()
+        self.cancelButton.hide()
+        layout = self.content_layout
         hint = CaptionLabel(tr("psd.multi.hint"), self)
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -338,12 +343,15 @@ class PsdReconstructionPage(QFrame):
     capturePoseRequested = Signal()
     repackApplyRequested = Signal(str)
     repackModRequested = Signal(str)
+    repackSkinReady = Signal(str)
     previewClosed = Signal()
 
     def __init__(self, parent=None, *, compact: bool = False, settings=None):
         super().__init__(parent)
         self._compact = bool(compact)
         self.export_snapshot_provider = None
+        self.skin_context = None
+        self.pending_skin_context = None
         self.preview_command_handler = None
         self._export_snapshot = ""
         self._bound_project_files: list[str] = []
@@ -979,6 +987,10 @@ class PsdReconstructionPage(QFrame):
         self.bound_hint.setWordWrap(True)
         self.bound_hint.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.main_layout.addWidget(self.bound_hint)
+        self.skin_context_label = CaptionLabel(self)
+        self.skin_context_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.skin_context_label.hide()
+        self.main_layout.addWidget(self.skin_context_label)
         self.workflow_tabs = FluentEditorTabs(self)
         self.workflow_tabs.setMinimumWidth(0)
         self.workflow_tabs.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
@@ -1072,6 +1084,22 @@ class PsdReconstructionPage(QFrame):
             self._compact_button_grids.append((grid, buttons))
         self.workflow_tabs.currentChanged.connect(self._compact_workflow_changed)
         self._set_log_expanded(False)
+
+    def set_skin_context(self, context):
+        self.skin_context = dict(context) if context else None
+        if not self._compact:
+            return
+        self.skin_context_label.setVisible(bool(context))
+        if context:
+            label = skin_text("editor.skin.psd_current", name=context.get("name", ""))
+            self.skin_context_label.setText(label)
+            self.skin_context_label.setToolTip(label + "\n" + skin_text("editor.skin.psd_hint"))
+        self.apply_version_button.setText(skin_text("editor.skin.psd_save"))
+        self.send_mod_button.setText(skin_text("editor.skin.psd_viewer"))
+
+    def _refresh_skin_labels(self):
+        if self._compact:
+            self.set_skin_context(self.skin_context)
 
     def _compact_workflow_changed(self, index: int):
         if index < 2:
@@ -1175,6 +1203,7 @@ class PsdReconstructionPage(QFrame):
                                 (self.version_hint, "version_hint")):
                 widget.setText(_workspace_text("psd.workspace." + key))
             self._update_project_header()
+            self._refresh_skin_labels()
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -1379,7 +1408,7 @@ class PsdReconstructionPage(QFrame):
         self.mark_project_dirty()
 
     def _prompt_non_empty_name(self, title_key: str, prompt_key: str, default: str = "") -> str:
-        value, accepted = QInputDialog.getText(
+        value, accepted = get_editor_text(
             self,
             tr(title_key),
             tr(prompt_key),
@@ -1762,6 +1791,10 @@ class PsdReconstructionPage(QFrame):
         self._update_artmesh_inspector_button()
 
         self.update_project_after_result(result)
+        if (self._compact and result.mode in {"multi-repack", "mesh-repack", "atlas-repack"}
+                and self.pending_repack_id and self.current_project
+                and find_repack_entry(self.current_project, self.pending_repack_id)):
+            self.repackSkinReady.emit("repack:" + self.pending_repack_id)
 
         self.append_log(
             tr(
@@ -1886,6 +1919,10 @@ class PsdReconstructionPage(QFrame):
     def _update_action_availability(self, *_args):
         if not hasattr(self, "reconstruct_button"):
             return
+        if self._compact and hasattr(self, "single_repack_button"):
+            ready = not self._is_busy and self.current_project is not None
+            self.single_repack_button.setEnabled(ready and bool(self.selected_repack_psd_path()))
+            self.multi_repack_button.setEnabled(ready and bool(self.project_psd_choices()))
         if self._is_busy or (self._compact and not self.current_project):
             self.reconstruct_button.setEnabled(False)
             return
@@ -2239,6 +2276,7 @@ class PsdReconstructionPage(QFrame):
         self._pose_scheme_refreshing = False
         self._sync_default_metadata()
         self._sync_repack_output_dir()
+        self._update_action_availability()
 
     def on_pose_scheme_changed(self, *_args):
         if self._pose_scheme_refreshing:
@@ -2952,6 +2990,29 @@ class PsdReconstructionPage(QFrame):
                     display_name=self.pending_repack_name,
                     texture_outputs=result.texture_outputs,
                 )
+            if result.mode in {"mesh", "atlas-components", "atlas-artmesh"} and self.pending_skin_context:
+                exports = self.current_project.data.get("psd_exports") or []
+                if exports and not self.pending_pose_scheme_id:
+                    exports[-1]["skin_source"] = dict(self.pending_skin_context)
+                for scheme in self.current_project.data.get("pose_schemes", []):
+                    if scheme.get("id") == self.pending_pose_scheme_id:
+                        scheme["skin_source"] = dict(self.pending_skin_context)
+                save_project(self.current_project.project_dir, self.current_project.data)
+            elif result.mode in {"mesh-repack", "atlas-repack"} and self.pending_repack_id:
+                scheme = self.pose_scheme_for_psd(self.pending_repack_source)
+                source_context = (scheme or {}).get("skin_source")
+                if source_context is None:
+                    source = Path(self.pending_repack_source).resolve()
+                    source_context = next((item.get("skin_source") for item in self.current_project.data.get("psd_exports", [])
+                                           if item.get("psd") and resolve_project_path(self.current_project, item["psd"]) == source), None)
+                for entry in self.current_project.data.get("repack_history", []):
+                    if entry.get("id") == self.pending_repack_id:
+                        entry["skin_source"] = dict(source_context) if source_context else None
+                for pose in self.current_project.data.get("pose_schemes", []):
+                    for version in pose.get("versions", []):
+                        if version.get("id") == self.pending_repack_id:
+                            version["skin_source"] = dict(source_context) if source_context else None
+                save_project(self.current_project.project_dir, self.current_project.data)
             self.refresh_project_ui(self.pending_repack_id or None)
             self.refresh_project_combo(select_project_file=str(self.current_project.project_file))
             self._project_dirty = False

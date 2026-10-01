@@ -215,7 +215,7 @@ class Live2DEditorPageTests(unittest.TestCase):
             self.assertTrue(card.isVisible(), str(index))
             self.assertEqual(psd._compact_scrolls[index].horizontalScrollBar().maximum(), 0)
             self.assertLessEqual(card.width(), psd._compact_scrolls[index].viewport().width())
-        self.page.tabs.setCurrentWidget(self.page.mod_tab)
+        self.page.show_viewer_export()
         self.app.processEvents()
         self.assertTrue(self.page.mod_panel.isVisible())
         self.assertEqual((self.page.width(), self.page.height()), (1040, 760))
@@ -269,7 +269,7 @@ class Live2DEditorPageTests(unittest.TestCase):
         project = record_repack(psd.current_project, version_id, psd.current_project.base_model_json,
                                 None, directory, [texture], texture_outputs={0: texture})
         psd.set_current_project(project)
-        self.page.tabs.setCurrentWidget(self.page.mod_tab)
+        self.page.show_viewer_export()
         result = self.page.save_copy(str(self.root / "before"))
         self.assertIsNotNone(result)
         self.assertFalse(session.dirty)

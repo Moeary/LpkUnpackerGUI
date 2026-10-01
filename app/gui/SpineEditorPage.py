@@ -10,8 +10,8 @@ from pathlib import Path
 from PySide6.QtCore import QPoint, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
-    QDialog, QFileDialog, QFormLayout, QGridLayout, QHBoxLayout, QInputDialog, QListWidgetItem,
-    QMessageBox, QFrame, QSplitter, QStackedWidget, QTreeWidgetItem, QVBoxLayout, QWidget, QSizePolicy,
+    QDialog, QFileDialog, QFormLayout, QGridLayout, QHBoxLayout, QListWidgetItem,
+    QFrame, QSplitter, QStackedWidget, QTreeWidgetItem, QVBoxLayout, QWidget, QSizePolicy,
 )
 from qfluentwidgets import (
     BodyLabel as QLabel, CaptionLabel, CheckBox as QCheckBox,
@@ -25,6 +25,7 @@ from app.core.editor_session import BONE_FIELDS, SpineEditorSession
 from app.gui.SpinePreviewWidget import SpinePreviewWidget
 from app.gui.editor_timeline import AnimationTimelineEditor
 from app.gui.editor_actions import ActionComboBox, ActionDeleteDialog, ActionNameDialog, close_editor_popup
+from app.gui.editor_dialogs import EditorMessageBox as QMessageBox
 from app.gui.editor_workspace import EditorComboBox as QComboBox, EditorTabs, EditorViewportLayout, EditorWorkspace
 from app.i18n import get_i18n, tr
 
@@ -602,7 +603,7 @@ class SpineEditorPage(QWidget):
         self.source_label.setText(session.original_source.name)
         self.source_label.setToolTip(str(session.original_source))
         self.source_label.show()
-        self._populate()
+        self._populate(preserve_view=False)
         self._load_preview(plan)
         self.status_label.setText(_text("spine_editor.ready"))
         self._update_actions()
@@ -625,10 +626,32 @@ class SpineEditorPage(QWidget):
                 self._preview_timer.start()
         worker.deleteLater()
 
-    def _populate(self):
+    def _structure_items(self):
+        pending = [self.tree.topLevelItem(i) for i in range(self.tree.topLevelItemCount())]
+        while pending:
+            item = pending.pop()
+            yield item
+            pending.extend(item.child(i) for i in range(item.childCount()))
+
+    def _structure_view_state(self):
+        """The history owns model data; the user's browsing state stays local."""
+        current = self.tree.currentItem()
+        return {
+            "current": current.data(0, Qt.ItemDataRole.UserRole) if current else None,
+            "selected": {item.data(0, Qt.ItemDataRole.UserRole) for item in self.tree.selectedItems()},
+            "expanded": {item.data(0, Qt.ItemDataRole.UserRole) for item in self._structure_items() if item.isExpanded()},
+            "scroll": (self.tree.horizontalScrollBar().value(), self.tree.verticalScrollBar().value()),
+            "filter": self.search_edit.text(),
+        }
+
+    def _populate(self, preserve_view=True):
         if not self.session:
             return
         animation, skin, selection, track = self.animation_name, self.skin_combo.currentText(), self._selection, self._track
+        tree_state = self._structure_view_state() if preserve_view and self.tree.topLevelItemCount() else None
+        atlas_item = self.atlas_list.currentItem() if preserve_view else None
+        atlas_key = atlas_item.data(Qt.ItemDataRole.UserRole) if atlas_item else None
+        atlas_scroll = (self.atlas_list.horizontalScrollBar().value(), self.atlas_list.verticalScrollBar().value())
         self._updating = True
         self.animation_combo.clear()
         self.animation_combo.addItem(_text("spine_editor.setup"), "")
@@ -651,7 +674,33 @@ class SpineEditorPage(QWidget):
             item = QTreeWidgetItem([f"◇ {slot['name']}"])
             item.setData(0, Qt.ItemDataRole.UserRole, ("slot", slot["name"]))
             nodes[slot["bone"]].addChild(item)
-        self.tree.expandToDepth(1)
+        keyed_items = {item.data(0, Qt.ItemDataRole.UserRole): item for item in self._structure_items()}
+        if tree_state is None:
+            self.tree.expandToDepth(1)
+        # Reapply the existing search to the rebuilt nodes; filtering is a view
+        # preference and must not be undone together with skeleton edits.
+        self._filter_structure(self.search_edit.text())
+        if tree_state:
+            for key, item in keyed_items.items():
+                item.setExpanded(key in tree_state["expanded"])
+            current = keyed_items.get(tree_state["current"])
+        else:
+            current = None
+        if selection and selection[0] in {"bone", "slot"} and selection not in keyed_items:
+            selection = None
+        selection = selection or ("bone", self.session.document["bones"][0]["name"])
+        current = current or keyed_items.get(selection) or self.tree.topLevelItem(0)
+        if current:
+            self.tree.setCurrentItem(current)
+        if tree_state:
+            selected_keys = tree_state["selected"].intersection(keyed_items)
+            if tree_state["current"] not in keyed_items and current:
+                selected_keys.add(current.data(0, Qt.ItemDataRole.UserRole))
+            for key, item in keyed_items.items():
+                item.setSelected(key in selected_keys)
+            self.tree.doItemsLayout()
+            self.tree.horizontalScrollBar().setValue(tree_state["scroll"][0])
+            self.tree.verticalScrollBar().setValue(tree_state["scroll"][1])
         self.channel_combo.clear()
         channels = ["rotate", "translate", "scale", "shear"]
         if self.session.project.version.startswith("4.0."):
@@ -664,8 +713,13 @@ class SpineEditorPage(QWidget):
             item = QListWidgetItem(region["name"])
             item.setData(Qt.ItemDataRole.UserRole, (region["atlas"], region["id"]))
             self.atlas_list.addItem(item)
+            if item.data(Qt.ItemDataRole.UserRole) == atlas_key:
+                self.atlas_list.setCurrentItem(item)
+        if preserve_view:
+            self.atlas_list.horizontalScrollBar().setValue(atlas_scroll[0])
+            self.atlas_list.verticalScrollBar().setValue(atlas_scroll[1])
         self._updating = False
-        self._selection = selection or ("bone", self.session.document["bones"][0]["name"])
+        self._selection = selection
         self._refresh_track_list()
         self._refresh_layers()
         self._show_selection()
@@ -1057,9 +1111,11 @@ class SpineEditorPage(QWidget):
 
     def confirm_discard_or_save(self) -> bool:
         if self.session and self.session.dirty:
+            self.pause_playback()
             answer = QMessageBox.question(self, _text("spine_editor.discard_title"), _text("spine_editor.discard_message"),
                                           QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
-                                          QMessageBox.StandardButton.Save)
+                                          QMessageBox.StandardButton.Save,
+                                          button_texts={QMessageBox.StandardButton.Save: _text("spine_editor.save")})
             if answer == QMessageBox.StandardButton.Cancel:
                 return False
             if answer == QMessageBox.StandardButton.Save and not self.export_copy():
