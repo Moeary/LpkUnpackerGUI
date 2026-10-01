@@ -486,6 +486,17 @@ def reconstruct_live2d_psd(
         layers, size, layer_metadata = _render_mesh_layers(
             cv2, source_info.mesh_data, textures, progress, limits, texture_pixels, selection
         )
+        if selection is not None:
+            selection["exported_ids"] = [item["drawable_id"] for item in layer_metadata]
+            exported_ids = set(selection["exported_ids"])
+            selection["omitted_ids"] = [identifier for identifier in selection["selected_ids"]
+                                        if identifier not in exported_ids]
+            if selection["omitted_ids"]:
+                warnings.append(
+                    "Selected ArtMeshes omitted from PSD: " + ", ".join(selection["omitted_ids"])
+                    + ". They have no visible rendered pixels in the current pose after clipping/transparency, "
+                    "or unusable drawable geometry."
+                )
         mode = "mesh"
     elif mode == "atlas-artmesh":
         if not source_info.mesh_data:
@@ -549,7 +560,6 @@ def reconstruct_live2d_psd(
     if mode == "atlas-artmesh":
         metadata["shared_regions"] = shared_regions
     if selection is not None:
-        selection["selected_ids"] = [item["drawable_id"] for item in layer_metadata]
         metadata["selection"] = selection
     _write_layer_baselines(psd_path, metadata_path, layer_metadata)
     _write_json(metadata_path, metadata)
@@ -2329,6 +2339,12 @@ def _render_mesh_layers(
         _emit(progress, 20 + int((index + 1) / total * 70), f"Rendered {drawable['id']}")
 
     if not layers:
+        if selection is not None:
+            raise PsdReconstructionError(
+                "None of the selected ArtMeshes have visible rendered pixels in the current pose "
+                "after clipping/transparency, or usable drawable geometry: "
+                + ", ".join(selection["selected_ids"])
+            )
         raise PsdReconstructionError("No drawable layers were rendered.")
     # Keep one editable layer per drawable.  Global seam-cover layers obscure
     # edits underneath them and have no ArtMesh identity for reverse mapping.

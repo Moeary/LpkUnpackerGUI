@@ -39,7 +39,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QColor, QPixmap
 from qfluentwidgets import (SubtitleLabel, BodyLabel, CaptionLabel, PushButton, Slider, CheckBox, SpinBox, InfoBar, InfoBarPosition,
                            CardWidget, SingleDirectionScrollArea, TextBrowser, ColorDialog, FluentIcon, IconWidget,
-                           ComboBox, EditableComboBox, LineEdit, TransparentToolButton)
+                           ComboBox, EditableComboBox, LineEdit, SearchLineEdit, TransparentToolButton)
 
 from app.core.assetstudio_cli import AssetStudioCLI
 from app.core.model import resolve_live2d_package
@@ -70,7 +70,6 @@ from app.gui.SettingsPage import ToolchainInstallWorker
 from app.gui.ImagePreviewPanel import ImagePreviewPanel
 from app.gui.Live2DPreviewWindow import Live2DPreviewWindow
 from app.gui.SpinePreviewWidget import SpinePreviewWidget
-from app.gui.PreviewArtMeshPanel import PreviewArtMeshPanel
 from app.gui.editor_workspace import EditorTabs, EditorViewportLayout, EditorComboBox
 from app.i18n import get_i18n, tr
 from app.paths import PROJECT_ROOT
@@ -81,7 +80,8 @@ PREVIEW_LAYOUT_TEXT = {
     "preview.layout.display_interaction": "显示与交互",
     "preview.layout.animation": "动画",
     "preview.layout.display": "显示",
-    "preview.layout.artmesh": "ArtMesh 部件",
+    "preview.parameter_search": "搜索动画参数 ID",
+    "preview.parameter_count": "显示 {shown} / {total} 个参数",
     "preview.layout.empty": "载入资源后显示对应的预览控制。",
     "preview.motion_freeze_hint": "冻结保留当前动画时刻；拖动时间修改姿态后，取消冻结将从头重新播放该动作。",
     "preview.motion_playback_position": "{motion} · {current:.2f} / {total:.2f} 秒",
@@ -895,6 +895,11 @@ class Live2DSettingsPanel(QFrame):
         self.advanced_param_sliders = {}  # id -> (slider, label, scale)
         self.PARAM_SPECS = []
         self.param_specs_by_id = {}  # id -> spec dict
+        self._parameter_schema = None
+        self._parameter_row_widgets = {}
+        self._filtered_parameter_ids = []
+        self.parameter_search = None
+        self.parameter_count = None
         self.advanced_group = None
         self.adv_params_container = None
         self.adv_params_container_layout = None
@@ -1218,6 +1223,12 @@ class Live2DSettingsPanel(QFrame):
         self.advanced_enable_check.toggled.connect(lambda _: self._emit_settings())
         layout.addWidget(self.advanced_enable_check)
 
+        self.parameter_search = SearchLineEdit(group)
+        self.parameter_search.textChanged.connect(self._filter_advanced_params)
+        layout.addWidget(self.parameter_search)
+        self.parameter_count = CaptionLabel(group)
+        layout.addWidget(self.parameter_count)
+
         # 容器用于放置动态参数滑条
         self.adv_params_container = QWidget(group)
         self.adv_params_container_layout = QGridLayout(self.adv_params_container)
@@ -1292,6 +1303,9 @@ class Live2DSettingsPanel(QFrame):
             self.refresh_adv_btn.setText(tr("preview.refresh_current_model"))
         if self.reset_adv_btn:
             self.reset_adv_btn.setText(tr("preview.reset_advanced_params"))
+        if self.parameter_search:
+            self.parameter_search.setPlaceholderText(_layout_text("preview.parameter_search"))
+            self._update_parameter_count()
 
     def set_spine_mode(self, active: bool):
         """Show only display settings that have a meaning for Spine."""
@@ -1339,6 +1353,13 @@ class Live2DSettingsPanel(QFrame):
         meta: list of {id, type, value, min, max, default}
         尽可能保留用户当前已设定的值。
         """
+        ordered = sorted(meta_list, key=lambda item: str(item.get("id", "")))
+        schema = tuple((str(item.get("id", "")), float(item.get("min", 0)),
+                        float(item.get("max", 1)), float(item.get("default", 0))) for item in ordered)
+        if schema == self._parameter_schema:
+            self.sync_advanced_param_values(meta_list)
+            return
+        self._parameter_schema = schema
         # 尽可能保留用户当前已设定的值
         prev_values = {}
         for pid, (slider, _lbl, scale) in self.advanced_param_sliders.items():
@@ -1349,6 +1370,7 @@ class Live2DSettingsPanel(QFrame):
         self.advanced_param_sliders.clear()
         self.PARAM_SPECS = []
         self.param_specs_by_id.clear()
+        self._parameter_row_widgets.clear()
 
         # 缩放决定函数
         def decide_scale(vmin, vmax):
@@ -1360,7 +1382,7 @@ class Live2DSettingsPanel(QFrame):
             return 1
 
         # 构造控件，按id字母序排列以保持一致性
-        for p in sorted(meta_list, key=lambda x: str(x.get('id', ''))):
+        for p in ordered:
             pid = str(p.get('id', ''))
             pmin = float(p.get('min', 0.0))
             pmax = float(p.get('max', 1.0))
@@ -1428,10 +1450,38 @@ class Live2DSettingsPanel(QFrame):
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
             )
             self.advanced_param_sliders[pid] = (slider, val_label, scale)
+            self._parameter_row_widgets[pid] = (name_label, slider, val_label)
+        self._filter_advanced_params()
 
-    def sync_advanced_param_values(self, meta_list: list):
+    def _filter_advanced_params(self, *_args):
+        query = self.parameter_search.text().strip().casefold() if self.parameter_search else ""
+        self._filtered_parameter_ids = []
+        for parameter_id, widgets in self._parameter_row_widgets.items():
+            match = not query or query in parameter_id.casefold()
+            for widget in widgets:
+                widget.setVisible(match)
+            if match:
+                self._filtered_parameter_ids.append(parameter_id)
+        self._update_parameter_count()
+
+    def _update_parameter_count(self):
+        if self.parameter_count:
+            self.parameter_count.setText(tr("preview.parameter_count", PREVIEW_LAYOUT_TEXT["preview.parameter_count"],
+                                            shown=len(self._filtered_parameter_ids), total=len(self.advanced_param_sliders)))
+
+    def visible_parameter_ids(self) -> list[str]:
+        if not self.isVisible() or not self.adv_params_container.isVisible():
+            return []
+        viewport = self.parameter_scroll.viewport()
+        top = self.adv_params_container.mapTo(viewport, QPoint()).y()
+        height = viewport.height()
+        return [parameter_id for parameter_id in self._filtered_parameter_ids
+                if (slider := self.advanced_param_sliders[parameter_id][0]).y() + top < height
+                and slider.y() + top + slider.height() > 0]
+
+    def sync_advanced_param_values(self, meta_list: list | dict[str, float]):
         """Mirror current model values without emitting override changes."""
-        current_values = {
+        current_values = meta_list if isinstance(meta_list, dict) else {
             str(item.get("id", "")): float(item.get("value", 0.0))
             for item in meta_list
             if item.get("id")
@@ -1443,12 +1493,13 @@ class Live2DSettingsPanel(QFrame):
             value = current_values[pid]
             if spec:
                 value = max(spec["min"], min(spec["max"], value))
-            slider.blockSignals(True)
-            slider.setValue(int(round(value * scale)))
-            slider.blockSignals(False)
-            value_label.setText(
-                f"{value:.2f}" if scale != 1 else f"{int(round(value))}"
-            )
+            quantized = int(round(value * scale))
+            if slider.value() != quantized:
+                with QSignalBlocker(slider):
+                    slider.setValue(quantized)
+            text = f"{value:.2f}" if scale != 1 else f"{int(round(value))}"
+            if value_label.text() != text:
+                value_label.setText(text)
 
     def set_advanced_param_values(self, values: dict[str, float]):
         """Update visible parameter controls from a frozen motion timeline."""
@@ -1783,7 +1834,6 @@ class PreviewPage(QFrame):
         self.left_sidebar = None
         self.right_sidebar = None
         self._motion_items = []
-        self._motion_parameter_ids_cache = {}
         self.drag_drop_area = None
         self.source_label = None
         self.source_edit = None
@@ -1844,7 +1894,6 @@ class PreviewPage(QFrame):
         self._psd_project_context = None
         self._pending_psd_project_context = None
         self._resource_mode = "empty"
-        self._artmesh_loaded_for = None
         self._live2d_load_timer = QTimer(self)
         self._live2d_load_timer.setSingleShot(True)
         self._live2d_load_timer.setInterval(50)
@@ -1920,6 +1969,7 @@ class PreviewPage(QFrame):
         left_layout.setSpacing(12)
 
         import_card = CardWidget(self)
+        self.source_card = import_card
         import_layout = QVBoxLayout(import_card)
         import_layout.setContentsMargins(12, 12, 12, 12)
         import_layout.setSpacing(8)
@@ -1994,31 +2044,31 @@ class PreviewPage(QFrame):
             }
         """)
 
-        left_layout.addWidget(self.model_info_text_box)
 
         # Display and interaction controls move into the format-aware right tabs.
         self.settings_panel = Live2DSettingsPanel(self, mode="display")
         self.settings_panel.settingsChanged.connect(self.on_settings_changed)
         self.settings_panel.requestRefreshParams.connect(self.on_request_refresh_params)
         left_layout.addStretch(1)
+        left_layout.addWidget(self.model_info_text_box)
 
         # 控制按钮区域
-        button_layout = QHBoxLayout()
+        button_layout = QVBoxLayout()
         button_layout.setSpacing(10)
-        self.preview_btn = PushButton("", self)
+        self.preview_btn = PushButton("", import_card)
         self.preview_btn.setIcon(FluentIcon.PLAY)
         self.preview_btn.setEnabled(False)
         # 修改：接入冷却逻辑
         self.preview_btn.clicked.connect(self._on_preview_clicked)
 
-        self.close_all_btn = PushButton("", self)
+        self.close_all_btn = PushButton("", import_card)
         self.close_all_btn.setIcon(FluentIcon.CLOSE)
         self.close_all_btn.clicked.connect(self.close_preview_window)
 
         button_layout.addWidget(self.preview_btn, 1)
         button_layout.addWidget(self.close_all_btn, 1)
 
-        left_layout.addLayout(button_layout)
+        import_layout.insertLayout(3, button_layout)
 
         # 中间：统一的图片 / Live2D 预览舞台
         right_widget = QWidget()
@@ -2255,12 +2305,9 @@ class PreviewPage(QFrame):
             self._display_layouts[kind] = display_layout
             tabs.addTab(host, "")
         self._display_layouts["live2d"].addWidget(self.settings_panel, 1)
-        self.artmesh_panel = PreviewArtMeshPanel(self.live2d_details)
-        self.artmesh_panel.overridesChanged.connect(self._preview_parts_changed)
-        self.artmesh_panel.parameterRequested.connect(self._show_artmesh_parameter)
-        self.artmesh_panel.freezeRequested.connect(self.freeze_motion_check.setChecked)
-        self.live2d_details.addTab(self.artmesh_panel, "")
         self.live2d_details.currentChanged.connect(self._on_preview_tab_changed)
+        self.advanced_panel.parameter_scroll.verticalScrollBar().valueChanged.connect(lambda _value: self._sync_live_parameter_controls())
+        self.advanced_panel.parameter_search.textChanged.connect(lambda _text: self._sync_live_parameter_controls())
 
         # 添加到分割器
         splitter.addWidget(left_widget)
@@ -2326,12 +2373,11 @@ class PreviewPage(QFrame):
             self.preview_stage_close_btn.setToolTip(tr("preview.close_window"))
             self.preview_stage_close_btn.setAccessibleName(tr("preview.close_window"))
         self.empty_details.setText(_layout_text("preview.layout.empty"))
-        for tabs, keys in ((self.live2d_details, ("animation_parameters", "display_interaction", "artmesh")),
+        for tabs, keys in ((self.live2d_details, ("animation_parameters", "display_interaction")),
                            (self.spine_details, ("animation", "display"))):
             for index, key in enumerate(keys):
                 tabs.setTabText(index, _layout_text(f"preview.layout.{key}"))
         self.resource_combo.setToolTip(tr("preview.preview_item_list_title"))
-        self.artmesh_panel.retranslate_ui()
         if self.motion_group_title:
             self.motion_group_title.setText(tr("preview.trigger_motion"))
         if self.motion_combo:
@@ -2409,12 +2455,8 @@ class PreviewPage(QFrame):
         self._parameter_refresh_timer.stop()
         if self._parameter_sync_timer:
             self._parameter_sync_timer.stop()
-        self._artmesh_loaded_for = None
-        self._motion_parameter_ids_cache.clear()
         self._frozen_parameter_values.clear()
         self._pose_slider_values.clear()
-        if hasattr(self, "artmesh_panel"):
-            self.artmesh_panel.clear()
         if self.advanced_panel:
             self.advanced_panel.rebuild_advanced_params([])
             with QSignalBlocker(self.advanced_panel.advanced_enable_check):
@@ -2446,45 +2488,10 @@ class PreviewPage(QFrame):
         meta = self.live2d_preview.get_parameter_meta_list() if self.live2d_preview else []
         return {str(item["id"]): float(item.get("value", 0)) for item in meta if item.get("id")}
 
-    def _ensure_artmesh_loaded(self):
-        if self._resource_mode != "live2d" or not self.current_model_path:
-            return False
-        if self._artmesh_loaded_for == self.current_model_path:
-            return True
-        latest = self._load_latest_preview_settings() or {}
-        dll = (latest.get("tools") or {}).get("cubism_core_dll_path")
-        if not dll:
-            getter = getattr(self.settings_manager, "get_cubism_core_dll_path", None)
-            dll = getter() if callable(getter) else None
-        if self.artmesh_panel.load_source(self.current_model_path, dll):
-            self._artmesh_loaded_for = self.current_model_path
-            return True
-        return False
-
     def _on_preview_tab_changed(self, index):
-        if index == 2 and self._ensure_artmesh_loaded():
-            self.artmesh_panel.refresh(self._preview_parameters())
-            self._sync_live_parameter_controls(force=True)
-
-    def _show_artmesh_parameter(self, parameter_id):
-        controls = self.advanced_panel.advanced_param_sliders.get(str(parameter_id))
-        if controls:
-            self.live2d_details.setCurrentIndex(0)
-            self.advanced_panel.parameter_scroll.ensureWidgetVisible(controls[0], 0, 30)
-            controls[0].setFocus()
-
-    def _motion_parameter_ids(self, motion):
-        path = str((motion or {}).get("file") or "")
-        if path not in self._motion_parameter_ids_cache:
-            try:
-                data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
-            except (OSError, ValueError):
-                data = {}
-            self._motion_parameter_ids_cache[path] = {
-                str(curve["Id"]) for curve in data.get("Curves", [])
-                if isinstance(curve, dict) and curve.get("Target") == "Parameter" and curve.get("Id")
-            }
-        return self._motion_parameter_ids_cache[path]
+        self._update_parameter_sync_timer()
+        if index == 0:
+            self._sync_live_parameter_controls()
 
     def _motion_playback_context(self):
         getter = getattr(self.live2d_preview, "get_motion_playback_state", None)
@@ -2495,22 +2502,6 @@ class PreviewPage(QFrame):
                            == (str(state.get("group", "")), int(state.get("index", -2)))), None)
             return motion or state, state
         return self._selected_motion_item(), None
-
-    def _preview_parts_changed(self, values, defaults):
-        setter = getattr(self.live2d_preview, "set_part_opacity_overrides", None)
-        if callable(setter):
-            setter(values, defaults)
-
-    def _preview_drawable_clicked(self, drawable_id):
-        if self._ensure_artmesh_loaded() and any(entry.drawable_id == str(drawable_id)
-                                               for entry in self.artmesh_panel.inspector.entries):
-            self.live2d_details.setCurrentIndex(2)
-            self.artmesh_panel.select_drawable(drawable_id)
-
-    def _preview_model_point_clicked(self, x, y):
-        if self._ensure_artmesh_loaded():
-            self.live2d_details.setCurrentIndex(2)
-            self.artmesh_panel.select_model_point(x, y, self._preview_parameters())
 
     def _update_editor_button(self):
         button = self.open_editor_btn
@@ -2600,13 +2591,13 @@ class PreviewPage(QFrame):
             elif active and timer_id is None:
                 canvas._render_timer_id = canvas.startTimer(int(1000 / 60))
         if not active:
-            for timer in (self._parameter_sync_timer, self._preview_dock_timer):
+            for timer in (self._parameter_sync_timer, self._parameter_refresh_timer, self._preview_dock_timer):
                 if timer is not None:
                     timer.stop()
-        elif self._resource_mode == "live2d" and self.advanced_panel.isVisible():
-            self._parameter_sync_timer.start()
         self._native_playback_suspended = not active
         self._preview_page_active = active
+        if active:
+            self._update_parameter_sync_timer()
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -2639,7 +2630,6 @@ class PreviewPage(QFrame):
         self._terminate_preview_process()
         self._destroy_embedded_live2d()
         self._destroy_embedded_spine()
-        self.artmesh_panel.shutdown()
         # MainWindow releases editor leases after editor shutdown. A copying
         # editor may still need the source even after this view is destroyed.
         for cleanup in (self._cleanup_model_preview_temp_dirs, self._cleanup_spine_preview_temp_dirs, self._cleanup_image_preview_temp_dirs, self._cleanup_archive_preview_temp_dirs, self._cleanup_folder_preview_temp_dirs):
@@ -2651,6 +2641,10 @@ class PreviewPage(QFrame):
         if widget is None:
             return
         widget.setVisible(not widget.isVisible())
+        if side == "right":
+            self._update_parameter_sync_timer()
+            if widget.isVisible():
+                self._sync_live_parameter_controls()
         self._update_sidebar_button_text()
         self._save_preview_ui_state()
 
@@ -3081,8 +3075,6 @@ class PreviewPage(QFrame):
             return None
         self.live2d_preview = preview
         self.preview_dock_layout.addWidget(preview, 1)
-        preview.live2d_canvas.drawableClicked.connect(self._preview_drawable_clicked)
-        preview.live2d_canvas.modelPointClicked.connect(self._preview_model_point_clicked)
         preview.hide()
         return preview
 
@@ -3323,11 +3315,7 @@ class PreviewPage(QFrame):
             self.pose_controls_card.setEnabled(bool(visible))
         if self.advanced_panel:
             self.advanced_panel.setEnabled(bool(visible))
-        if self._parameter_sync_timer:
-            if visible and self.advanced_panel and not self.advanced_panel.isHidden():
-                self._parameter_sync_timer.start()
-            else:
-                self._parameter_sync_timer.stop()
+        self._update_parameter_sync_timer()
 
     def play_selected_motion(self):
         if not self._motion_items or not self.motion_combo:
@@ -3471,8 +3459,6 @@ class PreviewPage(QFrame):
             if not was_frozen:
                 self._sync_live_parameter_controls(force=True)
                 self._capture_frozen_parameters()
-            if self.live2d_details.currentIndex() == 2 and self._ensure_artmesh_loaded():
-                self.artmesh_panel.refresh(self._preview_parameters())
         else:
             self._frozen_parameter_values.clear()
             self._pose_slider_values.clear()
@@ -3506,24 +3492,53 @@ class PreviewPage(QFrame):
                 values["advanced_params"] = dict(self._frozen_parameter_values)
             self.live2d_preview.apply_settings(values)
 
+    def _update_parameter_sync_timer(self):
+        if self._parameter_sync_timer is None:
+            return
+        if (self._resource_mode == "live2d" and self._preview_page_active is not False
+                and self.isVisible() and self.right_sidebar.isVisible()
+                and self.live2d_details.currentIndex() == 0 and self.advanced_panel.isEnabled()):
+            self._parameter_sync_timer.start()
+        else:
+            self._parameter_sync_timer.stop()
+
     def _sync_live_parameter_controls(self, force: bool = False):
-        self._update_motion_timeline_visibility()
         if (
             self.live2d_preview is None
             or self.advanced_panel is None
+            or self._resource_mode != "live2d"
+            or (not force and (self._preview_page_active is False or not self.isVisible()
+                               or not self.right_sidebar.isVisible() or self.live2d_details.currentIndex() != 0))
         ):
             return
-        meta = self.live2d_preview.get_parameter_meta_list()
-        if not meta:
-            return
+        self._update_motion_timeline_visibility()
         frozen = bool(self.freeze_motion_check and self.freeze_motion_check.isChecked())
-        if force or not frozen:
+        if force or not self.advanced_panel.advanced_param_sliders:
+            meta = self.live2d_preview.get_parameter_meta_list()
+            if not meta:
+                return
             if not self.advanced_panel.advanced_param_sliders:
                 self.advanced_panel.rebuild_advanced_params(meta)
             self.advanced_panel.sync_advanced_param_values(meta)
-        if self.live2d_details.currentIndex() == 2:
-            motion, _state = self._motion_playback_context()
-            self.artmesh_panel.set_parameter_context(meta, self._motion_parameter_ids(motion), frozen)
+            return
+        ids = self.advanced_panel.visible_parameter_ids()
+        if not ids:
+            return
+        if frozen:
+            values = {parameter_id: self._frozen_parameter_values[parameter_id]
+                      for parameter_id in ids if parameter_id in self._frozen_parameter_values}
+        else:
+            getter = getattr(self.live2d_preview, "get_parameter_values", None)
+            if callable(getter):
+                values = getter(ids)
+            else:
+                values = {item["id"]: float(item["value"]) for item in self.live2d_preview.get_parameter_meta_list()
+                          if item.get("id") in ids}
+        self.advanced_panel.sync_advanced_param_values(values)
+        if frozen:
+            for parameter_id in values:
+                slider, _label, scale = self.advanced_panel.advanced_param_sliders[parameter_id]
+                self._pose_slider_values[parameter_id] = slider.value() / float(scale)
 
     def _cleanup_temp_model_json(self):
         """Forget the model reference; owned temporary directories clean it up."""
@@ -4705,7 +4720,6 @@ class PreviewPage(QFrame):
             })
             preview.apply_settings(settings)
             self._set_resource_mode("live2d")
-            self._preview_parts_changed(self.artmesh_panel.part_overrides, self.artmesh_panel.part_defaults)
             preview.show()
             self._set_motion_debug_visible(True)
             self._on_motion_selection_changed(self.motion_combo.currentIndex())
@@ -4769,7 +4783,9 @@ class PreviewPage(QFrame):
 
     def _refresh_parameter_controls(self, retries: int = 0):
         preview = self.live2d_preview
-        if preview is None or self.advanced_panel is None:
+        if (preview is None or self.advanced_panel is None or self._preview_page_active is False
+                or not self.isVisible() or not self.right_sidebar.isVisible()
+                or self.live2d_details.currentIndex() != 0):
             return
         meta = preview.get_parameter_meta_list()
         if meta:

@@ -900,6 +900,16 @@ class Live2DPreviewWindow(QWidget):
             return []
         return self.live2d_canvas.getParameterMetaList()
 
+    def get_parameter_values(self, parameter_ids) -> dict[str, float]:
+        """Read current values without rebuilding static metadata or updating the model."""
+        if not self.live2d_canvas:
+            return {}
+        getter = getattr(self.live2d_canvas, "getParameterValues", None)
+        if callable(getter):
+            return getter(parameter_ids)
+        ids = set(parameter_ids)
+        return {item["id"]: float(item["value"]) for item in self.get_parameter_meta_list() if item["id"] in ids}
+
     def get_motion_playback_state(self) -> dict | None:
         if not self.live2d_canvas:
             return None

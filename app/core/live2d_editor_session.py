@@ -15,6 +15,7 @@ import os
 import shutil
 import tempfile
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -259,6 +260,8 @@ class Live2DEditorSession:
         self._signature_changed = self._invalidate_signature
         self._pose_changed = self._invalidate_pose_signature
         self._parameter_preview: dict[str, float] = {}
+        self._local_textures = OrderedDict()
+        self._local_crops = OrderedDict()
         self._projects = Live2DEditorProjects(self)
         self.original_bindings: dict[tuple[str, int], int] = {}
         self._deleted_original_bindings: set[tuple[str, int]] = set()
@@ -914,25 +917,66 @@ class Live2DEditorSession:
         index = int(drawable.get("texture_index", -1))
         if not 0 <= index < len(self.texture_paths):
             return None
-        with Image.open(self.texture_paths[index]) as texture:
-            image = texture.convert("RGBA")
+        path = self.texture_paths[index]
+        try:
+            stamp = path.stat()
+            file_stamp = (str(path), stamp.st_mtime_ns, stamp.st_size)
+        except OSError:
+            file_stamp = (str(path), None, None)
+        data = self._texture_data[index]
+        token = (*file_stamp, id(data))
+        # The watcher accepts a complete image before replacing these bytes.
+        # A half-written external PNG must never replace a valid local preview.
+        cached = self._local_textures.get(index)
+        if cached is None or cached[0] != token:
+            with Image.open(io.BytesIO(data)) as texture:
+                image = texture.convert("RGBA")
+            self._local_textures[index] = (token, image)
+        else:
+            image = cached[1]
+        self._local_textures.move_to_end(index)
+        while len(self._local_textures) > 2:
+            self._local_textures.popitem(last=False)
         width, height = image.size
         uvs = drawable.get("uvs", [])
-        points = [(float(u) * width, (1 - float(v)) * height) for u, v in uvs]
         indices = drawable.get("indices", [])
-        mask = Image.new("L", image.size)
+        key = (index, token, tuple(tuple(uv) for uv in uvs), tuple(indices),
+               tuple(max_size) if max_size is not None else None)
+        if key in self._local_crops:
+            self._local_crops.move_to_end(key)
+            cached = self._local_crops[key]
+            return cached.copy() if cached is not None else None
+        points = [(float(u) * width, (1 - float(v)) * height) for u, v in uvs]
+        triangles = [indices[offset:offset + 3] for offset in range(0, len(indices) - 2, 3)]
+        triangles = [triangle for triangle in triangles if all(0 <= int(i) < len(points) for i in triangle)]
+        vertices = [points[int(index)] for triangle in triangles for index in triangle]
+        if not vertices:
+            return None
+        left = max(0, math.floor(min(point[0] for point in vertices)))
+        top = max(0, math.floor(min(point[1] for point in vertices)))
+        right = min(width, math.ceil(max(point[0] for point in vertices)) + 1)
+        bottom = min(height, math.ceil(max(point[1] for point in vertices)) + 1)
+        if right <= left or bottom <= top:
+            return None
+        mask = Image.new("L", (right - left, bottom - top))
         painter = ImageDraw.Draw(mask)
-        for offset in range(0, len(indices) - 2, 3):
-            triangle = indices[offset:offset + 3]
-            if all(0 <= int(i) < len(points) for i in triangle):
-                painter.polygon([points[int(i)] for i in triangle], fill=255)
-        if not mask.getbbox():
+        for triangle in triangles:
+            painter.polygon([(points[int(i)][0] - left, points[int(i)][1] - top) for i in triangle], fill=255)
+        bounds = mask.getbbox()
+        if bounds is None:
             return None
         from PIL import ImageChops
-        image.putalpha(ImageChops.multiply(image.getchannel("A"), mask))
-        result = image.crop(mask.getbbox())
+        result = image.crop((left, top, right, bottom))
+        result.putalpha(ImageChops.multiply(result.getchannel("A"), mask))
+        result = result.crop(bounds)
         if max_size is not None:
             result.thumbnail(max_size)
+            # Cache only small previews. Full-resolution popup crops and large
+            # custom sizes cannot accumulate hundreds of atlas-sized images.
+            if result.width * result.height * 4 <= 2 * 1024 * 1024:
+                self._local_crops[key] = result.copy()
+                while len(self._local_crops) > 24:
+                    self._local_crops.popitem(last=False)
         return result
 
     def write_inspector_metadata(self, parameters: dict[str, float]) -> Path:
@@ -1044,6 +1088,8 @@ class Live2DEditorSession:
 
     def close(self) -> None:
         self._core_model = None
+        self._local_textures.clear()
+        self._local_crops.clear()
         temporary = getattr(self, "_temporary", None)
         if temporary:
             temporary.cleanup()

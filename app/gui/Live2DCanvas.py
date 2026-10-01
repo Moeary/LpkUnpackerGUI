@@ -465,6 +465,8 @@ class Live2DCanvas(ADPOpenGLCanvas):
     modelPointClicked = Signal(float, float)
     drawablesPicked = Signal(list)
     regionPicked = Signal(list, dict)
+    drawablesPickedWithMode = Signal(list, str)
+    regionPickedWithMode = Signal(list, dict, str)
     selectionFailed = Signal(str)
     selectionCancelled = Signal()
     def __init__(self, model_path=None, embedded: bool = False):
@@ -504,6 +506,10 @@ class Live2DCanvas(ADPOpenGLCanvas):
         self._selection_scene_provider = None
         self._selection_alpha_cache = {}
         self._selection_drag = None
+        self._selection_shift = False
+        self._selection_moved = False
+        self._parameter_value_model_id = None
+        self._parameter_value_indices = {}
         self._last_selection_region = None
         self._selection_region_canvas = None
         self._part_opacity_overrides = {}
@@ -544,6 +550,8 @@ class Live2DCanvas(ADPOpenGLCanvas):
         if self._fbo_width > 0 and self._fbo_height > 0:
             model.Resize(self._fbo_width, self._fbo_height)
         self.model = model
+        self._parameter_value_model_id = None
+        self._parameter_value_indices.clear()
         self.model_path = model_path
         self._selection_alpha_cache.clear()
         self._selection_drag = None
@@ -592,6 +600,8 @@ class Live2DCanvas(ADPOpenGLCanvas):
                 self.makeCurrent()
                 context_current = True
             self.model = None
+            self._parameter_value_model_id = None
+            self._parameter_value_indices.clear()
         finally:
             if context_current:
                 self.doneCurrent()
@@ -647,10 +657,12 @@ class Live2DCanvas(ADPOpenGLCanvas):
         self._mouse_follow_enabled = bool(enable)
 
     def mouseMoveEvent(self, event):
-        if self._selection_mode != "none":
+        if self._effective_selection_mode() != "none":
             if self._selection_drag is not None:
-                self._selection_drag[1] = event.position()
-                self.update()
+                self._selection_drag[1] = QPointF(event.position())
+                self._selection_moved |= (self._selection_drag[1] - self._selection_drag[0]).manhattanLength() >= 4
+                if self._effective_selection_mode() == "rectangle":
+                    self.update()
             event.accept()
             return
         if not self._mouse_follow_enabled or self.model is None:
@@ -668,17 +680,13 @@ class Live2DCanvas(ADPOpenGLCanvas):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            if self._selection_mode != "none":
+            if self._effective_selection_mode() != "none":
                 if self.model is not None:
-                    try:
-                        if self._selection_mode == "rectangle":
-                            self._selection_drag = [QPointF(event.position()), QPointF(event.position())]
-                            self._last_selection_region = None
-                            self.update()
-                        else:
-                            self.pickDrawablesAt(event.position().x(), event.position().y())
-                    except Exception as exc:
-                        self.selectionFailed.emit(str(exc))
+                    self._selection_drag = [QPointF(event.position()), QPointF(event.position())]
+                    self._selection_shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+                    self._selection_moved = False
+                    self._last_selection_region = None
+                    self.update()
                 event.accept()
                 return
             try:
@@ -693,10 +701,11 @@ class Live2DCanvas(ADPOpenGLCanvas):
             last = QPointF(event.position())
             self._selection_drag = None
             try:
-                if (last - first).manhattanLength() < 4:
-                    self.pickDrawablesAt(last.x(), last.y())
-                else:
-                    self.pickDrawablesInRect(first, last)
+                moved = self._selection_moved or (last - first).manhattanLength() >= 4
+                if not moved:
+                    self.pickDrawablesAt(last.x(), last.y(), "toggle" if self._selection_shift else "replace")
+                elif self._effective_selection_mode() == "rectangle":
+                    self.pickDrawablesInRect(first, last, "add" if self._selection_shift else "replace")
             except Exception as exc:
                 self.selectionFailed.emit(str(exc))
             self.update()
@@ -895,6 +904,11 @@ class Live2DCanvas(ADPOpenGLCanvas):
     def selectionMode(self) -> str:
         return self._selection_mode
 
+    def _effective_selection_mode(self):
+        # An editor's neutral mode still inspects the model. The resource
+        # preview retains its existing tap interactions when no tool is active.
+        return "point" if self._editor_interaction and self._selection_mode == "none" else self._selection_mode
+
     def setSelectionSceneProvider(self, provider):
         """Set an on-demand read-only provider returning snapshot/texture_paths.
 
@@ -907,14 +921,43 @@ class Live2DCanvas(ADPOpenGLCanvas):
     def getSelectionPose(self) -> dict:
         if self.model is None:
             return {"parameters": {}, "parts": {}, "parts_complete": False}
-        parameter_ids = self.model.GetParamIds()
-        parameters = {str(parameter_id): float(self.model.GetParameterValue(i))
-                      for i, parameter_id in enumerate(parameter_ids)}
+        parameters = self.getParameterValues(self._parameter_indices())
         parts = dict(self._part_opacity_defaults)
         parts.update(self._part_opacity_overrides)
         # live2d-py exposes SetPartOpacity but no opacity getter. Do not invent
         # SDK Pose-controller values; only the overrides actually applied here.
         return {"parameters": parameters, "parts": parts, "parts_complete": False}
+
+    def _parameter_indices(self):
+        model_id = id(self.model) if self.model is not None else None
+        if model_id != self._parameter_value_model_id:
+            # A failed read from a newly loaded model must not leave the old
+            # model's ID map reachable or mark that failed map as initialized.
+            self._parameter_value_model_id = None
+            self._parameter_value_indices = {}
+            self._parameter_value_indices = ({str(identifier): index for index, identifier in enumerate(self.model.GetParamIds())}
+                                             if self.model is not None else {})
+            self._parameter_value_model_id = model_id
+        return self._parameter_value_indices
+
+    def getParameterValues(self, parameter_ids) -> dict[str, float]:
+        """Read only requested native values without Update, clamping or metadata.
+
+        The static ID/index map is rebuilt when the native model object changes.
+        Unknown IDs are omitted rather than filled with invented default values.
+        """
+        indices = self._parameter_indices()
+        if self.model is None:
+            return {}
+        values = {}
+        getter = getattr(self.model, "GetParameterValue", None)
+        for identifier in dict.fromkeys([parameter_ids] if isinstance(parameter_ids, str) else parameter_ids):
+            index = indices.get(str(identifier))
+            if index is None:
+                continue
+            value = getter(index) if callable(getter) else self.model.GetParameter(index).value
+            values[str(identifier)] = float(value)
+        return values
 
     def getSelectionScene(self) -> SelectionScene:
         if self._selection_scene_provider is None:
@@ -939,11 +982,14 @@ class Live2DCanvas(ADPOpenGLCanvas):
         snapshot = snapshot if snapshot is not None else self.getSelectionScene().snapshot
         return self._selection_coordinates(snapshot).canvas_to_window((x, y))
 
-    def pickDrawablesAt(self, x: float, y: float) -> list[str]:
+    def pickDrawablesAt(self, x: float, y: float, selection_mode="replace") -> list[str]:
+        if selection_mode not in ("replace", "toggle"):
+            raise ValueError("Point selection operation must be replace or toggle")
         if self._selection_scene_provider is not None:
             scene = self.getSelectionScene()
             point = self._selection_coordinates(scene.snapshot).window_to_canvas((x, y))
             hits = scene.hit_point(point)
+            self.drawablesPickedWithMode.emit(hits, selection_mode)
             self.drawablesPicked.emit(hits)
             return hits
         # Compatibility for callers without a Core snapshot: the SDK's real
@@ -952,12 +998,15 @@ class Live2DCanvas(ADPOpenGLCanvas):
         fbo_x, fbo_y = self.windowPointToModel(x, y)
         native = getattr(self.model, "_model", self.model)
         hits = list(native.HitDrawable(fbo_x, fbo_y, False))
+        self.drawablesPickedWithMode.emit(hits, selection_mode)
         self.drawablesPicked.emit(hits)
         if hits:
             self.drawableClicked.emit(str(hits[0]))
         return hits
 
-    def pickDrawablesInRect(self, first, last) -> list[str]:
+    def pickDrawablesInRect(self, first, last, selection_mode="replace") -> list[str]:
+        if selection_mode not in ("replace", "add"):
+            raise ValueError("Rectangle selection operation must be replace or add")
         scene = self.getSelectionScene()
         coordinates = self._selection_coordinates(scene.snapshot)
         point = lambda p: (p.x(), p.y()) if hasattr(p, "x") else tuple(p)
@@ -965,11 +1014,12 @@ class Live2DCanvas(ADPOpenGLCanvas):
         hits = scene.hit_region(region)
         self._last_selection_region = region
         self._selection_region_canvas = scene.snapshot["canvas"]
+        self.regionPickedWithMode.emit(hits, region, selection_mode)
         self.regionPicked.emit(hits, region)
         return hits
 
     def draw_overlay(self, width, height, dpr):
-        if self._selection_drag is not None:
+        if self._selection_drag is not None and self._effective_selection_mode() == "rectangle":
             first, last = self._selection_drag
             points = [(first.x(), first.y()), (last.x(), first.y()),
                       (last.x(), last.y()), (first.x(), last.y())]

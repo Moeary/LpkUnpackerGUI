@@ -40,7 +40,7 @@ from qfluentwidgets import (
 from app.i18n import get_i18n, tr
 from app.gui.editor_workspace import FluentEditorTabs, EditorViewportLayout
 from app.gui.editor_dialogs import ThemedEditorDialog
-from app.gui.live2d_selection import SelectionScene, barycentric
+from app.gui.live2d_selection import SelectionScene, barycentric, combine_selection, intersect_convex
 
 
 ARTMESH_TEXT = {
@@ -52,6 +52,7 @@ ARTMESH_TEXT = {
     "artmesh.inspector.pick_trigger": "选择换装触发部件",
     "artmesh.inspector.no_trigger": "请先预览此工程的主模型，再选择未绑定事件的部件。",
     "artmesh.inspector.zoom_hint": "滚轮缩放，中键拖动，双击复位；总览中使用 Ctrl+滚轮缩放。",
+    "artmesh.inspector.selection_hint": "单击选择；Shift+单击增减；拖动框选；Shift+框选合并。",
 }
 
 
@@ -183,6 +184,8 @@ class _MeshCanvas(QWidget):
     """Paint a static pose or atlas and convert clicks to source coordinates."""
 
     hitRequested = Signal(float, float)
+    selectionRequested = Signal(float, float, str)
+    regionRequested = Signal(dict, str)
 
     def __init__(self, mode: str, parent: QWidget | None = None):
         super().__init__(parent)
@@ -198,6 +201,12 @@ class _MeshCanvas(QWidget):
         self.zoom_factor = 1.0
         self.pan_offset = QPointF()
         self._pan_anchor = None
+        self.selection_mode = "rectangle"
+        self._selection_anchor = None
+        self._selection_position = None
+        self._selection_shift = False
+        self._selection_moved = False
+        self._triangle_cache = {}
         self.overview_mode = False
         self.setMinimumSize(100, 100)
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
@@ -215,6 +224,9 @@ class _MeshCanvas(QWidget):
         shared_indices: set[int] | None = None,
         selected_indices: set[int] | None = None,
     ) -> None:
+        if (self.entries is not entries or self.source_size != tuple(map(int, source_size))
+                or self.texture_index != texture_index):
+            self._triangle_cache.clear()
         self.entries = entries
         if self.source_size != (max(1, int(source_size[0])), max(1, int(source_size[1]))):
             self.zoom_factor = 1.0
@@ -252,11 +264,11 @@ class _MeshCanvas(QWidget):
         return ((point.x() - offset_x) / scale, (point.y() - offset_y) / scale)
 
     def _entry_triangles(self, entry: ArtMeshEntry):
-        if self.mode == "pose":
-            return entry.pose_triangles()
-        if entry.texture_index != self.texture_index:
-            return []
-        return entry.atlas_triangles(self.source_size)
+        key = id(entry)
+        if key not in self._triangle_cache:
+            self._triangle_cache[key] = (entry.pose_triangles() if self.mode == "pose"
+                                         else entry.atlas_triangles(self.source_size) if entry.texture_index == self.texture_index else [])
+        return self._triangle_cache[key]
 
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
@@ -330,22 +342,37 @@ class _MeshCanvas(QWidget):
             for triangle in triangles:
                 polygon = QPolygonF([self.source_to_view(point) for point in triangle])
                 painter.drawPolygon(polygon)
+        if self._selection_anchor is not None and self.selection_mode == "rectangle" and self._selection_moved:
+            painter.setPen(QPen(QColor(0, 190, 220), 1.5, Qt.PenStyle.DashLine))
+            painter.setBrush(QColor(0, 190, 220, 30))
+            painter.drawRect(QRectF(self._selection_anchor, self._selection_position).normalized())
         painter.end()
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.MiddleButton:
             self._pan_anchor = QPointF(event.position())
+            self._selection_anchor = None
             event.accept()
             return
         if event.button() == Qt.MouseButton.LeftButton:
-            x, y = self.view_to_source(event.position())
-            self.hitRequested.emit(float(x), float(y))
+            self._selection_anchor = QPointF(event.position())
+            self._selection_position = QPointF(event.position())
+            self._selection_shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+            self._selection_moved = False
+            event.accept()
+            return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
         if self._pan_anchor is not None:
             self.pan_offset += event.position() - self._pan_anchor
             self._pan_anchor = QPointF(event.position())
+            self.update()
+            event.accept()
+            return
+        if self._selection_anchor is not None:
+            self._selection_position = QPointF(event.position())
+            self._selection_moved |= (self._selection_position - self._selection_anchor).manhattanLength() >= 4
             self.update()
             event.accept()
             return
@@ -356,7 +383,34 @@ class _MeshCanvas(QWidget):
             self._pan_anchor = None
             event.accept()
             return
+        if event.button() == Qt.MouseButton.LeftButton and self._selection_anchor is not None:
+            first, last = self._selection_anchor, QPointF(event.position())
+            moved = self._selection_moved or (last - first).manhattanLength() >= 4
+            self._selection_anchor = None
+            if moved and self.selection_mode == "rectangle":
+                rectangle = QRectF(first, last).normalized()
+                polygon = [self.view_to_source(point) for point in (
+                    rectangle.topLeft(), rectangle.topRight(), rectangle.bottomRight(), rectangle.bottomLeft())]
+                xs, ys = zip(*polygon)
+                region = {"coordinate_space": "canvas-pixels-y-down" if self.mode == "pose" else "atlas-pixels-y-down",
+                          "x": min(xs), "y": min(ys), "width": max(xs) - min(xs), "height": max(ys) - min(ys),
+                          "polygon": [list(point) for point in polygon]}
+                self.regionRequested.emit(region, "add" if self._selection_shift else "replace")
+            elif not moved:
+                x, y = self.view_to_source(last)
+                self.selectionRequested.emit(float(x), float(y), "toggle" if self._selection_shift else "replace")
+                self.hitRequested.emit(float(x), float(y))
+            self.update()
+            event.accept()
+            return
         super().mouseReleaseEvent(event)
+
+    def setSelectionMode(self, mode):
+        if mode not in ("point", "rectangle"):
+            raise ValueError("UV selection mode must be point or rectangle")
+        self.selection_mode = mode
+        self._selection_anchor = None
+        self.update()
 
     def wheelEvent(self, event):
         if self.overview_mode and not event.modifiers() & Qt.KeyboardModifier.ControlModifier:
@@ -380,6 +434,36 @@ class _MeshCanvas(QWidget):
         self.zoom_factor = 1.0
         self.pan_offset = QPointF()
         self.update()
+
+
+class _SelectionListWidget(QListWidget):
+    """Use Shift as a per-row toggle, rather than Qt's range selection."""
+    toggle_enabled = True
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._shift_click = False
+
+    def mousePressEvent(self, event):
+        if (self.toggle_enabled and event.button() == Qt.MouseButton.LeftButton
+                and event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
+            self._shift_click = True
+            item = self.itemAt(event.position().toPoint())
+            if item is not None:
+                index = self.indexFromItem(item)
+                self.selectionModel().setCurrentIndex(index, QItemSelectionModel.SelectionFlag.NoUpdate)
+                self.selectionModel().select(index, QItemSelectionModel.SelectionFlag.Toggle)
+            event.accept()
+            return
+        self._shift_click = False
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._shift_click and event.button() == Qt.MouseButton.LeftButton:
+            self._shift_click = False
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 
 class ArtMeshInspector(QWidget):
@@ -410,10 +494,16 @@ class ArtMeshInspector(QWidget):
         self.selected_indices: set[int] = set()
         self._texture_pixmaps = {}
         self._selection_alpha_cache = {}
+        self._atlas_geometry_cache = {}
         self._atlas_indices = None
         self._allowed_ids = None
         self.pick_candidates = []
         self._keep_pick_candidates = False
+        self._candidate_baseline = []
+        self._candidate_primary = None
+        self._candidate_selection_mode = "replace"
+        self._multi_selection = True
+        self._selection_mode = "rectangle"
         self._loading = False
         self.i18n = get_i18n()
         self._build_ui()
@@ -464,7 +554,7 @@ class ArtMeshInspector(QWidget):
         self.main_layout.addWidget(self.candidate_combo)
 
         self.splitter = QSplitter(Qt.Orientation.Horizontal, self)
-        self.entry_list = QListWidget(self.splitter)
+        self.entry_list = _SelectionListWidget(self.splitter)
         self.entry_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.entry_list.itemSelectionChanged.connect(self._entry_selection_changed)
         right = QSplitter(Qt.Orientation.Vertical, self.splitter)
@@ -475,7 +565,8 @@ class ArtMeshInspector(QWidget):
         self.pose_title_label = QLabel(pose_frame)
         pose_layout.addWidget(self.pose_title_label)
         self.pose_canvas = _MeshCanvas("pose", pose_frame)
-        self.pose_canvas.hitRequested.connect(self._pose_hit)
+        self.pose_canvas.selectionRequested.connect(self._pose_hit)
+        self.pose_canvas.regionRequested.connect(self._pose_region)
         pose_layout.addWidget(self.pose_canvas, 1)
         atlas_frame = QFrame(right)
         self.atlas_frame = atlas_frame
@@ -521,7 +612,9 @@ class ArtMeshInspector(QWidget):
         self._update_status()
         self.candidate_combo.setToolTip(_text("artmesh.inspector.overlap_hint"))
         for canvas in [self.pose_canvas, self.atlas_canvas, *self.atlas_canvases.values(), *self.overview_canvases.values()]:
-            canvas.setToolTip(_text("artmesh.inspector.zoom_hint"))
+            canvas.setToolTip(_text("artmesh.inspector.zoom_hint") +
+                              ("\n" + _text("artmesh.inspector.selection_hint") if self._multi_selection else ""))
+        self.entry_list.setToolTip(_text("artmesh.inspector.selection_hint") if self._multi_selection else "")
         if self.atlas_tabs:
             self.atlas_tabs.setTabText(0, _text("artmesh.inspector.overview"))
 
@@ -560,6 +653,7 @@ class ArtMeshInspector(QWidget):
             self.sidecar_canvas_size = (1, 1)
             sidecar = self._load_drawables_sidecar(metadata, path)
             self.entries = self._build_entries(metadata, sidecar)
+            self._atlas_geometry_cache.clear()
             self._load_textures(metadata, path)
             self._load_pose_preview(metadata, path)
             self._populate_texture_combo()
@@ -608,6 +702,7 @@ class ArtMeshInspector(QWidget):
             layers = [dict(item, drawable_id=item.get("id", item.get("drawable_id", "")))
                       for item in snapshot.get("drawables", [])]
             self.entries = self._build_entries({"layers": layers}, {})
+            self._atlas_geometry_cache.clear()
             self.texture_paths = ({int(i): Path(p) for i, p in texture_paths.items()}
                                   if isinstance(texture_paths, Mapping)
                                   else {i: Path(p) for i, p in enumerate(texture_paths)})
@@ -1009,9 +1104,13 @@ class ArtMeshInspector(QWidget):
         for position, texture_index in enumerate(indices):
             canvas = old_canvas if position == 0 else _MeshCanvas("atlas", self.atlas_frame)
             if hasattr(canvas, "_inspector_hit_callback"):
-                canvas.hitRequested.disconnect(canvas._inspector_hit_callback)
-            canvas._inspector_hit_callback = lambda x, y, i=texture_index: self._atlas_hit_texture(i, x, y)
-            canvas.hitRequested.connect(canvas._inspector_hit_callback)
+                canvas.selectionRequested.disconnect(canvas._inspector_hit_callback)
+                canvas.regionRequested.disconnect(canvas._inspector_region_callback)
+            canvas._inspector_hit_callback = lambda x, y, mode, i=texture_index: self._atlas_hit_texture(i, x, y, mode)
+            canvas._inspector_region_callback = lambda region, mode, i=texture_index: self._atlas_region(i, region, mode)
+            canvas.selectionRequested.connect(canvas._inspector_hit_callback)
+            canvas.regionRequested.connect(canvas._inspector_region_callback)
+            canvas.setSelectionMode(self._selection_mode if self._multi_selection else "point")
             canvas.setToolTip(_text("artmesh.inspector.zoom_hint"))
             self.atlas_canvases[texture_index] = canvas
             self.atlas_tabs.addTab(canvas, str(texture_index))
@@ -1031,7 +1130,9 @@ class ArtMeshInspector(QWidget):
             overview_canvas.setToolTip(_text("artmesh.inspector.zoom_hint"))
             overview_canvas.setMinimumHeight(150)
             overview_canvas.setMaximumHeight(260)
-            overview_canvas.hitRequested.connect(lambda x, y, i=texture_index: self._atlas_hit_texture(i, x, y))
+            overview_canvas.selectionRequested.connect(lambda x, y, mode, i=texture_index: self._atlas_hit_texture(i, x, y, mode))
+            overview_canvas.regionRequested.connect(lambda region, mode, i=texture_index: self._atlas_region(i, region, mode))
+            overview_canvas.setSelectionMode(self._selection_mode if self._multi_selection else "point")
             card_layout.addWidget(overview_canvas)
             self.overview_canvases[texture_index] = overview_canvas
             self._overview_cards.append(card)
@@ -1116,6 +1217,8 @@ class ArtMeshInspector(QWidget):
                 self.candidate_combo.clear()
             self.candidate_combo.hide()
         ids = list(dict.fromkeys(str(value) for value in drawable_ids))
+        if not self._multi_selection:
+            ids = [primary_id] if primary_id in ids else ids[:1]
         by_id = {entry.drawable_id: index for index, entry in enumerate(self.entries)
                  if self._allowed_ids is None or entry.drawable_id in self._allowed_ids}
         self.selected_indices = {by_id[identifier] for identifier in ids if identifier in by_id}
@@ -1149,6 +1252,31 @@ class ArtMeshInspector(QWidget):
         self.selectionChanged.emit(self.current_entry())
         return [self.entries[by_id[identifier]] for identifier in ids if identifier in by_id]
 
+    def apply_selection(self, drawable_ids, mode="replace", primary_id=None):
+        """Apply UV, list or preview gestures to the same final selection."""
+        picked = list(dict.fromkeys(map(str, drawable_ids)))
+        mode = mode if self._multi_selection else "replace"
+        identifiers = combine_selection(self.selected_drawable_ids(), picked, mode)
+        primary = primary_id or (picked[0] if picked else getattr(self.current_entry(), "drawable_id", None))
+        return self.select_entries(identifiers, primary_id=primary)
+
+    def set_multi_selection(self, enabled):
+        """ViewerEX uses False: modifiers and drags never select many IDs."""
+        self._multi_selection = bool(enabled)
+        self.entry_list.toggle_enabled = self._multi_selection
+        self.entry_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection if enabled
+                                         else QAbstractItemView.SelectionMode.SingleSelection)
+        self.set_selection_mode(self._selection_mode)
+        self.select_entries(self.selected_drawable_ids(), primary_id=getattr(self.current_entry(), "drawable_id", None))
+        self.retranslate_ui()
+
+    def set_selection_mode(self, mode):
+        if mode not in ("point", "rectangle"):
+            raise ValueError("UV selection mode must be point or rectangle")
+        self._selection_mode = mode
+        for canvas in [self.pose_canvas, *self.atlas_canvases.values(), *self.overview_canvases.values()]:
+            canvas.setSelectionMode(mode if self._multi_selection else "point")
+
     def selected_drawable_ids(self) -> list[str]:
         return [entry.drawable_id for index, entry in enumerate(self.entries) if index in self.selected_indices]
 
@@ -1161,7 +1289,12 @@ class ArtMeshInspector(QWidget):
         self._allowed_ids = None if drawable_ids is None else set(map(str, drawable_ids))
         self._filter_entries()
 
-    def set_pick_candidates(self, drawable_ids):
+    def set_pick_candidates(self, drawable_ids, selection_mode="replace"):
+        if selection_mode not in ("replace", "toggle"):
+            raise ValueError("Point selection operation must be replace or toggle")
+        self._candidate_baseline = self.selected_drawable_ids()
+        self._candidate_primary = getattr(self.current_entry(), "drawable_id", None)
+        self._candidate_selection_mode = selection_mode if self._multi_selection else "replace"
         available = {entry.drawable_id for entry in self.entries}
         self.pick_candidates = [identifier for identifier in dict.fromkeys(map(str, drawable_ids))
                                 if identifier in available and (self._allowed_ids is None or identifier in self._allowed_ids)]
@@ -1172,7 +1305,7 @@ class ArtMeshInspector(QWidget):
         self.candidate_combo.setVisible(len(self.pick_candidates) > 1)
         self._keep_pick_candidates = True
         try:
-            self.select_entries(self.pick_candidates[:1])
+            self._apply_pick_candidate(self.pick_candidates[0] if self.pick_candidates else None)
         finally:
             self._keep_pick_candidates = False
 
@@ -1180,9 +1313,16 @@ class ArtMeshInspector(QWidget):
         if index >= 0 and not self._loading:
             self._keep_pick_candidates = True
             try:
-                self.select_entry(str(self.candidate_combo.itemData(index)))
+                self._apply_pick_candidate(str(self.candidate_combo.itemData(index)))
             finally:
                 self._keep_pick_candidates = False
+
+    def _apply_pick_candidate(self, identifier):
+        # Choosing a back layer refines this same gesture. Recompute from its
+        # baseline so a Shift click never toggles every layer clicked through.
+        ids = combine_selection(self._candidate_baseline, [identifier] if identifier else [],
+                                self._candidate_selection_mode)
+        self.select_entries(ids, primary_id=identifier or self._candidate_primary)
 
     def _shared_entry_indices(self, texture_index: int | None = None) -> set[int]:
         result: set[int] = set()
@@ -1220,26 +1360,47 @@ class ArtMeshInspector(QWidget):
 
     def _atlas_candidates(self, texture_index, x, y):
         point = (float(x), float(y))
-        candidates: list[tuple[tuple[float, float, int, int], int]] = []
-        size = self.texture_sizes.get(int(texture_index), (1, 1))
-        for index, entry in enumerate(self.entries):
-            if (entry.texture_index != int(texture_index) or not entry.has_atlas_geometry
-                    or (self._allowed_ids is not None and entry.drawable_id not in self._allowed_ids)):
-                continue
-            if any(_point_in_triangle(point, triangle) for triangle in entry.atlas_triangles(size)):
-                order = (entry.render_order, entry.draw_order, entry.source_index, index)
-                candidates.append((order, index))
-        return [index for _, index in sorted(candidates, reverse=True)]
+        return [index for index, bounds, triangles in self._atlas_geometry(texture_index)
+                if (self._allowed_ids is None or self.entries[index].drawable_id in self._allowed_ids)
+                and bounds[0] <= point[0] <= bounds[2] and bounds[1] <= point[1] <= bounds[3]
+                and any(_point_in_triangle(point, triangle) for triangle in triangles)]
 
-    def _pose_hit(self, x: float, y: float) -> None:
+    def _atlas_geometry(self, texture_index):
+        """UVs are static per snapshot; opacity/eligible IDs remain live filters."""
+        size = self.texture_sizes.get(int(texture_index), (1, 1))
+        cached = self._atlas_geometry_cache.get(int(texture_index))
+        if cached is not None and cached[0] == size:
+            return cached[1]
+        geometry = []
+        for index, entry in enumerate(self.entries):
+            if entry.texture_index != int(texture_index) or not entry.has_atlas_geometry:
+                continue
+            triangles = entry.atlas_triangles(size)
+            points = [point for triangle in triangles for point in triangle]
+            if not points:
+                continue
+            bounds = (min(p[0] for p in points), min(p[1] for p in points),
+                      max(p[0] for p in points), max(p[1] for p in points))
+            order = (entry.render_order, entry.draw_order, entry.source_index, index)
+            geometry.append((order, index, bounds, triangles))
+        result = [(index, bounds, triangles) for _, index, bounds, triangles in sorted(geometry, reverse=True)]
+        self._atlas_geometry_cache[int(texture_index)] = (size, result)
+        return result
+
+    def _pose_scene(self):
         drawables = self.metadata.get("drawables")
         if not isinstance(drawables, list):
             drawables = [dict(entry.raw, id=entry.drawable_id,
                               vertices=[(x * entry.coordinate_scale, y * entry.coordinate_scale) for x, y in entry.vertices])
                          for entry in self.entries]
-        scene = SelectionScene({"drawables": drawables, "parts": self.metadata.get("parts", [])},
-                               self.texture_paths, alpha_cache=self._selection_alpha_cache)
-        self.set_pick_candidates(scene.hit_point((x, y)))
+        return SelectionScene({"drawables": drawables, "parts": self.metadata.get("parts", [])},
+                              self.texture_paths, alpha_cache=self._selection_alpha_cache)
+
+    def _pose_hit(self, x: float, y: float, mode="replace") -> None:
+        self.set_pick_candidates(self._pose_scene().hit_point((x, y)), selection_mode=mode)
+
+    def _pose_region(self, region, mode="replace"):
+        self.apply_selection(self._pose_scene().hit_region(region), mode=mode)
 
     def _atlas_hit(self, x: float, y: float) -> None:
         texture_index = int(self.texture_combo.currentData() or 0)
@@ -1247,9 +1408,18 @@ class ArtMeshInspector(QWidget):
         if index is not None:
             self.select_entry(index)
 
-    def _atlas_hit_texture(self, texture_index, x, y):
+    def _atlas_hit_texture(self, texture_index, x, y, mode="replace"):
         indices = self._atlas_candidates(texture_index, x, y)
-        self.set_pick_candidates([self.entries[index].drawable_id for index in indices])
+        self.set_pick_candidates([self.entries[index].drawable_id for index in indices], selection_mode=mode)
+
+    def _atlas_region(self, texture_index, region, mode="replace"):
+        polygon = region["polygon"]
+        xs, ys = zip(*polygon)
+        bounds = (min(xs), min(ys), max(xs), max(ys))
+        identifiers = [self.entries[index].drawable_id for index, entry_bounds, triangles in self._atlas_geometry(texture_index)
+                       if SelectionScene._bounds_overlap(entry_bounds, bounds)
+                       and any(len(intersect_convex(triangle, polygon)) >= 3 for triangle in triangles)]
+        self.apply_selection(identifiers, mode=mode)
 
     def _update_views(self) -> None:
         # Callers clearing a model already clear entries/textures. Clear all
@@ -1364,6 +1534,7 @@ class ArtMeshPickDialog(ThemedEditorDialog):
         self.setMaximumWidth(1000)
         self.resize(880, 660)
         self.inspector = ArtMeshInspector(parent=self)
+        self.inspector.set_multi_selection(False)
         self._eligible_ids = set(eligible_ids)
         self.inspector.load_snapshot(snapshot, texture_paths)
         if pose_frame is not None:

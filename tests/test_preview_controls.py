@@ -34,6 +34,8 @@ class FakeNativePreview(QWidget):
         self.motion_seek_items = []
         self.failure = None
         self.playback = None
+        self.meta_reads = 0
+        self.value_reads = []
 
     def load_model(self, path):
         if self.failure:
@@ -47,7 +49,13 @@ class FakeNativePreview(QWidget):
         self.settings.update(settings)
 
     def get_parameter_meta_list(self):
+        self.meta_reads += 1
         return copy.deepcopy(self.meta)
+
+    def get_parameter_values(self, parameter_ids):
+        ids = list(parameter_ids)
+        self.value_reads.append(ids)
+        return {item["id"]: float(item["value"]) for item in self.meta if item["id"] in ids}
 
     def set_motion_frozen(self, value):
         self.frozen = value
@@ -78,16 +86,6 @@ class FakeNativePreview(QWidget):
         pass
 
 
-class FakeCoreModel:
-    def drawable_snapshot(self, parameters):
-        mesh = {"id": "HairMesh", "drawable_id": "HairMesh", "parent_part_id": "PartHair", "parent_part_index": 0,
-                "texture_index": 0, "vertices": [[10, 10], [90, 10], [90, 90]],
-                "uvs": [[0, 1], [1, 1], [1, 0]], "indices": [0, 1, 2], "opacity": 1,
-                "visible": True, "render_order": 1}
-        return {"canvas": {"width": 100, "height": 100}, "parts": [{"id": "PartHair", "opacity": .8}],
-                "drawables": [mesh, dict(mesh, id="HairMesh2", drawable_id="HairMesh2", render_order=2)]}
-
-
 class PreviewControlsTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -104,7 +102,6 @@ class PreviewControlsTests(unittest.TestCase):
                 super().__init__(settings_file)
 
         self.module = importlib.import_module("app.gui.PreviewPage")
-        self.mesh_module = importlib.import_module("app.gui.PreviewArtMeshPanel")
         with patch.object(self.module, "SettingsManager", TempSettings), patch.object(self.module, "SpinePreviewWidget", DummySpinePreview), patch.object(PreviewPage, "_ensure_embedded_live2d", return_value=None):
             self.page = PreviewPage()
         self.native = FakeNativePreview(self.page.preview_dock_area)
@@ -213,80 +210,140 @@ class PreviewControlsTests(unittest.TestCase):
         self.assertEqual(self.native.motion_seek_items[-1]["group"], "Idle")
         self.assertIn("Idle[0]", page.motion_time_label.text())
 
-    def test_mouse_tabs_return_from_artmesh_and_inspect_current_pose_parameters(self):
+    def test_two_mouse_tabs_and_search_retain_current_animation_parameters(self):
         self.load_live()
         self.native.meta[0]["value"] = 3.14159265
         self.native.meta.append({"id": "ParamOther", "min": 0, "max": 1, "value": .125})
         self.page._refresh_parameter_controls()
-        with patch.object(self.mesh_module, "CubismCore") as core:
-            core.return_value.load_moc.return_value = FakeCoreModel()
-            page = self.page
-            for index in (2, 0, 1, 2):
-                item = page.live2d_details.pivot.widget(page.live2d_details._keys[index])
-                page.live2d_details.tab_scroll.ensureWidgetVisible(item, 8, 0)
-                self.app.processEvents()
-                QTest.mouseClick(item, Qt.LeftButton)
-                self.app.processEvents()
-                self.assertEqual(page.live2d_details.currentIndex(), index)
-            panel = page.artmesh_panel
-            panel.select_drawable("HairMesh2")
-            self.assertEqual(panel._parameter_rows, ["ParamAngleX"])
-            self.assertEqual(float(panel.parameter_table.item(0, 1).text()), 3.14159)
-            panel.freeze_pose.click()
-            self.assertTrue(page.freeze_motion_check.isChecked())
-            self.assertEqual(panel.inspector.current_entry().drawable_id, "HairMesh2")
-            panel.parameter_search.setText("Other")
-            self.assertEqual(panel._parameter_rows, ["ParamOther"])
-            self.assertEqual(panel.parameter_table.item(0, 1).text(), "0.125")
-            self.assertEqual(panel.inspector.current_entry().drawable_id, "HairMesh2")
-            panel.parameter_table.cellDoubleClicked.emit(0, 0)
-            self.assertEqual(page.live2d_details.currentIndex(), 0)
-            self.assertEqual(panel.inspector.current_entry().drawable_id, "HairMesh2")
+        page = self.page
+        self.assertEqual(page.live2d_details.count(), 2)
+        self.assertFalse(hasattr(page, "artmesh_panel"))
+        for index in (1, 0, 1, 0):
+            item = page.live2d_details.pivot.widget(page.live2d_details._keys[index])
+            page.live2d_details.tab_scroll.ensureWidgetVisible(item, 8, 0)
+            self.app.processEvents()
+            QTest.mouseClick(item, Qt.LeftButton)
+            self.app.processEvents()
+            self.assertEqual(page.live2d_details.currentIndex(), index)
+        panel = page.advanced_panel
+        panel.parameter_search.setText("Other")
+        self.app.processEvents()
+        self.assertEqual(panel.visible_parameter_ids(), ["ParamOther"])
+        self.assertTrue(panel.advanced_param_sliders["ParamAngleX"][0].isHidden())
+        self.native.meta[-1]["value"] = .875
+        reads = self.native.meta_reads
+        page._sync_live_parameter_controls()
+        self.assertEqual(self.native.meta_reads, reads)
+        self.assertEqual(self.native.value_reads[-1], ["ParamOther"])
+        slider, _, scale = panel.advanced_param_sliders["ParamOther"]
+        self.assertEqual(slider.value() / scale, .88)
+        page.freeze_motion_check.click()
+        self.assertEqual(self.native.settings["advanced_params"]["ParamAngleX"], 3.14159265)
+        self.assertEqual(self.native.settings["advanced_params"]["ParamOther"], .875)
 
-    def test_artmesh_controls_use_part_id_and_leave_source_unchanged(self):
+    def test_removed_artmesh_never_loads_extra_core_and_preview_is_read_only(self):
         self.load_live()
         source_files = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
                         for path in self.root.iterdir() if path.name != "settings.json"}
-        with patch.object(self.mesh_module, "CubismCore") as core:
-            core.return_value.load_moc.return_value = FakeCoreModel()
-            page = self.page
-            page.live2d_details.setCurrentIndex(2)
-            panel = page.artmesh_panel
-            self.assertEqual(panel.inspector.current_entry().drawable_id, "HairMesh")
-            panel.part_visible.click()
-            self.assertEqual(self.native.part_calls[-1][0], {"PartHair": 0})
-            self.assertNotIn("HairMesh", panel.part_overrides)
-            page._preview_drawable_clicked("PartHair")
-            self.assertEqual(panel.inspector.current_entry().drawable_id, "HairMesh")
-            panel.reset_button.click()
-            self.assertEqual(self.native.part_calls[-1], ({}, {"PartHair": .8}))
-            page._preview_model_point_clicked(.75, .25)
-            self.assertEqual(panel.inspector.current_entry().drawable_id, "HairMesh2")
-            panel.part_opacity.setValue(.2)
-            self.assertEqual(self.native.part_calls[-1][0], {"PartHair": .2})
+        with patch("app.gui.PreviewArtMeshPanel.CubismCore") as core:
+            for index in (1, 0, 1, 0):
+                self.page.live2d_details.setCurrentIndex(index)
+                self.page._sync_live_parameter_controls()
+            self.page.freeze_motion_check.click()
+            slider, _, _ = self.page.advanced_panel.advanced_param_sliders["ParamAngleX"]
+            slider.setValue(750)
+            core.assert_not_called()
         self.assertEqual(source_files, {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
                                        for path in self.root.iterdir() if path.name != "settings.json"})
-        self.assertFalse(Path(panel.inspector.metadata_path).is_relative_to(self.root))
+        self.assertFalse(self.native.part_calls)
 
-    def test_switching_formats_clears_parameter_and_part_overrides(self):
+    def test_switching_formats_clears_animation_parameter_overrides(self):
         self.load_live()
         page = self.page
-        page.artmesh_panel.part_overrides = {"PartHair": 0}
         page.freeze_motion_check.setChecked(True)
         page._show_spine_stage()
         self.assertIs(page.resource_details_stack.currentWidget(), page.spine_details)
         self.assertTrue(page.pose_controls_card.isHidden())
-        self.assertFalse(page.artmesh_panel.part_overrides)
-        self.assertEqual(self.native.part_calls[-1], ({}, {}))
+        self.assertFalse(self.native.part_calls)
         self.assertFalse(page.advanced_panel.advanced_param_sliders)
         self.assertFalse(page.freeze_motion_check.isChecked())
         page._show_image_stage()
         self.assertIs(page.resource_details_stack.currentWidget(), page.image_item_list)
         self.assertTrue(page.open_editor_btn.isHidden())
         self.load_live()
-        self.assertFalse(page.artmesh_panel.part_overrides)
         slider, _, scale = page.advanced_panel.advanced_param_sliders["ParamAngleX"]
         self.assertEqual(slider.value() / scale, 0)
+
+    def test_hidden_tabs_sidebar_and_page_do_not_read_or_refresh_parameters(self):
+        self.load_live()
+        page = self.page
+        page.live2d_details.setCurrentIndex(1)
+        self.native.meta_reads = 0
+        self.native.value_reads.clear()
+        for _ in range(20):
+            page._sync_live_parameter_controls()
+        page._refresh_parameter_controls(retries=5)
+        self.assertFalse(page._parameter_sync_timer.isActive())
+        self.assertEqual(self.native.meta_reads, 0)
+        self.assertFalse(self.native.value_reads)
+        page.live2d_details.setCurrentIndex(0)
+        page._toggle_sidebar("right")
+        self.native.value_reads.clear()
+        for _ in range(20):
+            page._sync_live_parameter_controls()
+        self.assertFalse(page._parameter_sync_timer.isActive())
+        self.assertFalse(self.native.value_reads)
+        page._toggle_sidebar("right")
+        page.set_active(False)
+        self.native.value_reads.clear()
+        page._sync_live_parameter_controls()
+        self.assertFalse(page._parameter_sync_timer.isActive())
+        self.assertFalse(self.native.value_reads)
+        self.assertFalse(page._parameter_refresh_timer.isActive())
+
+    def test_unchanged_values_and_static_schema_preserve_widgets_without_writes(self):
+        self.load_live()
+        panel = self.page.advanced_panel
+        slider, label, _ = panel.advanced_param_sliders["ParamAngleX"]
+        with patch.object(slider, "setValue", wraps=slider.setValue) as write_value, \
+                patch.object(label, "setText", wraps=label.setText) as write_text:
+            panel.sync_advanced_param_values(self.native.meta)
+            write_value.assert_not_called()
+            write_text.assert_not_called()
+            self.native.meta[0]["value"] = 7.5
+            self.page._refresh_parameter_controls()
+            self.assertIs(panel.advanced_param_sliders["ParamAngleX"][0], slider)
+            self.assertEqual(write_value.call_count, 1)
+            self.assertEqual(write_text.call_count, 1)
+
+    def test_scrolling_reads_only_newly_visible_parameter_rows(self):
+        self.native.meta = [{"id": f"Param{index:03d}", "min": -30, "max": 30,
+                             "default": 0, "value": 0} for index in range(486)]
+        self.load_live()
+        panel = self.page.advanced_panel
+        first_ids = panel.visible_parameter_ids()
+        self.assertTrue(first_ids)
+        self.assertLess(len(first_ids), 30)
+        self.native.meta[-1]["value"] = 7.125
+        reads = self.native.meta_reads
+        panel.parameter_scroll.verticalScrollBar().setValue(panel.parameter_scroll.verticalScrollBar().maximum())
+        self.app.processEvents()
+        self.page._sync_live_parameter_controls()
+        last_ids = self.native.value_reads[-1]
+        self.assertIn("Param485", last_ids)
+        self.assertLess(len(last_ids), 30)
+        self.assertFalse(set(first_ids) & set(last_ids))
+        self.assertEqual(self.native.meta_reads, reads)
+        slider, _, scale = panel.advanced_param_sliders["Param485"]
+        self.assertEqual(slider.value(), int(round(7.125 * scale)))
+
+    def test_source_actions_are_at_top_and_existing_log_is_last_left_widget(self):
+        page = self.page
+        self.assertTrue(page.source_card.isAncestorOf(page.preview_btn))
+        self.assertTrue(page.source_card.isAncestorOf(page.close_all_btn))
+        self.assertLess(page.preview_btn.mapTo(page, QPoint()).y(), page.model_info_text_box.mapTo(page, QPoint()).y())
+        layout = page.left_sidebar.layout()
+        self.assertIs(layout.itemAt(layout.count() - 1).widget(), page.model_info_text_box)
 
     def test_images_keep_large_center_vertical_thumbnails_and_navigation(self):
         page = self.page

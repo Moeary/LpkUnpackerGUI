@@ -3,14 +3,49 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
 
-from app.gui.live2d_selection import ModelCoordinates, PreviewTransform, SelectionScene
+from app.gui.live2d_selection import ModelCoordinates, PreviewTransform, SelectionScene, combine_selection
 
 
 class Live2DSelectionTests(unittest.TestCase):
+    def test_selection_operations_preserve_order_and_empty_shift_gestures(self):
+        self.assertEqual(combine_selection(["face", "ear"], ["hand"], "replace"), ["hand"])
+        self.assertEqual(combine_selection(["face", "ear"], ["ear", "hand"], "add"), ["face", "ear", "hand"])
+        self.assertEqual(combine_selection(["face", "ear"], ["face"], "toggle"), ["ear"])
+        self.assertEqual(combine_selection(["face", "ear"], [], "toggle"), ["face", "ear"])
+        self.assertEqual(combine_selection(["face", "ear"], [], "replace"), [])
+        with self.assertRaises(ValueError):
+            combine_selection(["face"], ["ear"], "unsupported")
+
+    def test_hit_caches_are_bounded_to_one_request_and_observe_pose_part_and_alpha_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            texture = Path(directory) / "atlas.png"
+            Image.new("RGBA", (16, 16), (220, 90, 30, 255)).save(texture)
+            triangle = {"vertices": [[0, 0], [16, 0], [0, 16]], "uvs": [[0, 1], [1, 1], [0, 0]],
+                        "indices": [0, 1, 2], "texture_index": 0, "parent_part_id": "part"}
+            snapshot = {"parts": [{"id": "part", "opacity": 1}],
+                        "drawables": [dict(triangle, id=f"mesh-{i}") for i in range(40)]}
+            scene = SelectionScene(snapshot, [texture])
+            with patch.object(scene, "_load_alpha", wraps=scene._load_alpha) as alpha_loader:
+                self.assertEqual(len(scene.hit_point((4, 4))), 40)
+                self.assertEqual(alpha_loader.call_count, 1)
+                snapshot["parts"][0]["opacity"] = 0
+                self.assertEqual(scene.hit_point((4, 4)), [])
+                self.assertEqual(alpha_loader.call_count, 1)
+                snapshot["parts"][0]["opacity"] = 1
+                snapshot["drawables"] = [dict(triangle, id="changed-pose", vertices=[[8, 8], [16, 8], [8, 16]])]
+                self.assertEqual(scene.hit_point((4, 4)), [])
+                self.assertEqual(alpha_loader.call_count, 1, "Missed geometry must not stat/decode textures")
+                self.assertEqual(scene.hit_point((10, 10)), ["changed-pose"])
+                self.assertEqual(alpha_loader.call_count, 2)
+                Image.new("RGBA", (16, 16), (220, 90, 30, 0)).save(texture)
+                self.assertEqual(scene.hit_point((10, 10)), [])
+                self.assertEqual(alpha_loader.call_count, 3)
+
     def test_sdk_mvp_and_preview_transform_are_both_inverted_at_all_aspects(self):
         canvas = {"origin_x": 830, "origin_y": 500, "pixels_per_unit": 400}
         matrix = np.eye(4)

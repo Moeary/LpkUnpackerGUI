@@ -103,6 +103,10 @@ LIVE2D_EDITOR_TEXT = {
     "editor.live2d.pick_psd_hint": "将选中的完整 ArtMesh 按当前姿态导出为可回写 PSD",
     "editor.live2d.pick_count": "已选 {count} 个",
     "editor.live2d.local_preview_zoom": "放大查看所选 ArtMesh 贴图区域",
+    "editor.live2d.pick_hidden_title": "选中部件已隐藏",
+    "editor.live2d.pick_hidden_export": "所属 Part 已隐藏：{parts}。仅在导出副本中恢复这些 Part 可见，并导出所选 ArtMesh；当前预览与编辑记录保持不变。继续？",
+    "editor.live2d.pick_restore_export": "恢复可见并导出",
+    "editor.live2d.pick_invisible": "以下选中 ArtMesh 在当前参数姿态中没有可见内容，请调整姿态后再导出：{ids}",
 }
 
 
@@ -165,6 +169,7 @@ class Live2DEditorPage(QFrame):
         self._manual_pose = False
         self._selected_parameter = ""
         self._inspector_session = None
+        self._inspector_scene_key = None
         self._parameter_spins: dict[str, _ParameterValue] = {}
         self._parameter_rows: dict[str, int] = {}
         self._parameter_dragging = False
@@ -172,6 +177,7 @@ class Live2DEditorPage(QFrame):
         self._selection_cache = None
         self._selected_drawable_ids: list[str] = []
         self._selection_region = None
+        self._selection_region_key = None
         self._mod_preview_model_id = ""
         self._external_editor = ""
         self.last_saved_copy: dict | None = None
@@ -486,13 +492,17 @@ class Live2DEditorPage(QFrame):
         inspector.status_label.hide()
         inspector.details.textChanged.connect(lambda: inspector.setToolTip(inspector.details.toPlainText()))
         inspector.refresh_button.clicked.disconnect()
-        inspector.refresh_button.clicked.connect(self._refresh_mesh)
+        inspector.refresh_button.clicked.connect(lambda: self._refresh_mesh(force=True))
         inspector.selectionChanged.connect(self._artmesh_selected)
         inspector.selectionIdsChanged.connect(self._artmesh_selection_changed)
         layout.addWidget(inspector, 1)
         self.local_preview_label = CaptionLabel(self.artmesh_tab)
+        self.local_preview_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         local_row = QHBoxLayout()
         local_row.addWidget(self.local_preview_label, 1)
+        self.artmesh_export_button = PushButton(FluentIcon.SAVE, "", self.artmesh_tab)
+        self.artmesh_export_button.clicked.connect(self.export_selected_artmeshes)
+        local_row.addWidget(self.artmesh_export_button)
         self.local_preview_button = TransparentToolButton(FluentIcon.ZOOM, self.artmesh_tab)
         self.local_preview_button.setFixedSize(28, 28)
         self.local_preview_button.clicked.connect(self._show_local_artmesh_image)
@@ -635,6 +645,8 @@ class Live2DEditorPage(QFrame):
             button.setToolTip(_text("editor.live2d." + key))
             button.setAccessibleName(button.toolTip())
         self.export_selection_button.setText(_text("editor.live2d.pick_psd"))
+        self.artmesh_export_button.setText(_text("editor.live2d.pick_psd"))
+        self.artmesh_export_button.setToolTip(_text("editor.live2d.pick_psd_hint"))
         self._update_selection_actions()
         self.use_for_mod_button.setToolTip(_text("editor.live2d.mod_hint"))
         self.parameter_name.setText(_text("editor.live2d.selected_parameter"))
@@ -713,7 +725,12 @@ class Live2DEditorPage(QFrame):
                 self.preview.live2d_canvas.drawableClicked.connect(self._native_drawable_clicked)
                 self.preview.live2d_canvas.modelPointClicked.connect(self._native_model_point_clicked)
                 canvas = self.preview.live2d_canvas
-                if hasattr(canvas, "drawablesPicked"):
+                if hasattr(canvas, "drawablesPickedWithMode"):
+                    canvas.drawablesPickedWithMode.connect(self._native_drawables_picked)
+                    canvas.regionPickedWithMode.connect(self._native_region_picked)
+                    canvas.selectionFailed.connect(self._error)
+                    canvas.selectionCancelled.connect(self.clear_artmesh_selection)
+                elif hasattr(canvas, "drawablesPicked"):
                     canvas.drawablesPicked.connect(self._native_drawables_picked)
                     canvas.regionPicked.connect(self._native_region_picked)
                     canvas.selectionFailed.connect(self._error)
@@ -1450,14 +1467,25 @@ class Live2DEditorPage(QFrame):
         if self.tabs.currentWidget() is self.artmesh_tab:
             self._refresh_mesh()
 
-    def _refresh_mesh(self):
+    def _refresh_mesh(self, *, force=False):
         if not self.session:
             return
         try:
             scene = self._selection_scene()
+            texture_stamps = []
+            for path in scene["texture_paths"]:
+                try:
+                    stamp = Path(path).stat()
+                    texture_stamps.append((path, stamp.st_mtime_ns, stamp.st_size))
+                except OSError:
+                    texture_stamps.append((path, None, None))
+            key = (id(scene["snapshot"]), tuple(texture_stamps))
+            if not force and self._inspector_session is (self._preview_session or self.session) and self._inspector_scene_key == key:
+                return
             self.artmesh_inspector.load_snapshot(scene["snapshot"], scene["texture_paths"],
                                                  selected_ids=self._selected_drawable_ids)
             self._inspector_session = self._preview_session or self.session
+            self._inspector_scene_key = key
         except Exception as exc:
             self._error(exc)
 
@@ -1501,6 +1529,7 @@ class Live2DEditorPage(QFrame):
 
     def clear_artmesh_selection(self):
         self._selection_region = None
+        self._selection_region_key = None
         self._selected_drawable_ids = []
         self._selection_cache = None
         with QSignalBlocker(self.point_select_button), QSignalBlocker(self.rect_select_button):
@@ -1524,27 +1553,62 @@ class Live2DEditorPage(QFrame):
         self.clear_selection_button.setEnabled(bool(self._selected_drawable_ids or self._selection_region))
         self.export_selection_button.setEnabled(bool(available and not self._preview_session
                                                      and self._selected_drawable_ids and not self._projects_busy()))
+        self.artmesh_export_button.setEnabled(self.export_selection_button.isEnabled())
+        self.artmesh_export_button.setToolTip(_text("editor.live2d.pick_psd_hint") + "\n" +
+                                             _text("editor.live2d.pick_count", count=len(self._selected_drawable_ids)))
         self.selection_count.setText(_text("editor.live2d.pick_count", count=len(self._selected_drawable_ids)))
 
     def _artmesh_selection_changed(self, identifiers: list):
         self._selected_drawable_ids = list(dict.fromkeys(str(identifier) for identifier in identifiers))
+        # A UV/list/candidate gesture no longer describes the earlier rectangle.
+        # Rectangle handlers restore their own region only after final IDs sync.
+        self._selection_region = None
+        self._selection_region_key = None
         self._update_selection_actions()
 
-    def _native_drawables_picked(self, identifiers: list):
+    def _native_drawables_picked(self, identifiers: list, mode: str = "replace"):
         self._selection_region = None
         in_mod = self._in_viewer_workspace()
         if not in_mod:
             self.tabs.setCurrentWidget(self.artmesh_tab)
         self._refresh_mesh()
-        self.artmesh_inspector.set_pick_candidates(identifiers)
+        self.artmesh_inspector.set_pick_candidates(identifiers, selection_mode=mode)
         if in_mod and identifiers and self._mod_preview_model_id:
             self.mod_panel.select_trigger(identifiers[0])
 
-    def _native_region_picked(self, identifiers: list, region: dict):
-        self._selection_region = dict(region)
+    def _native_region_picked(self, identifiers: list, region: dict, mode: str = "replace"):
         self.tabs.setCurrentWidget(self.artmesh_tab)
         self._refresh_mesh()
-        self.artmesh_inspector.select_entries(identifiers)
+        self.artmesh_inspector.apply_selection(identifiers, mode=mode)
+        # An additive selection can span several regions and atlas pages.
+        # Do not attach only its final rectangle to the complete selection.
+        self._selection_region = dict(region) if mode == "replace" else None
+        self._selection_region_key = self._selection_cache[0] if self._selection_region and self._selection_cache else None
+        self._update_selection_actions()
+
+    def _selection_export_scene(self, identifiers: list):
+        scene = self._selection_scene()
+        by_id = {item["id"]: item for item in scene["snapshot"].get("drawables", [])}
+        parts = dict(scene["pose"]["parts"])
+        hidden = sorted({str(by_id[identifier].get("parent_part_id") or "") for identifier in identifiers
+                         if identifier in by_id and parts.get(str(by_id[identifier].get("parent_part_id") or ""), 1) <= .001})
+        if hidden:
+            answer = QMessageBox.question(self.window(), _text("editor.live2d.pick_hidden_title"),
+                                          _text("editor.live2d.pick_hidden_export", parts=", ".join(hidden)),
+                                          QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel,
+                                          button_texts={QMessageBox.Yes: _text("editor.live2d.pick_restore_export")})
+            if answer != QMessageBox.Yes:
+                return None
+            parts.update({part: 1.0 for part in hidden})
+            snapshot = self.session.exact_pose_mesh(scene["pose"]["parameters"], parts)
+            pose = dict(scene["pose"], parts=parts, export_visibility_restored_parts=hidden)
+            scene = dict(scene, snapshot=snapshot, pose=pose)
+            by_id = {item["id"]: item for item in snapshot.get("drawables", [])}
+        invisible = [identifier for identifier in identifiers if identifier not in by_id or
+                     not by_id[identifier].get("visible", True) or float(by_id[identifier].get("opacity", 1)) <= .001]
+        if invisible:
+            raise RuntimeError(_text("editor.live2d.pick_invisible", ids=", ".join(invisible)))
+        return scene
 
     def export_selected_artmeshes(self) -> bool:
         if not self.session or self._preview_session or not self._selected_drawable_ids or self._projects_busy():
@@ -1552,9 +1616,12 @@ class Live2DEditorPage(QFrame):
         try:
             self._flush_parameter_edit()
             self.timeline.set_playing(False)
-            scene = self._selection_scene()
             identifiers = list(self._selected_drawable_ids)
-            region = dict(self._selection_region) if self._selection_region else None
+            scene = self._selection_export_scene(identifiers)
+            if scene is None:
+                return False
+            region = (dict(self._selection_region) if self._selection_region and self._selection_cache
+                      and self._selection_region_key == self._selection_cache[0] else None)
             if not self.open_psd_workspace():
                 return False
             return self.psd_panel.export_selected_artmeshes(identifiers, scene["pose"], region,

@@ -78,6 +78,18 @@ class _Preview(QWidget):
         pass
 
 
+class _ModeCanvas(_Canvas):
+    drawablesPickedWithMode = Signal(list, str)
+    regionPickedWithMode = Signal(list, dict, str)
+
+
+class _ModePreview(_Preview):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.live2d_canvas.deleteLater()
+        self.live2d_canvas = _ModeCanvas(self)
+
+
 class Live2DEditorPageTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -285,6 +297,135 @@ class Live2DEditorPageTests(unittest.TestCase):
         self.assertEqual(page.preview.live2d_canvas.mode, "none")
         page.preview.live2d_canvas.drawablesPicked.emit(["ArtMeshFace"])
         self.assertEqual(page.artmesh_inspector.current_entry().drawable_id, "ArtMeshFace")
+
+    def _add_atlas_meshes(self):
+        from PIL import Image
+        path = self.model.parent / "drawables.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["parts"].append({"id": "PartEar", "index": 1, "opacity": .8})
+        data["drawables"].append(dict(data["drawables"][0], id="ArtMeshEar", texture_index=1,
+                                       parent_part_id="PartEar", parent_part_index=1))
+        data["drawables"].append(dict(data["drawables"][0], id="ArtMeshHair"))
+        path.write_text(json.dumps(data), encoding="utf-8")
+        Image.new("RGBA", (32, 32), (200, 50, 100, 180)).save(self.model.parent / "ear.png")
+        model = json.loads(self.model.read_text(encoding="utf-8"))
+        model["FileReferences"]["Textures"].append("ear.png")
+        self.model.write_text(json.dumps(model), encoding="utf-8")
+
+    def test_preview_modes_are_consumed_once_and_share_cross_atlas_selection(self):
+        self._add_atlas_meshes()
+        with patch("app.gui.Live2DPreviewWindow.Live2DPreviewWindow", _ModePreview):
+            self.assertTrue(self.page.open_source(str(self.model)))
+        page = self.page
+        canvas = page.preview.live2d_canvas
+        before = page.session._signature()
+        canvas.drawablesPickedWithMode.emit(["ArtMeshFace"], "replace")
+        canvas.drawablesPicked.emit(["ArtMeshFace"])  # Native emits both for compatibility.
+        self.assertEqual(page._selected_drawable_ids, ["ArtMeshFace"])
+        page.artmesh_inspector.apply_selection(["ArtMeshEar"], mode="add")
+        self.assertEqual(set(page._selected_drawable_ids), {"ArtMeshFace", "ArtMeshEar"})
+        canvas.drawablesPickedWithMode.emit(["ArtMeshFace"], "toggle")
+        canvas.drawablesPicked.emit(["ArtMeshFace"])
+        self.assertEqual(page._selected_drawable_ids, ["ArtMeshEar"])
+        canvas.drawablesPickedWithMode.emit([], "toggle")
+        self.assertEqual(page._selected_drawable_ids, ["ArtMeshEar"])
+        region = {"x": 10, "y": 10, "width": 80, "height": 80}
+        canvas.regionPickedWithMode.emit(["ArtMeshHair"], region, "add")
+        canvas.regionPicked.emit(["ArtMeshHair"], region)
+        self.assertEqual(set(page._selected_drawable_ids), {"ArtMeshEar", "ArtMeshHair"})
+        self.assertIsNone(page._selection_region)
+        canvas.drawablesPickedWithMode.emit([], "replace")
+        self.assertEqual(page._selected_drawable_ids, [])
+        self.assertFalse(page.artmesh_export_button.isEnabled())
+        self.assertEqual(page.session._signature(), before)
+
+    def test_uv_selection_exports_without_preview_and_invalidates_old_rectangle(self):
+        self._add_atlas_meshes()
+        self.open()
+        page = self.page
+        region = {"x": 10, "y": 10, "width": 80, "height": 80}
+        page._native_region_picked(["ArtMeshFace"], region)
+        self.assertEqual(page._selection_region, region)
+        page.artmesh_inspector.apply_selection(["ArtMeshEar"], mode="add", primary_id="ArtMeshEar")
+        self.assertIsNone(page._selection_region)
+        self.assertEqual(page.artmesh_inspector.current_entry().drawable_id, "ArtMeshEar")
+        self.assertEqual(page.preview.parts["PartFace"], .7)
+        page.workspace.set_panel_visible("preview", False)
+        self.assertTrue(page.artmesh_export_button.isEnabled())
+        with patch.object(page.psd_panel, "export_selected_artmeshes", return_value=True) as export:
+            self.assertTrue(page.export_selected_artmeshes())
+        self.assertEqual(set(export.call_args.args[0]), {"ArtMeshFace", "ArtMeshEar"})
+        self.assertIsNone(export.call_args.args[2])
+        page._native_region_picked(["ArtMeshFace"], region)
+        page._parameter_spins["ParamAngleY"].setValue(12)
+        with patch.object(page.psd_panel, "export_selected_artmeshes", return_value=True) as export:
+            self.assertTrue(page.export_selected_artmeshes())
+        self.assertIsNone(export.call_args.args[2])  # The old rectangle no longer refers to this pose.
+
+    def test_hidden_selected_export_only_restores_snapshot_parts_and_preserves_preview_history(self):
+        from app.gui.editor_dialogs import EditorMessageBox
+        self._add_atlas_meshes()
+        self.open()
+        page, session = self.page, self.page.session
+        page.tabs.setCurrentWidget(page.artmesh_tab)
+        page.artmesh_inspector.select_entries(["ArtMeshFace", "ArtMeshEar"])
+        session.set_part_opacity("PartFace", 0)
+        page._apply_preview_pose()
+        signature, undo = session._signature(), list(session._undo)
+        with patch("app.gui.Live2DEditorPage.QMessageBox.question", return_value=EditorMessageBox.Yes) as confirm, \
+                patch.object(page, "open_psd_workspace", return_value=True), \
+                patch.object(page.psd_panel, "export_selected_artmeshes", return_value=True) as export:
+            self.assertTrue(page.export_selected_artmeshes())
+        self.assertIn("PartFace", confirm.call_args.args[2])
+        self.assertEqual(export.call_args.args[1]["parts"], {"PartFace": 1, "PartEar": .8})
+        self.assertEqual(set(export.call_args.args[0]), {"ArtMeshFace", "ArtMeshEar"})
+        self.assertGreater(export.call_args.kwargs["mesh_data"]["drawables"][0].get("opacity", 1), 0)
+        self.assertEqual(page.preview.parts["PartFace"], 0)
+        self.assertEqual(session.part_overrides, {"PartFace": 0})
+        self.assertEqual(session._signature(), signature)
+        self.assertEqual(session._undo, undo)
+        self.assertEqual(page._selection_scene()["snapshot"]["drawables"][0]["opacity"], 0)
+
+    def test_hidden_export_cancel_and_intrinsic_invisibility_do_not_silently_drop_ids(self):
+        from app.gui.editor_dialogs import EditorMessageBox
+        self.open()
+        page, session = self.page, self.page.session
+        page.tabs.setCurrentWidget(page.artmesh_tab)
+        page.artmesh_inspector.select_entry("ArtMeshFace")
+        session.set_part_opacity("PartFace", 0)
+        page._apply_preview_pose()
+        signature, history = session._signature(), len(session._undo)
+        with patch("app.gui.Live2DEditorPage.QMessageBox.question", return_value=EditorMessageBox.Cancel), \
+                patch.object(page, "open_psd_workspace") as opened, \
+                patch.object(page.psd_panel, "export_selected_artmeshes") as export:
+            self.assertFalse(page.export_selected_artmeshes())
+            opened.assert_not_called()
+            export.assert_not_called()
+        self.assertEqual(session._signature(), signature)
+        self.assertEqual(len(session._undo), history)
+        self.assertEqual(page.preview.parts["PartFace"], 0)
+        session.mesh_data["drawables"][0]["opacity"] = 0  # Intrinsic pose opacity, even after restoring Part.
+        page._selection_cache = None
+        with patch("app.gui.Live2DEditorPage.QMessageBox.question", return_value=EditorMessageBox.Yes), \
+                patch.object(page.psd_panel, "export_selected_artmeshes") as export:
+            self.assertFalse(page.export_selected_artmeshes())
+            export.assert_not_called()
+        self.assertIn("ArtMeshFace", page.status_label.text())
+
+    def test_unchanged_pose_selection_does_not_rebuild_inspector_or_redecode_atlas(self):
+        self.open()
+        page = self.page
+        page.tabs.setCurrentWidget(page.artmesh_tab)
+        page._native_drawables_picked(["ArtMeshFace"])
+        with patch.object(page.artmesh_inspector, "load_snapshot", wraps=page.artmesh_inspector.load_snapshot) as loaded:
+            for _ in range(3):
+                page._native_drawables_picked(["ArtMeshFace"])
+            loaded.assert_not_called()
+            page.preview.values["ParamAngleY"] = 5
+            page._refresh_mesh()
+            self.assertEqual(loaded.call_count, 1)
+            page._refresh_mesh(force=True)
+            self.assertEqual(loaded.call_count, 2)
 
     def test_local_artmesh_thumbnail_geometry_never_overlaps_part_controls(self):
         from PIL import Image

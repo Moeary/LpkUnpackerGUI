@@ -14,6 +14,20 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 
+def combine_selection(current, picked, mode="replace"):
+    """Apply one explicit selection gesture while keeping stable ID order."""
+    current = list(dict.fromkeys(str(value) for value in current if value))
+    picked = list(dict.fromkeys(str(value) for value in picked if value))
+    if mode == "replace":
+        return picked
+    if mode == "add":
+        return list(dict.fromkeys(current + picked))
+    if mode == "toggle":
+        removed = set(picked)
+        return [value for value in current if value not in removed] + [value for value in picked if value not in current]
+    raise ValueError("Selection operation must be replace, add or toggle")
+
+
 def barycentric(point, triangle):
     if len(triangle) != 3:
         return None
@@ -141,8 +155,19 @@ class SelectionScene:
         self.texture_paths = dict(enumerate(texture_paths)) if not isinstance(texture_paths, Mapping) else texture_paths
         self._alpha_cache = alpha_cache if alpha_cache is not None else {}
         self._alpha_arrays = {}
+        self._request_alpha = None
+        self._request_bounds = {}
+        self._request_triangles = {}
 
     def _alpha(self, texture_index):
+        if self._request_alpha is not None and texture_index in self._request_alpha:
+            return self._request_alpha[texture_index]
+        alpha = self._load_alpha(texture_index)
+        if self._request_alpha is not None:
+            self._request_alpha[texture_index] = alpha
+        return alpha
+
+    def _load_alpha(self, texture_index):
         path = self.texture_paths.get(texture_index)
         if not path:
             return None
@@ -155,24 +180,58 @@ class SelectionScene:
                 # part of the key so a skin change never keeps old transparency.
                 for old in list(self._alpha_cache):
                     if old[0] == key[0]:
+                        self._alpha_arrays.pop(id(self._alpha_cache[old]), None)
                         del self._alpha_cache[old]
                 with Image.open(path) as image:
-                    self._alpha_cache[key] = image.convert("RGBA").getchannel("A")
+                    self._alpha_cache[key] = (image.getchannel("A") if "A" in image.getbands()
+                                              else image.convert("RGBA").getchannel("A"))
             return self._alpha_cache[key]
         except (OSError, ValueError):
             return None
+
+    def _begin_request(self):
+        # Geometry, opacity and parts may change between gestures. These small
+        # broad-phase caches live only for one hit, never across pose changes.
+        self.drawables = self.snapshot.get("drawables", [])
+        self.parts = {str(p["id"]): float(p.get("opacity", 1)) for p in self.snapshot.get("parts", [])}
+        self._request_alpha = {}
+        self._request_bounds = {}
+        self._request_triangles = {}
+
+    def _bounds(self, drawable):
+        key = id(drawable)
+        if key not in self._request_bounds:
+            points = [(float(p[0]), float(p[1])) for p in drawable.get("vertices", [])
+                      if len(p) >= 2 and math.isfinite(p[0]) and math.isfinite(p[1])]
+            xs, ys = zip(*points) if points else ((), ())
+            self._request_bounds[key] = (min(xs), min(ys), max(xs), max(ys)) if points else None
+        return self._request_bounds[key]
+
+    def _triangles(self, drawable):
+        key = id(drawable)
+        if key not in self._request_triangles:
+            self._request_triangles[key] = list(triangle_indices(drawable))
+        return self._request_triangles[key]
+
+    @staticmethod
+    def _bounds_overlap(left, right):
+        return (left is not None and left[0] <= right[2] and left[2] >= right[0]
+                and left[1] <= right[3] and left[3] >= right[1])
 
     def _visible(self, drawable):
         return (drawable.get("visible", True) and float(drawable.get("opacity", 1)) > 0
                 and self.parts.get(str(drawable.get("parent_part_id")), 1) > 0)
 
     def _point_alpha(self, drawable, point):
-        alpha = self._alpha(int(drawable.get("texture_index", 0)))
+        if not self._bounds_overlap(self._bounds(drawable), (point[0], point[1], point[0], point[1])):
+            return 0.0
         vertices, uvs = drawable.get("vertices", []), drawable.get("uvs", [])
-        for indices in triangle_indices(drawable):
+        for indices in self._triangles(drawable):
             weights = barycentric(point, [vertices[i] for i in indices])
             if weights is None:
                 continue
+            # Texture decoding/stat calls are only needed after geometry hits.
+            alpha = self._alpha(int(drawable.get("texture_index", 0)))
             if alpha is None or max(indices) >= len(uvs):
                 return 1.0
             u = sum(w * uvs[i][0] for w, i in zip(weights, indices))
@@ -192,6 +251,10 @@ class SelectionScene:
                      if isinstance(i, int) and 0 <= i < len(self.drawables)), default=0)
         return 1 - alpha if drawable.get("inverted_mask") else alpha
 
+    def _visible_at_point(self, drawable, point):
+        alpha = self._point_alpha(drawable, point)
+        return alpha > .01 and alpha * self._mask_alpha(drawable, point) > .01
+
     def _mask_alpha_many(self, drawable, points):
         """Evaluate clipping at visible own-texel positions in bounded batches."""
         result = np.zeros(len(points), dtype=float)
@@ -203,7 +266,7 @@ class SelectionScene:
             if alpha is not None and id(alpha) not in self._alpha_arrays:
                 self._alpha_arrays[id(alpha)] = np.asarray(alpha)
             vertices, uvs = source.get("vertices", []), source.get("uvs", [])
-            for indices in triangle_indices(source):
+            for indices in self._triangles(source):
                 triangle = [vertices[i] for i in indices]
                 (ax, ay), (bx, by), (cx, cy) = triangle
                 min_x, max_x = min(ax, bx, cx), max(ax, bx, cx)
@@ -258,9 +321,13 @@ class SelectionScene:
                 drawable.get("draw_order", 0), index)
 
     def hit_point(self, point):
-        return [str(d.get("id") or d.get("drawable_id"))
-                for _, d in sorted(enumerate(self.drawables), key=self._order, reverse=True)
-                if self._visible(d) and self._point_alpha(d, point) * self._mask_alpha(d, point) > 0.01]
+        self._begin_request()
+        try:
+            return [str(d.get("id") or d.get("drawable_id"))
+                    for _, d in sorted(enumerate(self.drawables), key=self._order, reverse=True)
+                    if self._visible(d) and self._visible_at_point(d, point)]
+        finally:
+            self._request_alpha = None
 
     def _region_alpha(self, drawable, triangle, indices, polygon):
         alpha = self._alpha(int(drawable.get("texture_index", 0)))
@@ -306,16 +373,29 @@ class SelectionScene:
         return False
 
     def hit_region(self, region):
+        self._begin_request()
+        try:
+            return self._hit_region(region)
+        finally:
+            self._request_alpha = None
+
+    def _hit_region(self, region):
         polygon = region.get("polygon")
         if not polygon:
             x, y, w, h = (float(region[k]) for k in ("x", "y", "width", "height"))
             polygon = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
+        xs, ys = zip(*polygon)
+        bounds = (min(xs), min(ys), max(xs), max(ys))
         result = []
         for _, drawable in sorted(enumerate(self.drawables), key=self._order, reverse=True):
-            if not self._visible(drawable):
+            if not self._visible(drawable) or not self._bounds_overlap(self._bounds(drawable), bounds):
                 continue
-            for indices in triangle_indices(drawable):
+            for indices in self._triangles(drawable):
                 triangle = [drawable["vertices"][i] for i in indices]
+                triangle_bounds = (min(p[0] for p in triangle), min(p[1] for p in triangle),
+                                   max(p[0] for p in triangle), max(p[1] for p in triangle))
+                if not self._bounds_overlap(triangle_bounds, bounds):
+                    continue
                 overlap = intersect_convex(triangle, polygon)
                 if len(overlap) >= 3 and self._region_alpha(drawable, triangle, indices, overlap):
                     # Keep whole ArtMeshes, including partially intersecting

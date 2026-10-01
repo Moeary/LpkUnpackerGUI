@@ -137,6 +137,45 @@ class SelectedPosePsdTests(unittest.TestCase):
             np.testing.assert_array_equal(pixels[:, :, 3], original[:, :, 3])
             self.assertGreater(int(np.any(original != pixels, axis=2).sum()), 0)
 
+    def test_fully_masked_selection_is_reported_without_losing_requested_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model, textures, mesh = self.make_source(root, masked=True)
+            mask_pixels = np.asarray(Image.open(textures[1])).copy()
+            mask_pixels[12:22, 12:22, 3] = 0
+            Image.fromarray(mask_pixels).save(textures[1])
+            result = self.export(root, model, mesh, ["Head", "EarLeft"])
+            metadata = self.metadata(result)
+            self.assertEqual([item["drawable_id"] for item in metadata["layers"]], ["EarLeft"])
+            selection = metadata["selection"]
+            self.assertEqual(selection["requested_ids"], ["Head", "EarLeft"])
+            self.assertEqual(selection["selected_ids"], ["Head", "EarLeft"])
+            self.assertEqual(selection["exported_ids"], ["EarLeft"])
+            self.assertEqual(selection["omitted_ids"], ["Head"])
+            self.assertEqual(result.report["selection"], selection)
+            omission = [warning for warning in result.warnings if "omitted from PSD" in warning]
+            self.assertEqual(len(omission), 1)
+            self.assertIn("Head", omission[0])
+            self.assertIn("current pose after clipping", omission[0])
+            self.assertNotIn("EarLeft", omission[0])
+            saved_report = json.loads(result.report_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved_report["selection"]["omitted_ids"], ["Head"])
+            packed = repack_atlas_png_from_psd(result.psd_path, root / "noop")
+            for index, source in enumerate(textures):
+                self.assertEqual(packed.texture_outputs[index].read_bytes(), source.read_bytes())
+
+    def test_all_selected_drawables_masked_fail_with_current_pose_and_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model, textures, mesh = self.make_source(root, masked=True)
+            mask_pixels = np.asarray(Image.open(textures[1])).copy()
+            mask_pixels[12:22, 12:22, 3] = 0
+            Image.fromarray(mask_pixels).save(textures[1])
+            with self.assertRaisesRegex(PsdReconstructionError, "current pose.*clipping/transparency.*Head"):
+                self.export(root, model, mesh, ["Head"])
+            self.assertFalse(list((root / "export").glob("*.psd")))
+            self.assertFalse(list((root / "export").glob("*.lpkpsd.json")))
+
     def test_alpha_erase_changes_only_selected_texel_in_masked_pose(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

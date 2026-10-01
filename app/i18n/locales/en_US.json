@@ -1338,5 +1338,12 @@
   "artmesh.inspector.pick_trigger": "Choose a skin-switch trigger part",
   "artmesh.inspector.no_trigger": "Preview this project's main model, then select a part without an existing event.",
   "artmesh.inspector.zoom_hint": "Wheel: zoom · Middle-drag: pan · Double-click: reset · Overview: Ctrl+wheel",
-  "mod.workspace.pick_trigger": "Choose trigger part…"
+  "mod.workspace.pick_trigger": "Choose trigger part…",
+  "preview.parameter_search": "Search parameter IDs",
+  "preview.parameter_count": "{shown} / {total} parameters",
+  "editor.live2d.pick_hidden_title": "Selected parts are hidden",
+  "editor.live2d.pick_hidden_export": "Parent Parts are hidden: {parts}. Restore visibility only in the export copy and export the selected ArtMeshes. The current preview and edit history stay unchanged. Continue?",
+  "editor.live2d.pick_restore_export": "Show and export",
+  "editor.live2d.pick_invisible": "These selected ArtMeshes have no visible content in the current pose. Adjust the pose before exporting: {ids}",
+  "artmesh.inspector.selection_hint": "Click to select; Shift+click to add/remove; drag to select a region; Shift+drag to merge."
 }

@@ -133,6 +133,65 @@ class Live2DEditorSessionTests(unittest.TestCase):
         self.assertTrue(self.session.redo())
         self.assertFalse(self.session.dirty)
 
+    def test_local_crop_bbox_raster_matches_full_atlas_mask_at_edges_and_alpha_holes(self):
+        from PIL import ImageChops, ImageDraw
+        image = Image.new("RGBA", (32, 32))
+        for y in range(32):
+            for x in range(32):
+                image.putpixel((x, y), (x * 7, y * 7, 100, 0 if 10 <= x <= 15 and 10 <= y <= 15 else 180))
+        image.save(self.session.texture_paths[0])
+        self.session.accept_texture_change(0)
+        for uvs in ([[0, 1], [1, 1], [1, 0]],
+                    [[-.2, 1.2], [.63, .75], [.45, -.1]],
+                    [[.218, .891], [.867, .613], [.713, .142]],
+                    [[1.2, 1.3], [1.4, .4], [1.5, .1]]):
+            mask = Image.new("L", image.size)
+            points = [(u * 32, (1 - v) * 32) for u, v in uvs]
+            ImageDraw.Draw(mask).polygon(points, fill=255)
+            expected = image.copy()
+            expected.putalpha(ImageChops.multiply(expected.getchannel("A"), mask))
+            bounds = mask.getbbox()
+            actual = self.session.local_artmesh_image({"texture_index": 0, "uvs": uvs, "indices": [0, 1, 2]}, max_size=None)
+            if bounds is None:
+                self.assertIsNone(actual)
+            else:
+                expected = expected.crop(bounds)
+                self.assertEqual(actual.size, expected.size)
+                self.assertEqual(actual.tobytes(), expected.tobytes())
+
+    def test_local_crop_cache_is_bounded_separates_zoom_and_uses_last_valid_bytes(self):
+        drawable = self.session.mesh_data["drawables"][0]
+        with patch("app.core.live2d_editor_session.Image.open", wraps=Image.open) as opened:
+            small = self.session.local_artmesh_image(drawable, max_size=(4, 4))
+            again = self.session.local_artmesh_image(drawable, max_size=(4, 4))
+            full = self.session.local_artmesh_image(drawable, max_size=None)
+            self.assertEqual(opened.call_count, 1)
+            self.assertEqual(small.tobytes(), again.tobytes())
+            self.assertGreater(full.width, small.width)
+            small.putpixel((0, 0), (255, 0, 0, 255))
+            self.assertEqual(self.session.local_artmesh_image(drawable, max_size=(4, 4)).tobytes(), again.tobytes())
+        self.session.texture_paths[0].write_bytes(b"half-written PNG")
+        self.assertEqual(self.session.local_artmesh_image(drawable, max_size=None).tobytes(), full.tobytes())
+        self.session.restore_texture(0)
+        for index in range(50):
+            shifted = dict(drawable, uvs=[[index / 100, 1], [.9, 1], [.9, .1]])
+            self.session.local_artmesh_image(shifted)
+        self.assertLessEqual(len(self.session._local_crops), 24)
+        self.assertLessEqual(len(self.session._local_textures), 2)
+
+    def test_local_crop_updates_for_texture_replacement_undo_redo_and_stamp_changes(self):
+        drawable = self.session.mesh_data["drawables"][0]
+        original = self.session.local_artmesh_image(drawable).tobytes()
+        replacement = self.root / "red.png"
+        Image.new("RGBA", (32, 32), (230, 40, 80, 255)).save(replacement)
+        self.session.replace_texture(0, replacement)
+        changed = self.session.local_artmesh_image(drawable).tobytes()
+        self.assertNotEqual(changed, original)
+        self.assertTrue(self.session.undo())
+        self.assertEqual(self.session.local_artmesh_image(drawable).tobytes(), original)
+        self.assertTrue(self.session.redo())
+        self.assertEqual(self.session.local_artmesh_image(drawable).tobytes(), changed)
+
     def test_exact_selection_pose_preserves_out_of_range_values_and_restores_core_arrays(self):
         from types import SimpleNamespace
         values, parts = [2.0], [.7]
