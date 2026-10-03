@@ -7,6 +7,12 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+LIVE2D_FILES = ("_v3cpp.pyd", "LpkPreviewCubismCore.dll", "live2d_native.json", "SOURCE_METADATA.json",
+                "THIRD_PARTY_NOTICES.md", "LICENSE.live2d-py", "LICENSE.CubismFramework.md",
+                "LICENSE.CubismCore.md", "FrameworkShaders/FragShaderSrc.frag")
 
 
 def source_artifacts(root: Path = ROOT) -> dict[str, Path]:
@@ -28,6 +34,8 @@ def source_artifacts(root: Path = ROOT) -> dict[str, Path]:
     notices = third_party_root / "THIRD_PARTY_NOTICES.md"
     if notices.is_file():
         result["converter third-party notices"] = notices
+    live2d_root = root / "runtime/tools/live2d_native/opacity-v1"
+    result.update({"Live2D preview " + name: live2d_root / name for name in LIVE2D_FILES})
     return result
 
 
@@ -50,6 +58,8 @@ def packaged_artifacts(dist_root: Path, *, require_notices: bool = False) -> dic
         result["converter third-party notices"] = (
             dist_root / "tools" / "SpineSkeletonDataConverter" / "THIRD_PARTY_NOTICES.md"
         )
+    live2d_root = dist_root / "tools/live2d_native/opacity-v1"
+    result.update({"Live2D preview " + name: live2d_root / name for name in LIVE2D_FILES})
     return result
 
 
@@ -66,14 +76,20 @@ def validate_native_sources(root: Path = ROOT, *, require_notices: bool = False)
     if require_notices:
         notices = root / "third_party" / "wang606_spine_converter" / "THIRD_PARTY_NOTICES.md"
         files["converter third-party notices"] = notices
-    return _validate(files, label="Native source build")
+    result = _validate(files, label="Native source build")
+    from app.core.live2d_preview_native import validate_preview_runtime
+    validate_preview_runtime(root / "runtime/tools/live2d_native/opacity-v1")
+    return result
 
 
 def validate_packaged_dist(dist_root: Path, *, require_notices: bool = False) -> tuple[Path, ...]:
-    return _validate(
+    result = _validate(
         packaged_artifacts(dist_root.resolve(), require_notices=require_notices),
         label="Packaged native runtime",
     )
+    from app.core.live2d_preview_native import validate_preview_runtime
+    validate_preview_runtime(dist_root.resolve() / "tools/live2d_native/opacity-v1")
+    return result
 
 
 def main() -> int:

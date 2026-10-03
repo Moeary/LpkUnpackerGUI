@@ -37,7 +37,8 @@ class _Canvas(QObject):
 
     def getSelectionPose(self):
         owner = self.parent()
-        return {"parameters": dict(owner.values), "parts": dict(getattr(owner, "parts", {})), "parts_complete": False}
+        return {"parameters": dict(owner.values), "parts": dict(getattr(owner, "parts", {})),
+                "drawables": dict(getattr(owner, "drawables", {})), "parts_complete": False}
 
 
 class _EditorTestSettings(_TestSettings):
@@ -73,6 +74,9 @@ class _Preview(QWidget):
 
     def set_part_opacity_overrides(self, values, defaults=None):
         self.parts = dict(defaults or {}, **values)
+
+    def set_drawable_opacity_overrides(self, values):
+        self.drawables = dict(values)
 
     def set_motion_frozen(self, _frozen):
         pass
@@ -339,6 +343,99 @@ class Live2DEditorPageTests(unittest.TestCase):
         self.assertFalse(page.artmesh_export_button.isEnabled())
         self.assertEqual(page.session._signature(), before)
 
+    def test_ctrl_multi_selection_visibility_changes_only_selected_meshes_and_restores_opacity(self):
+        self._add_atlas_meshes()
+        self.open()
+        page, session = self.page, self.page.session
+        page.resize(1040, 760)
+        page.show()
+        page.tabs.setCurrentWidget(page.artmesh_tab)
+        self.app.processEvents()
+        inspector = page.artmesh_inspector
+        items = {inspector.entries[int(inspector.entry_list.item(row).data(Qt.UserRole))].drawable_id:
+                 inspector.entry_list.item(row) for row in range(inspector.entry_list.count())}
+        QTest.mouseClick(inspector.entry_list.viewport(), Qt.LeftButton, pos=inspector.entry_list.visualItemRect(items["ArtMeshFace"]).center())
+        QTest.mouseClick(inspector.entry_list.viewport(), Qt.LeftButton, Qt.ControlModifier,
+                         inspector.entry_list.visualItemRect(items["ArtMeshEar"]).center())
+        self.assertEqual(set(page._selected_drawable_ids), {"ArtMeshFace", "ArtMeshEar"})
+        session.set_drawable_opacity(["ArtMeshFace"], .3)
+        session.set_drawable_opacity(["ArtMeshEar"], .6)
+        page._apply_preview_pose()
+        page._update_actions()
+        self.assertEqual(page.drawable_opacity.value(), -.01)
+        parts, undo = dict(session.part_overrides), len(session._undo)
+        inspector.set_uv_preview_visible(False)
+        self.app.processEvents()
+        self.assertTrue(page.drawable_visible.isVisible())
+        self.assertTrue(page.drawable_opacity.isVisible())
+        QTest.mouseClick(page.drawable_visible, Qt.LeftButton)
+        self.assertEqual(session.drawable_visibility_overrides, {"ArtMeshFace": False, "ArtMeshEar": False})
+        self.assertEqual(len(session._undo), undo + 1)
+        snapshot = {entry["id"]: entry for entry in page._selection_scene()["snapshot"]["drawables"]}
+        self.assertEqual(snapshot["ArtMeshFace"]["opacity"], 0)
+        self.assertEqual(snapshot["ArtMeshEar"]["opacity"], 0)
+        self.assertGreater(snapshot["ArtMeshHair"]["opacity"], 0)
+        self.assertEqual(session.part_overrides, parts)
+        QTest.mouseClick(page.drawable_visible, Qt.LeftButton)
+        self.assertEqual(session.drawable_visibility_overrides, {})
+        self.assertEqual(page.preview.drawables, {"ArtMeshFace": .3, "ArtMeshEar": .6})
+        self.assertEqual(session.drawable_opacity_overrides, {"ArtMeshFace": .3, "ArtMeshEar": .6})
+        self.assertEqual(len(session._undo), undo + 2)
+        page.undo()
+        self.assertEqual(session.drawable_visibility_overrides, {"ArtMeshFace": False, "ArtMeshEar": False})
+        page.redo()
+        self.assertEqual(session.drawable_visibility_overrides, {})
+
+    def test_hidden_selected_drawables_restore_only_export_snapshot_without_mutating_preview(self):
+        from app.gui.editor_dialogs import EditorMessageBox
+        self._add_atlas_meshes()
+        self.open()
+        page, session = self.page, self.page.session
+        page.tabs.setCurrentWidget(page.artmesh_tab)
+        page.artmesh_inspector.select_entries(["ArtMeshFace", "ArtMeshEar"])
+        session.set_drawable_visibility(["ArtMeshFace", "ArtMeshHair"], False)
+        page._apply_preview_pose()
+        signature, undo = session._signature(), len(session._undo)
+        with patch("app.gui.Live2DEditorPage.QMessageBox.question", return_value=EditorMessageBox.Yes), \
+                patch.object(page, "open_psd_workspace", return_value=True), \
+                patch.object(page.psd_panel, "export_selected_artmeshes", return_value=True) as export:
+            self.assertTrue(page.export_selected_artmeshes())
+        pose = export.call_args.args[1]
+        self.assertEqual(pose["export_visibility_restored_drawables"], ["ArtMeshFace"])
+        self.assertEqual(pose["drawables"], {"ArtMeshFace": 1, "ArtMeshHair": 0})
+        snapshot = {entry["id"]: entry for entry in export.call_args.kwargs["mesh_data"]["drawables"]}
+        self.assertGreater(snapshot["ArtMeshFace"]["opacity"], 0)
+        self.assertEqual(snapshot["ArtMeshHair"]["opacity"], 0)
+        self.assertEqual(page.preview.drawables, {"ArtMeshFace": 0, "ArtMeshHair": 0})
+        self.assertEqual(session._signature(), signature)
+        self.assertEqual(len(session._undo), undo)
+
+    def test_batch_opacity_digits_fit_at_narrow_and_wide_sizes_in_all_languages(self):
+        from app.i18n import get_i18n
+        self.open()
+        page = self.page
+        page.tabs.setCurrentWidget(page.artmesh_tab)
+        page.artmesh_inspector.select_entries(["ArtMeshFace"])
+        page.show()
+        language = get_i18n().language
+        try:
+            for locale in ("zh_CN", "en_US", "ja_JP"):
+                get_i18n().set_language(locale)
+                for width in (1040, 1320):
+                    page.resize(width, 760)
+                    self.app.processEvents()
+                    for value in (1, .5):
+                        page.drawable_opacity.setValue(value)
+                        self.app.processEvents()
+                        edit = page.drawable_opacity.lineEdit()
+                        margins = edit.textMargins()
+                        available = edit.width() - margins.left() - margins.right() - 4
+                        self.assertLessEqual(edit.fontMetrics().horizontalAdvance(edit.text()), available)
+                        self.assertTrue(page.drawable_opacity.isVisible())
+                        self.assertTrue(page.drawable_visible.isVisible())
+        finally:
+            get_i18n().set_language(language)
+
     def test_uv_selection_exports_without_preview_and_invalidates_old_rectangle(self):
         self._add_atlas_meshes()
         self.open()
@@ -434,14 +531,16 @@ class Live2DEditorPageTests(unittest.TestCase):
         self.page.show()
         self.page.tabs.setCurrentWidget(self.page.artmesh_tab)
         self.page.artmesh_inspector.select_entry("ArtMeshFace")
+        self.page.parent_part_controls.show()
         entry = self.page.artmesh_inspector.current_entry()
         for size in ((2000, 3), (3, 2000), (300, 300)):
             with patch.object(self.page.session, "local_artmesh_image", return_value=Image.new("RGBA", size)):
                 self.page._artmesh_selected(entry)
                 self.app.processEvents()
                 label = self.page.artmesh_image
-                self.assertLessEqual(label.frameGeometry().bottom(), self.page.part_visible.frameGeometry().top())
-                self.assertLessEqual(label.frameGeometry().bottom(), self.page.part_opacity.frameGeometry().top())
+                parent = self.page.artmesh_details_widget
+                self.assertLessEqual(label.mapTo(parent, label.rect().bottomLeft()).y(), self.page.part_visible.mapTo(parent, self.page.part_visible.rect().topLeft()).y())
+                self.assertLessEqual(label.mapTo(parent, label.rect().bottomLeft()).y(), self.page.part_opacity.mapTo(parent, self.page.part_opacity.rect().topLeft()).y())
                 self.assertLessEqual(label.height(), 160)
         with patch.object(self.page.session, "local_artmesh_image", return_value=None):
             self.page._artmesh_selected(entry)
@@ -455,6 +554,7 @@ class Live2DEditorPageTests(unittest.TestCase):
         page.tabs.setCurrentWidget(page.artmesh_tab)
         inspector.select_entry("ArtMeshFace")
         page.show()
+        page.parent_part_controls.show()
         i18n, before = get_i18n(), get_i18n().language
         try:
             for language in ("zh_CN", "en_US", "ja_JP"):
@@ -475,8 +575,9 @@ class Live2DEditorPageTests(unittest.TestCase):
                                        page.part_opacity, page.part_hint, page.artmesh_export_button):
                             self.assertTrue(inspector.isAncestorOf(widget))
                         self.assertEqual(page.artmesh_scroll.horizontalScrollBar().maximum(), 0)
-                        self.assertLessEqual(page.artmesh_image.frameGeometry().bottom(), page.part_visible.frameGeometry().top())
-                        self.assertLessEqual(page.part_opacity.frameGeometry().bottom(), page.artmesh_export_button.frameGeometry().top())
+                        parent = page.artmesh_details_widget
+                        self.assertLessEqual(page.artmesh_image.mapTo(parent, page.artmesh_image.rect().bottomLeft()).y(), page.part_visible.mapTo(parent, page.part_visible.rect().topLeft()).y())
+                        self.assertLessEqual(page.part_opacity.mapTo(parent, page.part_opacity.rect().bottomLeft()).y(), page.artmesh_export_button.mapTo(parent, page.artmesh_export_button.rect().topLeft()).y())
                         self.assertTrue(page.artmesh_export_button.isEnabled())
                         if size[0] > 1040:
                             self.assertGreater(inspector.atlas_frame.width(), previous_width)
@@ -619,7 +720,21 @@ class Live2DEditorPageTests(unittest.TestCase):
             time.sleep(.01)
         self.app.processEvents()
         self.assertFalse(self.page.psd_panel.is_busy(), self.page.psd_panel.log_text.toPlainText())
-        self.assertEqual(self.page.psd_panel.progress_bar.value(), 100, self.page.psd_panel.log_text.toPlainText())
+        self.assertEqual(self.page.psd_panel._task_state, "succeeded", self.page.psd_panel.log_text.toPlainText())
+        self.assertEqual(self.page.psd_panel._task_progress, 100, self.page.psd_panel.log_text.toPlainText())
+        if self.page.psd_panel._task_id == "project-preparation":
+            self.assertIsNotNone(self.page.psd_panel.current_project)
+        else:
+            self.assertEqual(self.page.psd_panel.progress_bar.value(), 100, self.page.psd_panel.log_text.toPlainText())
+
+    def _wait_preview_worker(self):
+        limit = time.monotonic() + 10
+        while (self.page._preview_workers or self.page._preview_request) and time.monotonic() < limit:
+            self.app.processEvents()
+            time.sleep(.005)
+        self.app.processEvents()
+        self.assertFalse(self.page._preview_workers, self.page.status_label.text())
+        self.assertIsNone(self.page._preview_request, self.page.status_label.text())
 
     def test_complete_psd_workflows_fit_single_column_and_keep_original_page(self):
         self.open()
@@ -630,10 +745,10 @@ class Live2DEditorPageTests(unittest.TestCase):
         psd = self.page.psd_panel
         self.assertTrue(psd._compact)
         self.assertEqual(psd.workflow_tabs.count(), 4)
-        self.assertFalse(psd.content_splitter.isVisible())
-        self.assertFalse(psd.preview_dialog.isVisible())
+        self.assertFalse(hasattr(psd, "content_splitter"))
+        self.assertIsNone(psd.preview_dialog)
         for index, card in enumerate((psd.export_card, psd.repack_card, psd.preview_control_frame, psd.project_frame)):
-            psd.workflow_tabs.setCurrentIndex(index)
+            self.page.appearance_workspace.show_psd_task(("export", "repack", "history", "advanced")[index])
             self.app.processEvents()
             self.assertTrue(card.isVisible(), str(index))
             self.assertEqual(psd._compact_scrolls[index].horizontalScrollBar().maximum(), 0)
@@ -698,6 +813,7 @@ class Live2DEditorPageTests(unittest.TestCase):
         self.assertFalse(session.dirty)
         model = self.page._psd_version_workspace("repack:" + version_id)
         self.page._open_psd_preview(str(model), str(project.project_file))
+        self._wait_preview_worker()
         self.assertIs(self.page.session, session)
         self.assertIsNotNone(self.page._preview_session)
         self.assertFalse(session.dirty)

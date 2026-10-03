@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import subprocess
+import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -39,6 +41,22 @@ class BuildNuitkaTests(unittest.TestCase):
         for path, payload in files.items():
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(payload)
+        live2d_root = root / "runtime/tools/live2d_native/opacity-v1"
+        live2d_files = {
+            "_v3cpp.pyd": b"extension", "LpkPreviewCubismCore.dll": b"core",
+            "SOURCE_METADATA.json": b"{}", "THIRD_PARTY_NOTICES.md": b"notices",
+            "LICENSE.live2d-py": b"mit", "LICENSE.CubismFramework.md": b"framework",
+            "LICENSE.CubismCore.md": b"core", "FrameworkShaders/FragShaderSrc.frag": b"shader",
+        }
+        for name, data in live2d_files.items():
+            target = live2d_root / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+        metadata = {"format": "LpkUnpacker.Live2DPreviewRuntime", "version": 1, "drawable_opacity_api_version": 1,
+                    "upstream_version": "0.7.0", "sdk_version": "5-r.4.1", "python_abi": "cp310-abi3",
+                    "architecture": "win_amd64", "files": {name: hashlib.sha256(data).hexdigest()
+                                                           for name, data in live2d_files.items()}}
+        (live2d_root / "live2d_native.json").write_text(json.dumps(metadata), encoding="utf-8")
 
     def test_required_native_build_fails_with_explicit_missing_artifacts(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -65,6 +83,11 @@ class BuildNuitkaTests(unittest.TestCase):
             ):
                 self.assertIn(relative, joined)
             self.assertIn("THIRD_PARTY_NOTICES.md", joined)
+            self.assertIn("--include-distribution-metadata=live2d-py", args)
+            self.assertIn("--include-module=app.core.psd_worker", args)
+            self.assertIn("live2d-native.nuitka-package.config.yml", joined)
+            self.assertIn("tools/live2d_native/opacity-v1/live2d_native.json", joined)
+            self.assertNotIn("--include-data-file=" + str(root / "runtime/tools/live2d_native/opacity-v1/_v3cpp.pyd"), joined)
 
     def test_packaging_includes_bridge_source_under_app_native(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -71,6 +71,10 @@ def run_application():
         return 1
 
 def main():
+    if "--psd-worker" in sys.argv:
+        from app.core.psd_worker import main as run_psd_worker
+
+        return run_psd_worker([arg for arg in sys.argv[1:] if arg != "--psd-worker"])
     if "--mcp-animation" in sys.argv:
         args = [arg for arg in sys.argv[1:] if arg != "--mcp-animation"]
         from app.mcp_server import main as run_mcp

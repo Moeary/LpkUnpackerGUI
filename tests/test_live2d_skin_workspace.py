@@ -28,6 +28,7 @@ class Live2DSkinWorkspaceTests(unittest.TestCase):
     _cleanup_page = fixtures.Live2DEditorPageTests._cleanup_page
     open = fixtures.Live2DEditorPageTests.open
     _wait_psd_worker = fixtures.Live2DEditorPageTests._wait_psd_worker
+    _wait_preview_worker = fixtures.Live2DEditorPageTests._wait_preview_worker
 
     def _show(self):
         self.page.resize(1040, 760)
@@ -42,6 +43,8 @@ class Live2DSkinWorkspaceTests(unittest.TestCase):
         QTest.mouseClick(item, Qt.LeftButton)
         self.app.processEvents()
         self.assertEqual(tabs.currentIndex(), index)
+        if tabs is self.page.tabs and index == 2:
+            self._wait_psd_worker()
 
     def _paint_texture(self, name="pink", color=(240, 20, 90, 255)):
         path = self.root / f"{name}.png"
@@ -54,7 +57,7 @@ class Live2DSkinWorkspaceTests(unittest.TestCase):
 
     def _export_psd(self, mode="mesh"):
         psd = self.page.psd_panel
-        psd.workflow_tabs.setCurrentIndex(0)
+        self.page.appearance_workspace.show_psd_task("export")
         psd.mode_combo.setCurrentIndex(psd._combo_index_by_data(psd.mode_combo, mode))
         QTest.mouseClick(psd.reconstruct_button, Qt.LeftButton)
         self._wait_psd_worker()
@@ -72,7 +75,8 @@ class Live2DSkinWorkspaceTests(unittest.TestCase):
         session.create_motion("CurrentAction", 2)
         session.set_keyframes("CurrentAction", "ParamAngleY", [{"time": 0, "value": -10}, {"time": 2, "value": 10}])
         self.page._populate_motions("CurrentAction")
-        self._click_tab(self.page.tabs, 3)  # PSD needs no second model picker.
+        self._click_tab(self.page.tabs, 2)
+        self._wait_psd_worker()
         psd = self.page.psd_panel
         self.assertIsNotNone(psd.current_project)
         self.assertTrue(psd.current_project.project_dir.is_relative_to(session.root / "psd"))
@@ -97,7 +101,7 @@ class Live2DSkinWorkspaceTests(unittest.TestCase):
         document.remove(original)
         document.save(psd_path)
         baseline = session.texture_paths[0].read_bytes()
-        psd.workflow_tabs.setCurrentIndex(1)
+        self.page.appearance_workspace.show_psd_task("repack")
         psd.metadata_edit.setText(str(metadata_path))
         psd._compact_scrolls[1].ensureWidgetVisible(psd.single_repack_button)
         self.app.processEvents()
@@ -117,7 +121,7 @@ class Live2DSkinWorkspaceTests(unittest.TestCase):
         self.assertEqual(session.active_skin_id, new_skin["id"])
         self.assertEqual(session.texture_paths[0].read_bytes(), changed)
         # Ordinary export does not create a ViewerEX subproject.
-        self._click_tab(self.page.tabs, 4)
+        self._click_tab(self.page.tabs, 3)
         self.assertIsNone(session.mod_project)
         self.assertFalse(self.page.mod_panel.isVisible())
         self.assertFalse(self.page._in_viewer_workspace())
@@ -149,6 +153,7 @@ class Live2DSkinWorkspaceTests(unittest.TestCase):
         self._show()
         self._click_tab(self.page.tabs, 2)
         session = self.page.session
+        original_signature, original_dirty = session._signature(), session.dirty
         source = make_model(self.root / "foreign")
         source.parent.joinpath("model.moc3").write_bytes(b"another UV model")
         self._paint_texture().replace(source.parent / "texture.png")
@@ -167,7 +172,7 @@ class Live2DSkinWorkspaceTests(unittest.TestCase):
 
         mime = QMimeData()
         mime.setUrls([QUrl.fromLocalFile(str(source))])
-        surface = self.page.texture_scroll.viewport()
+        surface = self.page.skin_controls.scroll.viewport()
         enter = QDragEnterEvent(surface.rect().center(), Qt.CopyAction, mime, Qt.LeftButton, Qt.NoModifier)
         drop = QDropEvent(QPointF(surface.rect().center()), Qt.CopyAction, mime, Qt.LeftButton, Qt.NoModifier)
         with patch.object(self.page, "_skin_name_dialog", return_value="Mapped foreign skin"), \
@@ -182,14 +187,15 @@ class Live2DSkinWorkspaceTests(unittest.TestCase):
         self.assertEqual(len(session.list_skins()), 2)
         self.page.undo()
         self.assertEqual(len(session.list_skins()), 1)
-        self.assertFalse(session.dirty)
+        self.assertEqual(session._signature(), original_signature)
+        self.assertEqual(session.dirty, original_dirty)
         self.assertEqual(foreign_before, {path.name: path.read_bytes() for path in source.parent.iterdir()})
 
     def test_switch_keeps_external_working_edit_and_skin_catalog_undo(self):
         self.open()
         self._show()
         self._click_tab(self.page.tabs, 2)
-        self.assertFalse(self.page.session.dirty)
+        self.assertIsNotNone(self.page.psd_panel.current_project)
         self.assertFalse(self.page.skin_controls.rename_button.isEnabled())
         self.assertFalse(self.page.skin_controls.delete_button.isEnabled())
         path = self._paint_texture()
@@ -323,10 +329,10 @@ class Live2DSkinWorkspaceTests(unittest.TestCase):
         record = self.page.save_psd_version_as_skin("repack:" + unknown_id, "Unknown historical source")
         self.assertIsNone(record["source"]["metadata"]["export_skin"])
 
-    def test_five_main_tabs_and_viewer_advanced_are_mouse_reachable_at_1040(self):
+    def test_four_main_tabs_and_viewer_advanced_are_mouse_reachable_at_1040(self):
         self.open()
         self._show()
-        for index in range(5):
+        for index in range(4):
             self._click_tab(self.page.tabs, index)
             self.assertTrue(self.page.tabs.widget(index).isVisible())
         self.assertIsNone(self.page.session.mod_project)
@@ -351,7 +357,7 @@ class Live2DSkinWorkspaceTests(unittest.TestCase):
                        self.page.skin_controls.capture_button, self.page.skin_controls.combo):
             self.assertTrue(widget.isVisible())
             self.assertGreater(widget.width(), 20)
-            self.assertLessEqual(widget.mapTo(self.page.texture_tab, widget.rect().topRight()).x(), self.page.texture_tab.width())
+            self.assertLessEqual(widget.mapTo(self.page.appearance_workspace, widget.rect().topRight()).x(), self.page.appearance_workspace.width())
         self.assertEqual((self.page.width(), self.page.height()), (1040, 760))
         self.assertFalse(self.page.hasHeightForWidth())
 
@@ -359,6 +365,7 @@ class Live2DSkinWorkspaceTests(unittest.TestCase):
         self.open()
         self._show()
         self._click_tab(self.page.tabs, 2)
+        original_signature = self.page.session._signature()
         dialog = SkinNameDialog("Skin", self.page, {"Original", "Pink"})
         self.addCleanup(dialog.deleteLater)
         dialog.show()
@@ -372,7 +379,7 @@ class Live2DSkinWorkspaceTests(unittest.TestCase):
         dialog.name_edit.setText("Blue")
         QTest.mouseClick(dialog.cancelButton, Qt.LeftButton)
         self.assertFalse(dialog.isVisible())
-        self.assertFalse(self.page.session.dirty)
+        self.assertEqual(self.page.session._signature(), original_signature)
         self.assertEqual(len(self.page.session.list_skins()), 1)
         self.assertIsNone(QApplication.activeModalWidget())
 

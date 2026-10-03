@@ -12,7 +12,8 @@ from PySide6.QtGui import QGuiApplication, QPalette
 import OpenGL.GL as GL
 from abc import abstractmethod
 
-import live2d.v3 as live2d
+from app.core.live2d_preview_native import load_preview_runtime, preview_native_status
+live2d = load_preview_runtime()
 from live2d.utils.canvas import Canvas
 
 from app.core.model.motions import evaluate_motion_parameters, load_live2d_motions
@@ -669,6 +670,8 @@ class Live2DCanvas(ADPOpenGLCanvas):
         self._part_opacity_overrides = {}
         self._part_opacity_defaults = {}
         self._part_indices = {}
+        self._drawable_opacity_overrides = {}
+        self._drawable_indices = {}
         self._gl_initialized = False
         self._model_load_generation = 1 if model_path else 0
         self._active_model_generation = 0
@@ -729,6 +732,8 @@ class Live2DCanvas(ADPOpenGLCanvas):
         self._advanced_params = {}
         self._part_opacity_overrides = {}
         self._part_opacity_defaults = {}
+        self._drawable_opacity_overrides = {}
+        self._drawable_indices = {str(identifier): index for index, identifier in enumerate(model.GetDrawableIds())}
         try:
             self._part_indices = {str(part_id): index for index, part_id in enumerate(model.GetPartIds())}
         except Exception:
@@ -781,6 +786,8 @@ class Live2DCanvas(ADPOpenGLCanvas):
         self._part_opacity_overrides = {}
         self._part_opacity_defaults = {}
         self._part_indices = {}
+        self._drawable_opacity_overrides = {}
+        self._drawable_indices = {}
         self._selection_alpha_cache.clear()
         self._selection_drag = None
         self._last_selection_region = None
@@ -864,7 +871,7 @@ class Live2DCanvas(ADPOpenGLCanvas):
             if self._effective_selection_mode() != "none":
                 if self.model is not None:
                     self._selection_drag = [QPointF(event.position()), QPointF(event.position())]
-                    self._selection_shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+                    self._selection_shift = bool(event.modifiers() & (Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.ControlModifier))
                     self._selection_moved = False
                     self._last_selection_region = None
                     self.update()
@@ -1101,13 +1108,14 @@ class Live2DCanvas(ADPOpenGLCanvas):
 
     def getSelectionPose(self) -> dict:
         if self.model is None:
-            return {"parameters": {}, "parts": {}, "parts_complete": False}
+            return {"parameters": {}, "parts": {}, "drawables": {}, "parts_complete": False}
         parameters = self.getParameterValues(self._parameter_indices())
         parts = dict(self._part_opacity_defaults)
         parts.update(self._part_opacity_overrides)
         # live2d-py exposes SetPartOpacity but no opacity getter. Do not invent
         # SDK Pose-controller values; only the overrides actually applied here.
-        return {"parameters": parameters, "parts": parts, "parts_complete": False}
+        return {"parameters": parameters, "parts": parts, "drawables": dict(self._drawable_opacity_overrides),
+                "parts_complete": False}
 
     def _parameter_indices(self):
         model_id = id(self.model) if self.model is not None else None
@@ -1178,7 +1186,8 @@ class Live2DCanvas(ADPOpenGLCanvas):
         # FBO point signal is emitted alongside the new selection workflow.
         fbo_x, fbo_y = self.windowPointToModel(x, y)
         native = getattr(self.model, "_model", self.model)
-        hits = list(native.HitDrawable(fbo_x, fbo_y, False))
+        hits = [identifier for identifier in native.HitDrawable(fbo_x, fbo_y, False)
+                if self._drawable_opacity_overrides.get(str(identifier), 1.0) > 0]
         self.drawablesPickedWithMode.emit(hits, selection_mode)
         self.drawablesPicked.emit(hits)
         if hits:
@@ -1238,6 +1247,30 @@ class Live2DCanvas(ADPOpenGLCanvas):
         effective.update(values)
         overrides = {str(key): max(0.0, min(1.0, float(value))) for key, value in effective.items()}
         self._part_opacity_overrides = overrides
+        self.update()
+
+    def supportsDrawableOpacityOverrides(self) -> bool:
+        native = getattr(self.model, "_model", self.model)
+        return bool(native is not None and callable(getattr(native, "SetDrawableOpacityOverrides", None)))
+
+    def drawableOpacitySupportReason(self) -> str:
+        return preview_native_status().get("reason", "")
+
+    def setDrawableOpacityOverrides(self, values: dict[str, float]):
+        from app.core.live2d_drawables import opacity_multiplier
+        overrides = {str(key): opacity_multiplier(value) for key, value in values.items()}
+        native = getattr(self.model, "_model", self.model)
+        setter = getattr(native, "SetDrawableOpacityOverrides", None)
+        if not callable(setter):
+            if overrides:
+                raise RuntimeError(self.drawableOpacitySupportReason() or "Drawable-opacity preview is unavailable.")
+            self._drawable_opacity_overrides = {}
+            return
+        if any(identifier not in self._drawable_indices for identifier in overrides):
+            raise ValueError("Unknown preview ArtMesh.")
+        setter({self._drawable_indices[key]: value for key, value in overrides.items()})
+        self._drawable_opacity_overrides = overrides
+        self._selection_alpha_cache.clear()
         self.update()
 
     def isMotionFrozen(self) -> bool:

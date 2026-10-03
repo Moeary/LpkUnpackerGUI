@@ -4,10 +4,11 @@ from pathlib import Path
 from PySide6.QtCore import QEvent, QSignalBlocker, Qt, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QSizePolicy, QVBoxLayout, QWidget
-from qfluentwidgets import CaptionLabel, FluentIcon, PushButton, TransparentToolButton
+from qfluentwidgets import CaptionLabel, FluentIcon, PushButton, ScrollArea, TransparentToolButton
 
 from app.gui.editor_actions import ActionComboBox
 from app.gui.editor_dialogs import EditorTextDialog
+from app.gui.live2d_appearance import CompactAppearanceButton, appearance_text
 from app.i18n import tr
 
 
@@ -156,51 +157,75 @@ class TexturePreviewLabel(QLabel):
         super().clear()
 
 
-class SkinCatalogControls(QWidget):
+class SkinCatalogControls(SkinDropFrame):
     skinSelected = Signal(str)
     captureRequested = Signal()
     renameRequested = Signal()
     deleteRequested = Signal()
     importModelRequested = Signal()
     importTexturesRequested = Signal()
-    editPsdRequested = Signal()
+    originRequested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._records = []
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(7)
-        row = QHBoxLayout()
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        content = QWidget(self)
+        body = QVBoxLayout(content)
+        body.setContentsMargins(6, 4, 6, 4)
+        body.setSpacing(5)
+        body.setAlignment(Qt.AlignTop)
+        self.title_label = CaptionLabel(content)
+        self.title_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        body.addWidget(self.title_label)
         self.combo = ActionComboBox(self)
         self.combo.setMaximumWidth(16777215)
-        self.combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.combo.setMinimumWidth(0)
+        self.combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.combo.currentIndexChanged.connect(self._selected)
-        row.addWidget(self.combo, 1)
-        self.capture_button = TransparentToolButton(FluentIcon.ADD, self)
-        self.rename_button = TransparentToolButton(FluentIcon.EDIT, self)
-        self.delete_button = TransparentToolButton(FluentIcon.REMOVE, self)
-        for button, signal in ((self.capture_button, self.captureRequested),
-                               (self.rename_button, self.renameRequested),
-                               (self.delete_button, self.deleteRequested)):
-            button.setFixedSize(28, 28)
-            button.clicked.connect(signal)
-            row.addWidget(button)
-        root.addLayout(row)
-        imports = QVBoxLayout()
-        self.import_model_button = PushButton(FluentIcon.FOLDER, "", self)
-        self.import_textures_button = PushButton(FluentIcon.PHOTO, "", self)
+        body.addWidget(self.combo)
+        self.import_model_button = CompactAppearanceButton(self)
+        self.import_textures_button = CompactAppearanceButton(self)
         self.import_model_button.clicked.connect(self.importModelRequested)
         self.import_textures_button.clicked.connect(self.importTexturesRequested)
-        imports.addWidget(self.import_model_button)
-        imports.addWidget(self.import_textures_button)
-        root.addLayout(imports)
+        body.addWidget(self.import_model_button)
+        body.addWidget(self.import_textures_button)
+        row = QHBoxLayout()
+        row.setSpacing(3)
+        self.save_new_skin_button = CompactAppearanceButton(self)
+        self.save_new_skin_button.clicked.connect(self.captureRequested)
+        self.capture_button = self.save_new_skin_button
+        row.addWidget(self.save_new_skin_button, 1)
+        self.rename_button = TransparentToolButton(FluentIcon.EDIT, self)
+        self.delete_button = TransparentToolButton(FluentIcon.REMOVE, self)
+        for button, signal in ((self.rename_button, self.renameRequested),
+                               (self.delete_button, self.deleteRequested)):
+            button.setFixedSize(26, 28)
+            button.clicked.connect(signal)
+            row.addWidget(button)
+        body.addLayout(row)
         self.state_label = CaptionLabel(self)
         self.state_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-        root.addWidget(self.state_label)
-        self.psd_button = PushButton(FluentIcon.EDIT, "", self)
-        self.psd_button.clicked.connect(self.editPsdRequested)
-        root.addWidget(self.psd_button)
+        self.state_label.hide()
+        self.origin_button = CompactAppearanceButton(self)
+        self.origin_button.clicked.connect(self.originRequested)
+        body.addWidget(self.origin_button)
+        self.origin_button.hide()
+        self.drop_hint = CaptionLabel(self)
+        self.drop_hint.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        body.addWidget(self.drop_hint)
+        self.scroll = ScrollArea(self)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.scroll.setMinimumSize(0, 0)
+        self.scroll.setWidget(content)
+        self.scroll.enableTransparentBackground()
+        root.addWidget(self.scroll)
+        for surface in (self.scroll.viewport(), content, self.combo, self.import_model_button, self.import_textures_button):
+            self.watch_drop_surface(surface)
         self.retranslate_ui()
 
     def _selected(self, _index):
@@ -215,16 +240,22 @@ class SkinCatalogControls(QWidget):
                 label = skin_text("editor.skin.original") if record.get("is_original") else record["name"]
                 self.combo.addItem(label, record["id"])
             self.combo.setCurrentIndex(max(0, self.combo.findData(active_id)))
+            self.combo.setCursorPosition(0)
         active = next((entry for entry in self._records if entry["id"] == active_id), {})
         name = skin_text("editor.skin.original") if active.get("is_original") else active.get("name", "")
         self.state_label.setText(skin_text("editor.skin.modified" if modified else "editor.skin.active", name=name)
                                  if active else skin_text("editor.skin.empty"))
         self.state_label.setToolTip(skin_text("editor.skin.modified_hint") if modified else self.state_label.text())
+        self.combo.setToolTip(self.state_label.text())
         self.setEnabled(enabled)
         self.rename_button.setEnabled(enabled and bool(active) and not active.get("is_original"))
         self.delete_button.setEnabled(enabled and bool(active) and not active.get("is_original"))
+        origin = active.get("origin") or (active.get("source", {}).get("metadata", {}).get("origin"))
+        self.origin_button.setVisible(bool(origin))
+        self.origin_button.setEnabled(enabled and bool(origin))
 
     def retranslate_ui(self):
+        self.title_label.setText(appearance_text("editor.appearance.catalog"))
         self.combo.setPlaceholderText(skin_text("editor.skin.select"))
         self.combo.setToolTip(skin_text("editor.skin.select"))
         self.combo.setAccessibleName(skin_text("editor.skin.select"))
@@ -233,5 +264,11 @@ class SkinCatalogControls(QWidget):
             button.setToolTip(skin_text("editor.skin." + key))
             button.setAccessibleName(button.toolTip())
         for button, key in ((self.import_model_button, "import_model"), (self.import_textures_button, "import_textures"),
-                            (self.psd_button, "edit_psd")):
-            button.setText(skin_text("editor.skin." + key))
+                            (self.save_new_skin_button, "capture"),
+                            (self.origin_button, "origin")):
+            button.setText(appearance_text("editor.appearance." + key))
+        self.import_model_button.setToolTip(skin_text("editor.skin.import_model"))
+        self.import_textures_button.setToolTip(skin_text("editor.skin.mapping_hint"))
+        self.save_new_skin_button.setToolTip(skin_text("editor.skin.capture"))
+        self.drop_hint.setText(appearance_text("editor.appearance.catalog_drop"))
+        self.drop_hint.setToolTip(skin_text("editor.skin.drop_hint"))

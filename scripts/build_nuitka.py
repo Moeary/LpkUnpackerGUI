@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import os
 import subprocess
 import sys
@@ -75,6 +76,8 @@ def build_nuitka_args(compiler: str, *, require_native: bool = False) -> list[st
         # the old source-only behavior for contributors who only need to
         # inspect the Python application.
         validate_native_sources(ROOT, require_notices=True)
+        if importlib.metadata.version("live2d-py") != "0.7.0":
+            raise RuntimeError("Release preview requires the pinned live2d-py 0.7.0 Python wrapper.")
 
     compiler_args = ["--msvc=14.3"]
     if compiler == "mingw":
@@ -104,6 +107,8 @@ def build_nuitka_args(compiler: str, *, require_native: bool = False) -> list[st
         # alongside the pinned PyOpenGL version.
         "--include-package=OpenGL_accelerate",
         "--include-package=psd_tools",
+        "--include-module=app.core.psd_worker",
+        "--include-distribution-metadata=live2d-py",
         "--include-package=mcp",
         "--include-package=uvicorn",
         "--windows-icon-from-ico=assets/app/icon.ico",
@@ -138,6 +143,13 @@ def build_nuitka_args(compiler: str, *, require_native: bool = False) -> list[st
     bridge_source = ROOT / "app" / "native" / "spine_bridge"
     if bridge_source.is_dir():
         args.insert(-1, f"--include-data-dir={bridge_source}=app/native/spine_bridge")
+    live2d_root = ROOT / "runtime/tools/live2d_native/opacity-v1"
+    if (live2d_root / "live2d_native.json").is_file():
+        args.insert(-1, f"--user-package-configuration-file={ROOT / 'scripts/live2d-native.nuitka-package.config.yml'}")
+        for source in sorted(live2d_root.rglob("*")):
+            if source.is_file() and source.suffix.lower() not in {".dll", ".pyd"}:
+                target = "tools/live2d_native/opacity-v1/" + source.relative_to(live2d_root).as_posix()
+                args.insert(-1, f"--include-data-file={source}={target}")
     return args
 
 

@@ -30,6 +30,7 @@ from app.core.psd_reconstructor import resolve_live2d_source
 from app.core.live2d_references import iter_live2d_asset_references
 from app.core.live2d_editor_project import Live2DEditorProjects
 from app.core.live2d_skins import Live2DSkins
+from app.core.live2d_editor_export import Live2DExportSnapshotRequest, WorkspaceAssetLifetime
 
 
 EDITOR_MANIFEST = "lpk_live2d_editor.json"
@@ -250,6 +251,7 @@ class Live2DEditorSession:
         if self.original_document.get("Version") != 3 or not isinstance(self.original_document.get("FileReferences"), dict):
             raise AnimationEditingError("Choose a Cubism 3 model settings JSON.")
         self._temporary = tempfile.TemporaryDirectory(prefix="lpk-live2d-editor-")
+        self._asset_lifetime = WorkspaceAssetLifetime(self._temporary)
         self.root = Path(self._temporary.name) / "model"
         self.root.mkdir()
         self.model_path = self.root / "model.json"
@@ -258,6 +260,7 @@ class Live2DEditorSession:
         self._signature_cache = None
         self._asset_signature_cache = None
         self._signature_changed = self._invalidate_signature
+        self._appearance_changed = self._invalidate_texture_signature
         self._pose_changed = self._invalidate_pose_signature
         self._parameter_preview: dict[str, float] = {}
         self._local_textures = OrderedDict()
@@ -317,6 +320,8 @@ class Live2DEditorSession:
             self._parameters_by_id = {parameter["id"]: parameter for parameter in self.parameters}
             self.parameter_overrides: dict[str, float] = {}
             self.part_overrides: dict[str, float] = {}
+            self.drawable_visibility_overrides: dict[str, bool] = {}
+            self.drawable_opacity_overrides: dict[str, float] = {}
             self._core_model = None
             self.mesh_data = copy.deepcopy(info.mesh_data)
             try:
@@ -335,6 +340,13 @@ class Live2DEditorSession:
                                                 if k in known and known[k]["min"] <= float(v) <= known[k]["max"]}
                     self.part_overrides = {k: float(v) for k, v in state.get("preview_part_opacity", {}).items()
                                            if math.isfinite(float(v)) and 0 <= float(v) <= 1}
+                    known_drawables = {item["id"] for item in (self.mesh_data or {}).get("drawables", [])}
+                    self.drawable_visibility_overrides = {
+                        k: v for k, v in state.get("preview_drawable_visibility", {}).items()
+                        if k in known_drawables and isinstance(v, bool) and not v}
+                    self.drawable_opacity_overrides = {
+                        k: float(v) for k, v in state.get("preview_drawable_opacity", {}).items()
+                        if k in known_drawables and math.isfinite(float(v)) and 0 <= float(v) < 1}
                     self._projects.restore(self.source_root, state)
                     if state.get("skins") is not None:
                         self._skins.restore(self.source_root, state["skins"])
@@ -382,6 +394,8 @@ class Live2DEditorSession:
                 "bindings": project.bindings, "settings": project.settings,
                 "modified": project.modified, "parameters": self.parameter_overrides,
                 "parts": self.part_overrides, "textures": self._texture_data,
+                "drawable_visibility": self.drawable_visibility_overrides,
+                "drawable_opacity": self.drawable_opacity_overrides,
                 "skins": self._skins.state,
                 "original_bindings": self.original_bindings,
                 "deleted_original_bindings": self._deleted_original_bindings}
@@ -406,16 +420,25 @@ class Live2DEditorSession:
             setattr(self.project, name, state[name])
         self.parameter_overrides = state["parameters"]
         self.part_overrides = state["parts"]
+        self.drawable_visibility_overrides = state.get("drawable_visibility", {})
+        self.drawable_opacity_overrides = state.get("drawable_opacity", {})
         self._texture_data = state["textures"]
         self._skins.state = state["skins"]
         self.original_bindings = state["original_bindings"]
         self._deleted_original_bindings = state["deleted_original_bindings"]
+        self._skins._touch()
         self._invalidate_signature()
 
     def _invalidate_signature(self):
         self._signature_revision += 1
         self._signature_cache = None
         self._asset_signature_cache = None
+
+    def _invalidate_texture_signature(self):
+        """Invalidate workspace and skin polling state for a texture mutation."""
+        self._invalidate_signature()
+        if hasattr(self, "_skins"):
+            self._skins._touch()
 
     def _invalidate_pose_signature(self):
         # Pose edits do not alter any model, motion or texture bytes. Reuse
@@ -432,18 +455,29 @@ class Live2DEditorSession:
             if tracked is not value:
                 setattr(self.project, name, tracked)
                 self._invalidate_signature()
-        for name in ("_texture_data", "original_bindings"):
+        self._observe_appearance_values()
+        for name in ("original_bindings",):
             value = getattr(self, name)
             tracked = _track_mutable(value, self._signature_changed)
             if tracked is not value:
                 setattr(self, name, tracked)
                 self._invalidate_signature()
-        for name in ("parameter_overrides", "part_overrides"):
+        for name in ("parameter_overrides", "part_overrides", "drawable_visibility_overrides", "drawable_opacity_overrides"):
             value = getattr(self, name)
             tracked = _track_mutable(value, self._pose_changed)
             if tracked is not value:
                 setattr(self, name, tracked)
                 self._invalidate_pose_signature()
+
+    def _observe_appearance_values(self):
+        # Keep a stable callback object: bound-method lookups are distinct
+        # objects and would rewrap/invalidate on every timer tick.
+        textures = _track_mutable(self._texture_data, self._appearance_changed)
+        registry = _track_mutable(self._skins.state, self._appearance_changed)
+        if textures is not self._texture_data or registry is not self._skins.state:
+            self._texture_data = textures
+            self._skins.state = registry
+            self._invalidate_texture_signature()
 
     def _signature(self) -> str:
         self._observe_signature_values()
@@ -455,6 +489,8 @@ class Live2DEditorSession:
             snapshot = self._snapshot_values()
             snapshot.pop("parameters")
             snapshot.pop("parts")
+            snapshot.pop("drawable_visibility")
+            snapshot.pop("drawable_opacity")
             snapshot["modified"] = sorted(snapshot["modified"])
             snapshot["textures"] = [hashlib.sha256(data).hexdigest() for data in snapshot["textures"]]
             snapshot["original_bindings"] = sorted((group, index, original) for (group, index), original in self.original_bindings.items())
@@ -462,24 +498,34 @@ class Live2DEditorSession:
             snapshot["project_revision"] = self._project_revision
             asset_signature = hashlib.sha256(json.dumps(snapshot, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
             self._asset_signature_cache = token, asset_signature
-        pose = json.dumps([self.parameter_overrides, self.part_overrides], sort_keys=True, allow_nan=False)
+        pose_values = [self.parameter_overrides, self.part_overrides]
+        if self.drawable_visibility_overrides or self.drawable_opacity_overrides:
+            pose_values.extend([self.drawable_visibility_overrides, self.drawable_opacity_overrides])
+        pose = json.dumps(pose_values, sort_keys=True, allow_nan=False)
         signature = hashlib.sha256((self._asset_signature_cache[1] + pose).encode()).hexdigest()
         self._signature_cache = token, signature
         return signature
 
     def _record(self, action) -> Any:
         self.commit_parameter_preview()
+        self._observe_appearance_values()
         previous = self._snapshot()
+        skin_revision = self._skins.revision
         try:
             result = action()
         except Exception:
             self._restore(previous)
             raise
-        if previous != self._snapshot_values():
+        current = self._snapshot_values()
+        skin_changed = (previous["textures"] != current["textures"] or
+                        previous["skins"] != current["skins"])
+        if previous != current:
             self._invalidate_signature()
             self._undo.append(previous)
             del self._undo[:-32]
             self._redo.clear()
+        if skin_changed and self._skins.revision == skin_revision:
+            self._skins._touch()
         return result
 
     @property
@@ -487,12 +533,19 @@ class Live2DEditorSession:
         return self.parameter_preview_pending or self._signature() != self._saved_signature
 
     def _pose_history(self) -> dict:
-        return {"_history_kind": "pose", "parameters": dict(self.parameter_overrides),
-                "parts": dict(self.part_overrides)}
+        state = {"_history_kind": "pose", "parameters": dict(self.parameter_overrides),
+                 "parts": dict(self.part_overrides)}
+        if self.drawable_visibility_overrides:
+            state["drawable_visibility"] = dict(self.drawable_visibility_overrides)
+        if self.drawable_opacity_overrides:
+            state["drawable_opacity"] = dict(self.drawable_opacity_overrides)
+        return state
 
     def _restore_pose(self, state: dict) -> None:
         self.parameter_overrides = _track_mutable(dict(state["parameters"]), self._pose_changed)
         self.part_overrides = _track_mutable(dict(state["parts"]), self._pose_changed)
+        self.drawable_visibility_overrides = _track_mutable(dict(state.get("drawable_visibility", {})), self._pose_changed)
+        self.drawable_opacity_overrides = _track_mutable(dict(state.get("drawable_opacity", {})), self._pose_changed)
         self._invalidate_pose_signature()
 
     def _record_pose(self, action) -> Any:
@@ -548,6 +601,30 @@ class Live2DEditorSession:
     def list_skins(self):
         return self._skins.list()
 
+    def skin_state_snapshot(self) -> dict:
+        """Return the cached skin/working-texture view for UI polling.
+
+        The returned object is detached and read-only by contract.  Reuse it
+        while ``revision`` is unchanged; a new object is published after skin
+        or working-atlas mutations, undo/redo, or external texture acceptance.
+        """
+        return self._skins.snapshot()
+
+    get_skin_state_snapshot = skin_state_snapshot
+
+    def find_psd_skin(self, project_file, version, *, version_kind=None):
+        """Return an exact materialized PSD version, if it is already known."""
+        return self._skins.lookup_psd_skin(project_file, version, version_kind=version_kind)
+
+    lookup_psd_skin = find_psd_skin
+
+    def get_skin_origin(self, skin_id):
+        return self._skins.get_origin(skin_id)
+
+    def find_skin_origin(self, origin):
+        """Look up a normalized skin origin without importing or applying it."""
+        return self._skins.find_origin(origin)
+
     def inspect_skin_source(self, source):
         return self._skins.inspect_source(source)
 
@@ -555,9 +632,23 @@ class Live2DEditorSession:
         return self._skins.paths(skin_id)
 
     def import_skin(self, source, name=None, *, mapping=None, source_kind="model",
-                    source_metadata=None, metadata=None, activate=False):
+                    source_metadata=None, metadata=None, activate=False, reuse_origin=True):
         return self._skins.import_skin(source, name, mapping=mapping, source_kind=source_kind,
-                                       metadata=metadata if metadata is not None else source_metadata, activate=activate)
+                                       metadata=metadata if metadata is not None else source_metadata,
+                                       activate=activate, reuse_origin=reuse_origin)
+
+    def import_psd_skin(self, source, name=None, *, project_file, version, version_kind=None, metadata=None,
+                        activate=True, reuse_origin=True):
+        """Import one PSD history version with an explicit stable origin key."""
+        values = dict(metadata or {})
+        values.update({"project_file": project_file, "version": version})
+        origin = self._skins.psd_origin(project_file, version, version_kind=version_kind)
+        if origin is None:
+            raise AnimationEditingError("A PSD skin requires a managed project identity and a history kind/version.")
+        values["project_file"] = origin["project"]
+        values["origin"] = origin
+        return self.import_skin(source, name, source_kind="psd", source_metadata=values,
+                                activate=activate, reuse_origin=reuse_origin)
 
     def capture_skin(self, name, *, source_kind="current", source_metadata=None, metadata=None):
         return self._skins.capture(name, source_kind=source_kind,
@@ -780,7 +871,47 @@ class Live2DEditorSession:
             self.mesh_data = self._core_model.drawable_snapshot(parameters)
         return self.mesh_data or {}
 
-    def exact_pose_mesh(self, parameters: Mapping[str, float], parts: Mapping[str, float] | None = None) -> dict:
+    def drawable_opacity_multipliers(self) -> dict[str, float]:
+        from app.core.live2d_drawables import effective_drawable_opacities
+        return effective_drawable_opacities(self.drawable_visibility_overrides, self.drawable_opacity_overrides)
+
+    def _drawable_ids(self, identifiers) -> tuple[str, ...]:
+        if isinstance(identifiers, str):
+            identifiers = [identifiers]
+        identifiers = tuple(dict.fromkeys(map(str, identifiers)))
+        known = {str(item["id"]) for item in (self.mesh_data or {}).get("drawables", [])}
+        if any(identifier not in known for identifier in identifiers):
+            raise AnimationEditingError("Choose ArtMeshes in the current model.")
+        return identifiers
+
+    def set_drawable_visibility(self, identifiers, visible: bool) -> None:
+        """Hide/restore selected colour draws in one undo step, preserving opacity."""
+        identifiers = self._drawable_ids(identifiers)
+        if not isinstance(visible, bool):
+            raise AnimationEditingError("ArtMesh preview visibility must be a boolean.")
+        def update():
+            for identifier in identifiers:
+                if visible:
+                    self.drawable_visibility_overrides.pop(identifier, None)
+                else:
+                    self.drawable_visibility_overrides[identifier] = False
+        self._record_pose(update)
+
+    def set_drawable_opacity(self, identifiers, value: float) -> None:
+        """Set selected preview multipliers without changing their hidden state."""
+        from app.core.live2d_drawables import opacity_multiplier
+        identifiers = self._drawable_ids(identifiers)
+        number = opacity_multiplier(value)
+        def update():
+            for identifier in identifiers:
+                if number == 1.0:
+                    self.drawable_opacity_overrides.pop(identifier, None)
+                else:
+                    self.drawable_opacity_overrides[identifier] = number
+        self._record_pose(update)
+
+    def exact_pose_mesh(self, parameters: Mapping[str, float], parts: Mapping[str, float] | None = None,
+                        drawable_opacities: Mapping[str, float] | None = None) -> dict:
         """Read geometry from a displayed pose without clamping physics values.
 
         The renderer supplies actual parameter values. Cubism Core's ordinary
@@ -832,7 +963,9 @@ class Live2DEditorSession:
         for drawable in snapshot.get("drawables", []):
             if drawable.get("parent_part_id") in hidden:
                 drawable["opacity"] = 0.0
-        return snapshot
+        from app.core.live2d_drawables import apply_drawable_opacities
+        return apply_drawable_opacities(snapshot, self.drawable_opacity_multipliers()
+                                       if drawable_opacities is None else drawable_opacities)
 
     @staticmethod
     def _write_texture(path: Path, data: bytes) -> None:
@@ -1012,6 +1145,38 @@ class Live2DEditorSession:
 
     export_model_snapshot = export_snapshot
 
+    def capture_export_snapshot(self, output_dir=None, *, skin_source=None) -> Live2DExportSnapshotRequest:
+        """Capture plain state on the owner thread for a CPU worker to export.
+
+        The request leases immutable workspace assets and owns detached motion,
+        document and pose data. Atlas bytes are immutable references. Pending
+        parameter values are included without committing history. No Core or
+        QWidget is read here; the worker constructs its own Core instance.
+        """
+        parameters = dict(self.parameter_overrides)
+        parameters.update(self._parameter_preview)
+        active = self._skins.get(self.active_skin_id)
+        return Live2DExportSnapshotRequest(
+            _project=copy.deepcopy(self.project),
+            _original_document=copy.deepcopy(self.original_document),
+            _original_bindings=copy.deepcopy(self.original_bindings),
+            _deleted_original_bindings=frozenset(self._deleted_original_bindings),
+            _textures=tuple((path.relative_to(self.root).as_posix(), data)
+                            for path, data in zip(self.texture_paths, self._texture_data)),
+            _parameters=parameters,
+            _parts=dict(self.part_overrides),
+            _drawable_visibility=dict(self.drawable_visibility_overrides),
+            _drawable_opacity=dict(self.drawable_opacity_overrides),
+            _mesh_metadata=copy.deepcopy(self.mesh_data or {}),
+            _warnings=tuple(self.warnings),
+            _source_path=self.source_path,
+            _skin_at_export={"id": active["id"], "name": active["name"],
+                             "working_modified": self.skin_modified},
+            skin_source=copy.deepcopy(skin_source or {}),
+            output_dir=Path(output_dir).expanduser().resolve() if output_dir is not None else None,
+            _lease=self._asset_lifetime.acquire(),
+        )
+
     def save_copy(self, output_dir: str | Path, *, include_projects: bool = True, include_skins: bool = True,
                   include_editor_metadata: bool = True, mark_saved: bool = True) -> dict[str, Any]:
         output = Path(output_dir).expanduser().resolve()
@@ -1061,6 +1226,10 @@ class Live2DEditorSession:
                          "source_path": str(self.source_path), "pose_parameters": self.parameter_overrides,
                          "preview_part_opacity": self.part_overrides, "warnings": self.warnings,
                          "authoring_source": None, "model": "model.json", "projects": projects}
+                if self.drawable_visibility_overrides:
+                    state["preview_drawable_visibility"] = dict(self.drawable_visibility_overrides)
+                if self.drawable_opacity_overrides:
+                    state["preview_drawable_opacity"] = dict(self.drawable_opacity_overrides)
                 if include_skins:
                     state["skins"] = self._skins.export_registry(stage)
                 else:
@@ -1092,5 +1261,21 @@ class Live2DEditorSession:
         self._local_crops.clear()
         temporary = getattr(self, "_temporary", None)
         if temporary:
-            temporary.cleanup()
+            self._asset_lifetime.close()
             self._temporary = None
+
+
+def prepare_readonly_preview_session(source, *, cancel_event=None) -> Live2DEditorSession:
+    """Prepare a fresh CPU session under exclusive worker ownership.
+
+    The caller transfers ownership after this function returns; only then may
+    the GUI load its model into OpenGL. An active session/Core is never shared.
+    """
+    from concurrent.futures import CancelledError
+    if cancel_event is not None and cancel_event.is_set():
+        raise CancelledError()
+    candidate = Live2DEditorSession(source)
+    if cancel_event is not None and cancel_event.is_set():
+        candidate.close()
+        raise CancelledError()
+    return candidate

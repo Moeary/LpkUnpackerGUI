@@ -2696,6 +2696,8 @@ def _normalize_drawable(item: dict[str, Any]) -> Optional[dict[str, Any]]:
         "uvs": uvs,
         "indices": indices,
         "opacity": float(item.get("opacity", 1.0)),
+        "source_pose_opacity": float(item.get("source_pose_opacity", item.get("opacity", 1.0))),
+        "preview_opacity_multiplier": float(item.get("preview_opacity_multiplier", 1.0)),
         "visible": _drawable_visible(item),
         "masks": _as_int_list(item.get("masks") or []),
         "inverted_mask": bool(item.get("inverted_mask", False)),
@@ -3051,7 +3053,9 @@ def _apply_drawable_masks(
             vertices - origin,
             mask_drawable["indices"],
         )
-        opacity = float(mask_drawable.get("opacity", 1.0))
+        # An editor-only hidden colour pass must remain usable as a clipping
+        # source. The native renderer also uses its intrinsic pose opacity.
+        opacity = float(mask_drawable.get("source_pose_opacity", mask_drawable.get("opacity", 1.0)))
         if opacity < 1.0:
             mask_layer[:, :, 3] = np.clip(
                 mask_layer[:, :, 3].astype(np.float32) * opacity,

@@ -311,6 +311,14 @@ class MainWindowEditorNavigationTests(unittest.TestCase):
         self.window.spineEditorPage.sourceOpened.emit(str(model))
         self.assertEqual(self.window.previewPage.leases, set())
 
+    def test_editor_shutdown_can_keep_parent_alive_until_worker_finishes(self):
+        window = self.window
+        with patch.object(window.live2dEditorPage, "shutdown", return_value=False):
+            self.assertFalse(window.close())
+            self.assertTrue(window.isVisible())
+            self.assertEqual(window.spineEditorPage.shutdown_count, 0)
+        self.assertTrue(window.close())
+
     def test_theme_switch_persists_without_reloading_or_changing_editor(self):
         window = self.window
         window.switchTo(window.live2dEditorPage)

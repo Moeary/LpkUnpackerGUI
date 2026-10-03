@@ -1,0 +1,200 @@
+--- a/Live2D/V3/Main/src/Model.hpp
++++ b/Live2D/V3/Main/src/Model.hpp
+@@ -165,6 +165,9 @@
+     void DestroyRenderer();
+ 
+     void Draw();
++    void SetDrawableOpacityOverrides(const std::vector<float>& values);
++    float GetDrawableOpacityMultiplier(int index) const;
++    float GetIntrinsicDrawableOpacity(int index) const;
+ 
+     // part
+     int GetPartCount();
+@@ -279,4 +282,5 @@
+ 
+     bool autoBreath;
+     bool autoBlink;
++    std::vector<float> _drawableOpacityMultipliers;
+ };
+\ No newline at end of file
+--- a/Live2D/V3/Main/src/Model.cpp
++++ b/Live2D/V3/Main/src/Model.cpp
+@@ -1029,7 +1029,32 @@
+ 
+     renderer->SetMvpMatrix(&matrix);
+ 
++    // Only the colour shader consumes these values; mask generation uses the
++    // intrinsic model. Cubism Core memory is never modified by preview hiding.
++    renderer->SetPreviewDrawableOpacityMultipliers(
++        _drawableOpacityMultipliers.empty() ? nullptr : _drawableOpacityMultipliers.data(),
++        static_cast<csmInt32>(_drawableOpacityMultipliers.size()));
++    struct RestorePreviewOpacity {
++        Rendering::CubismRenderer_OpenGLES2* renderer;
++        ~RestorePreviewOpacity() { renderer->SetPreviewDrawableOpacityMultipliers(nullptr, 0); }
++    } restore = {renderer};
+     renderer->DrawModel();
++}
++
++void Model::SetDrawableOpacityOverrides(const std::vector<float>& values)
++{
++    _drawableOpacityMultipliers = values;
++}
++
++float Model::GetDrawableOpacityMultiplier(int index) const
++{
++    return index >= 0 && index < static_cast<int>(_drawableOpacityMultipliers.size())
++        ? _drawableOpacityMultipliers[index] : 1.0f;
++}
++
++float Model::GetIntrinsicDrawableOpacity(int index) const
++{
++    return _model->GetDrawableOpacity(index);
+ }
+ 
+ int Model::GetPartCount()
+--- a/Live2D/V3/Framework/src/Rendering/OpenGL/CubismRenderer_OpenGLES2.hpp
++++ b/Live2D/V3/Framework/src/Rendering/OpenGL/CubismRenderer_OpenGLES2.hpp
+@@ -185,6 +185,17 @@
+      *
+      * @param[in]  model -> モデルのインスタンス
+      */
++    void SetPreviewDrawableOpacityMultipliers(const csmFloat32* values, csmInt32 count)
++    {
++        _previewDrawableOpacityMultipliers = values;
++        _previewDrawableOpacityCount = count;
++    }
++    csmFloat32 GetPreviewDrawableOpacityMultiplier(csmInt32 index) const
++    {
++        return _previewDrawableOpacityMultipliers && index >= 0 && index < _previewDrawableOpacityCount
++            ? _previewDrawableOpacityMultipliers[index] : 1.0f;
++    }
++
+     void Initialize(Framework::CubismModel* model);
+ 
+     void Initialize(Framework::CubismModel* model, csmInt32 maskBufferCount);
+@@ -282,6 +293,9 @@
+ #endif
+ 
+ private:
++    const csmFloat32* _previewDrawableOpacityMultipliers = NULL;
++    csmInt32 _previewDrawableOpacityCount = 0;
++
+     // Prevention of copy Constructor
+     CubismRenderer_OpenGLES2(const CubismRenderer_OpenGLES2&);
+     CubismRenderer_OpenGLES2& operator=(const CubismRenderer_OpenGLES2&);
+--- a/Live2D/V3/Framework/src/Rendering/OpenGL/CubismShader_OpenGLES2.cpp
++++ b/Live2D/V3/Framework/src/Rendering/OpenGL/CubismShader_OpenGLES2.cpp
+@@ -479,7 +479,7 @@
+     glUniformMatrix4fv(shaderSet->UniformMatrixLocation, 1, 0, renderer->GetMvpMatrix().GetArray()); //
+ 
+     // ユニフォーム変数設定
+-    CubismRenderer::CubismTextureColor baseColor = renderer->GetModelColorWithOpacity(model.GetDrawableOpacity(index));
++    CubismRenderer::CubismTextureColor baseColor = renderer->GetModelColorWithOpacity(model.GetDrawableOpacity(index) * renderer->GetPreviewDrawableOpacityMultiplier(index));
+     CubismRenderer::CubismTextureColor multiplyColor = model.GetMultiplyColor(index);
+     CubismRenderer::CubismTextureColor screenColor = model.GetScreenColor(index);
+     SetColorUniformVariables(renderer, model, index, shaderSet, baseColor, multiplyColor, screenColor);
+--- a/Wrapper/V3/PyModel.cpp
++++ b/Wrapper/V3/PyModel.cpp
+@@ -1,6 +1,7 @@
+ #include "PyModel.hpp"
+ 
+ #include <Log.hpp>
++#include <cmath>
+ 
+ static void MotionStartCallback(ACubismMotion *motion)
+ {
+@@ -640,6 +641,55 @@
+ 							});
+ 	return list;
+ }
++static PyObject *PyModel_SetDrawableOpacityOverrides(PyModelObject *self, PyObject *args)
++{
++    PyObject* mapping;
++    if (!PyArg_ParseTuple(args, "O!", &PyDict_Type, &mapping)) return nullptr;
++    const int count = self->model->GetDrawableCount();
++    std::vector<float> values(count, 1.0f);
++    PyObject *key, *value;
++    Py_ssize_t position = 0;
++    while (PyDict_Next(mapping, &position, &key, &value))
++    {
++        const long index = PyLong_AsLong(key);
++        if (PyErr_Occurred()) return nullptr;
++        const double opacity = PyFloat_AsDouble(value);
++        if (PyErr_Occurred()) return nullptr;
++        if (index < 0 || index >= count || !std::isfinite(opacity) || opacity < 0.0 || opacity > 1.0)
++        {
++            PyErr_SetString(PyExc_ValueError, "drawable index/opacity out of range");
++            return nullptr;
++        }
++        values[index] = static_cast<float>(opacity);
++    }
++    self->model->SetDrawableOpacityOverrides(values);
++    Py_RETURN_NONE;
++}
++
++static PyObject *PyModel_GetDrawableOpacityMultiplier(PyModelObject *self, PyObject *args)
++{
++    int index;
++    if (!PyArg_ParseTuple(args, "i", &index)) return nullptr;
++    if (index < 0 || index >= self->model->GetDrawableCount())
++    {
++        PyErr_SetString(PyExc_ValueError, "drawable index out of range");
++        return nullptr;
++    }
++    return PyFloat_FromDouble(self->model->GetDrawableOpacityMultiplier(index));
++}
++
++static PyObject *PyModel_GetIntrinsicDrawableOpacity(PyModelObject *self, PyObject *args)
++{
++    int index;
++    if (!PyArg_ParseTuple(args, "i", &index)) return nullptr;
++    if (index < 0 || index >= self->model->GetDrawableCount())
++    {
++        PyErr_SetString(PyExc_ValueError, "drawable index out of range");
++        return nullptr;
++    }
++    return PyFloat_FromDouble(self->model->GetIntrinsicDrawableOpacity(index));
++}
++
+ static PyObject *PyModel_SetPartOpacity(PyModelObject *self, PyObject *args, PyObject *kwargs)
+ {
+ 	int index;
+@@ -967,6 +1017,9 @@
+ 	{"GetPartScreenColor", (PyCFunction)PyModel_GetPartScreenColor, METH_VARARGS | METH_KEYWORDS, nullptr},
+ 	{"GetPartMultiplyColor", (PyCFunction)PyModel_GetPartMultiplyColor, METH_VARARGS | METH_KEYWORDS, nullptr},
+ 	{"GetDrawableIds", (PyCFunction)PyModel_GetDrawableIds, METH_VARARGS | METH_KEYWORDS, nullptr},
++    {"SetDrawableOpacityOverrides", (PyCFunction)PyModel_SetDrawableOpacityOverrides, METH_VARARGS, nullptr},
++    {"GetDrawableOpacityMultiplier", (PyCFunction)PyModel_GetDrawableOpacityMultiplier, METH_VARARGS, nullptr},
++    {"GetIntrinsicDrawableOpacity", (PyCFunction)PyModel_GetIntrinsicDrawableOpacity, METH_VARARGS, nullptr},
+ 	{"SetDrawableMultiplyColor", (PyCFunction)PyModel_SetDrawableMultiplyColor, METH_VARARGS | METH_KEYWORDS, nullptr},
+ 	{"SetDrawableScreenColor", (PyCFunction)PyModel_SetDrawableScreenColor, METH_VARARGS | METH_KEYWORDS, nullptr},
+ 
+--- a/Wrapper/V3/Init.cpp
++++ b/Wrapper/V3/Init.cpp
+@@ -171,6 +171,12 @@
+         return NULL;
+     }
+ 
++    if (PyModule_AddIntConstant(m, "DRAWABLE_OPACITY_API_VERSION", 1) < 0 ||
++        PyModule_AddStringConstant(m, "UPSTREAM_VERSION", "0.7.0") < 0)
++    {
++        Py_DECREF(m);
++        return NULL;
++    }
+ #ifdef CSM_TARGET_WIN_GL
+     SetConsoleOutputCP(65001);
+ #endif
+--- a/Live2D/V3/cmake/Core.cmake
++++ b/Live2D/V3/cmake/Core.cmake
+@@ -46,4 +46,9 @@
+ target_compile_definitions(Live2DCubismCore
+   INTERFACE
+   ${CSM_TARGET}
+-)
+\ No newline at end of file
++)
++# The controlled Windows preview build links an import library for its uniquely
++# named SDK DLL, avoiding Windows' reuse of another loaded Cubism Core basename.
++if(LPK_CORE_IMPORT_LIBRARY)
++  set_property(TARGET Live2DCubismCore PROPERTY IMPORTED_LOCATION "${LPK_CORE_IMPORT_LIBRARY}")
++endif()

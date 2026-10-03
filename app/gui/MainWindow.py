@@ -331,8 +331,9 @@ class MainWindow(FluentWindow):
             return
         for page in (getattr(self, "live2dEditorPage", None), getattr(self, "spineEditorPage", None)):
             shutdown = getattr(page, "shutdown", None)
-            if callable(shutdown):
-                shutdown()
+            if callable(shutdown) and shutdown() is False:
+                event.ignore()
+                return
             self._release_editor_source_leases(page)
         # Store the restore rectangle, not the maximized monitor rectangle.
         # Otherwise opening the next session looks maximized but its titlebar

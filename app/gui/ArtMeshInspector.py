@@ -35,6 +35,7 @@ from qfluentwidgets import (
     ComboBox as QComboBox, LineEdit as QLineEdit, ListWidget as QListWidget,
     PushButton as QPushButton, TextEdit as QTextEdit,
     ScrollArea, LineEdit, BodyLabel, FluentIcon, TransparentToolButton,
+    setCustomStyleSheet,
 )
 
 from app.i18n import get_i18n, tr
@@ -52,7 +53,8 @@ ARTMESH_TEXT = {
     "artmesh.inspector.pick_trigger": "选择换装触发部件",
     "artmesh.inspector.no_trigger": "请先预览此工程的主模型，再选择未绑定事件的部件。",
     "artmesh.inspector.zoom_hint": "滚轮缩放，中键拖动，双击复位；总览中使用 Ctrl+滚轮缩放。",
-    "artmesh.inspector.selection_hint": "单击选择；Shift+单击增减；拖动框选；Shift+框选合并。",
+    "artmesh.inspector.selection_hint": "单击选择；Ctrl/Shift+单击增减；拖动框选；Ctrl/Shift+框选合并。",
+    "artmesh.inspector.uv_toggle": "显示/收起 UV 与局部预览",
 }
 
 
@@ -273,7 +275,7 @@ class _MeshCanvas(QWidget):
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.fillRect(self.rect(), QColor("#20252d"))
+        painter.fillRect(self.rect(), self.palette().window())
         scale, offset_x, offset_y = self._transform()
         width, height = self.source_size
         target = QRectF(offset_x, offset_y, width * scale, height * scale)
@@ -357,7 +359,7 @@ class _MeshCanvas(QWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             self._selection_anchor = QPointF(event.position())
             self._selection_position = QPointF(event.position())
-            self._selection_shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+            self._selection_shift = bool(event.modifiers() & (Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.ControlModifier))
             self._selection_moved = False
             event.accept()
             return
@@ -437,7 +439,7 @@ class _MeshCanvas(QWidget):
 
 
 class _SelectionListWidget(QListWidget):
-    """Use Shift as a per-row toggle, rather than Qt's range selection."""
+    """Use Ctrl or Shift as the same per-row toggle as preview picking."""
     toggle_enabled = True
 
     def __init__(self, parent=None):
@@ -446,7 +448,7 @@ class _SelectionListWidget(QListWidget):
 
     def mousePressEvent(self, event):
         if (self.toggle_enabled and event.button() == Qt.MouseButton.LeftButton
-                and event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
+                and event.modifiers() & (Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.ControlModifier)):
             self._shift_click = True
             item = self.itemAt(event.position().toPoint())
             if item is not None:
@@ -468,6 +470,7 @@ class _SelectionListWidget(QListWidget):
 
 class ArtMeshInspector(QWidget):
     """Static ArtMesh list, pose hit-testing and atlas UV inspection widget."""
+    uvPreviewVisibilityChanged = Signal(bool)
 
     selectionChanged = Signal(object)
     metadataChanged = Signal(str)
@@ -624,8 +627,8 @@ class ArtMeshInspector(QWidget):
             self.details.textChanged.connect(lambda: self.setToolTip(self.details.toPlainText()))
 
             self.list_panel = QWidget(self.splitter)
-            self.list_panel.setMinimumWidth(100)
-            self.list_panel.setMaximumWidth(270)
+            self.list_panel.setMinimumWidth(76)
+            self.list_panel.setAutoFillBackground(True)
             self.list_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
             list_layout = QVBoxLayout(self.list_panel)
             list_layout.setContentsMargins(0, 0, 0, 0)
@@ -643,6 +646,11 @@ class ArtMeshInspector(QWidget):
             self.refresh_button.setFixedSize(28, 32)
             self.refresh_button.setToolTip(tr("psd.inspector.refresh"))
             search_row.addWidget(self.refresh_button)
+            self.uv_toggle_button = TransparentToolButton(FluentIcon.VIEW, self.list_panel)
+            self.uv_toggle_button.setFixedSize(28, 32)
+            self.uv_toggle_button.setToolTip(_text("artmesh.inspector.uv_toggle"))
+            self.uv_toggle_button.clicked.connect(lambda: self.set_uv_preview_visible(not self.uv_preview_visible()))
+            search_row.addWidget(self.uv_toggle_button)
             list_layout.addLayout(search_row)
             self.candidate_combo.setParent(self.list_panel)
             list_layout.addWidget(self.candidate_combo)
@@ -652,6 +660,8 @@ class ArtMeshInspector(QWidget):
             self.entry_list.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
             self.entry_list.setTextElideMode(Qt.TextElideMode.ElideRight)
             self.entry_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            surface_qss = "QListWidget { background: palette(window); border: none; }"
+            setCustomStyleSheet(self.entry_list, surface_qss, surface_qss)
             list_layout.addWidget(self.entry_list, 1)
 
             pose_frame = self.pose_canvas.parentWidget()
@@ -671,11 +681,19 @@ class ArtMeshInspector(QWidget):
             self.view_splitter.setSizes([290, 195])
             self.splitter.insertWidget(0, self.list_panel)
             self.splitter.setChildrenCollapsible(False)
+            self.splitter.setCollapsible(1, True)
             self.splitter.setHandleWidth(6)
             self.splitter.setStretchFactor(0, 0)
             self.splitter.setStretchFactor(1, 1)
             self.splitter.setSizes([132, 310])
-            self.atlas_frame.setMinimumSize(100, 120)
+            self.view_splitter.setMinimumWidth(0)
+            self.view_splitter.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
+            self.atlas_frame.setMinimumSize(0, 120)
+            self.atlas_frame.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
+            self.atlas_frame.setAutoFillBackground(True)
+            self.atlas_canvas.setMinimumWidth(0)
+            self._uv_saved_sizes = [132, 310]
+            self.splitter.splitterMoved.connect(self._uv_splitter_moved)
             self.atlas_title_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
             self._atlas_layout.insertWidget(0, self.atlas_title_label)
             self.atlas_title_label.show()
@@ -695,10 +713,34 @@ class ArtMeshInspector(QWidget):
             self.editor_details_scroll.setWidget(details_widget)
             details_widget.show()
 
+    def uv_preview_visible(self) -> bool:
+        return self._layout_mode != "editor" or self.splitter.sizes()[1] > 0
+
+    def set_uv_preview_visible(self, visible: bool) -> None:
+        """Collapse the UV column without disturbing the current selection."""
+        if self._layout_mode != "editor":
+            return
+        sizes = self.splitter.sizes()
+        if visible:
+            if sizes[1] == 0:
+                self.splitter.setSizes(self._uv_saved_sizes)
+        elif sizes[1] > 0:
+            self._uv_saved_sizes = sizes
+            self.splitter.setSizes([max(1, sum(sizes)), 0])
+        self._uv_splitter_moved()
+
+    def _uv_splitter_moved(self, *_args) -> None:
+        sizes = self.splitter.sizes()
+        visible = sizes[1] > 0
+        if visible:
+            self._uv_saved_sizes = sizes
+        self.uvPreviewVisibilityChanged.emit(visible)
+
     def retranslate_ui(self, *_args) -> None:
         self.open_button.setText(tr("psd.inspector.open_metadata"))
         if self._layout_mode == "editor":
             self.refresh_button.setText("")
+            self.uv_toggle_button.setToolTip(_text("artmesh.inspector.uv_toggle"))
             self.refresh_button.setToolTip(tr("psd.inspector.refresh"))
             self.search_edit.setToolTip(_text("artmesh.inspector.search"))
         else:
@@ -1191,7 +1233,7 @@ class ArtMeshInspector(QWidget):
             # canvas all the UV area, keeping zoom and selection identical.
             self.atlas_tabs = None
             self.atlas_canvas = old_canvas
-            old_canvas.setMinimumSize(100, 100)
+            old_canvas.setMinimumSize(0, 100)
             if indices:
                 texture_index = indices[0]
                 self._connect_atlas_canvas(old_canvas, texture_index)

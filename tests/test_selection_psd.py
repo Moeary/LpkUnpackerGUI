@@ -137,6 +137,28 @@ class SelectedPosePsdTests(unittest.TestCase):
             np.testing.assert_array_equal(pixels[:, :, 3], original[:, :, 3])
             self.assertGreater(int(np.any(original != pixels, axis=2).sum()), 0)
 
+    def test_preview_hidden_mask_keeps_intrinsic_clipping_for_selected_export(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model, textures, mesh = self.make_source(root, masked=True)
+            before = {path.name: path.read_bytes() for path in textures}
+            normal = self.export(root / "normal", model, mesh, ["Head"])
+            hidden = copy.deepcopy(mesh)
+            mask = hidden["drawables"][4]
+            mask.update(source_pose_opacity=mask["opacity"], preview_opacity_multiplier=0,
+                        opacity=0, visible=False)
+            original_hidden = copy.deepcopy(hidden)
+            result = self.export(root / "hidden", model, hidden, ["Head"])
+            normal_metadata, metadata = self.metadata(normal), self.metadata(result)
+            self.assertEqual([item["drawable_id"] for item in metadata["layers"]], ["Head"])
+            self.assertEqual(metadata["layers"][0]["baseline_rgba_sha256"],
+                             normal_metadata["layers"][0]["baseline_rgba_sha256"])
+            self.assertEqual(hidden, original_hidden)
+            packed = repack_atlas_png_from_psd(result.psd_path, root / "packed", metadata_path=result.metadata_path)
+            for index, path in enumerate(textures):
+                self.assertEqual(path.read_bytes(), before[path.name])
+                self.assertEqual(packed.texture_outputs[index].read_bytes(), before[path.name])
+
     def test_fully_masked_selection_is_reported_without_losing_requested_ids(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

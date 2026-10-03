@@ -13,11 +13,50 @@ class ProjectBoundModPage(Live2DModPage):
     """Keep original model/skin tools while owning only workspace copies."""
 
     projectChanged = Signal(object)
+    taskStateChanged = Signal(object)
 
     def __init__(self, session_provider, parent=None):
         self._session_provider = session_provider
         self._binding = False
+        self._task_details = []
+        self._task_failed = False
+        self._feedback_task = "viewer"
         super().__init__(parent, compact=True)
+        self.workflow_status.hide()
+
+    def _emit_task_state(self, *, busy=None):
+        busy = bool(self.worker and self.worker.isRunning()) if busy is None else bool(busy)
+        self.taskStateChanged.emit({"task": self._feedback_task,
+                                    "state": "running" if busy else "failed" if self._task_failed else "succeeded",
+                                    "busy": busy, "progress": 0 if busy else 100,
+                                    "phase": "ViewerEX", "message": getattr(self, "_last_log_message", ""),
+                                    "details": "\n".join(self._task_details)})
+
+    def start_worker(self, action, **kwargs):
+        self._feedback_task = "viewer:" + str(action)
+        self._task_details = []
+        self._task_failed = False
+        super().start_worker(action, **kwargs)
+
+    def set_busy(self, busy):
+        super().set_busy(busy)
+        self._emit_task_state(busy=busy)
+
+    def append_log(self, message):
+        super().append_log(message)
+        if message:
+            self._task_details.append(str(message))
+            self._task_details = self._task_details[-1000:]
+            self._emit_task_state()
+
+    def on_worker_error(self, error):
+        self._task_failed = True
+        super().on_worker_error(error)
+
+    def show_error(self, message):
+        self._task_failed = True
+        self.append_log(message)
+        super().show_error(message)
 
     def load_last_project(self, silent=False):
         # A standalone last-project preference must never replace this root.

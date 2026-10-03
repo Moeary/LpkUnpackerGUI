@@ -109,6 +109,9 @@ class EditorTabs(QWidget):
         layout.addWidget(self.stack, 1)
         self._keys = []
         self._tab_labels = []
+        self._tab_fit_timer = QTimer(self)
+        self._tab_fit_timer.setSingleShot(True)
+        self._tab_fit_timer.timeout.connect(self._ensure_current_tab_visible)
         self.stack.currentChanged.connect(self._changed)
         self.back_button.clicked.connect(lambda: self._scroll_tabs(-120))
         self.forward_button.clicked.connect(lambda: self._scroll_tabs(120))
@@ -139,6 +142,9 @@ class EditorTabs(QWidget):
 
     def tabText(self, index: int) -> str:  # noqa: N802
         return self._tab_labels[index]
+
+    def setTabToolTip(self, index: int, text: str):  # noqa: N802
+        self.pivot.widget(self._keys[index]).setToolTip(text)
 
     def currentIndex(self) -> int:  # noqa: N802
         return self.stack.currentIndex()
@@ -186,6 +192,13 @@ class EditorTabs(QWidget):
             item.setText(item.fontMetrics().elidedText(label, Qt.TextElideMode.ElideRight, available))
         self.pivot.adjustSize()
         self._update_tab_arrows()
+        if hasattr(self, "_tab_fit_timer"):
+            self._tab_fit_timer.start(0)
+
+    def _ensure_current_tab_visible(self):
+        index = self.currentIndex()
+        if 0 <= index < len(self._keys):
+            self.tab_scroll.ensureWidgetVisible(self.pivot.widget(self._keys[index]), 8, 0)
 
     def reserve_corner(self, width: int):
         self._corner_space = max(0, int(width))
@@ -290,6 +303,7 @@ class _WorkspaceSplitter(QSplitter):
 
 class EditorWorkspace(QWidget):
     panelVisibilityChanged = Signal(str, bool)
+    panelVisibilityEdited = Signal(str, bool)
 
     def __init__(self, preview: QWidget, details: QWidget, timeline: QWidget,
                  parent=None, settings_key: str | None = None, settings=None):
@@ -298,6 +312,10 @@ class EditorWorkspace(QWidget):
         self._settings_key = settings_key
         self._restoring = False
         self._initial_show = False
+        self._task_context = None
+        self._task_timeline_default = True
+        self._task_timeline_visibility = {}
+        self._legacy_timeline_visibility = None
         self._visibility = {"preview": True, "details": True, "timeline": True}
         self._horizontal_sizes = [550, 450]
         self._vertical_sizes = [450, 195]
@@ -318,7 +336,7 @@ class EditorWorkspace(QWidget):
         for panel, button in self._toggles.items():
             button.setChecked(True)
             button.setFixedSize(30, 30)
-            button.clicked.connect(lambda checked, name=panel: self.set_panel_visible(name, checked))
+            button.clicked.connect(lambda checked, name=panel: self.set_panel_visible(name, checked, user=True))
             bar.addWidget(button)
         self.reset_button = TransparentToolButton(FluentIcon.SYNC, self)
         self.reset_button.setFixedSize(30, 30)
@@ -357,7 +375,7 @@ class EditorWorkspace(QWidget):
         layout.addWidget(self._body, 1)
         self._panels = {"preview": self.preview_panel, "details": self.details_panel, "timeline": self.timeline_panel}
         for name, panel in self._panels.items():
-            panel.hideRequested.connect(lambda name=name: self.set_panel_visible(name, False))
+            panel.hideRequested.connect(lambda name=name: self.set_panel_visible(name, False, user=True))
         self.horizontal_splitter.splitterMoved.connect(self._splitter_moved)
         self.vertical_splitter.splitterMoved.connect(self._splitter_moved)
         self.horizontal_splitter.resetRequested.connect(self.reset_layout)
@@ -372,18 +390,34 @@ class EditorWorkspace(QWidget):
         return self._visibility[panel]
 
     def toggle_panel(self, panel: str):
-        self.set_panel_visible(panel, not self.is_panel_visible(panel))
+        self.set_panel_visible(panel, not self.is_panel_visible(panel), user=True)
+
+    def set_task_context(self, context: str, *, timeline_visible=True):
+        """Apply a task default while preserving a user's choice for that task."""
+        if (self._task_context is None and self._legacy_timeline_visibility is not None
+                and str(context) not in self._task_timeline_visibility):
+            self._task_timeline_visibility[str(context)] = self._legacy_timeline_visibility
+        self._task_context = str(context)
+        self._task_timeline_default = bool(timeline_visible)
+        visible = self._task_timeline_visibility.get(self._task_context, self._task_timeline_default)
+        self.set_panel_visible("timeline", visible)
 
     def move_toolbar_to(self, layout: QHBoxLayout):
         """Place the permanent visibility controls in the page's header."""
         self.layout().removeWidget(self.layout_toolbar)
         layout.addWidget(self.layout_toolbar)
 
-    def set_panel_visible(self, panel: str, visible: bool):
+    def set_panel_visible(self, panel: str, visible: bool, *, user=False):
         if panel not in self._panels:
             raise ValueError(f"Unknown editor panel: {panel}")
         visible = bool(visible)
+        if user and not self._restoring:
+            if panel == "timeline" and self._task_context is not None:
+                self._task_timeline_visibility[self._task_context] = visible
+            self.panelVisibilityEdited.emit(panel, visible)
         if self._visibility[panel] == visible:
+            if user:
+                self.save_layout()
             return
         self._remember_sizes()
         self._visibility[panel] = visible
@@ -422,11 +456,12 @@ class EditorWorkspace(QWidget):
             updates["preview"] = updates["timeline"] = False
         for panel, visible in updates.items():
             if self._visibility[panel] != visible:
-                self.set_panel_visible(panel, visible)
+                self.set_panel_visible(panel, visible, user=True)
         self.save_layout()
 
     def reset_layout(self):
         self._restoring = True
+        self._task_timeline_visibility.clear()
         for name, panel in self._panels.items():
             self._visibility[name] = True
             panel.show()
@@ -439,6 +474,8 @@ class EditorWorkspace(QWidget):
         self.horizontal_splitter.setSizes(self._horizontal_sizes)
         self.vertical_splitter.setSizes(self._vertical_sizes)
         self._restoring = False
+        if self._task_context is not None:
+            self._task_timeline_visibility[self._task_context] = True
         self.retranslate_ui()
         self.save_layout()
 
@@ -449,7 +486,8 @@ class EditorWorkspace(QWidget):
                  "horizontal": bytes(self.horizontal_splitter.saveState()).hex(),
                  "vertical": bytes(self.vertical_splitter.saveState()).hex(),
                  "sizes-h": self._horizontal_sizes, "sizes-v": self._vertical_sizes,
-                 "visible": dict(self._visibility)}
+                 "visible": dict(self._visibility),
+                 "task-timeline": dict(self._task_timeline_visibility)}
         self._settings.set(f"editor_layouts.{self._settings_key}", state)
 
     def restore_layout(self):
@@ -460,12 +498,16 @@ class EditorWorkspace(QWidget):
         self._restoring = True
         saved = self._settings.get(f"editor_layouts.{self._settings_key}", {})
         saved = saved if isinstance(saved, dict) else {}
+        task_visibility = saved.get("task-timeline", {})
+        self._task_timeline_visibility = ({str(key): bool(value) for key, value in task_visibility.items()}
+                                          if isinstance(task_visibility, dict) else {})
         # The old vertical-over-horizontal tree cannot be restored into this
         # layout. Migrate to the new visible default rather than reinterpret
         # its byte states or keep a hidden, unexpectedly narrow workspace.
         migrated = bool(saved) and (saved.get("version") != 2 or saved.get("layout") != "left-preview-timeline")
         if migrated:
             saved = {}
+            self._task_timeline_visibility.clear()
         if not saved:
             self._horizontal_sizes = [550, 450]
             self.horizontal_splitter.setSizes(self._horizontal_sizes)
@@ -473,6 +515,13 @@ class EditorWorkspace(QWidget):
             self.vertical_splitter.setSizes(self._vertical_sizes)
         visibility = saved.get("visible", {})
         visibility = visibility if isinstance(visibility, dict) else {}
+        self._legacy_timeline_visibility = (visibility["timeline"] if saved and "task-timeline" not in saved
+                                            and isinstance(visibility.get("timeline"), bool) else None)
+        if (self._task_context is not None and saved and "task-timeline" not in saved
+                and isinstance(visibility.get("timeline"), bool)):
+            # A valid version-2 layout predates task preferences. Preserve the
+            # user's saved choice for the initially restored task only.
+            self._task_timeline_visibility[self._task_context] = visibility["timeline"]
         for key, splitter in (("horizontal", self.horizontal_splitter), ("vertical", self.vertical_splitter)):
             state = saved.get(key)
             if isinstance(state, str):
@@ -487,6 +536,8 @@ class EditorWorkspace(QWidget):
                     pass
         for name in self._panels:
             visible = bool(visibility.get(name, True))
+            if name == "timeline" and self._task_context is not None:
+                visible = self._task_timeline_visibility.get(self._task_context, self._task_timeline_default)
             self._visibility[name] = visible
             self._panels[name].setVisible(visible)
             self._toggles[name].setChecked(visible)
@@ -527,5 +578,6 @@ class EditorWorkspace(QWidget):
 
 
 FluentEditorTabs = EditorTabs
+EditorSplitter = _WorkspaceSplitter
 
-__all__ = ["EditorWorkspace", "EditorPanel", "EditorTabs", "FluentEditorTabs", "EditorComboBox", "EditorViewportLayout", "WORKSPACE_TEXT"]
+__all__ = ["EditorWorkspace", "EditorPanel", "EditorTabs", "FluentEditorTabs", "EditorComboBox", "EditorSplitter", "EditorViewportLayout", "WORKSPACE_TEXT"]

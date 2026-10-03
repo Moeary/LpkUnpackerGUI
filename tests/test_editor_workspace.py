@@ -152,6 +152,45 @@ class EditorWorkspaceTests(unittest.TestCase):
         tabs.setTabText(3, "MOD 管理")
         self.assertEqual(tabs.tabText(3), "MOD 管理")
 
+    def test_task_defaults_preserve_manual_choices_without_treating_restore_as_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = SettingsManager(Path(directory) / "settings.json")
+            workspace, _ = self.workspace(settings)
+            workspace.set_task_context("animation", timeline_visible=True)
+            workspace.set_task_context("appearance", timeline_visible=False)
+            self.assertFalse(workspace.is_panel_visible("timeline"))
+            workspace.timeline_toggle.click()
+            self.assertTrue(workspace.is_panel_visible("timeline"))
+            workspace.set_task_context("animation", timeline_visible=True)
+            workspace.timeline_toggle.click()
+            workspace.set_task_context("appearance", timeline_visible=False)
+            self.assertTrue(workspace.is_panel_visible("timeline"))
+            edited = []
+            workspace.panelVisibilityEdited.connect(lambda *args: edited.append(args))
+            workspace.restore_layout()
+            self.assertEqual(edited, [])
+            workspace.set_task_context("animation", timeline_visible=True)
+            self.assertFalse(workspace.is_panel_visible("timeline"))
+            restored, _ = self.workspace(SettingsManager(Path(directory) / "settings.json"))
+            restored.set_task_context("appearance", timeline_visible=False)
+            self.assertTrue(restored.is_panel_visible("timeline"))
+
+    def test_valid_legacy_visibility_migrates_to_initial_task_and_invalid_layout_drops_preferences(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = SettingsManager(Path(directory) / "settings.json")
+            settings.set("editor_layouts.test", {"version": 2, "layout": "left-preview-timeline",
+                                                 "visible": {"timeline": False}})
+            workspace, _ = self.workspace(settings)
+            workspace.set_task_context("animation", timeline_visible=True)
+            workspace.restore_layout()
+            self.assertFalse(workspace.is_panel_visible("timeline"))
+            self.assertEqual(workspace._task_timeline_visibility, {"animation": False})
+            settings.set("editor_layouts.test", {"version": 1, "layout": "obsolete",
+                                                 "task-timeline": {"animation": False}})
+            workspace.restore_layout()
+            self.assertTrue(workspace.is_panel_visible("timeline"))
+            self.assertEqual(workspace._task_timeline_visibility, {})
+
     def test_mouse_clicks_switch_every_tab_and_return_from_artmesh(self):
         tabs = EditorTabs()
         self.widgets.append(tabs)

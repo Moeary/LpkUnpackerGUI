@@ -1,0 +1,16 @@
+{
+  "format": "LpkUnpacker.Live2DPreviewSource",
+  "version": 1,
+  "upstream": {
+    "version": "0.7.0",
+    "url": "https://files.pythonhosted.org/packages/12/c9/1aa781189888a38c96bd8edeaf29dd74bb1008772243987bab35ca1b4b65/live2d_py-0.7.0.tar.gz",
+    "sha256": "a9ff84237b9bfcb50a852ccac5377fbe3ea4495a02efe09601924e0c48407ca0"
+  },
+  "sdk": {
+    "version": "5-r.4.1",
+    "url": "https://cubism.live2d.com/sdk-native/bin/CubismSdkForNative-5-r.4.1.zip",
+    "sha256": "b71ec6bafc6578cce3b4cbbaa42a1cb51ae6eb477557932b02d22af957e733c7"
+  },
+  "patch": "drawable-opacity.patch",
+  "drawable_opacity_api_version": 1
+}

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
+import tempfile
 import unittest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
+    from PySide6.QtCore import QPoint, QRect
     from PySide6.QtGui import QFont
     from PySide6.QtWidgets import QApplication
 
@@ -143,6 +146,46 @@ class PsdPageLayoutTests(unittest.TestCase):
             self.app.setFont(original_font)
             i18n.set_language(original_language)
             self.app.processEvents()
+
+    def test_embedded_common_configuration_fits_first_small_viewport_in_three_languages(self):
+        from tests.test_selection_psd_page import _Settings
+        i18n = get_i18n()
+        original_language = i18n.language
+        try:
+            with tempfile.TemporaryDirectory(prefix="psd-layout-") as directory:
+                for language in ("zh_CN", "en_US", "ja_JP"):
+                    i18n.set_language(language)
+                    page = PsdReconstructionPage(compact=True, settings=_Settings(Path(directory)))
+                    page.configure_task_embedding()
+                    page.resize(399, 294)
+                    page.show()
+                    page.updateUIScale(399, 294)
+                    try:
+                        for task, names in (
+                            ("export", ("capture_pose_button", "export_name_edit", "mode_combo", "mesh_canvas_spin")),
+                            ("repack", ("pose_scheme_combo", "metadata_edit", "texture_name_edit")),
+                        ):
+                            page.show_task(task)
+                            for _ in range(4):
+                                self.app.processEvents()
+                            viewport = page._compact_scrolls[page.workflow_tabs.currentIndex()].viewport()
+                            for name in names:
+                                control = getattr(page, name)
+                                self.assertTrue(control.isVisible(), (language, task, name))
+                                bounds = QRect(control.mapTo(viewport, QPoint()), control.size())
+                                self.assertTrue(viewport.rect().contains(bounds), (language, task, name, bounds))
+                        page.show_task("advanced")
+                        self.app.processEvents()
+                        self.assertFalse(page.context_paths_frame.isVisible())
+                        page.context_paths_toggle.click()
+                        self.app.processEvents()
+                        self.assertTrue(page.context_paths_frame.isVisible())
+                        self.assertTrue(page.source_edit.isVisible())
+                        self.assertTrue(page.output_edit.isReadOnly())
+                    finally:
+                        self._close_page(page)
+        finally:
+            i18n.set_language(original_language)
 
 
 if __name__ == "__main__":

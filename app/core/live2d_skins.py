@@ -82,6 +82,12 @@ class Live2DSkins:
         self._uv_cache: dict[str, str | None] = {}
         self._source_cache: dict[tuple, Path] = {}
         self._blobs: dict[str, tuple[bytes, ...]] = {}
+        # The GUI polls skin state while parameter/preview widgets are active.
+        # Keep one cheap invalidation counter instead of repeatedly copying the
+        # complete registry and comparing every atlas byte.
+        self._revision = 0
+        self._snapshot_cache: tuple[int, dict] | None = None
+        self._modified_cache: tuple[tuple[int, str], bool] | None = None
         original = self._entry(ORIGINAL_SKIN, "Original", tuple(session._texture_data),
                                source_kind="original", source=str(session.source_path),
                                metadata={}, compatibility={"mode": "original", "automatic": True,
@@ -91,16 +97,133 @@ class Live2DSkins:
         # No directory or duplicate atlas is created merely by opening a model.
         self._blobs[ORIGINAL_SKIN] = tuple(session._texture_data)
 
+    @property
+    def revision(self) -> int:
+        """Monotonic revision for the skin registry and working atlas."""
+        return self._revision
+
+    def _touch(self) -> None:
+        """Invalidate derived skin state after an observed mutation."""
+        self._revision += 1
+        self._snapshot_cache = None
+        self._modified_cache = None
+
+    @staticmethod
+    def _canonical_project_file(value, root: Path) -> str | None:
+        """Return a stable session-relative PSD project identity.
+
+        PSD history used to store this value only in source metadata.  Absolute
+        paths are accepted only when they point inside the current managed
+        workspace; paths outside it are deliberately treated as unknown
+        provenance rather than guessed from names or pixels.
+        """
+        if isinstance(value, Path):
+            value = str(value)
+        if not isinstance(value, str) or not value.strip():
+            return None
+        try:
+            candidate = Path(value.replace("\\", "/"))
+            if candidate.is_absolute():
+                candidate = candidate.resolve().relative_to(root.resolve())
+            return _relative(candidate.as_posix())
+        except (AnimationEditingError, OSError, ValueError):
+            return None
+
+    def _origin(self, source_kind, metadata) -> dict | None:
+        """Normalize exact PSD provenance without using lossy heuristics."""
+        if source_kind != "psd" or not isinstance(metadata, dict):
+            return None
+        raw = metadata.get("origin") if isinstance(metadata.get("origin"), dict) else metadata
+        return self.psd_origin(raw.get("project") or raw.get("project_file"),
+                               raw.get("version") or raw.get("token") or raw.get("version_id"),
+                               version_kind=raw.get("version_kind"))
+
+    def psd_origin(self, project_file, version, *, version_kind=None) -> dict | None:
+        """Use only a project identity and an explicit PSD history kind/token.
+
+        Old metadata stores the complete ``repack:id``/``composite:id`` token.
+        A bare ID with no kind is unknown provenance and cannot deduplicate.
+        """
+        project = self._canonical_project_file(project_file, self.root)
+        if not project or not isinstance(version, str) or not version.strip():
+            return None
+        token = version.strip()
+        prefix, separator, suffix = token.partition(":")
+        if separator and prefix in {"repack", "composite"}:
+            if version_kind is not None and version_kind != prefix:
+                return None
+            version_kind, token = prefix, suffix
+        if (version_kind not in {"repack", "composite"} or not token.strip()
+                or any(ord(char) < 32 for char in token)):
+            return None
+        return {"kind": "psd", "project": project,
+                "version_kind": version_kind, "version": token.strip()}
+
+    def _entry_origin(self, entry) -> dict | None:
+        source = entry.get("source") if isinstance(entry, dict) else None
+        metadata = source.get("metadata") if isinstance(source, dict) else None
+        origin = entry.get("origin") if isinstance(entry, dict) else None
+        if isinstance(origin, dict):
+            normalized = self._origin(entry.get("source_kind"), origin)
+            if normalized:
+                return normalized
+        return self._origin(entry.get("source_kind"), metadata)
+
+    def _find_origin(self, origin):
+        if origin is None:
+            return None
+        self.session._observe_appearance_values()
+        for entry in self.state["entries"]:
+            if self._entry_origin(entry) == origin:
+                return entry
+        return None
+
+    def find_origin(self, origin):
+        """Look up one exact provenance key without touching the workspace."""
+        normalized = self._origin("psd", origin)
+        return copy.deepcopy(self._find_origin(normalized)) if normalized is not None else None
+
+    def get_origin(self, skin_id):
+        entry = self.get(skin_id)
+        origin = self._entry_origin(entry)
+        # Explicit variants retain a back-link even if the primary skin is
+        # removed. They remain independent skins and never satisfy PSD reuse.
+        if origin is None and entry.get("source_kind") == "clone":
+            origin = self._origin("psd", entry.get("source", {}).get("metadata"))
+        return copy.deepcopy(origin)
+
+    def lookup_psd_skin(self, project_file, version, *, version_kind=None):
+        """Find a materialized PSD version by stable project-relative identity."""
+        origin = self.psd_origin(project_file, version, version_kind=version_kind)
+        entry = self._find_origin(origin)
+        if entry is None:
+            return None
+        self.bytes(entry["id"])
+        result = copy.deepcopy(entry)
+        result["active"] = result["id"] == self.active_id
+        result["texture_paths"] = [str(self.root / texture["path"]) for texture in result["textures"]]
+        return result
+
     def _entry(self, skin_id, name, blobs, *, source_kind, source, metadata, compatibility, mappings):
-        return {"id": skin_id, "name": name, "is_original": skin_id == ORIGINAL_SKIN,
+        metadata = _metadata(metadata)
+        origin = self._origin(source_kind, metadata)
+        if origin is not None:
+            # Retain the original fields for old consumers while making the
+            # deduplication key explicit and path-stable.
+            metadata["origin"] = copy.deepcopy(origin)
+        entry = {"id": skin_id, "name": name, "is_original": skin_id == ORIGINAL_SKIN,
                 "source_kind": source_kind, "source": {"kind": source_kind, "path": source,
                                                          "metadata": copy.deepcopy(metadata)},
                 "compatibility": copy.deepcopy(compatibility), "mappings": copy.deepcopy(mappings),
                 "textures": [{"index": index, "path": f"skins/{skin_id}/atlas_{index}.png",
                               "sha256": _sha(data), "width": size[0], "height": size[1]}
                              for index, (data, size) in enumerate(zip(blobs, self.session.texture_sizes))]}
+        if origin is not None:
+            entry["origin"] = origin
+        return entry
 
     def get(self, skin_id):
+        self.session._observe_appearance_values()
         entry = next((item for item in self.state["entries"] if item["id"] == skin_id), None)
         if entry is None:
             raise AnimationEditingError(f"Unknown skin: {skin_id}")
@@ -112,7 +235,13 @@ class Live2DSkins:
 
     @property
     def modified(self):
-        return tuple(self.session._texture_data) != self.bytes(self.active_id)
+        self.session._observe_appearance_values()
+        token = (self._revision, self.active_id)
+        if self._modified_cache is not None and self._modified_cache[0] == token:
+            return self._modified_cache[1]
+        value = tuple(self.session._texture_data) != self.bytes(self.active_id)
+        self._modified_cache = token, value
+        return value
 
     def list(self):
         result = copy.deepcopy(self.state["entries"])
@@ -120,6 +249,25 @@ class Live2DSkins:
             item["texture_paths"] = [str(self.root / texture["path"]) for texture in item["textures"]]
             item["active"] = item["id"] == self.active_id
         return result
+
+    def snapshot(self) -> dict:
+        """Return a stable, read-only-by-contract view for UI polling.
+
+        The returned object is detached from the live registry and cached until
+        ``revision`` changes.  Consumers must not mutate it; call again after a
+        revision change to obtain a fresh object.
+        """
+        self.session._observe_appearance_values()
+        if self._snapshot_cache is not None and self._snapshot_cache[0] == self._revision:
+            return self._snapshot_cache[1]
+        entries = copy.deepcopy(self.state["entries"])
+        for item in entries:
+            item["texture_paths"] = [str(self.root / texture["path"]) for texture in item["textures"]]
+            item["active"] = item["id"] == self.active_id
+        snapshot = {"revision": self._revision, "active_id": self.active_id,
+                    "modified": self.modified, "entries": entries}
+        self._snapshot_cache = self._revision, snapshot
+        return snapshot
 
     def _name(self, name, *, exclude=None):
         if not isinstance(name, str) or not name.strip() or len(name.strip()) > 80 or any(ord(c) < 32 for c in name):
@@ -209,8 +357,19 @@ class Live2DSkins:
                 shutil.copy2(source, target)
         if ORIGINAL_SKIN not in seen or state.get("active_id") not in seen:
             raise AnimationEditingError("Saved skin registry has no original or active skin.")
-        self.state = copy.deepcopy(state)
+        restored = copy.deepcopy(state)
+        # Version-1 registries predate the explicit origin field.  Upgrade only
+        # exact project_file+version evidence; unknown provenance stays unknown.
+        for entry in restored["entries"]:
+            origin = self._entry_origin(entry)
+            if origin is not None:
+                entry["origin"] = origin
+                source = entry.get("source")
+                if isinstance(source, dict) and isinstance(source.get("metadata"), dict):
+                    source["metadata"]["origin"] = copy.deepcopy(origin)
+        self.state = restored
         self._blobs.clear()
+        self._touch()
 
     def _validate_image(self, data, index):
         try:
@@ -268,8 +427,12 @@ class Live2DSkins:
     def clone(self, skin_id, name):
         name, source = self._name(name), self.get(skin_id)
         blobs = self.bytes(skin_id)
+        metadata = {"source_skin_id": skin_id}
+        origin = self.get_origin(skin_id)
+        if origin is not None:
+            metadata["origin"] = origin
         return self.session._record(lambda: copy.deepcopy(self._add(name, blobs, source_kind="clone",
-                                   metadata={"source_skin_id": skin_id}, compatibility=source["compatibility"],
+                                   metadata=metadata, compatibility=source["compatibility"],
                                    mappings=source.get("mappings", []))))
 
     def rename(self, skin_id, name):
@@ -356,8 +519,22 @@ class Live2DSkins:
             return {"mode": "same_uv", "automatic": True, "moc_sha256": digest, "uv_sha256": signature}
         return None
 
-    def import_skin(self, source, name=None, *, mapping=None, source_kind="model", metadata=None, activate=False):
+    def import_skin(self, source, name=None, *, mapping=None, source_kind="model", metadata=None,
+                    activate=False, reuse_origin=True):
         source_path = Path(source).expanduser().resolve() if source is not None else None
+        metadata = _metadata(metadata)
+        origin = self._origin(source_kind, metadata)
+        if reuse_origin and origin is not None:
+            existing = self._find_origin(origin)
+            if existing is not None:
+                # Registry-owned immutable bytes are sufficient even when the
+                # external preview source has vanished. Corrupt saved assets
+                # must be reported, never silently replaced or guessed.
+                self.bytes(existing["id"])
+                if not activate or (self.active_id == existing["id"] and not self.modified):
+                    return copy.deepcopy(existing)
+                self.session._record(lambda: self._apply(existing["id"]))
+                return copy.deepcopy(existing)
         textures, moc, model = [], None, None
         if source_path is not None:
             model, moc, textures = self._source(source_path)
@@ -403,7 +580,6 @@ class Live2DSkins:
                              "source_path": str(image_path), "source_sha256": _sha(image_path.read_bytes())})
         # Validate everything before publishing registry/assets or applying bytes.
         # Provenance is JSON-only, never an operational external dependency.
-        metadata = _metadata(metadata)
         def action():
             if activate:
                 self._retain_working_edit()

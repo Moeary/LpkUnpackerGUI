@@ -983,6 +983,13 @@ class Live2DPreviewWindow(QWidget):
         if self.live2d_canvas:
             self.live2d_canvas.setPartOpacityOverrides(values, defaults)
 
+    def supports_drawable_opacity_overrides(self) -> bool:
+        return bool(self.live2d_canvas and self.live2d_canvas.supportsDrawableOpacityOverrides())
+
+    def set_drawable_opacity_overrides(self, values: dict[str, float]):
+        if self.live2d_canvas:
+            self.live2d_canvas.setDrawableOpacityOverrides(values)
+
     def toggle_control_panel(self):
         """切换控制面板显示/隐藏"""
         if self.control_panel.isVisible():
