@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -86,7 +87,6 @@ from app.core.live2dviewer_mod_project import (
     update_model_mappings,
 )
 from app.core.settings_manager import SettingsManager
-from app.core.live2d_editor_mod_preview import mapped_mod_skin_preview
 from app.gui.editor_workspace import EditorViewportLayout, FluentEditorTabs
 from app.i18n import get_i18n, tr
 from app.gui.editor_dialogs import EditorMessageBox as QMessageBox, ThemedEditorDialog as MessageBoxBase
@@ -1009,6 +1009,7 @@ class ProjectSearchComboBox(EditableComboBox):
 
 class Live2DModPage(QFrame):
     previewModelRequested = Signal(str)
+    mappedSkinPreviewRequested = Signal(object, str)
     triggerSelectionChanged = Signal(str)
 
     def __init__(self, parent=None, compact: bool = False):
@@ -1841,11 +1842,9 @@ class Live2DModPage(QFrame):
         if self._compact and self.current_project.models and model is not self.current_project.models[0]:
             if not self.flush_pending_changes():
                 return
-            try:
-                with mapped_mod_skin_preview(self.current_project, model_id) as model_json:
-                    self.previewModelRequested.emit(str(model_json))
-            except Exception as exc:
-                self.show_error(str(exc))
+            # The asynchronous consumer owns mapping and temporary-package
+            # lifetime. Snapshot mutable project data before leaving the GUI.
+            self.mappedSkinPreviewRequested.emit(copy.deepcopy(self.current_project), model_id)
             return
         model_json = self.resolve_project_path(str(model.get("model_json") or ""))
         if not model_json.is_file():

@@ -73,6 +73,14 @@ class Live2DEditorModTests(unittest.TestCase):
             time.sleep(.005)
         self.assertFalse(self.errors, self.errors)
 
+    def wait_preview(self):
+        deadline = time.monotonic() + 10
+        while self.page._preview_workers or self.page._preview_request:
+            self.assertLess(time.monotonic(), deadline, self.page.status_label.text())
+            self.app.processEvents()
+            time.sleep(.005)
+        self.assertIsNotNone(self.page._preview_session, self.page.status_label.text())
+
     def new_project(self):
         if not self.page.session:
             self.open()
@@ -130,6 +138,7 @@ class Live2DEditorModTests(unittest.TestCase):
             (self.model.parent / "drawables.json").read_bytes())
         self.page.show_viewer_export()
         self.mod.preview_main_model()
+        self.wait_preview()
         self.page.preview.live2d_canvas.modelPointClicked.emit(.5, .5)
         self.assertIs(self.page.tabs.currentWidget(), self.page.mod_tab)
         self.assertEqual(self.mod.current_project.data["selected_artmesh_id"], "ArtMeshFace")
@@ -151,13 +160,18 @@ class Live2DEditorModTests(unittest.TestCase):
         self.new_project()
         skin = self.add_skin()
         self.mod.preview_main_model()
+        self.wait_preview()
         original_session = self.page.session
         self.page._parameter_spins["ParamAngleY"].setValue(20)
         self.mod.model_selector.setCurrentIndex(1)
+        self.wait_preview()
         self.assertIs(self.page.session, original_session)
         self.assertEqual(self.mod.model_selector.currentIndex(), 1)
         self.assertTrue(self.page.session.dirty)
         self.assertEqual(self.page._preview_session.texture_paths[0].read_bytes(), skin.read_bytes())
+        # The worker has copied the temporary mapped package before cleanup.
+        self.assertFalse(self.page._preview_session.source_path.exists())
+        self.assertTrue(self.page._preview_session.model_path.is_file())
         with patch("app.gui.Live2DEditorPage.QMessageBox.warning", return_value=QMessageBox.Cancel):
             self.assertFalse(self.page.confirm_discard_or_save())
         self.assertTrue(self.page.return_to_current_model())

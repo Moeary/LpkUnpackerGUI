@@ -378,6 +378,7 @@ class Live2DEditorPage(QFrame):
         self.mod_hint.hide()
         self.mod_panel = ProjectBoundModPage(lambda: self.session, self.viewer_tab)
         self.mod_panel.previewModelRequested.connect(self._open_mod_preview)
+        self.mod_panel.mappedSkinPreviewRequested.connect(self._open_mod_skin_preview)
         self.mod_panel.triggerSelectionChanged.connect(self._mod_trigger_selected)
         self.mod_panel.projectChanged.connect(self._mod_project_changed)
         self.mod_panel.set_artmesh_pick_provider(self._mod_pick_scene)
@@ -1183,14 +1184,14 @@ class Live2DEditorPage(QFrame):
     def _open_psd_preview(self, path: str, project_file: str):
         self._open_workspace_preview(path, _text("editor.live2d.psd_snapshot", name=Path(path).name))
 
-    def _open_workspace_preview(self, path: str, label: str, *, context=None) -> bool:
+    def _open_workspace_preview(self, path: str, label: str, *, context=None, mod_project=None) -> bool:
         if not self.preview or not self.session:
             return False
         self._flush_parameter_edit()
         self._cancel_preview_preparation()
         generation = self._preview_generation
         self._preview_request = {"generation": generation, "path": str(path), "label": label,
-                                 "context": dict(context or {})}
+                                 "context": dict(context or {}), "mod_project": mod_project}
         self.timeline.set_playing(False)
         self.task_feedback.set_state({"task": "preview", "state": "running", "busy": True, "progress": 0,
                                       "message": appearance_text("editor.appearance.preview_preparing", name=label)})
@@ -1205,7 +1206,10 @@ class Live2DEditorPage(QFrame):
         generation = request["generation"]
         if generation != self._preview_generation:
             return
-        worker = ReadonlyPreviewPrepareThread(generation, request["path"], self)
+        worker = ReadonlyPreviewPrepareThread(
+            generation, request["path"], self, mod_project=request.get("mod_project"),
+            mod_model_id=request["context"].get("mod_model_id", ""),
+        )
         self._preview_workers[generation] = worker
         worker.prepared.connect(self._preview_prepared)
         worker.failed.connect(self._preview_prepare_failed)
@@ -1389,6 +1393,14 @@ class Live2DEditorPage(QFrame):
             self.preview.set_selected_motion(str(payload.get("group") or ""), int(payload.get("index") or 0))
             return True
         return False
+
+    def _open_mod_skin_preview(self, project, model_id: str):
+        model = next((item for item in project.models if str(item.get("id")) == model_id), {})
+        label = _text("editor.live2d.mod_preview", name=model.get("skin_name") or model_id)
+        self._open_workspace_preview(
+            str(project.base_model_json), label,
+            context={"mod_model_id": model_id}, mod_project=project,
+        )
 
     def _open_mod_preview(self, path: str):
         model_id = self.mod_panel.requested_preview_model_id

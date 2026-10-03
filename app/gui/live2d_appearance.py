@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import CancelledError
+from contextlib import nullcontext
 from threading import Event
 
 from PySide6.QtCore import QSize, Qt, QThread, QSignalBlocker, QTimer, Signal
@@ -386,9 +387,10 @@ class ReadonlyPreviewPrepareThread(QThread):
     prepared = Signal(int, object)
     failed = Signal(int, str)
 
-    def __init__(self, generation, path, parent=None):
+    def __init__(self, generation, path, parent=None, *, mod_project=None, mod_model_id=""):
         super().__init__(parent)
         self.generation, self.path = generation, str(path)
+        self.mod_project, self.mod_model_id = mod_project, mod_model_id
         self.cancel_event, self.candidate = Event(), None
 
     def cancel(self):
@@ -397,7 +399,13 @@ class ReadonlyPreviewPrepareThread(QThread):
     def run(self):
         from app.core.live2d_editor_session import prepare_readonly_preview_session
         try:
-            candidate = prepare_readonly_preview_session(self.path, cancel_event=self.cancel_event)
+            if self.cancel_event.is_set():
+                return
+            from app.core.live2d_editor_mod_preview import mapped_mod_skin_preview
+            source = (mapped_mod_skin_preview(self.mod_project, self.mod_model_id)
+                      if self.mod_project is not None else nullcontext(self.path))
+            with source as path:
+                candidate = prepare_readonly_preview_session(path, cancel_event=self.cancel_event)
             if self.cancel_event.is_set():
                 candidate.close()
                 return
