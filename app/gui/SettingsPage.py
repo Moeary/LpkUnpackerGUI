@@ -861,6 +861,16 @@ class SettingsPage(QFrame):
             self.texture_viewer_desc,
             self.texture_viewer_combo,
         )
+        self.preview_image_limit_label = BodyLabel("", texture_card)
+        self.preview_image_limit_desc = CaptionLabel("", texture_card)
+        self.preview_image_limit_desc.setWordWrap(True)
+        self.preview_image_limit_spin = SpinBox(texture_card)
+        self.preview_image_limit_spin.setRange(1, 500)
+        self.preview_image_limit_spin.valueChanged.connect(self.on_preview_image_limit_changed)
+        self._add_choice_block(
+            texture_layout, self.preview_image_limit_label,
+            self.preview_image_limit_desc, self.preview_image_limit_spin,
+        )
         self.image_viewer_edit = LineEdit(texture_card)
         self.image_viewer_label = BodyLabel("", texture_card)
         self.image_viewer_desc = CaptionLabel("", texture_card)
@@ -1244,9 +1254,14 @@ class SettingsPage(QFrame):
             return
         super().closeEvent(event)
 
+    def on_preview_image_limit_changed(self, value):
+        if not self._syncing_ui:
+            self.settings_manager.set("preview.image_limit", int(value))
+
     def load_current_settings(self):
         self._syncing_ui = True
         try:
+            self.preview_image_limit_spin.setValue(int(self.settings_manager.get("preview.image_limit", 48) or 48))
             transport = str(self.settings_manager.get("mcp.transport", "streamable-http"))
             self._set_combo_by_value(self.mcp_transport_combo, self._mcp_transport_values, transport)
             self.mcp_workspace_edit.setText(str(self.settings_manager.get("mcp.workspace", self.settings_manager.get_output_dir("animations"))))
@@ -1752,6 +1767,8 @@ class SettingsPage(QFrame):
                 self._spine_native_family_values,
                 current_spine_family,
             )
+            self.preview_image_limit_label.setText(tr("settings.preview_image_limit_label"))
+            self.preview_image_limit_desc.setText(tr("settings.preview_image_limit_desc"))
             self.texture_viewer_label.setText(tr("settings.texture_viewer_label"))
             self.texture_viewer_desc.setText(tr("settings.texture_viewer_desc"))
             current_texture_viewer = self._current_combo_value(

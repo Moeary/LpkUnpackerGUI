@@ -458,7 +458,7 @@
   "psd.project.repack_versions": "再パック履歴:",
   "psd.pose.scheme": "PSD ファイル：",
   "psd.export.card_title": "PSD 書き出し",
-  "psd.export.name": "PSD 名 / パラメータ案：",
+  "psd.export.name": "名前 / プリセット：",
   "psd.export.name_placeholder": "既定または保存済みのプレビューパラメータ案を選択...",
   "psd.export.preset_hint": "パラメータ案の名前は PSD 名に紐付きます。既定は初期ポーズを直接書き出し、その他は統合プレビューで固定してから保存します。",
   "psd.export.selected_preset_hint": "「{name}」を選択中：書き出し時に記録済みの Live2D パラメータ {count} 件を適用します。",
@@ -925,7 +925,7 @@
   "settings.photoshop_saved": "Photoshop のパスを保存しました。",
   "settings.spine_section": "Spine",
   "settings.spine_compatibility_label": "Spine 互換モード",
-  "settings.spine_compatibility_desc": "プレビューと正式な抽出で検証済みの Spine 3.8.75 を使用します。正式な抽出では公式 CLI が利用できる場合、独立した .spine 編集プロジェクトも作成します。",
+  "settings.spine_compatibility_desc": "プレビューに検証済みの Spine 3.8.75 を使用します。抽出画面の変換チェックを初回に初期化し、その後は画面の選択に従います。公式 CLI が利用可能な場合、変換時に .spine プロジェクトも生成できます。",
   "settings.spine_compatibility_checkbox": "常に互換性のある Spine 3.8.75 を使用",
   "settings.spine_runtime_version_label": "インストール済み Spine ランタイム",
   "settings.spine_runtime_version_desc": "互換モードを無効にすると、ソースに一致する検証済みランタイムを優先します。矢印には対応済みのソースビルドパッケージだけを表示します。",
@@ -1423,5 +1423,9 @@
   "psd.workspace.paths": "工程・出力先",
   "psd.workspace.help": "出力の説明",
   "artmesh.inspector.uv_toggle": "UV・局部プレビューの表示切替",
-  "psd.task.ready": "PSD の準備完了"
+  "psd.task.ready": "PSD の準備完了",
+  "settings.preview_image_limit_label": "画像プレビューの最大枚数",
+  "settings.preview_image_limit_desc": "Unity 抽出やフォルダー走査でプレビューに読み込む画像数（1～500）。通常の画像エクスポート数は制限しません。",
+  "extractor.convert_spine_3875": "抽出後、すべての Spine モデルを 3.8.75 に変換",
+  "extractor.convert_spine_3875_desc": "元モデルを保持し、spine_converted に変換コピーを保存します。画像のみの抽出時には実行しません。"
 }

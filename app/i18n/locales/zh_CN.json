@@ -458,7 +458,7 @@
   "psd.project.repack_versions": "回写版本：",
   "psd.pose.scheme": "PSD 文件：",
   "psd.export.card_title": "导出 PSD",
-  "psd.export.name": "PSD 名称 / 参数方案：",
+  "psd.export.name": "名称 / 参数方案：",
   "psd.export.name_placeholder": "选择默认参数或已保存的预览参数方案...",
   "psd.export.preset_hint": "参数方案名称与 PSD 名称绑定。默认方案直接导出初始姿态；其他方案需先在统一预览中冻结姿势并保存。",
   "psd.export.selected_preset_hint": "已选择“{name}”：导出时会写入这套方案记录的 {count} 个 Live2D 参数。",
@@ -925,7 +925,7 @@
   "settings.photoshop_saved": "Photoshop 路径已保存。",
   "settings.spine_section": "Spine",
   "settings.spine_compatibility_label": "Spine 兼容模式",
-  "settings.spine_compatibility_desc": "预览和正式提取统一使用已验证的 Spine 3.8.75。正式提取还会在官方 CLI 可用时独立生成 .spine 编辑工程。",
+  "settings.spine_compatibility_desc": "预览统一使用已验证的 Spine 3.8.75；资源解包页的转换选项首次使用时据此初始化，之后以该页勾选状态为准。转换时可在官方 CLI 可用时生成 .spine 编辑工程。",
   "settings.spine_compatibility_checkbox": "始终使用兼容的 Spine 3.8.75",
   "settings.spine_runtime_version_label": "已安装的 Spine 运行时",
   "settings.spine_runtime_version_desc": "关闭兼容模式时优先使用与源版本匹配的已验证运行时。箭头只显示支持的源码构建包。",
@@ -1423,5 +1423,9 @@
   "psd.workspace.paths": "工程与输出路径",
   "psd.workspace.help": "导出说明",
   "artmesh.inspector.uv_toggle": "显示/收起 UV 与局部预览",
-  "psd.task.ready": "PSD 已就绪"
+  "psd.task.ready": "PSD 已就绪",
+  "settings.preview_image_limit_label": "图片预览数量上限",
+  "settings.preview_image_limit_desc": "限制资源预览从 Unity 提取或遍历文件夹时加载的图片数量（1–500）；不限制正式图片导出数量。",
+  "extractor.convert_spine_3875": "提取后将所有 Spine 模型转换为 3.8.75",
+  "extractor.convert_spine_3875_desc": "保留原始模型，在 spine_converted 目录生成转换副本；仅提取图片时不执行。"
 }

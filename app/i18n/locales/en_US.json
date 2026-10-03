@@ -458,7 +458,7 @@
   "psd.project.repack_versions": "Write-back Versions:",
   "psd.pose.scheme": "PSD file:",
   "psd.export.card_title": "Export PSD",
-  "psd.export.name": "PSD name / preset:",
+  "psd.export.name": "Name / preset:",
   "psd.export.name_placeholder": "Select the default or a saved preview parameter preset...",
   "psd.export.preset_hint": "The preset name is bound to the PSD name. Default exports the initial pose; save other frozen poses from the unified preview first.",
   "psd.export.selected_preset_hint": "Selected “{name}”. Export will apply the {count} recorded Live2D parameters.",
@@ -925,7 +925,7 @@
   "settings.photoshop_saved": "Photoshop path saved.",
   "settings.spine_section": "Spine",
   "settings.spine_compatibility_label": "Spine compatibility mode",
-  "settings.spine_compatibility_desc": "Use verified Spine 3.8.75 for preview and formal extraction. Formal extraction also creates an independent .spine project when the official CLI is available.",
+  "settings.spine_compatibility_desc": "Use verified Spine 3.8.75 for preview. This initializes the extraction conversion checkbox on first use; later extractions follow that checkbox. Conversion can also create a .spine project when the official CLI is available.",
   "settings.spine_compatibility_checkbox": "Always use compatible Spine 3.8.75",
   "settings.spine_runtime_version_label": "Installed Spine runtime",
   "settings.spine_runtime_version_desc": "When compatibility mode is off, prefer an installed verified runtime matching the source. The arrow lists only supported source-build packages.",
@@ -1423,5 +1423,9 @@
   "psd.workspace.paths": "Project and output paths",
   "psd.workspace.help": "Export help",
   "artmesh.inspector.uv_toggle": "Show or hide UV and local preview",
-  "psd.task.ready": "PSD is ready"
+  "psd.task.ready": "PSD is ready",
+  "settings.preview_image_limit_label": "Preview image count limit",
+  "settings.preview_image_limit_desc": "Maximum images loaded into resource preview from Unity extraction or folder scanning (1–500). Does not limit normal image exports.",
+  "extractor.convert_spine_3875": "Convert all Spine models to 3.8.75 after extraction",
+  "extractor.convert_spine_3875_desc": "Keep original models and write converted copies to spine_converted. Skipped in images-only mode."
 }

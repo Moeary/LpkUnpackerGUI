@@ -99,7 +99,7 @@ from app.core.psd_worker import (
 from app.gui.Live2DPreviewWindow import Live2DPreviewWindow
 from app.gui.ArtMeshInspector import ArtMeshInspectorDialog
 from app.gui.PreviewPage import ImagePreviewPanel
-from app.gui.editor_workspace import EditorComboBox, EditorViewportLayout
+from app.gui.editor_workspace import EditorComboBox, EditorViewportLayout, EditorSurface
 from app.gui.live2d_skin_controls import skin_text
 from app.gui.editor_dialogs import ThemedEditorDialog, get_editor_text
 from app.i18n import get_i18n, tr
@@ -720,7 +720,7 @@ class PsdReconstructionPage(QFrame):
 
 
     def _build_project_card(self, parent):
-        self.project_frame = CardWidget(parent)
+        self.project_frame = (EditorSurface if self._compact else CardWidget)(parent)
         self.project_frame.setObjectName("psdProjectFrame")
         self.project_layout = QVBoxLayout(self.project_frame)
         self.project_layout.setContentsMargins(12, 12, 12, 12)
@@ -794,7 +794,7 @@ class PsdReconstructionPage(QFrame):
 
 
     def _build_export_card(self, parent):
-        self.export_card = CardWidget(parent)
+        self.export_card = (EditorSurface if self._compact else CardWidget)(parent)
         self.export_card.setObjectName("psdExportCard")
         self.export_card_layout = QVBoxLayout(self.export_card)
         self.export_card_layout.setContentsMargins(14, 14, 14, 14)
@@ -922,7 +922,7 @@ class PsdReconstructionPage(QFrame):
 
 
     def _build_repack_card(self, parent):
-        self.repack_card = CardWidget(parent)
+        self.repack_card = (EditorSurface if self._compact else CardWidget)(parent)
         self.repack_card.setObjectName("psdRepackCard")
         self.repack_card_layout = QVBoxLayout(self.repack_card)
         self.repack_card_layout.setContentsMargins(14, 14, 14, 14)
@@ -1050,7 +1050,7 @@ class PsdReconstructionPage(QFrame):
 
 
     def _build_history_card(self, parent):
-        self.preview_control_frame = CardWidget(parent)
+        self.preview_control_frame = (EditorSurface if self._compact else CardWidget)(parent)
         self.preview_control_frame.setObjectName("psdPreviewControlFrame")
         self.preview_control_layout = QVBoxLayout(self.preview_control_frame)
         self.preview_control_layout.setContentsMargins(12, 12, 12, 12)
@@ -1092,7 +1092,7 @@ class PsdReconstructionPage(QFrame):
 
 
     def _build_motion_card(self, parent):
-        self.motion_frame = CardWidget(parent)
+        self.motion_frame = (EditorSurface if self._compact else CardWidget)(parent)
         self.motion_frame.setObjectName("psdMotionFrame")
         self.motion_layout = QVBoxLayout(self.motion_frame)
         self.motion_layout.setContentsMargins(12, 12, 12, 12)
@@ -1150,7 +1150,7 @@ class PsdReconstructionPage(QFrame):
 
 
     def _build_log_card(self, parent):
-        self.log_frame = CardWidget(parent)
+        self.log_frame = (EditorSurface if self._compact else CardWidget)(parent)
         self.log_frame.setObjectName("psdLogFrame")
         self.log_layout = QVBoxLayout(self.log_frame)
         self.log_layout.setContentsMargins(16, 10, 16, 10)
@@ -1266,7 +1266,7 @@ class PsdReconstructionPage(QFrame):
         self.preview_control_layout.addWidget(self.apply_version_button)
         self.preview_control_layout.addWidget(self.variant_version_button)
         self.preview_control_layout.addWidget(self.send_mod_button)
-        self.tools_card = CardWidget(self._compact_pages[3][0])
+        self.tools_card = (EditorSurface if self._compact else CardWidget)(self._compact_pages[3][0])
         tools = QVBoxLayout(self.tools_card)
         tools.setContentsMargins(12, 12, 12, 12)
         for button in (self.artmesh_inspector_button, self.open_output_button, self.preview_toggle_button):
@@ -1441,6 +1441,13 @@ class PsdReconstructionPage(QFrame):
         if not self._compact or self._task_embedded:
             return
         self._task_embedded = True
+        # Keep the primary action next to its settings instead of across a
+        # large empty viewport. Other actions live in their workflow cards.
+        self.action_layout.removeWidget(self.reconstruct_button)
+        self.export_card_layout.addWidget(self.reconstruct_button, 0, Qt.AlignRight)
+        self.reconstruct_button.setMinimumWidth(160)
+        self.reconstruct_button.setMaximumWidth(320)
+        self.right_footer.hide()
         self.task_selector.hide()
         self.bound_hint.hide()
         self.skin_context_label.hide()
@@ -1461,7 +1468,7 @@ class PsdReconstructionPage(QFrame):
         self.repack_card_layout.removeItem(self.repack_output_layout)
         parent, layout = self._compact_pages[3]
         self.context_paths_toggle = PushButton(_workspace_text("psd.workspace.paths"), parent)
-        self.context_paths_frame = CardWidget(parent)
+        self.context_paths_frame = (EditorSurface if self._compact else CardWidget)(parent)
         paths = QVBoxLayout(self.context_paths_frame)
         paths.setContentsMargins(10, 8, 10, 8)
         paths.addLayout(self.source_layout)

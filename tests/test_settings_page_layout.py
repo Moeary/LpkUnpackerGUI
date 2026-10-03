@@ -41,6 +41,8 @@ class SettingsPageLayoutTests(unittest.TestCase):
                 page = settings_page_module.SettingsPage()
             try:
                 page.show()
+                page.preview_image_limit_spin.setValue(75)
+                self.assertEqual(TempSettings().get("preview.image_limit"), 75)
                 self.assertEqual(
                     page.settings_scroll.horizontalScrollBarPolicy(),
                     Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
@@ -72,7 +74,7 @@ class SettingsPageLayoutTests(unittest.TestCase):
                     "spine": (page.spine_runtime_version_combo, page.spine_editor_edit),
                     "resources": (page.archive_tool_edit, page.assetstudio_tool_edit),
                     "ai": (page.mcp_port_spin, page.mcp_config_button, page.mcp_save_guide_button),
-                    "other": (page.texture_viewer_combo,),
+                    "other": (page.texture_viewer_combo, page.preview_image_limit_spin),
                 }
                 for width, height in ((1320, 900), (1040, 760)):
                     page.resize(width, height)

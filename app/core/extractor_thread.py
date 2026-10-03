@@ -13,18 +13,21 @@ class ExtractorThread(QThread):
     extractionError = Signal(str)
     logMessage = Signal(str, str)
 
-    def __init__(self, files, config_files, output_dir, extract_images_only=False):
+    def __init__(self, files, config_files, output_dir, extract_images_only=False, spine_conversion=None):
         super().__init__()
         self.files = files
         self.config_files = config_files
         self.output_dir = output_dir
         self.extract_images_only = extract_images_only
+        self.spine_conversion = spine_conversion
         self._is_running = True
 
     def run(self):
         try:
             mode = ExtractMode.TEXTURES if self.extract_images_only else ExtractMode.FULL
-            spine_conversion = _spine_conversion_snapshot()
+            spine_conversion = self.spine_conversion
+            if spine_conversion is None:
+                spine_conversion = _spine_conversion_snapshot()
             if self.extract_images_only:
                 # Texture-only extraction never invokes model conversion, even
                 # if the setting was enabled after the thread was created.

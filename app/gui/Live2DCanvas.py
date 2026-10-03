@@ -591,7 +591,7 @@ class ADPOpenGLCanvas(QOpenGLWindow):
         self.update()
 
     def _set_palette_background(self) -> None:
-        color = QGuiApplication.palette().color(QPalette.ColorRole.Base)
+        color = QGuiApplication.palette().color(QPalette.ColorRole.Window)
         self.__bg_color = (color.redF(), color.greenF(), color.blueF(), 1.0)
 
     def _on_palette_changed(self, *_args) -> None:

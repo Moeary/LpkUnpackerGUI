@@ -90,7 +90,7 @@ class Live2DAppearanceWorkflowTests(unittest.TestCase):
         first.vertical_splitter.moveSplitter(275, 1)
         first.upper_splitter.moveSplitter(150, 1)
         saved = settings.get("editor_layouts.live2d_appearance")
-        self.assertEqual(saved["upper_height"], first.upper_splitter.height())
+        self.assertEqual(saved["layouts"]["narrow"]["extent"], first.upper_splitter.height())
         first.hide()
         second.resize(420, 650)
         with patch.object(settings, "set", wraps=settings.set) as write:
@@ -98,8 +98,8 @@ class Live2DAppearanceWorkflowTests(unittest.TestCase):
             for _ in range(3):
                 self.app.processEvents()
             write.assert_not_called()
-        self.assertAlmostEqual(second.upper_splitter.height(), saved["upper_height"], delta=2)
-        self.assertAlmostEqual(second.upper_splitter.sizes()[0] / sum(second.upper_splitter.sizes()), saved["catalog_ratio"], delta=.01)
+        self.assertAlmostEqual(second.upper_splitter.height(), saved["layouts"]["narrow"]["extent"], delta=2)
+        self.assertAlmostEqual(second.upper_splitter.sizes()[0] / sum(second.upper_splitter.sizes()), saved["layouts"]["narrow"]["ratio"], delta=.01)
 
     def test_skin_import_and_current_atlas_drop_are_distinct_and_never_hide_psd(self):
         from app.gui.Live2DModPage import TextureMappingDialog
@@ -145,6 +145,32 @@ class Live2DAppearanceWorkflowTests(unittest.TestCase):
         self.assertIs(self.page.session, session)
         self.assertEqual(session.project.document["FileReferences"]["Moc"], moc)
         self.assertTrue(self.page.psd_panel.isVisible())
+
+    def test_appearance_changes_orientation_without_losing_task_or_split_sizes(self):
+        settings = SettingsManager(self.root / "adaptive-appearance.json")
+        workspace = AppearanceTaskWorkspace(QWidget(), QWidget(), QWidget(), QWidget(), settings=settings)
+        self.addCleanup(workspace.deleteLater)
+        workspace.resize(420, 650)
+        workspace.show()
+        self.app.processEvents()
+        workspace.show_psd_task("history")
+        workspace.vertical_splitter.moveSplitter(240, 1)
+        narrow_height = workspace.upper_splitter.height()
+        workspace.resize(960, 650)
+        self.app.processEvents()
+        self.assertEqual(workspace.vertical_splitter.orientation(), Qt.Horizontal)
+        self.assertEqual(workspace.upper_splitter.orientation(), Qt.Vertical)
+        self.assertEqual(workspace.current_task, "history")
+        self.assertGreater(workspace.psd_workspace.width(), workspace.upper_splitter.width())
+        workspace.vertical_splitter.moveSplitter(270, 1)
+        wide_width = workspace.upper_splitter.width()
+        workspace.resize(420, 650)
+        self.app.processEvents()
+        self.assertAlmostEqual(workspace.upper_splitter.height(), narrow_height, delta=2)
+        workspace.resize(960, 650)
+        self.app.processEvents()
+        self.assertAlmostEqual(workspace.upper_splitter.width(), wide_width, delta=2)
+        workspace.hide()
 
     def test_psd_result_reuse_skips_workspace_and_undo_and_variant_retains_reverse_link(self):
         self.open()

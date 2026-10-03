@@ -73,6 +73,13 @@ class PreviewEditorNavigationTests(unittest.TestCase):
         self.page.deleteLater()
         self.app.processEvents()
 
+    def test_preview_image_limit_reads_new_settings_without_recreating_page(self):
+        external = SettingsManager(self.page.settings_manager.settings_file)
+        external.set("preview.image_limit", 17)
+        self.assertEqual(self.page.current_preview_image_limit(), 17)
+        external.set("preview.image_limit", 93)
+        self.assertEqual(self.page.current_preview_image_limit(), 93)
+
     def test_live2d_button_uses_resolved_model_and_hides_for_images(self):
         model = self.root / "resolved" / "character.model3.json"
         model.parent.mkdir()

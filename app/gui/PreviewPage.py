@@ -1879,8 +1879,6 @@ class PreviewPage(QFrame):
         self.spine_runtime_label = None
         self.spine_runtime_edit = None
         self.spine_runtime_btn = None
-        self.image_limit_label = None
-        self.image_limit_spinbox = None
         self.title_label = None
         self.main_layout = None
         self.current_model_path = None
@@ -2052,26 +2050,12 @@ class PreviewPage(QFrame):
         for _widget in (self.spine_runtime_label, self.spine_runtime_edit, self.spine_runtime_btn):
             _widget.setVisible(False)
 
-        image_limit_row = QVBoxLayout()
-        image_limit_row.setSpacing(8)
-        self.image_limit_label = BodyLabel("", import_card)
-        self.image_limit_label.setWordWrap(True)
-        self.image_limit_spinbox = SpinBox(import_card)
-        self.image_limit_spinbox.setSymbolVisible(False)
-        self.image_limit_spinbox.setFixedWidth(80)
-        self.image_limit_spinbox.setRange(1, 500)
-        self.image_limit_spinbox.setValue(int(self.settings_manager.get("preview.image_limit", 48) or 48))
-        self.image_limit_spinbox.valueChanged.connect(self.on_preview_image_limit_changed)
-        image_limit_row.addWidget(self.image_limit_label)
-        image_limit_row.addWidget(self.image_limit_spinbox)
-        import_layout.addLayout(image_limit_row)
         left_layout.addWidget(import_card)
 
         # 当前模型信息
         self.model_info_text_box = TextBrowser(self)
         self.model_info_text_box.setMinimumHeight(120)
-        self.model_info_text_box.setMaximumHeight(170)
-        self.model_info_text_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.model_info_text_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.model_info_text_box.setStyleSheet("""
             TextBrowser {
                 border: 1px solid palette(mid);
@@ -2087,8 +2071,7 @@ class PreviewPage(QFrame):
         self.settings_panel.settingsChanged.connect(self.on_settings_changed)
         self.settings_panel.fitRequested.connect(self._fit_preview_model)
         self.settings_panel.requestRefreshParams.connect(self.on_request_refresh_params)
-        left_layout.addStretch(1)
-        left_layout.addWidget(self.model_info_text_box)
+        left_layout.addWidget(self.model_info_text_box, 1)
 
         # 控制按钮区域
         button_layout = QVBoxLayout()
@@ -2396,8 +2379,6 @@ class PreviewPage(QFrame):
             self.spine_runtime_edit.setText(
                 str(self.settings_manager.get("preview.spine_runtime_dir", "") or "")
             )
-        if self.image_limit_label:
-            self.image_limit_label.setText(tr("preview.image_limit_label"))
         if self.preview_stage_title:
             self.preview_stage_title.setText(tr("preview.stage_title"))
         if self.preview_placeholder:
@@ -2486,8 +2467,6 @@ class PreviewPage(QFrame):
             self.settings_panel.set_spine_mode(mode == "spine")
         if mode == "image":
             self.image_item_list.show()
-        self.image_limit_label.setVisible(mode != "spine")
-        self.image_limit_spinbox.setVisible(mode != "spine")
 
     def _clear_live2d_controls(self):
         self._live2d_source_generation += 1
@@ -2904,9 +2883,6 @@ class PreviewPage(QFrame):
         merged_ui_state.update(ui_state)
         preview["ui_state"] = merged_ui_state
         self.settings_manager.settings = latest
-
-    def on_preview_image_limit_changed(self, value: int):
-        self.settings_manager.set("preview.image_limit", int(value))
 
     def browse_spine_runtime(self):
         folder = QFileDialog.getExistingDirectory(
@@ -4428,9 +4404,8 @@ class PreviewPage(QFrame):
         self._folder_preview_thread.start()
 
     def current_preview_image_limit(self) -> int:
-        if self.image_limit_spinbox:
-            return int(self.image_limit_spinbox.value())
-        return int(self.settings_manager.get("preview.image_limit", 48) or 48)
+        self.settings_manager.reload_settings()
+        return max(1, min(500, int(self.settings_manager.get("preview.image_limit", 48) or 48)))
 
     def on_folder_preview_item_found(self, item: dict):
         self._preview_items.append(dict(item))

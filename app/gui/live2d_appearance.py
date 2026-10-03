@@ -106,7 +106,7 @@ class AppearanceStepPivot(Pivot):
         self._fit_items()
 
     def _fit_items(self):
-        width = max(1, self.width() // max(1, len(self.items)))
+        width = max(1, min(100, self.width() // max(1, len(self.items))))
         for key, item in self.items.items():
             item.setFixedWidth(width)
             item.setText(item.fontMetrics().elidedText(self._labels.get(key, ""), Qt.ElideRight, max(1, width - 24)))
@@ -144,6 +144,8 @@ class AppearanceTaskWorkspace(QWidget):
         self.skin_page, self.psd_page, self.psd_panel = atlas_page, psd_page, psd_panel
         self._task, self._context = "export", {}
         self._settings, self._initial_show, self._restoring = settings, False, False
+        self._wide = False
+        self._layout_states = {}
         self.setMinimumSize(0, 0)
         self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         root = EditorViewportLayout(self)
@@ -162,8 +164,8 @@ class AppearanceTaskWorkspace(QWidget):
         self.psd_workspace.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.psd_workspace.setMinimumHeight(150)
         lower = EditorViewportLayout(self.psd_workspace)
-        lower.setContentsMargins(0, 0, 0, 0)
-        lower.setSpacing(4)
+        lower.setContentsMargins(8, 0, 0, 0)
+        lower.setSpacing(8)
         self.task_toolbar = QWidget(self.psd_workspace)
         row = QHBoxLayout(self.task_toolbar)
         row.setContentsMargins(0, 0, 0, 0)
@@ -251,33 +253,50 @@ class AppearanceTaskWorkspace(QWidget):
         self._refresh_context()
 
     def save_layout(self, *_args):
-        if self._settings and self._initial_show and not self._restoring:
-            widths, heights = self.upper_splitter.sizes(), self.vertical_splitter.sizes()
-            if all(widths) and all(heights):
-                self._settings.set("editor_layouts.live2d_appearance", {"version": 1, "upper_height": heights[0],
-                                    "catalog_ratio": widths[0] / sum(widths)})
+        if self._initial_show and not self._restoring:
+            inner, outer = self.upper_splitter.sizes(), self.vertical_splitter.sizes()
+            if all(inner) and all(outer):
+                self._layout_states["wide" if self._wide else "narrow"] = {
+                    "extent": outer[0], "ratio": inner[0] / sum(inner)}
+                if self._settings:
+                    self._settings.set("editor_layouts.live2d_appearance", {
+                        "version": 2, "layouts": dict(self._layout_states)})
 
     def restore_layout(self):
         saved = self._settings.get("editor_layouts.live2d_appearance", {}) if self._settings else {}
-        saved = saved if isinstance(saved, dict) and saved.get("version") == 1 else {}
-        try:
-            height = max(150, int(saved.get("upper_height", 220)))
-            ratio = max(.25, min(.65, float(saved.get("catalog_ratio", .44))))
-        except (ValueError, TypeError):
-            height, ratio = 220, .44
+        saved = saved if isinstance(saved, dict) else {}
+        if saved.get("version") == 2 and isinstance(saved.get("layouts"), dict):
+            self._layout_states = dict(saved["layouts"])
+        elif saved.get("version") == 1:
+            self._layout_states["narrow"] = {"extent": saved.get("upper_height", 220),
+                                              "ratio": saved.get("catalog_ratio", .44)}
+        self._apply_layout()
+
+    def _apply_layout(self):
+        self._wide = self.width() >= 720
         self._restoring = True
-        available = max(310, self.vertical_splitter.height() - self.vertical_splitter.handleWidth())
-        self.vertical_splitter.setSizes([min(height, available - 150), max(150, available - height)])
-        width = max(260, self.upper_splitter.width() - self.upper_splitter.handleWidth())
-        self.upper_splitter.setSizes([round(width * ratio), round(width * (1 - ratio))])
+        self.vertical_splitter.setOrientation(Qt.Horizontal if self._wide else Qt.Vertical)
+        self.upper_splitter.setOrientation(Qt.Vertical if self._wide else Qt.Horizontal)
+        self.upper_splitter.setMinimumWidth(200 if self._wide else 0)
+        self.psd_workspace.setMinimumWidth(340 if self._wide else 0)
+        self.psd_workspace.layout().setContentsMargins(12 if self._wide else 0, 0, 0, 0)
+        saved = self._layout_states.get("wide" if self._wide else "narrow", {})
+        saved = saved if isinstance(saved, dict) else {}
+        try:
+            extent = max(150, int(saved.get("extent", 240 if self._wide else 204)))
+            ratio = max(.25, min(.65, float(saved.get("ratio", .4 if self._wide else .44))))
+        except (ValueError, TypeError):
+            extent, ratio = (240, .4) if self._wide else (204, .44)
+        available = (self.width() if self._wide else self.height()) - self.vertical_splitter.handleWidth()
+        extent = min(extent, max(150, available - (340 if self._wide else 180)))
+        self.vertical_splitter.setSizes([extent, max(150, available - extent)])
+        inner = (self.height() if self._wide else self.width()) - self.upper_splitter.handleWidth()
+        self.upper_splitter.setSizes([round(inner * ratio), round(inner * (1 - ratio))])
         self._restoring = False
 
     def reset_layout(self):
-        self._restoring = True
-        available = max(310, self.vertical_splitter.height() - self.vertical_splitter.handleWidth())
-        self.vertical_splitter.setSizes([220, max(150, available - 220)])
-        self.upper_splitter.setSizes([44, 56])
-        self._restoring = False
+        self._layout_states.pop("wide" if self._wide else "narrow", None)
+        self._apply_layout()
         self.save_layout()
 
     def showEvent(self, event):  # noqa: N802
@@ -289,6 +308,10 @@ class AppearanceTaskWorkspace(QWidget):
     def resizeEvent(self, event):  # noqa: N802
         super().resizeEvent(event)
         self.task_pivot.setFixedHeight(38)
+        if self._initial_show and (self.width() >= 720) != self._wide:
+            # splitterMoved already records user choices. At this point Qt has
+            # resized the old orientation, so saving would overwrite them.
+            self._apply_layout()
 
 
 class SharedTaskFeedback(QWidget):

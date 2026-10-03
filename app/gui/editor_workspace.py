@@ -7,12 +7,12 @@ The permanent layout bar remains available even with every panel collapsed.
 from __future__ import annotations
 
 from PySide6.QtCore import QByteArray, QPointF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QPainter
+from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QSplitter, QSplitterHandle, QStackedWidget, QVBoxLayout, QWidget, QSizePolicy
 from qfluentwidgets import (
     BodyLabel, CaptionLabel, CardWidget, FluentIcon, Pivot, TransparentToolButton,
     TransparentToggleToolButton, PushButton, ComboBox,
-    ScrollArea, setFont,
+    ScrollArea, setFont, isDarkTheme,
 )
 
 from app.i18n import tr
@@ -210,7 +210,19 @@ class EditorTabs(QWidget):
         self._fit_tab_items()
 
 
-class EditorPanel(CardWidget):
+class EditorSurface(CardWidget):
+    """An opaque, palette-owned surface without nested translucent layers."""
+
+    def paintEvent(self, event):  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        dark = isDarkTheme()
+        painter.setPen(Qt.NoPen if dark else QPen(QColor(0, 0, 0, 38), 1))
+        painter.setBrush(self.palette().window() if dark else QColor(255, 255, 255))
+        painter.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 8, 8)
+
+
+class EditorPanel(EditorSurface):
     hideRequested = Signal()
 
     def __init__(self, content: QWidget, panel: str, parent=None):

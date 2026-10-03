@@ -158,8 +158,7 @@ class SpinePreviewWidgetTests(unittest.TestCase):
             self.assertTrue(page.advanced_panel.isHidden())
             self.assertFalse(page.settings_panel.window_group.isHidden())
             self.assertTrue(page.settings_panel.interaction_group.isHidden())
-            self.assertTrue(page.image_limit_label.isHidden())
-            self.assertTrue(page.image_limit_spinbox.isHidden())
+            self.assertFalse(hasattr(page, "image_limit_spinbox"))
 
             page._set_spine_mode(False)
             self.assertFalse(page._spine_mode)
@@ -172,8 +171,7 @@ class SpinePreviewWidgetTests(unittest.TestCase):
             self.assertTrue(page.right_sidebar.isAncestorOf(page.settings_panel))
             self.assertFalse(page.settings_panel.window_group.isHidden())
             self.assertFalse(page.settings_panel.interaction_group.isHidden())
-            self.assertFalse(page.image_limit_label.isHidden())
-            self.assertFalse(page.image_limit_spinbox.isHidden())
+            self.assertFalse(hasattr(page, "image_limit_spinbox"))
         finally:
             page.close_preview_window()
             page._destroy_embedded_spine()
