@@ -1,0 +1,30 @@
+{
+  "tool": "lpk_spine_converter",
+  "upstream_repository": "https://github.com/wang606/SpineSkeletonDataConverter",
+  "upstream_commit": "5ecb2139b0a1af266974f95abeec6bb8562d1249",
+  "upstream_release": "v3.8",
+  "source_url": "https://github.com/wang606/SpineSkeletonDataConverter/archive/5ecb2139b0a1af266974f95abeec6bb8562d1249.tar.gz",
+  "license": "PolyForm Noncommercial License 1.0.0",
+  "license_url": "https://polyformproject.org/licenses/noncommercial/1.0.0/",
+  "license_file": "LICENSE",
+  "license_sha256": "75f5f2ae732cdc31adf8ad90a42ed4ed47476b3f27fcdf90de13e79d6788309d",
+  "license_sha256_scope": "local checkout bytes (CRLF line endings)",
+  "upstream_license_sha256_lf": "ffcca38841adb694b6f380647e15f17c446a4d1656fed51a1e2041d064c94cc8",
+  "build": {
+    "script": "build_native.ps1",
+    "cmake_minimum": "3.15",
+    "language": "C++20",
+    "target": "lpk_spine_converter",
+    "output": "runtime/tools/SpineSkeletonDataConverter/lpk_spine_converter.dll"
+  },
+  "abi": {
+    "version": "1",
+    "header": "include/spine_converter_capi.h",
+    "convert_function": "spine_converter_convert(input_file, output_file, target_version, output_format, remove_curve, error_buffer, error_buffer_size)"
+  },
+  "notes": [
+    "The vendored C++ readers, writers, and cross-family conversion passes are from the fixed upstream commit.",
+    "The upstream Python helper is a batch driver; this package adds a small C ABI wrapper so the application can call the same native conversion in-process.",
+    "The generated DLL is a local build artifact and is not required to be committed with the source tree."
+  ]
+}

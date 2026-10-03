@@ -1,9 +1,13 @@
 from hashlib import md5
+import json
+import logging
 import os
 import re
-import json
 import filetype
 from filetype.types import Type
+
+
+logger = logging.getLogger(__name__)
 
 def hashed_filename(s: str) -> str:
     t = md5()
@@ -23,7 +27,10 @@ def safe_mkdir(s: str):
     """
     # Create the directory
     os.makedirs(s, exist_ok=True)
-    print(f"Created directory: {s}")
+    # Directory creation is a routine operation.  Keeping it at DEBUG avoids
+    # flooding the GUI/terminal when a package contains many references while
+    # retaining the detail for an explicitly enabled diagnostic logger.
+    logger.debug("Created directory: %s", s)
 
 def genkey(s: str) -> int:
     ret = 0
@@ -34,15 +41,25 @@ def genkey(s: str) -> int:
     return ret
 
 def decrypt(key: int, data: bytes) -> bytes:
-    ret = []
-    for slice in [data[i:i+1024] for i in range(0, len(data), 1024)]:
+    """Decrypt an LPK payload using its per-block key stream.
+
+    The key intentionally resets at every 1024-byte block; this is part of
+    the LPK format and must not be changed to a single stream.  A bytearray
+    with a locally bound ``append`` avoids the temporary list of slices and
+    the per-byte list growth that made large texture payloads needlessly
+    expensive, while preserving the historical byte-for-byte output.
+    """
+
+    ret = bytearray()
+    append = ret.append
+    for start in range(0, len(data), 1024):
         tmpkey = key
-        for i in slice:
+        for value in data[start:start + 1024]:
             tmpkey = (65535 & 2531011 + 214013 * tmpkey >> 16) & 0xffffffff
-            ret.append((tmpkey & 0xff) ^ i)
+            append((tmpkey & 0xff) ^ value)
     return bytes(ret)
 
-match_rule = re.compile(r"[0-9a-f]{32}.bin3?")
+match_rule = re.compile(r"[0-9a-f]{32}\.bin3?", re.IGNORECASE)
 def is_encrypted_file(s: str) -> bool:
     if type(s) != str:
         return False
@@ -114,11 +131,101 @@ filetype.add_type(Moc3())
 filetype.add_type(Moc())
 
 def guess_type(data: bytes):
+    """Return a useful extension for an extracted encrypted payload.
+
+    ``filetype`` knows about common images and audio, but Live2DViewerEX
+    stores Spine atlas and skeleton files without their original extension.
+    Keep the normal detector first and use small, conservative content
+    signatures for those two text/binary formats afterwards.
+    """
     ftype = filetype.guess(data)
     if ftype != None:
         return "." + ftype.extension
     try:
         json.loads(data.decode("utf8"))
         return ".json"
-    except:
-        return ""
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+        pass
+    if is_spine_atlas_data(data):
+        return ".atlas"
+    if is_spine_skeleton_data(data):
+        return ".skel"
+    return ""
+
+
+def is_spine_atlas_data(data: bytes) -> bool:
+    """Return whether *data* looks like a text Spine ``.atlas`` file.
+
+    A page header is followed by metadata such as ``size:`` and
+    ``format:``.  Requiring those fields avoids treating arbitrary text
+    payloads (motion files, captions, etc.) as atlases.
+    """
+
+    if not isinstance(data, (bytes, bytearray)) or not data:
+        return False
+    try:
+        text = bytes(data).decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return False
+    raw_lines = text.splitlines()
+    lines = [line.strip().lower() for line in raw_lines]
+    if len(lines) < 2:
+        return False
+    page_metadata = (
+        "size:",
+        "format:",
+        "filter:",
+        "repeat:",
+        "pma:",
+        "scale:",
+        "minificationfilter:",
+        "magnificationfilter:",
+    )
+    region_metadata = (
+        "rotate:",
+        "xy:",
+        "bounds:",
+        "orig:",
+        "offset:",
+        "index:",
+    )
+    has_page_metadata = any(line.startswith(page_metadata) for line in lines)
+    has_region_metadata = any(
+        line.startswith(region_metadata)
+        for line in lines
+    )
+    # Keep at least one unindented page/region name.  JSON and ordinary text
+    # files use quoted keys or free-form prose, while atlas files have a
+    # page name followed by the metadata vocabulary above.
+    has_unindented_name = any(
+        raw_line and not raw_line[0].isspace() and stripped
+        and not stripped.startswith(page_metadata)
+        and not stripped.startswith(region_metadata)
+        for raw_line, stripped in zip(raw_lines, lines)
+    )
+    return has_unindented_name and (has_page_metadata or has_region_metadata)
+
+
+def is_spine_skeleton_data(data: bytes) -> bool:
+    """Return whether *data* has the characteristic Spine binary header.
+
+    Spine binary files begin with a variable-length hash and an ASCII
+    runtime version (for example ``2.1.27`` or ``3.8.96``).  The version is
+    bounded to the first 128 bytes and is accompanied by a later ``root`` or
+    path/string marker, which keeps this heuristic conservative for generic
+    binary assets.
+    """
+
+    if not isinstance(data, (bytes, bytearray)) or len(data) < 8:
+        return False
+    head = bytes(data[:128])
+    version = re.search(rb"(?<![0-9])(?:[0-9]+\.){1,3}[0-9]+(?![0-9])", head)
+    if not version:
+        return False
+    tail = bytes(data[:1024])
+    # Spine's binary string writer places a length marker (0x07 for the
+    # usual seven-byte version string) immediately before this version.  A
+    # few exports omit an obvious ``root``/``/spine/`` marker, so accept that
+    # canonical prefix as well.
+    marker_before_version = version.start() > 0 and head[version.start() - 1] == 0x07
+    return marker_before_version or b"root" in tail or b"/spine/" in tail or b"./spine" in tail

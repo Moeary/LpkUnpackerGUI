@@ -1,18 +1,30 @@
 import sys
-from PySide6.QtCore import Qt, QCoreApplication
-from PySide6.QtWidgets import QApplication
-from PySide6.QtGui import QIcon
-from app.paths import APP_ICON
-from app.core.app_logging import setup_runtime_logging
-from app.core.settings_manager import SettingsManager
-from app.i18n import get_i18n, normalize_language_code
 
-# Qt 6 enables high-DPI scaling by default. Keep shared OpenGL contexts for Live2D.
-if hasattr(Qt.ApplicationAttribute, "AA_ShareOpenGLContexts"):
-    QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
-QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+
+def _configure_qt_environment():
+    from PySide6.QtCore import Qt, QCoreApplication
+    from PySide6.QtWidgets import QApplication
+
+    # Keep the stdio MCP entry point free of GUI imports and startup output.
+    # Qt 6 enables DPI scaling by default; Live2D requires shared GL contexts.
+    # On Windows the native previews use desktop GL entry points. Qt's ANGLE
+    # backend creates an OpenGL ES context that PyOpenGL cannot use through WGL.
+    if sys.platform == "win32":
+        QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_UseDesktopOpenGL, True)
+    if hasattr(Qt.ApplicationAttribute, "AA_ShareOpenGLContexts"):
+        QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
+    QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
 
 def run_application():
+    _configure_qt_environment()
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtGui import QIcon
+    from app.paths import APP_ICON
+    from app.core.app_logging import setup_runtime_logging
+    from app.core.font_helper import apply_application_font
+    from app.core.settings_manager import SettingsManager
+    from app.i18n import get_i18n, normalize_language_code
+
     log_path = setup_runtime_logging()
     print(f"Runtime log: {log_path}")
 
@@ -31,10 +43,14 @@ def run_application():
     app_icon = QIcon(str(APP_ICON))
     app.setWindowIcon(app_icon)
     
-    # 设置全局字体缩放因子
-    font = app.font()
-    font.setPointSize(10)  # 设置一个基础字号大小
-    app.setFont(font)
+    # Set the persisted font before importing/constructing QFluentWidgets.
+    # QFluentWidgets assigns explicit fonts in widget constructors, so the
+    # helper also refreshes the completed window after MainWindow is built.
+    apply_application_font(
+        app,
+        settings_manager.get_font_family(),
+        settings_manager.get_font_size(),
+    )
     
     try:
         # 导入主窗口类
@@ -55,7 +71,17 @@ def run_application():
         return 1
 
 def main():
+    if "--psd-worker" in sys.argv:
+        from app.core.psd_worker import main as run_psd_worker
+
+        return run_psd_worker([arg for arg in sys.argv[1:] if arg != "--psd-worker"])
+    if "--mcp-animation" in sys.argv:
+        args = [arg for arg in sys.argv[1:] if arg != "--mcp-animation"]
+        from app.mcp_server import main as run_mcp
+
+        return run_mcp(args)
     if "--preview-process" in sys.argv:
+        _configure_qt_environment()
         args = [arg for arg in sys.argv[1:] if arg != "--preview-process"]
         from app.preview_process import run_preview_process
 

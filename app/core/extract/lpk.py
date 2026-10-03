@@ -55,6 +55,7 @@ def extract_lpk_full(
     output_dir.mkdir(parents=True, exist_ok=True)
     loader = LpkLoader(str(lpk_path), str(config_path) if config_path else None)
     created_dirs = loader.extract(str(output_dir)) or []
+    extracted_dirs = _unique_directories(created_dirs)
     result_output_dir = output_dir
     if len(created_dirs) == 1:
         result_output_dir = Path(created_dirs[0])
@@ -65,7 +66,23 @@ def extract_lpk_full(
         output_dir=result_output_dir,
         exported_count=1,
         message=f"Extracted LPK: {lpk_path.name}",
+        extracted_dirs=extracted_dirs,
     )
+
+
+def _unique_directories(values: list[str | Path]) -> list[Path]:
+    """Normalize loader-created directories without substituting output_dir."""
+
+    result: list[Path] = []
+    seen: set[str] = set()
+    for value in values:
+        path = Path(value).expanduser().resolve()
+        key = str(path).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(path)
+    return result
 
 
 def extract_lpk_textures(

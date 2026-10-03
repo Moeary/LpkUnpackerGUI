@@ -69,6 +69,63 @@ PSD 是编辑界面
 PNG atlas 是最终结果
 ```
 
+## 2A. 当前实现：三种导出模式与可靠基准
+
+`app.core.psd_reconstructor` 对外保留三个 `mode` 值：
+
+```text
+mesh             按当前姿态把 ArtMesh 渲染到人物/场景 PSD
+atlas-components 按 atlas 连通区域拆层，适合直接修改贴图
+atlas-artmesh    按每个 ArtMesh 的 UV/indices 提取 atlas 覆盖层
+```
+
+`atlas-artmesh` 的覆盖提取只依据 UV 三角形和 indices。隐藏 drawable、动态标志为零、透明度为零和只有很小覆盖面积的 drawable 仍会生成图层；因此它适合检查完整 atlas 覆盖，而不是复现某一帧的可见画面。每个覆盖层的 metadata 会保存 `texture_index`、`vertices`、`uvs`、`indices`、`bbox` 和 `source_index`。同一 texture 上的实际 mask 相交区域会记录在 `shared_regions` 中。
+
+有可用的 Cubism Core DLL 时，导出会优先从真实 `.moc3`/模型读取 drawable 数据；没有 DLL 时，才使用模型目录中的 `*.drawables.json` 等侧车数据。`parameter_values` 或姿态参数只影响 `mesh` 的姿态快照；`atlas-artmesh` 使用静态 UV/indices，不按姿态透明度裁掉覆盖。
+
+人物姿态 `mesh` 导出使用普通 ArtMesh 像素图层，严格保持 `render_order` 的后到前顺序，不建立语义集合、空绘制组或全局补缝层。每个像素层有持久 ID；直接在对应层修改，并保留旁边的元数据和 baseline 文件。此模式经过姿态变形、遮罩和采样，不能视为原作者 PSD 的恢复。
+
+图集模式的编辑单元采用以下 PSD 结构：
+
+```text
+<ArtMesh 单元>
+├─ Original   # 导出时的原始 RGBA，默认可见
+├─ Paint      # 空白编辑组
+└─ AI_Edit    # 空白编辑组
+```
+
+外层语义组可用于整理部件，但回写绑定依靠持久 PSD `layer_id` 和单元路径。重命名单元、原始像素层或外层组不会改变绑定。对没有这些持久 ID 的旧平铺 PSD，回写器只接受严格的 `原名` 与 `原名_数字` 命名，并按 PSD 实际堆栈顺序合成所有匹配层；任意相似前后缀都不会被自动归并。
+
+导出 PSD 会同时生成：
+
+```text
+model_<mode>.psd
+model_<mode>.lpkpsd.json
+model_<mode>.baseline/
+└─ layer_0000.png ...   # PSD 解码后的不可变 RGBA 图层基准
+```
+
+`.baseline` 目录是回写协议的一部分，必须和 `.lpkpsd.json` 一起保留或随工程移动。回写时，PSD 图层与对应 baseline 逐像素比较四个 RGBA 通道；alpha 变为零是有效擦除，会覆盖 atlas 中的原像素。基准 PNG 缺失、原始 atlas 缺失、atlas 尺寸改变，或输出文件会覆盖基准路径，都会抛出错误，不会创建透明空画布或静默 resize。多 PSD 处理以首个固定原始 atlas 为基准，把前一 PSD 的输出作为下一步的临时目标，因此不同 PSD 不会把上一次输出误当成不可变原图。
+
+### 回写结果与冲突报告
+
+```python
+result = repack_atlas_png_from_psd(psd, output_dir)
+result.change_regions  # 实际发生改变的 texture 像素 bbox
+result.conflicts       # 已证实的 mask 相交区域
+result.report          # 可序列化的模型、区域和冲突摘要
+```
+
+`conflicts` 的 `potential: false` 表示两个实际写入 mask 有像素交集；仅由 bbox 推断的旧格式候选会标为 `kind: "potential-overlap"`、`potential: true`，不应当当作真实冲突。`repack_multiple_psds` 会先校验模型文件名、MOC/模型摘要、贴图相对路径、顺序和尺寸，再按调用列表的优先级处理，列表靠前的 PSD 最后写入。不同姿态可以使用各自的投影画布；单个 PSD 仍会校验自己的 metadata 与基准画布。贴图输出通过 `texture_index` 及 metadata 中的 `relative_path` 绑定，即使多个目录存在同名 PNG 也不会靠文件名猜测。
+
+PSD 工作台的“ArtMesh 静态检查器”读取同一份 metadata 及同目录的 `*.drawables.json` sidecar，把当前导出姿态的网格、ArtMesh 列表和图集 UV 区域联动。点击三角形会按 render/draw/source 顺序选择最上层部件，列表选择会高亮对应 UV，并显示持久 layer ID、绑定路径和共享区域影响。mesh 模式会优先显示 PSD 内置的 merged preview；若没有预览则明确显示网格检查。该工具只检查当前导出快照，不模拟动态 Live2D 姿态。
+
+### 来源入口与 Spine 图集
+
+PSD 工作台接收 `model3.json`、`.moc3` 或完整 Live2D 模型目录；纹理路径在 metadata 中同时保存相对路径和尺寸。资源预览还可把 LPK、WPK、Unity、压缩包和文件夹识别为来源，再导入对应模型目录。
+
+Spine 图集使用独立的“Spine 图集”入口：选择 `.atlas` 文件或包含它的目录后，`parse_atlas`/`extract_spine_atlas` 会按页解析区域、旋转、裁剪和多页贴图，导出区域 PNG、JSON metadata，并可选生成 PSD。`writeback_spine_atlas` 只写入输出目录中的贴图副本，保留原始 atlas 文本和骨骼文件；该入口是图集交换工具，不替代 Spine 原生动画运行时。
+
 ---
 
 ## 3. 需要解决的问题

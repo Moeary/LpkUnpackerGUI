@@ -37,6 +37,8 @@ from qfluentwidgets import (
 
 from app.core.assetstudio_cli import AssetStudioCLI
 from app.core.config_manager import ConfigManager
+from app.core.settings_manager import SettingsManager
+from app.core.spine_converter import SpineConversionOptions
 from app.core.extract import ExtractSourceType, ExtractTaskPlan, analyze_sources, scan_package_folder
 from app.core.extractor_thread import ExtractorThread
 from app.i18n import get_i18n, tr
@@ -252,6 +254,17 @@ class ExtractorPage(QFrame):
         self.images_only_checkbox.setChecked(self.config_manager.get_extract_images_only())
         self.images_only_checkbox.stateChanged.connect(self.on_images_only_changed)
         input_layout.addWidget(self.images_only_checkbox)
+        settings = SettingsManager()
+        self.spine_convert_checkbox = CheckBox("", self)
+        self.spine_convert_checkbox.setChecked(bool(settings.get(
+            "extractor.convert_spine_3875", settings.get_spine_compatibility_mode(),
+        )))
+        self.spine_convert_checkbox.setEnabled(not self.images_only_checkbox.isChecked())
+        self.spine_convert_checkbox.toggled.connect(
+            lambda checked: SettingsManager().set("extractor.convert_spine_3875", checked)
+        )
+        input_layout.addWidget(self.spine_convert_checkbox)
+
 
         self.top_panel_layout.addWidget(self.input_card)
 
@@ -366,11 +379,11 @@ class ExtractorPage(QFrame):
         self.setStyleSheet(
             """
             QSplitter::handle {
-                background: #eef2f7;
+                background: palette(alternate-base);
                 border-radius: 3px;
             }
             QSplitter::handle:hover {
-                background: #d5dde8;
+                background: palette(mid);
             }
             QProgressBar {
                 min-height: 6px;
@@ -434,6 +447,8 @@ class ExtractorPage(QFrame):
         self.images_only_checkbox.setText(
             tr("extractor.extract_images_only", default="Extract Images Only")
         )
+        self.spine_convert_checkbox.setText(tr("extractor.convert_spine_3875"))
+        self.spine_convert_checkbox.setToolTip(tr("extractor.convert_spine_3875_desc"))
         self.extract_button.setText(tr("extractor.extract_button"))
         self.clear_tasks_button.setText(tr("extractor.clear_tasks"))
         self.open_folder_button.setText(tr("extractor.open_output_folder"))
@@ -454,6 +469,7 @@ class ExtractorPage(QFrame):
 
     def on_images_only_changed(self, state):
         self.config_manager.set_extract_images_only(state == Qt.Checked)
+        self.spine_convert_checkbox.setEnabled(not self.images_only_checkbox.isChecked())
         self.refresh_task_modes()
 
     def dragEnterEvent(self, event: QDragEnterEvent):
@@ -788,6 +804,7 @@ class ExtractorPage(QFrame):
             self.selected_configs,
             output_dir,
             self.images_only_checkbox.isChecked(),
+            spine_conversion=self._extraction_spine_options(),
         )
         self.extractor_thread.progressUpdated.connect(self.on_progress_updated)
         self.extractor_thread.extractionFinished.connect(self.extraction_finished)
@@ -797,6 +814,17 @@ class ExtractorPage(QFrame):
         self.mark_selected_tasks_running()
 
         logging.info(f"Starting extraction of {len(self.selected_files)} file(s) to {output_dir}")
+
+    def _extraction_spine_options(self):
+        settings = SettingsManager()
+        return SpineConversionOptions(
+            enabled=self.spine_convert_checkbox.isChecked() and not self.images_only_checkbox.isChecked(),
+            target_version="3.8.75",
+            output_format="json",
+            converter_path=settings.get_spine_converter_path() or None,
+            create_project=settings.get_spine_create_project(),
+            editor_path=settings.get_spine_editor_path() or None,
+        )
 
     def on_progress_updated(self, value):
         self.progress_bar.setValue(value)

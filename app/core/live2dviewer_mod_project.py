@@ -478,6 +478,10 @@ def generate_live2dviewer_mod(
         raise Live2DViewerModProjectError(
             "The first card must contain a complete Live2D model."
         )
+    # Check the editable source before deleting/rebuilding any generated files.
+    # Our generated menu can be regenerated; unrelated same-name motions must
+    # never be silently replaced by the reserved ViewerEX commands.
+    validate_switch_motion_groups(_read_json(main_model_json))
     main_package = resolve_live2d_package(main_model_json)
     output_dir = project_dir / BUILD_DIR
     _log(log, f"Preparing build directory: {output_dir}")
@@ -1200,6 +1204,37 @@ def _copy_skin_texture(
     target_path = output_dir / f"{model_index}_{target_index}{suffix}"
     shutil.copy2(source, target_path)
     return target_path
+
+
+def validate_switch_motion_groups(model_data: dict[str, Any]) -> None:
+    """Protect existing actions while allowing this tool's exact menu pair."""
+    refs = model_data.get("FileReferences") or {}
+    motions = refs.get("Motions") or {} if isinstance(refs, dict) else {}
+    if not isinstance(motions, dict):
+        raise Live2DViewerModProjectError("Live2D motion groups must be an object.")
+    reserved = [name for name in ("TapSwitchSkin", "SwitchSkin") if motions.get(name)]
+    if not reserved:
+        return
+    menu, switches = motions.get("TapSwitchSkin"), motions.get("SwitchSkin")
+    generated = isinstance(menu, list) and len(menu) == 1 and isinstance(switches, list) and bool(switches)
+    if generated:
+        item = menu[0]
+        generated = (isinstance(item, dict) and set(item) == {"Name", "Text", "Choices"}
+                     and item["Name"] == "0" and item["Text"] == "Switch Skin"
+                     and isinstance(item["Choices"], list) and len(item["Choices"]) == len(switches))
+    if generated:
+        for index, (choice, switch) in enumerate(zip(menu[0]["Choices"], switches)):
+            if (not isinstance(choice, dict) or set(choice) != {"Text", "NextMtn"}
+                    or not isinstance(choice["Text"], str) or not choice["Text"].strip()
+                    or choice["NextMtn"] != f"SwitchSkin:{index}"
+                    or not isinstance(switch, dict) or set(switch) != {"Name", "Command"}
+                    or switch["Name"] != str(index) or switch["Command"] != f"change_model model{index}.json"):
+                generated = False
+                break
+    if not generated:
+        raise Live2DViewerModProjectError(
+            "ViewerEX export would replace an existing motion group: " + ", ".join(reserved)
+        )
 
 
 def _inject_switch_menu(

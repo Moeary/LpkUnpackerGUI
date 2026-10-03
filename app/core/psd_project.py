@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import copy
 import json
+import os
 import re
 import shutil
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from PIL import Image, ImageChops
 
@@ -44,6 +47,70 @@ class Live2DPSDProject:
     def base_model_json(self) -> Path:
         value = str(self.data.get("workspace", {}).get("base_model_json") or "")
         return (self.project_dir / value).resolve() if value else self.live2d_dir
+
+
+@dataclass(frozen=True)
+class PsdSnapshotRequest:
+    """Immutable source lease handed from an editor into a PSD worker.
+
+    ``model_path`` must point to a complete, read-only Live2D package.  The
+    owner may keep that package in an editor-managed snapshot directory or
+    provide a stable source package path.  PSD workers only consume this
+    value; they never call back into a QWidget or an editor/session provider.
+    ``source_origin`` is metadata used to explain where a snapshot came from
+    (for example ``appearance`` or ``original``), while ``skin_source`` is
+    copied into PSD metadata without becoming part of the skin registry.
+    """
+
+    model_path: str = ""
+    source_origin: str = ""
+    skin_source: Mapping[str, Any] | None = None
+    export_request: Any = None
+
+    def normalized(self) -> "PsdSnapshotRequest":
+        path = Path(self.model_path).expanduser().resolve() if self.model_path else None
+        if self.export_request is None and (path is None or not path.is_file()):
+            raise Live2DPSDProjectError(f"PSD snapshot model does not exist: {path}")
+        if self.export_request is not None and not callable(getattr(self.export_request, "write", None)):
+            raise Live2DPSDProjectError("PSD snapshot request has no detached writer.")
+        return PsdSnapshotRequest(
+            str(path) if path else "",
+            str(self.source_origin or ""),
+            copy.deepcopy(dict(self.skin_source or {})),
+            self.export_request,
+        )
+
+
+@dataclass
+class PsdPoseExportStage:
+    """Worker-owned filesystem stage for a new pose export.
+
+    The stage lives below ``.psd-staging`` and is deliberately absent from
+    ``project.lpkpsd_project.json`` until :func:`commit_pose_export_stage`
+    succeeds.  This lets a failed preparation or PSD reconstruction cleanly
+    discard all new files while preserving existing project history.
+    """
+
+    stage_root: Path
+    snapshot_dir: Path
+    scheme_dir: Path
+    final_snapshot_dir: Path
+    final_scheme_dir: Path
+    source_model: Path
+    scheme: dict[str, Any]
+    project_data: dict[str, Any]
+
+    def rebase_path(self, value: str | Path) -> Path:
+        path = Path(value).resolve()
+        try:
+            relative = path.relative_to(self.scheme_dir.resolve())
+        except ValueError:
+            try:
+                relative = path.relative_to(self.snapshot_dir.resolve())
+            except ValueError:
+                return path
+            return (self.final_snapshot_dir / relative).resolve()
+        return (self.final_scheme_dir / relative).resolve()
 
 
 def create_project_from_source(
@@ -120,6 +187,51 @@ def new_project_data(
     }
 
 
+def create_project_from_snapshot_request(
+    request: Any,
+    project_dir: str | Path,
+    project_name: str = "psd",
+    *,
+    stage_dir: str | Path | None = None,
+    cancelled: Callable[[], bool] | None = None,
+    owner_token: str = "",
+) -> Live2DPSDProject:
+    """Create one immutable editor baseline without a second package copy.
+
+    Consume a detached request in a CPU worker. Only the new, owned directory
+    is published; an existing project is never replaced.
+    """
+    target = Path(project_dir).resolve()
+    if target.exists():
+        raise Live2DPSDProjectError(f"PSD project already exists: {target}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(stage_dir).resolve() if stage_dir is not None else Path(
+        tempfile.mkdtemp(prefix=".psd-init-", dir=target.parent)
+    )
+    if stage_dir is not None:
+        stage.mkdir(parents=True, exist_ok=False)
+    try:
+        if owner_token:
+            (stage / ".psd-init-owner").write_text(owner_token, encoding="utf-8")
+        if cancelled and cancelled():
+            raise InterruptedError("PSD task cancelled")
+        model = Path(request.write(stage / "live2d")).resolve()
+        package = resolve_live2d_package(model)
+        source = Path(getattr(request, "_source_path", target / "live2d" / model.name))
+        data = new_project_data(
+            sanitize_project_name(project_name), source, package, stage,
+        )
+        save_project(stage, data)
+        _ensure_project_dirs(stage)
+        if cancelled and cancelled():
+            raise InterruptedError("PSD task cancelled")
+        os.rename(stage, target)
+        return Live2DPSDProject(target, target / PROJECT_FILE_NAME, data)
+    except Exception:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+
+
 def load_project(project_file: str | Path) -> Live2DPSDProject:
     path = Path(project_file).resolve()
     if path.is_dir():
@@ -138,11 +250,19 @@ def load_project(project_file: str | Path) -> Live2DPSDProject:
 def save_project(project_dir: str | Path, data: dict[str, Any]) -> Path:
     directory = Path(project_dir).resolve()
     directory.mkdir(parents=True, exist_ok=True)
-    payload = normalize_project_data(data, directory.name)
+    payload = normalize_project_data(copy.deepcopy(data), directory.name)
     project_file = directory / PROJECT_FILE_NAME
-    with project_file.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-        f.write("\n")
+    descriptor, temporary = tempfile.mkstemp(prefix=".psd-registry-", suffix=".tmp", dir=directory)
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary_path, project_file)
+    finally:
+        temporary_path.unlink(missing_ok=True)
     return project_file
 
 
@@ -409,6 +529,276 @@ def create_pose_scheme(
     return updated, entry, scheme_dir
 
 
+def stage_pose_export(
+    project: Live2DPSDProject,
+    name: str,
+    priority: int,
+    parameters: Mapping[str, float] | None,
+    snapshot: PsdSnapshotRequest | Mapping[str, Any] | str | Path,
+    *,
+    scheme_id: str,
+    selection: Mapping[str, Any] | None = None,
+    skin_source: Mapping[str, Any] | None = None,
+    pose_source: str = "preview",
+    parameter_preset_id: str = "",
+    project_data: Mapping[str, Any] | None = None,
+    log: LogCallback | None = None,
+    stage_dir: str | Path | None = None,
+) -> PsdPoseExportStage:
+    """Prepare a pose export without mutating the PSD registry.
+
+    The function is safe to call from a worker thread.  It takes only paths,
+    plain dictionaries and immutable request data, copies the read-only
+    source package into a private stage, and copies each atlas once into the
+    staged pose directory.  It deliberately does not call ``save_project``
+    or update an existing project object.  Call
+    :func:`commit_pose_export_stage` only after reconstruction succeeds.
+    """
+
+    request = _normalize_snapshot_request(snapshot)
+    display_name = str(name or "").strip()
+    if not display_name:
+        raise Live2DPSDProjectError("Pose scheme name cannot be empty.")
+    normalized_id = sanitize_project_name(scheme_id or display_name)
+    if not normalized_id:
+        raise Live2DPSDProjectError("Pose scheme id cannot be empty.")
+
+    final_snapshot_dir = project.project_dir / "snapshots" / normalized_id
+    final_scheme_dir = project.project_dir / "psd" / normalized_id
+    if final_snapshot_dir.exists() or final_scheme_dir.exists():
+        raise Live2DPSDProjectError(f"Pose export already exists: {normalized_id}")
+
+    staging_parent = project.project_dir / ".psd-staging"
+    staging_parent.mkdir(parents=True, exist_ok=True)
+    if stage_dir is None:
+        stage_root = Path(tempfile.mkdtemp(prefix=f"{normalized_id}-", dir=str(staging_parent)))
+    else:
+        stage_root = Path(stage_dir).resolve()
+        if not stage_root.is_relative_to(staging_parent.resolve()):
+            raise Live2DPSDProjectError("PSD export stage must be inside its project staging directory.")
+        stage_root.mkdir(parents=True, exist_ok=False)
+    snapshot_dir = stage_root / "snapshot"
+    scheme_dir = stage_root / "scheme"
+
+    try:
+        if request.export_request is not None:
+            staged_model = Path(request.export_request.write(snapshot_dir)).resolve()
+        else:
+            source_package = resolve_live2d_package(Path(request.model_path))
+            staged_model = _copy_psd_source(source_package, snapshot_dir)
+        staged_package = resolve_live2d_package(staged_model)
+
+        scheme_dir.mkdir(parents=True, exist_ok=True)
+        source_textures: list[str] = []
+        for index, source_texture in enumerate(staged_package.texture_paths):
+            suffix = source_texture.suffix or ".png"
+            target = scheme_dir / f"texture_{index:02d}{suffix}"
+            shutil.copy2(source_texture, target)
+            source_textures.append(
+                _relative_to_project(final_scheme_dir / target.name, project.project_dir)
+            )
+            if log:
+                log(f"Staged PSD source texture: {target.name}")
+
+        source_snapshot = _relative_to_project(
+            final_snapshot_dir / staged_package.model_json.relative_to(snapshot_dir),
+            project.project_dir,
+        )
+        scheme: dict[str, Any] = {
+            "id": normalized_id,
+            "name": display_name,
+            "priority": int(priority),
+            "directory": _relative_to_project(final_scheme_dir, project.project_dir),
+            "parameters": {
+                str(key): float(value)
+                for key, value in dict(parameters or {}).items()
+            },
+            "exported_parameters": {
+                str(key): float(value)
+                for key, value in dict(parameters or {}).items()
+            },
+            "pose_source": "initial" if pose_source == "initial" else "preview",
+            "parameter_preset_id": str(parameter_preset_id or normalized_id),
+            "source_textures": source_textures,
+            "editor_snapshot": source_snapshot,
+            "psd": "",
+            "metadata": "",
+            "mode": "mesh",
+            "layer_count": 0,
+            "versions": [],
+            "selected_version": "",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        if selection:
+            scheme["selection"] = copy.deepcopy(dict(selection))
+        if request.source_origin:
+            scheme["source_origin"] = request.source_origin
+        context = skin_source or request.skin_source
+        if context:
+            # This is provenance for a PSD export.  It is intentionally
+            # separate from the editor's skin registry.
+            scheme["skin_source"] = copy.deepcopy(dict(context))
+
+        data = normalize_project_data(
+            copy.deepcopy(dict(project_data if project_data is not None else project.data)),
+            project.project_name,
+        )
+        data.setdefault("pose_schemes", []).append(copy.deepcopy(scheme))
+        data["selected_pose_scheme"] = normalized_id
+        return PsdPoseExportStage(
+            stage_root=stage_root,
+            snapshot_dir=snapshot_dir,
+            scheme_dir=scheme_dir,
+            final_snapshot_dir=final_snapshot_dir,
+            final_scheme_dir=final_scheme_dir,
+            source_model=staged_package.model_json,
+            scheme=scheme,
+            project_data=data,
+        )
+    except Exception:
+        shutil.rmtree(stage_root, ignore_errors=True)
+        raise
+
+
+def commit_pose_export_stage(
+    project: Live2DPSDProject,
+    stage: PsdPoseExportStage,
+) -> Live2DPSDProject:
+    """Publish owned directories, then atomically replace the PSD registry.
+
+    A failed directory move or registry replacement restores the directories
+    to the private stage.  The previous registry bytes are never truncated.
+    """
+
+    if project.project_dir.resolve() != stage.final_scheme_dir.parent.parent.resolve():
+        raise Live2DPSDProjectError("PSD pose stage belongs to another project.")
+    if stage.final_snapshot_dir.exists() or stage.final_scheme_dir.exists():
+        raise Live2DPSDProjectError("PSD pose stage destination already exists.")
+
+    moved: list[tuple[Path, Path]] = []
+    try:
+        stage.final_snapshot_dir.parent.mkdir(parents=True, exist_ok=True)
+        stage.final_scheme_dir.parent.mkdir(parents=True, exist_ok=True)
+        os.rename(stage.snapshot_dir, stage.final_snapshot_dir)
+        moved.append((stage.final_snapshot_dir, stage.snapshot_dir))
+        os.rename(stage.scheme_dir, stage.final_scheme_dir)
+        moved.append((stage.final_scheme_dir, stage.scheme_dir))
+        data = normalize_project_data(copy.deepcopy(stage.project_data), project.project_name)
+        project_file = save_project(project.project_dir, data)
+        shutil.rmtree(stage.stage_root, ignore_errors=True)
+        return Live2DPSDProject(project.project_dir, project_file, data)
+    except Exception:
+        # Roll back only the directories created by this stage.  Existing
+        # project content and the registry file are never removed here.
+        for destination, source in reversed(moved):
+            if destination.exists() and not source.exists():
+                try:
+                    os.rename(destination, source)
+                except Exception:
+                    # The destination is owned by this stage, never a prior
+                    # history item.  Keep it for recovery if rollback fails.
+                    raise Live2DPSDProjectError(f"PSD stage rollback failed: {destination}")
+        raise
+
+
+def finalize_pose_export_stage(stage: PsdPoseExportStage, result: Any) -> None:
+    """Freeze result metadata with its published paths before GUI registration."""
+    for path in stage.scheme_dir.rglob("*.json"):
+        with path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+        payload = _rebase_stage_json(payload, stage)
+        with path.open("w", encoding="utf-8", newline="\n") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+    scheme = stage.scheme
+    scheme["psd"] = _relative_to_project(stage.rebase_path(result.psd_path), stage.final_scheme_dir.parent.parent)
+    scheme["metadata"] = (
+        _relative_to_project(stage.rebase_path(result.metadata_path), stage.final_scheme_dir.parent.parent)
+        if result.metadata_path else ""
+    )
+    scheme["mode"] = str(result.mode)
+    scheme["layer_count"] = int(result.layer_count)
+    scheme["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    for stored in stage.project_data.get("pose_schemes", []):
+        if stored.get("id") == scheme["id"]:
+            stored.update(copy.deepcopy(scheme))
+
+
+def _rebase_stage_json(value: Any, stage: PsdPoseExportStage) -> Any:
+    if isinstance(value, dict):
+        return {key: _rebase_stage_json(item, stage) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_rebase_stage_json(item, stage) for item in value]
+    if isinstance(value, str) and Path(value).is_absolute():
+        return str(stage.rebase_path(value))
+    return value
+
+
+def _copy_psd_source(package: Live2DPackage, destination: Path) -> Path:
+    """Copy model references and drawable sidecars without skin/PSD history."""
+    root = package.root_dir.resolve()
+    files = {package.model_json, *package.texture_paths}
+    if package.moc_path and package.moc_path.is_file():
+        files.add(package.moc_path)
+    with package.model_json.open("r", encoding="utf-8-sig") as f:
+        references = json.load(f).get("FileReferences", {})
+
+    def add_references(value):
+        if isinstance(value, dict):
+            for item in value.values():
+                add_references(item)
+        elif isinstance(value, list):
+            for item in value:
+                add_references(item)
+        elif isinstance(value, str):
+            candidate = (root / value).resolve()
+            if candidate.is_file():
+                files.add(candidate)
+
+    add_references(references)
+    sidecars = [root / "drawables.json", root / "mesh.json",
+                package.model_json.with_suffix(".drawables.json")]
+    if package.moc_path:
+        sidecars.append(package.moc_path.with_suffix(".drawables.json"))
+    files.update(path for path in sidecars if path.is_file())
+    destination.mkdir(parents=True, exist_ok=False)
+    for source in sorted(files):
+        try:
+            relative = source.resolve().relative_to(root)
+        except ValueError as exc:
+            raise Live2DPSDProjectError(f"PSD source reference leaves its package: {source}") from exc
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+    return destination / package.model_json.relative_to(root)
+
+
+def discard_pose_export_stage(stage: PsdPoseExportStage | None) -> None:
+    if stage is not None:
+        shutil.rmtree(stage.stage_root, ignore_errors=True)
+
+
+def _normalize_snapshot_request(
+    snapshot: PsdSnapshotRequest | Mapping[str, Any] | str | Path,
+) -> PsdSnapshotRequest:
+    if isinstance(snapshot, PsdSnapshotRequest):
+        return snapshot.normalized()
+    if isinstance(snapshot, (str, Path)):
+        return PsdSnapshotRequest(str(snapshot)).normalized()
+    if not isinstance(snapshot, Mapping):
+        raise Live2DPSDProjectError("PSD snapshot request must contain a model path.")
+    value = snapshot.get("model_path") or snapshot.get("source_model") or snapshot.get("path") or ""
+    export_request = snapshot.get("export_request")
+    if not value and export_request is None:
+        raise Live2DPSDProjectError("PSD snapshot request is missing model_path.")
+    return PsdSnapshotRequest(
+        str(value),
+        str(snapshot.get("source_origin") or snapshot.get("origin") or ""),
+        copy.deepcopy(dict(snapshot.get("skin_source") or snapshot.get("skin_context") or {})),
+        export_request,
+    ).normalized()
+
+
 def record_pose_scheme_export(
     project: Live2DPSDProject,
     scheme_id: str,
@@ -547,6 +937,9 @@ def record_repack(
     output_paths: list[Path],
     scheme_id: str = "",
     display_name: str = "",
+    texture_outputs: Mapping[int, str | Path] | None = None,
+    allow_shared_uv: bool = False,
+    affected_unselected_ids: list[str] | None = None,
 ) -> Live2DPSDProject:
     data = normalize_project_data(project.data, project.project_name)
     entry = {
@@ -558,9 +951,16 @@ def record_repack(
         else "",
         "textures_dir": _relative_to_project(Path(textures_dir), project.project_dir),
         "output_paths": [_relative_to_project(Path(path), project.project_dir) for path in output_paths],
+        "texture_outputs": {
+            str(int(index)): _relative_to_project(Path(path), project.project_dir)
+            for index, path in (texture_outputs or {}).items()
+        },
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "scheme_id": str(scheme_id or ""),
     }
+    if allow_shared_uv:
+        entry["allow_shared_uv"] = True
+        entry["affected_unselected_ids"] = sorted(set(affected_unselected_ids or []))
     data.setdefault("repack_history", []).append(entry)
     data["selected_repack"] = version_id
     if scheme_id:
@@ -583,6 +983,7 @@ def record_multi_repack(
     textures_dir: str | Path,
     output_paths: list[Path],
     display_name: str,
+    texture_outputs: Mapping[int, str | Path] | None = None,
 ) -> Live2DPSDProject:
     """Record a multi-PSD output without involving pose-priority composition."""
     data = normalize_project_data(project.data, project.project_name)
@@ -596,6 +997,10 @@ def record_multi_repack(
         ],
         "textures_dir": _relative_to_project(Path(textures_dir), project.project_dir),
         "output_paths": [_relative_to_project(Path(path), project.project_dir) for path in output_paths],
+        "texture_outputs": {
+            str(int(index)): _relative_to_project(Path(path), project.project_dir)
+            for index, path in (texture_outputs or {}).items()
+        },
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "scheme_id": "",
     }
@@ -802,7 +1207,12 @@ def prepare_repack_preview_workspace(
     if not outputs:
         raise Live2DPSDProjectError(f"Repack version has no output texture paths: {entry.get('id')}")
 
-    _overlay_preview_textures(outputs, package.texture_paths, log)
+    texture_outputs = {
+        int(index): resolve_project_path(project, value)
+        for index, value in (entry.get("texture_outputs") or {}).items()
+        if str(value or "").strip()
+    }
+    _overlay_preview_textures(outputs, package.texture_paths, log, texture_outputs)
     return package.model_json
 
 
@@ -892,7 +1302,21 @@ def _overlay_preview_textures(
     outputs: list[Path],
     target_textures: list[Path],
     log: LogCallback | None,
+    texture_outputs: Mapping[int, Path] | None = None,
 ) -> None:
+    if texture_outputs:
+        for index, target in enumerate(target_textures):
+            output = texture_outputs.get(index)
+            if output is None:
+                continue
+            if not output.is_file():
+                raise Live2DPSDProjectError(f"Repacked texture is missing: {output}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(output, target)
+            if log:
+                log(f"Preview texture replaced: {target}")
+        return
+
     copied_targets: set[Path] = set()
     for output, target in zip(outputs, target_textures):
         if not output.is_file():

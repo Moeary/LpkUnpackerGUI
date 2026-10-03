@@ -4,8 +4,8 @@ import os
 
 from PySide6.QtCore import QEvent, QPoint, Qt, Signal
 from PySide6.QtGui import QPixmap
-from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QScrollArea, QVBoxLayout, QWidget
-from qfluentwidgets import BodyLabel, FluentIcon, PushButton
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
+from qfluentwidgets import BodyLabel, FluentIcon, TransparentToolButton
 
 from app.i18n import tr
 
@@ -39,6 +39,7 @@ class ImageZoomScrollArea(QScrollArea):
 
 class ImagePreviewPanel(QFrame):
     itemActivated = Signal(int)
+    itemsChanged = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -54,12 +55,12 @@ class ImagePreviewPanel(QFrame):
         self.main_image_label = QLabel(self)
         self.image_scroll = ImageZoomScrollArea(self)
         self.path_label = BodyLabel("", self)
-        self.prev_btn = PushButton("", self)
-        self.next_btn = PushButton("", self)
-        self.fit_btn = PushButton("", self)
-        self.actual_btn = PushButton("", self)
-        self.zoom_out_btn = PushButton("", self)
-        self.zoom_in_btn = PushButton("", self)
+        self.prev_btn = TransparentToolButton(FluentIcon.LEFT_ARROW, self)
+        self.next_btn = TransparentToolButton(FluentIcon.RIGHT_ARROW, self)
+        self.fit_btn = TransparentToolButton(FluentIcon.FIT_PAGE, self)
+        self.actual_btn = TransparentToolButton(FluentIcon.ZOOM, self)
+        self.zoom_out_btn = TransparentToolButton(FluentIcon.ZOOM_OUT, self)
+        self.zoom_in_btn = TransparentToolButton(FluentIcon.ZOOM_IN, self)
         self.list_title_label = BodyLabel("", self)
         self.limit_label = BodyLabel("", self)
         self.list_widget = QWidget(self)
@@ -68,6 +69,7 @@ class ImagePreviewPanel(QFrame):
         self.list_layout.setSpacing(6)
 
         root_layout = QHBoxLayout(self)
+        self.root_layout = root_layout
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(10)
 
@@ -76,9 +78,11 @@ class ImagePreviewPanel(QFrame):
         preview_layout.setSpacing(8)
         preview_layout.addWidget(self.title_label)
 
-        self.main_image_label.setMinimumHeight(420)
+        self.main_image_label.setMinimumHeight(1)
         self.main_image_label.setAlignment(Qt.AlignCenter)
-        self.main_image_label.setStyleSheet("background: transparent; color: #68707D;")
+        self.main_image_label.setStyleSheet(
+            "background: transparent; color: palette(placeholder-text);"
+        )
         self.image_scroll.setWidget(self.main_image_label)
         self.image_scroll.setWidgetResizable(False)
         self.image_scroll.setAlignment(Qt.AlignCenter)
@@ -86,9 +90,9 @@ class ImagePreviewPanel(QFrame):
         self.image_scroll.zoomRequested.connect(self.zoom_at_position)
         self.image_scroll.setStyleSheet("""
             QScrollArea {
-                border: 1px solid #DDE2EA;
+                border: 1px solid palette(mid);
                 border-radius: 8px;
-                background: #FFFFFF;
+                background: palette(base);
             }
         """)
         preview_layout.addWidget(self.image_scroll, 1)
@@ -111,8 +115,8 @@ class ImagePreviewPanel(QFrame):
             self.zoom_out_btn,
             self.zoom_in_btn,
         ):
-            button.setFixedHeight(32)
-        self.path_label.setWordWrap(True)
+            button.setFixedSize(32, 32)
+        self.path_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         nav_layout.addWidget(self.prev_btn)
         nav_layout.addWidget(self.next_btn)
         nav_layout.addWidget(self.fit_btn)
@@ -128,16 +132,16 @@ class ImagePreviewPanel(QFrame):
         self.side_panel.setMaximumWidth(270)
         self.side_panel.setStyleSheet("""
             QFrame#imagePreviewSidePanel {
-                border: 1px solid #E3E6EA;
+                border: 1px solid palette(mid);
                 border-radius: 8px;
-                background: #FAFBFD;
+                background: palette(alternate-base);
             }
         """)
         side_layout = QVBoxLayout(self.side_panel)
         side_layout.setContentsMargins(10, 10, 10, 10)
         side_layout.setSpacing(8)
         self.limit_label.setWordWrap(True)
-        self.limit_label.setStyleSheet("color: #68707D;")
+        self.limit_label.setStyleSheet("color: palette(placeholder-text);")
         list_scroll = QScrollArea(self.side_panel)
         list_scroll.setWidgetResizable(True)
         list_scroll.setFrameShape(QFrame.NoFrame)
@@ -148,17 +152,15 @@ class ImagePreviewPanel(QFrame):
 
         root_layout.addLayout(preview_layout, 1)
         root_layout.addWidget(self.side_panel)
-        self.setMinimumHeight(420)
+        self.setMinimumHeight(160)
         self.retranslate_ui()
 
     def retranslate_ui(self):
-        self.fit_btn.setText(tr("preview.image_fit"))
+        self.fit_btn.setAccessibleName(tr("preview.image_fit"))
         self.fit_btn.setToolTip(tr("preview.image_fit_tooltip"))
-        self.actual_btn.setText(tr("preview.image_actual"))
+        self.actual_btn.setAccessibleName(tr("preview.image_actual"))
         self.actual_btn.setToolTip(tr("preview.image_actual_tooltip"))
-        self.zoom_out_btn.setText("-")
         self.zoom_out_btn.setToolTip(tr("preview.image_zoom_out_tooltip"))
-        self.zoom_in_btn.setText("+")
         self.zoom_in_btn.setToolTip(tr("preview.image_zoom_in_tooltip"))
         self.prev_btn.setToolTip(tr("preview.image_previous_tooltip"))
         self.next_btn.setToolTip(tr("preview.image_next_tooltip"))
@@ -197,6 +199,7 @@ class ImagePreviewPanel(QFrame):
         self.limit_label.setText(tr("preview.image_limited_note", count=len(self._image_paths)))
         self._populate_items()
         self._show_current_item()
+        self.itemsChanged.emit()
 
     def append_item(self, item: dict):
         self._preview_items.append(dict(item))
@@ -206,6 +209,7 @@ class ImagePreviewPanel(QFrame):
         self.limit_label.setText(tr("preview.image_limited_note", count=len(self._image_paths)))
         self._add_item_widget(len(self._preview_items) - 1, self._preview_items[-1])
         self._update_list_styles()
+        self.itemsChanged.emit()
 
     def current_item(self) -> dict | None:
         if not self._preview_items:
@@ -241,6 +245,13 @@ class ImagePreviewPanel(QFrame):
     def set_item_list_visible(self, visible: bool):
         self.side_panel.setVisible(bool(visible))
 
+    def take_item_list(self):
+        """Move the same thumbnail list into a format-aware external sidebar."""
+        self.root_layout.removeWidget(self.side_panel)
+        self.side_panel.setParent(None)
+        self.side_panel.setMaximumWidth(16777215)
+        return self.side_panel
+
     def set_current_index(self, index: int, emit: bool = False):
         if not self._preview_items:
             return
@@ -271,10 +282,10 @@ class ImagePreviewPanel(QFrame):
         thumb.setAlignment(Qt.AlignCenter)
         thumb.setStyleSheet("""
             QLabel {
-                border: 1px solid #E3E6EA;
+                border: 1px solid palette(mid);
                 border-radius: 6px;
-                background: #FFFFFF;
-                color: #68707D;
+                background: palette(base);
+                color: palette(placeholder-text);
                 font-weight: 600;
             }
         """)
@@ -307,7 +318,7 @@ class ImagePreviewPanel(QFrame):
         detail = str(item.get("detail") or "")
         detail_label = BodyLabel(detail, text_box)
         detail_label.setWordWrap(True)
-        detail_label.setStyleSheet("color: #68707D;")
+        detail_label.setStyleSheet("color: palette(placeholder-text);")
         text_layout.addWidget(type_label)
         text_layout.addWidget(name_label)
         if detail:
@@ -342,6 +353,7 @@ class ImagePreviewPanel(QFrame):
         self.path_label.clear()
         self.limit_label.clear()
         self.main_image_label.clear()
+        self.itemsChanged.emit()
 
     def _clear_list(self):
         self._list_items = []
@@ -512,7 +524,7 @@ class ImagePreviewPanel(QFrame):
                     QFrame#imagePreviewListItem {
                         border: 1px solid #00A6B3;
                         border-radius: 8px;
-                        background: #EFFBFC;
+                        background: palette(highlight);
                     }
                 """)
             else:
@@ -523,8 +535,8 @@ class ImagePreviewPanel(QFrame):
                         background: transparent;
                     }
                     QFrame#imagePreviewListItem:hover {
-                        border-color: #D0D7E2;
-                        background: #FFFFFF;
+                        border-color: palette(mid);
+                        background: palette(base);
                     }
                 """)
 

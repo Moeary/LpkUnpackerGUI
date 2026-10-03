@@ -13,6 +13,8 @@ app/tools/AssetStudioCLI/
 app/tools/CubismCore/*
 !app/tools/CubismCore/README.txt
 .codex-temp/
+.test-tmp*/
+.pytest_cache/
 
 # Python
 __pycache__/

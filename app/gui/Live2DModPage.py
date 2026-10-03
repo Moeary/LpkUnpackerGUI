@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import copy
 import hashlib
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -14,6 +16,7 @@ from PySide6.QtCore import (
     Qt,
     QThread,
     QTimer,
+    QSignalBlocker,
     QUrl,
     Signal,
 )
@@ -37,12 +40,12 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
-    QMessageBox,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
+    QSizePolicy,
 )
 from qfluentwidgets import (
     BodyLabel,
@@ -55,11 +58,12 @@ from qfluentwidgets import (
     InfoBar,
     InfoBarPosition,
     LineEdit,
-    MessageBoxBase,
     PrimaryPushButton,
     PushButton,
     ScrollArea,
     SubtitleLabel,
+    TableWidget,
+    TextEdit,
     TransparentToolButton,
 )
 
@@ -83,10 +87,39 @@ from app.core.live2dviewer_mod_project import (
     update_model_mappings,
 )
 from app.core.settings_manager import SettingsManager
+from app.gui.editor_workspace import EditorViewportLayout, FluentEditorTabs
 from app.i18n import get_i18n, tr
+from app.gui.editor_dialogs import EditorMessageBox as QMessageBox, ThemedEditorDialog as MessageBoxBase
+from app.gui.ArtMeshInspector import ArtMeshPickDialog, ARTMESH_TEXT
 
 
 MODEL_DRAG_MIME = "application/x-live2d-mod-model"
+MOD_WORKSPACE_TEXT = {
+    "mod.workspace.project": "工程",
+    "mod.workspace.models": "模型与皮肤",
+    "mod.workspace.export": "换装与导出",
+    "mod.workspace.file": "文件",
+    "mod.workspace.folder": "文件夹",
+    "mod.workspace.import": "导入",
+    "mod.workspace.save": "保存",
+    "mod.workspace.trigger_hint": "先预览工程主模型或皮肤，再在左侧点击 ArtMesh 选择换装触发区。已绑定事件的区域不可选。",
+    "mod.workspace.preview_hint": "皮肤预览使用主模型 MOC 和当前贴图映射，与最终导出一致。",
+    "mod.workspace.config": "查看导出配置",
+    "mod.workspace.config_title": "MOD 导出配置",
+    "mod.workspace.config_hint": "导出包含完整模型、皮肤切换菜单、skin_manifest.json 与 texture_mapping.json。",
+    "mod.workspace.preview_export": "预览导出模型",
+    "mod.workspace.previewing": "左侧正在预览：{name}",
+    "mod.workspace.ready": "选择工程，或导入模型开始制作 MOD",
+    "mod.workspace.trigger_selected": "换装触发区：{id}",
+    "mod.workspace.trigger_unavailable": "{id} 已绑定事件或不是主模型可用的触发区。",
+    "mod.workspace.preview_main": "预览主模型",
+    "mod.workspace.import_options": "导入选项",
+    "mod.workspace.pick_trigger": "选择触发部件…",
+}
+
+
+def _workspace_text(key: str, **values) -> str:
+    return tr(key, default=MOD_WORKSPACE_TEXT[key], **values)
 _TEXTURE_PIXMAP_CACHE: dict[tuple[str, int, int, int], QPixmap] = {}
 _TEXTURE_HASH_CACHE: dict[tuple[str, int, int], str] = {}
 
@@ -198,19 +231,27 @@ class ProjectNameDialog(MessageBoxBase):
     def validate(self) -> bool:
         return bool(self.name_edit.text().strip())
 
+    def _on_confirm(self):
+        if self.validate():
+            self.accept()
+
     @property
     def project_name(self) -> str:
         return sanitize_project_name(self.name_edit.text())
 
 
-class DeleteProjectDialog(QDialog):
+class DeleteProjectDialog(MessageBoxBase):
     def __init__(self, project_name: str, project_dir: Path, parent=None):
         super().__init__(parent)
         self.setWindowTitle(
             tr("mod.project.delete_title", default="删除 MOD 工程")
         )
         self.setMinimumWidth(460)
-        layout = QVBoxLayout(self)
+        self.main_layout.setContentsMargins(0, 0, 0, 0)
+        self.title_label.hide()
+        self.yesButton.hide()
+        self.cancelButton.hide()
+        layout = self.content_layout
         layout.setContentsMargins(22, 20, 22, 18)
         layout.setSpacing(14)
 
@@ -263,7 +304,7 @@ class DeleteProjectDialog(QDialog):
         return self.delete_files_checkbox.isChecked()
 
 
-class TextureMappingDialog(QDialog):
+class TextureMappingDialog(MessageBoxBase):
     def __init__(
         self,
         skin_name: str,
@@ -271,9 +312,11 @@ class TextureMappingDialog(QDialog):
         source_textures: list[Path],
         current_mappings: list[tuple[int, Path]],
         parent=None,
+        *, hint_text: str | None = None,
     ):
         super().__init__(parent)
         self.setWindowTitle(tr("mod.mapping.dialog_title", default="编辑多贴图映射"))
+        self.setMaximumWidth(16777215)
         self.setMinimumSize(900, 560)
         self.main_textures = [
             path.resolve() for path in main_textures if path.is_file()
@@ -286,7 +329,11 @@ class TextureMappingDialog(QDialog):
             for target, source in current_mappings
         }
 
-        layout = QVBoxLayout(self)
+        self.main_layout.setContentsMargins(0, 0, 0, 0)
+        self.title_label.hide()
+        self.yesButton.hide()
+        self.cancelButton.hide()
+        layout = self.content_layout
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(10)
         title = SubtitleLabel(
@@ -298,7 +345,7 @@ class TextureMappingDialog(QDialog):
             self,
         )
         hint = CaptionLabel(
-            tr(
+            hint_text or tr(
                 "mod.mapping.hint",
                 default="每一行都是一张导入贴图。请选择它对应的主模型贴图；同名、同尺寸和同序号会优先自动匹配。",
             ),
@@ -308,7 +355,9 @@ class TextureMappingDialog(QDialog):
         layout.addWidget(title)
         layout.addWidget(hint)
 
-        self.table = QTableWidget(self)
+        self.table = TableWidget(self)
+        self.table.setBorderVisible(False)
+        self.table.setAlternatingRowColors(True)
         self.table.setColumnCount(3)
         self.table.setHorizontalHeaderLabels(
             [
@@ -408,15 +457,20 @@ class TextureMappingDialog(QDialog):
         self.accept()
 
 
-class TextureGalleryDialog(QDialog):
+class TextureGalleryDialog(MessageBoxBase):
     def __init__(self, title: str, textures: list[Path], parent=None):
         super().__init__(parent)
         self.setWindowTitle(title)
+        self.setMaximumWidth(16777215)
         self.setMinimumSize(860, 620)
         self.textures = [path.resolve() for path in textures if path.is_file()]
         self.current_index = 0
 
-        layout = QVBoxLayout(self)
+        self.main_layout.setContentsMargins(0, 0, 0, 0)
+        self.title_label.hide()
+        self.yesButton.hide()
+        self.cancelButton.hide()
+        layout = self.content_layout
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(10)
         header = QHBoxLayout()
@@ -691,6 +745,7 @@ class ModelCard(CardWidget):
         index: int,
         textures: list[Path],
         parent=None,
+        compact: bool = False,
     ):
         super().__init__(parent)
         self.model_id = str(model.get("id") or "")
@@ -698,7 +753,7 @@ class ModelCard(CardWidget):
         self.setObjectName("mainModelCard" if index == 0 else "modelCard")
         self.setMinimumHeight(172)
 
-        root = QHBoxLayout(self)
+        root = QVBoxLayout(self) if compact else QHBoxLayout(self)
         root.setContentsMargins(14, 12, 14, 12)
         root.setSpacing(14)
 
@@ -706,7 +761,7 @@ class ModelCard(CardWidget):
         texture_layout = QHBoxLayout(texture_panel)
         texture_layout.setContentsMargins(0, 0, 0, 0)
         texture_layout.setSpacing(5)
-        visible_textures = textures[:3]
+        visible_textures = textures[:1] if compact else textures[:3]
         if not visible_textures:
             empty = QLabel(
                 tr("mod.models.no_texture", default="无贴图"),
@@ -721,21 +776,21 @@ class ModelCard(CardWidget):
             texture_layout.addWidget(empty)
         for texture in visible_textures:
             label = QLabel(texture_panel)
-            label.setFixedSize(84, 96)
+            label.setFixedSize(60, 60) if compact else label.setFixedSize(84, 96)
             label.setAlignment(Qt.AlignCenter)
             label.setToolTip(str(texture))
             label.setStyleSheet(
                 "QLabel { background: rgba(127,127,127,0.08); "
                 "border: 1px solid rgba(127,127,127,0.22); border-radius: 8px; }"
             )
-            pixmap = _scaled_texture_pixmap(texture, 78, 90)
+            pixmap = _scaled_texture_pixmap(texture, 56, 56) if compact else _scaled_texture_pixmap(texture, 78, 90)
             if pixmap.isNull():
                 label.setText(texture.name)
             else:
                 label.setPixmap(
                     pixmap.scaled(
-                        78,
-                        90,
+                        56 if compact else 78,
+                        56 if compact else 90,
                         Qt.KeepAspectRatio,
                         Qt.SmoothTransformation,
                     )
@@ -746,7 +801,8 @@ class ModelCard(CardWidget):
             more.setAlignment(Qt.AlignCenter)
             more.setFixedWidth(32)
             texture_layout.addWidget(more)
-        root.addWidget(texture_panel)
+        if not compact:
+            root.addWidget(texture_panel)
 
         content = QVBoxLayout()
         content.setSpacing(6)
@@ -785,10 +841,20 @@ class ModelCard(CardWidget):
             )
         )
         header.addWidget(self.drag_handle)
+        if compact:
+            header.addWidget(texture_panel)
         header.addWidget(role_label)
-        header.addWidget(name_label)
-        header.addWidget(self.skin_name_edit, 1)
+        if compact:
+            header.addStretch(1)
+        if not compact:
+            header.addWidget(name_label)
+            header.addWidget(self.skin_name_edit, 1)
         content.addLayout(header)
+        if compact:
+            name_row = QHBoxLayout()
+            name_row.addWidget(name_label)
+            name_row.addWidget(self.skin_name_edit, 1)
+            content.addLayout(name_row)
 
         source = str(model.get("source_path") or model.get("workspace_path") or "")
         source_label = CaptionLabel(
@@ -798,6 +864,8 @@ class ModelCard(CardWidget):
         source_label.setWordWrap(True)
         source_label.setMaximumHeight(36)
         source_label.setToolTip(source)
+        source_label.setVisible(not compact)
+        self.setToolTip(source)
         content.addWidget(source_label)
         mappings = len(
             [
@@ -818,7 +886,7 @@ class ModelCard(CardWidget):
         )
         content.addWidget(detail)
 
-        actions = QHBoxLayout()
+        actions = QGridLayout() if compact else QHBoxLayout()
         actions.setSpacing(5)
         view_button = PushButton(
             tr("mod.models.view_short", default="贴图"),
@@ -850,7 +918,7 @@ class ModelCard(CardWidget):
         )
         has_model = bool(str(model.get("model_json") or ""))
         view_button.setEnabled(bool(textures))
-        preview_button.setEnabled(has_model)
+        preview_button.setEnabled(has_model or (index > 0 and bool(textures)))
         mapping_button.setEnabled(index > 0 and bool(textures))
         make_main_button.setEnabled(index > 0 and has_model)
         view_button.clicked.connect(
@@ -879,19 +947,26 @@ class ModelCard(CardWidget):
         folder_button.setToolTip(
             tr("mod.models.open_folder", default="打开模型目录")
         )
-        for button in (
+        make_main_button.setToolTip(tr("mod.models.make_main", default="设为主模型"))
+        self.view_button, self.preview_button, self.mapping_button = view_button, preview_button, mapping_button
+        self.make_main_button, self.folder_button, self.remove_button = make_main_button, folder_button, remove_button
+        for button_index, button in enumerate((
             view_button,
             preview_button,
             mapping_button,
             make_main_button,
             folder_button,
             remove_button,
-        ):
+        )):
             button.setMinimumWidth(50)
             button.setMaximumWidth(104)
             button.setMinimumHeight(30)
-            actions.addWidget(button)
-        actions.addStretch(1)
+            if compact:
+                actions.addWidget(button, button_index // 3, button_index % 3)
+            else:
+                actions.addWidget(button)
+        if not compact:
+            actions.addStretch(1)
         content.addLayout(actions)
         root.addLayout(content, 1)
 
@@ -934,9 +1009,12 @@ class ProjectSearchComboBox(EditableComboBox):
 
 class Live2DModPage(QFrame):
     previewModelRequested = Signal(str)
+    mappedSkinPreviewRequested = Signal(object, str)
+    triggerSelectionChanged = Signal(str)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, compact: bool = False):
         super().__init__(parent)
+        self._compact = bool(compact)
         self.setObjectName("live2dModPage")
         self.setAcceptDrops(True)
         self.i18n = get_i18n()
@@ -946,6 +1024,9 @@ class Live2DModPage(QFrame):
         self.worker: ModTaskThread | None = None
         self.worker_kind = ""
         self.pending_sources: list[str] = []
+        self._pending_skin_names: dict[str, str] = {}
+        self.requested_preview_model_id = ""
+        self.previewed_model_id = ""
         self._project_combo_refreshing = False
         self._project_search_timer = QTimer(self)
         self._project_search_timer.setSingleShot(True)
@@ -954,8 +1035,10 @@ class Live2DModPage(QFrame):
             self.open_project_from_search
         )
         self._artmesh_refreshing = False
+        self._models_refreshing = False
         self._loading_ui = False
         self._dirty = False
+        self._artmesh_pick_provider = None
         self.setup_ui()
         self.retranslate_ui()
         self.i18n.languageChanged.connect(self.retranslate_ui)
@@ -963,7 +1046,7 @@ class Live2DModPage(QFrame):
         self.load_last_project(silent=True)
 
     def setup_ui(self):
-        root = QVBoxLayout(self)
+        root = EditorViewportLayout(self) if self._compact else QVBoxLayout(self)
         root.setContentsMargins(18, 16, 18, 16)
         root.setSpacing(10)
         self.title_label = SubtitleLabel("", self)
@@ -974,7 +1057,7 @@ class Live2DModPage(QFrame):
         root.addWidget(self.splitter, 1)
 
         left = QWidget(self.splitter)
-        left.setMinimumWidth(350)
+        left.setMinimumWidth(0 if self._compact else 350)
         self.left_layout = QVBoxLayout(left)
         self.left_layout.setContentsMargins(0, 0, 8, 0)
         self.left_layout.setSpacing(10)
@@ -1031,6 +1114,10 @@ class Live2DModPage(QFrame):
         self.artmesh_combo.currentIndexChanged.connect(self.on_artmesh_combo_changed)
         artmesh_layout.addWidget(self.artmesh_title)
         artmesh_layout.addWidget(self.artmesh_combo)
+        self.pick_trigger_button = PushButton(FluentIcon.VIEW, "", self.artmesh_card)
+        self.pick_trigger_button.clicked.connect(self.open_artmesh_picker)
+        self.pick_trigger_button.setEnabled(False)
+        artmesh_layout.addWidget(self.pick_trigger_button)
         self.left_layout.addWidget(self.artmesh_card)
 
         self.export_card = CardWidget(left)
@@ -1075,6 +1162,9 @@ class Live2DModPage(QFrame):
         self.browse_folder_button.clicked.connect(self.browse_source_folder)
         self.import_button.clicked.connect(self.import_selected_source)
         source_row.addWidget(self.source_edit, 1)
+        if self._compact:
+            import_layout.addLayout(source_row)
+            source_row = QHBoxLayout()
         source_row.addWidget(self.browse_file_button)
         source_row.addWidget(self.browse_folder_button)
         source_row.addWidget(self.import_button)
@@ -1096,9 +1186,15 @@ class Live2DModPage(QFrame):
         model_header.addWidget(self.models_title)
         model_header.addWidget(self.models_count)
         model_header.addStretch(1)
-        model_header.addWidget(self.add_file_button)
-        model_header.addWidget(self.add_folder_button)
+        if not self._compact:
+            model_header.addWidget(self.add_file_button)
+            model_header.addWidget(self.add_folder_button)
         right_layout.addLayout(model_header)
+        if self._compact:
+            model_actions = QHBoxLayout()
+            model_actions.addWidget(self.add_file_button)
+            model_actions.addWidget(self.add_folder_button)
+            right_layout.addLayout(model_actions)
         self.models_hint = CaptionLabel("", right)
         self.models_hint.setWordWrap(True)
         right_layout.addWidget(self.models_hint)
@@ -1120,7 +1216,109 @@ class Live2DModPage(QFrame):
         self.splitter.addWidget(left)
         self.splitter.addWidget(right)
         self.splitter.setSizes([370, 1070])
+        if self._compact:
+            self._build_compact_workspace(root, left, right)
         self._apply_styles()
+
+    def _build_compact_workspace(self, root, left, right):
+        root.removeWidget(self.splitter)
+        self.splitter.hide()
+        root.setContentsMargins(2, 0, 2, 0)
+        root.setSpacing(6)
+        self.title_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        project_layout = self.project_card.layout()
+        project_layout.removeWidget(self.project_combo)
+        project_layout.itemAt(1).layout().removeWidget(self.save_project_button)
+        project_row = QHBoxLayout()
+        project_row.setSpacing(6)
+        self.project_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        project_row.addWidget(self.project_combo, 1)
+        self.save_project_button.setIcon(FluentIcon.SAVE)
+        project_row.addWidget(self.save_project_button)
+        root.insertLayout(1, project_row)
+        self.workflow_tabs = FluentEditorTabs(self)
+        self.left_layout.removeWidget(self.artmesh_card)
+        self.left_layout.removeWidget(self.export_card)
+        self.left_layout.setContentsMargins(0, 0, 0, 0)
+        self.left_layout.takeAt(self.left_layout.count() - 1)
+        self.left_layout.addStretch(1)
+        self.project_scroll = ScrollArea(self.workflow_tabs)
+        self.project_scroll.setWidgetResizable(True)
+        self.project_scroll.setFrameShape(QFrame.NoFrame)
+        self.project_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.project_scroll.setWidget(left)
+        self.project_scroll.enableTransparentBackground()
+        self.workflow_tabs.addTab(self.project_scroll, "")
+        right.setParent(self.workflow_tabs)
+        right.layout().setContentsMargins(0, 0, 0, 0)
+        right.layout().setSpacing(6)
+        right.layout().removeWidget(self.import_card)
+        self.import_dialog = QDialog(self)
+        self.import_dialog.setMinimumWidth(420)
+        import_dialog_layout = QVBoxLayout(self.import_dialog)
+        import_dialog_layout.addWidget(self.import_card)
+        self.import_button.clicked.connect(self.import_dialog.accept)
+        self.import_options_button = PushButton(FluentIcon.SETTING, "", right)
+        self.import_options_button.clicked.connect(self.import_dialog.show)
+        right.layout().itemAt(2).layout().addWidget(self.import_options_button)
+        self.import_dialog.hide()
+        self.title_label.hide()
+        self.models_hint.hide()
+        self.models_hint.setMaximumHeight(34)
+        self.models_title.hide()
+        self.models_count.hide()
+        self.model_selector = ComboBox(right)
+        self.model_selector.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.model_selector.currentIndexChanged.connect(self._selected_model_changed)
+        model_header = right.layout().itemAt(1).layout()
+        model_header.addWidget(self.model_selector, 1)
+        self.selected_preview_button = TransparentToolButton(FluentIcon.VIEW, right)
+        self.selected_gallery_button = TransparentToolButton(FluentIcon.PHOTO, right)
+        self.selected_mapping_button = TransparentToolButton(FluentIcon.DOCUMENT, right)
+        for button in (self.selected_preview_button, self.selected_gallery_button, self.selected_mapping_button):
+            button.setFixedSize(30, 30)
+            model_header.addWidget(button)
+        self.selected_preview_button.clicked.connect(lambda: self.preview_model(str(self.model_selector.currentData() or "")))
+        self.selected_gallery_button.clicked.connect(lambda: self.view_model_textures(str(self.model_selector.currentData() or "")))
+        self.selected_mapping_button.clicked.connect(lambda: self.edit_model_mapping(str(self.model_selector.currentData() or "")))
+        self.models_scroll.setMinimumHeight(80)
+        self.models_title.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        for button, icon in ((self.browse_file_button, FluentIcon.DOCUMENT),
+                             (self.browse_folder_button, FluentIcon.FOLDER),
+                             (self.add_file_button, FluentIcon.ADD),
+                             (self.add_folder_button, FluentIcon.FOLDER_ADD)):
+            button.setIcon(icon)
+        self.workflow_tabs.addTab(right, "")
+        self.export_page = QWidget(self.workflow_tabs)
+        export_layout = QVBoxLayout(self.export_page)
+        export_layout.setContentsMargins(0, 0, 0, 0)
+        export_layout.setSpacing(8)
+        export_layout.addWidget(self.artmesh_card)
+        self.trigger_hint = CaptionLabel(self.artmesh_card)
+        self.trigger_hint.setWordWrap(True)
+        self.artmesh_card.layout().addWidget(self.trigger_hint)
+        self.preview_main_button = PushButton(FluentIcon.VIEW, "", self.artmesh_card)
+        self.preview_main_button.clicked.connect(self.preview_main_model)
+        self.artmesh_card.layout().addWidget(self.preview_main_button)
+        export_layout.addWidget(self.export_card)
+        self.config_button = PushButton(FluentIcon.DOCUMENT, "", self.export_card)
+        self.config_button.clicked.connect(self.review_export_configuration)
+        self.preview_export_button = PushButton(FluentIcon.VIEW, "", self.export_card)
+        self.preview_export_button.clicked.connect(self.preview_export_model)
+        self.export_card.layout().addWidget(self.config_button)
+        self.export_card.layout().addWidget(self.preview_export_button)
+        export_layout.addStretch(1)
+        self.export_scroll = ScrollArea(self.workflow_tabs)
+        self.export_scroll.setWidgetResizable(True)
+        self.export_scroll.setFrameShape(QFrame.NoFrame)
+        self.export_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.export_scroll.setWidget(self.export_page)
+        self.export_scroll.enableTransparentBackground()
+        self.workflow_tabs.addTab(self.export_scroll, "")
+        root.addWidget(self.workflow_tabs, 1)
+        self.workflow_status = CaptionLabel(self)
+        self.workflow_status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        root.addWidget(self.workflow_status)
 
     def retranslate_ui(self):
         self.project_title.setText(tr("mod.project.title"))
@@ -1146,6 +1344,7 @@ class Live2DModPage(QFrame):
                 default="搜索并选择未绑定事件的 ArtMesh…",
             )
         )
+        self.pick_trigger_button.setText(_workspace_text("mod.workspace.pick_trigger"))
         self.export_title.setText(
             tr("mod.v2.export_title", default="4 · 最终导出")
         )
@@ -1185,6 +1384,26 @@ class Live2DModPage(QFrame):
         self.add_folder_button.setText(
             tr("mod.v2.add_folder", default="添加文件夹")
         )
+        if self._compact:
+            for index, key in enumerate(("project", "models", "export")):
+                self.workflow_tabs.setTabText(index, _workspace_text("mod.workspace." + key))
+            self.save_project_button.setText(_workspace_text("mod.workspace.save"))
+            self.save_project_button.setToolTip(tr("mod.project.save"))
+            self.browse_file_button.setText(_workspace_text("mod.workspace.file"))
+            self.browse_folder_button.setText(_workspace_text("mod.workspace.folder"))
+            self.browse_file_button.setToolTip(tr("mod.source.browse_file"))
+            self.browse_folder_button.setToolTip(tr("mod.source.browse_folder"))
+            self.trigger_hint.setText(_workspace_text("mod.workspace.trigger_hint"))
+            self.models_hint.setToolTip(_workspace_text("mod.workspace.preview_hint"))
+            self.config_button.setText(_workspace_text("mod.workspace.config"))
+            self.preview_export_button.setText(_workspace_text("mod.workspace.preview_export"))
+            self.preview_main_button.setText(_workspace_text("mod.workspace.preview_main"))
+            self.import_options_button.setText(_workspace_text("mod.workspace.import_options"))
+            self.import_dialog.setWindowTitle(tr("mod.v3.import_title", default="导入模型"))
+            self.selected_preview_button.setToolTip(tr("mod.models.preview", default="预览模型"))
+            self.selected_gallery_button.setToolTip(tr("mod.models.view_textures", default="查看贴图"))
+            self.selected_mapping_button.setToolTip(tr("mod.models.edit_mapping", default="编辑贴图映射"))
+            self.workflow_status.setText(getattr(self, "_last_log_message", _workspace_text("mod.workspace.ready")))
         self.refresh_project_ui()
         self.refresh_artmesh_combo()
         self.refresh_model_cards()
@@ -1248,7 +1467,7 @@ class Live2DModPage(QFrame):
             return
         self.queue_source_imports([source])
 
-    def queue_source_imports(self, sources: list[str]):
+    def queue_source_imports(self, sources: list[str], *, skin_names: dict[str, str] | None = None):
         normalized = [
             str(Path(source).resolve())
             for source in sources
@@ -1256,6 +1475,9 @@ class Live2DModPage(QFrame):
         ]
         if not normalized:
             return
+        if skin_names:
+            self._pending_skin_names.update({str(Path(path).resolve()): name
+                                             for path, name in skin_names.items()})
         if self.worker:
             self.pending_sources.extend(normalized)
             self.append_log(
@@ -1328,6 +1550,7 @@ class Live2DModPage(QFrame):
             "add",
             project=self.current_project,
             source=source,
+            skin_name=self._pending_skin_names.pop(source, None),
             temp_root=self.settings_manager.get_temp_dir(),
         )
 
@@ -1369,6 +1592,8 @@ class Live2DModPage(QFrame):
                 if self.worker_kind == "create"
                 else tr("mod.v2.model_added", default="模型已加入工程。")
             )
+            if self._compact:
+                self.workflow_tabs.setCurrentIndex(1)
 
     def on_worker_error(self, error: str):
         self.append_log(
@@ -1383,12 +1608,13 @@ class Live2DModPage(QFrame):
         )
         if self.worker_kind == "create":
             self.pending_sources.clear()
+            self._pending_skin_names.clear()
 
     def on_worker_finished(self):
         self.worker = None
         self.worker_kind = ""
         self.set_busy(False)
-        QTimer.singleShot(0, self.start_next_queued_import)
+        QTimer.singleShot(0, self, self.start_next_queued_import)
 
     def browse_and_add_file(self):
         if not self.current_project:
@@ -1412,8 +1638,22 @@ class Live2DModPage(QFrame):
             item = self.models_layout.takeAt(0)
             widget = item.widget()
             if widget:
+                # A refresh can happen twice in one event turn (import/save/
+                # translation). Removed cards must stop painting immediately,
+                # before DeferredDelete is delivered by the main event loop.
+                widget.hide()
                 widget.deleteLater()
         models = self.current_project.models if self.current_project else []
+        if self._compact:
+            selected = self.model_selector.currentData()
+            with QSignalBlocker(self.model_selector):
+                self.model_selector.clear()
+                for index, model in enumerate(models):
+                    role = tr("mod.models.main_badge", default="主模型") if index == 0 else str(index)
+                    self.model_selector.addItem(f"{role} · {model.get('skin_name') or model['id']}", userData=str(model['id']))
+                index = self.model_selector.findData(selected)
+                self.model_selector.setCurrentIndex(max(0, index))
+            self._update_selected_model_actions()
         self.models_count.setText(
             tr(
                 "mod.v3.model_count",
@@ -1443,6 +1683,7 @@ class Live2DModPage(QFrame):
                 index,
                 textures,
                 self.models_container,
+                compact=self._compact,
             )
             card.moveRequested.connect(self.move_model)
             card.mappingRequested.connect(self.edit_model_mapping)
@@ -1451,12 +1692,16 @@ class Live2DModPage(QFrame):
             card.texturesRequested.connect(self.view_model_textures)
             card.previewRequested.connect(self.preview_model)
             card.folderRequested.connect(self.open_model_folder)
+            if self._compact:
+                card.clicked.connect(lambda model_id=card.model_id: self.preview_model(model_id))
+            card.setProperty("previewed", card.model_id == self.previewed_model_id)
             self.models_layout.addWidget(card)
             cards.append(card)
         self.models_layout.addStretch(1)
         self.models_container.set_cards(cards)
         QTimer.singleShot(
             0,
+            self.models_scroll,
             lambda value=scroll_value: self.models_scroll.verticalScrollBar().setValue(
                 min(value, self.models_scroll.verticalScrollBar().maximum())
             ),
@@ -1593,6 +1838,14 @@ class Live2DModPage(QFrame):
         model = self.model_by_id(model_id)
         if not model or not self.current_project:
             return
+        self.requested_preview_model_id = model_id
+        if self._compact and self.current_project.models and model is not self.current_project.models[0]:
+            if not self.flush_pending_changes():
+                return
+            # The asynchronous consumer owns mapping and temporary-package
+            # lifetime. Snapshot mutable project data before leaving the GUI.
+            self.mappedSkinPreviewRequested.emit(copy.deepcopy(self.current_project), model_id)
+            return
         model_json = self.resolve_project_path(str(model.get("model_json") or ""))
         if not model_json.is_file():
             self.show_warning(
@@ -1603,6 +1856,113 @@ class Live2DModPage(QFrame):
             )
             return
         self.previewModelRequested.emit(str(model_json))
+
+    def note_preview_opened(self, model_id: str):
+        self.previewed_model_id = model_id
+        if self._compact:
+            with QSignalBlocker(self.model_selector):
+                self.model_selector.setCurrentIndex(self.model_selector.findData(model_id))
+            self._update_selected_model_actions()
+        model = self.model_by_id(model_id)
+        if model:
+            self.append_log(_workspace_text("mod.workspace.previewing", name=model.get("skin_name") or model_id))
+        for card in self.models_container.cards:
+            card.setProperty("previewed", card.model_id == model_id)
+            card.style().unpolish(card)
+            card.style().polish(card)
+
+    def _selected_model_changed(self, *_args):
+        self._update_selected_model_actions()
+        model_id = str(self.model_selector.currentData() or "")
+        if model_id and not self.worker:
+            self.preview_model(model_id)
+            if self.previewed_model_id and self.previewed_model_id != model_id:
+                with QSignalBlocker(self.model_selector):
+                    self.model_selector.setCurrentIndex(self.model_selector.findData(self.previewed_model_id))
+                self._update_selected_model_actions()
+
+    def _update_selected_model_actions(self):
+        if not self._compact:
+            return
+        model = self.model_by_id(str(self.model_selector.currentData() or ""))
+        ready = bool(model and not self.worker)
+        self.selected_preview_button.setEnabled(ready)
+        self.selected_gallery_button.setEnabled(ready and bool(model.get("textures")))
+        self.selected_mapping_button.setEnabled(ready and model is not self.current_project.models[0])
+
+    def preview_main_model(self):
+        if self.current_project and self.current_project.models:
+            self.preview_model(str(self.current_project.models[0].get("id") or ""))
+
+    def select_trigger(self, drawable_id: str) -> bool:
+        if not self.current_project:
+            return False
+        index = self.artmesh_combo.findData(drawable_id)
+        if index < 0:
+            self.append_log(_workspace_text("mod.workspace.trigger_unavailable", id=drawable_id))
+            return False
+        self.artmesh_combo.setCurrentIndex(index)
+        if self._compact:
+            self.workflow_tabs.setCurrentIndex(2)
+        self.append_log(_workspace_text("mod.workspace.trigger_selected", id=drawable_id))
+        return True
+
+    def set_artmesh_pick_provider(self, provider):
+        """The editor supplies geometry for this project's exact main model.
+
+        callback(main_model_id) returns snapshot, texture_paths, model_id and
+        model_path. Matching both ID and source path prevents accidental use of
+        an unrelated open model with coincidentally identical drawable names.
+        """
+        self._artmesh_pick_provider = provider
+        self.pick_trigger_button.setEnabled(callable(provider))
+
+    def open_artmesh_picker(self):
+        if not self.current_project or not self.current_project.models:
+            return False
+        main = self.current_project.models[0]
+        model_id = str(main.get("id") or "")
+        model_path = self.resolve_project_path(str(main.get("model_json") or "")).resolve()
+        payload = self._artmesh_pick_provider(model_id) if callable(self._artmesh_pick_provider) else None
+        if (not payload or str(payload.get("model_id")) != model_id
+                or Path(str(payload.get("model_path") or "")).resolve() != model_path):
+            self.show_warning(tr("artmesh.inspector.no_trigger", default=ARTMESH_TEXT["artmesh.inspector.no_trigger"]))
+            return False
+        eligible = {str(item.get("id")) for item in self.current_project.data.get("artmesh_areas", [])
+                    if isinstance(item, dict) and item.get("id") and not str(item.get("motion") or "").strip()}
+        dialog = ArtMeshPickDialog(payload["snapshot"], payload["texture_paths"], eligible,
+                                   self.window(), self.artmesh_combo.currentData(),
+                                   pose_frame=payload.get("pose_frame"),
+                                   pose_frame_canvas_polygon=payload.get("pose_frame_canvas_polygon"))
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return False
+        return self.select_trigger(dialog.selected_id)
+
+    def review_export_configuration(self):
+        if not self.current_project:
+            return
+        dialog = MessageBoxBase(self.window())
+        dialog.viewLayout.addWidget(SubtitleLabel(_workspace_text("mod.workspace.config_title"), dialog.widget))
+        hint = CaptionLabel(_workspace_text("mod.workspace.config_hint"), dialog.widget)
+        hint.setWordWrap(True)
+        dialog.viewLayout.addWidget(hint)
+        configuration = TextEdit(dialog.widget)
+        configuration.setReadOnly(True)
+        configuration.setPlainText(json.dumps(self.current_project.data, ensure_ascii=False, indent=2))
+        configuration.setMinimumSize(460, 300)
+        dialog.viewLayout.addWidget(configuration)
+        dialog.cancelButton.hide()
+        dialog.yesButton.setText(tr("common.close", default="关闭"))
+        dialog.exec()
+
+    def preview_export_model(self):
+        if not self.current_project:
+            return
+        exported = str(self.current_project.data.get("last_export_path") or "")
+        model_json = Path(exported) / "model0.json" if exported else None
+        if model_json and model_json.is_file():
+            self.requested_preview_model_id = str(self.current_project.models[0].get("id") or "")
+            self.previewModelRequested.emit(str(model_json))
 
     def open_model_folder(self, model_id: str):
         model = self.model_by_id(model_id)
@@ -1700,6 +2060,7 @@ class Live2DModPage(QFrame):
             return
         self.current_project.data["selected_artmesh_id"] = selected
         self.mark_dirty()
+        self.triggerSelectionChanged.emit(selected)
 
     def start_export(self):
         if not self.current_project or not self.current_project.models:
@@ -2138,6 +2499,13 @@ class Live2DModPage(QFrame):
                 default="自动建工程并导入",
             )
         )
+        if self._compact:
+            self.import_button.setToolTip(self.import_button.text())
+            self.import_button.setText(_workspace_text("mod.workspace.import"))
+            self.config_button.setEnabled(has_project and has_models and not busy)
+            self.preview_export_button.setEnabled(has_project and bool(self.current_project.data.get("last_export_path")) and not busy)
+            self.model_selector.setEnabled(has_models and not busy)
+            self._update_selected_model_actions()
         if has_project:
             self.project_status.setText(
                 tr(
@@ -2182,6 +2550,9 @@ class Live2DModPage(QFrame):
     def append_log(self, message: str):
         if message:
             self._last_log_message = str(message)
+            if hasattr(self, "workflow_status"):
+                self.workflow_status.setText(str(message).splitlines()[-1])
+                self.workflow_status.setToolTip(str(message))
 
     def show_warning(self, message: str):
         InfoBar.warning(
@@ -2221,6 +2592,9 @@ class Live2DModPage(QFrame):
         self.setStyleSheet(
             """
             CardWidget#mainModelCard {
+                border: 2px solid rgba(91, 141, 239, 0.9);
+            }
+            CardWidget[previewed="true"] {
                 border: 2px solid rgba(91, 141, 239, 0.9);
             }
             """

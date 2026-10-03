@@ -378,6 +378,34 @@ class CubismCore:
             model_pointer=ctypes.c_void_p(model_pointer),
         )
 
+    def validate_moc(self, moc_path: str | Path) -> int:
+        """Run the native MOC version and consistency checks without reviving it.
+
+        Asset extraction uses this lighter preflight so a malformed or
+        truncated MOC is rejected before the preview backend calls
+        ``LoadModelJson``.  The returned value is the native MOC version (for
+        example ``5`` for Cubism 5).  No source file is modified.
+        """
+
+        path = Path(moc_path).resolve()
+        if not path.is_file():
+            raise CubismCoreError(f"MOC3 file does not exist: {path}")
+
+        data = path.read_bytes()
+        if not data:
+            raise CubismCoreError(f"MOC3 file is empty: {path}")
+
+        moc_buffer = _AlignedBuffer(len(data), 64, data)
+        moc_version = int(self.dll.csmGetMocVersion(moc_buffer.pointer, len(data)))
+        if moc_version == 0:
+            raise CubismCoreError(f"Unsupported or unknown MOC3 version: {path}")
+        if not self.dll.csmHasMocConsistency(moc_buffer.pointer, len(data)):
+            raise CubismCoreError(
+                "MOC3 consistency check failed (csmHasMocConsistency returned false): "
+                f"{path}"
+            )
+        return moc_version
+
     def get_render_orders(self, model) -> Optional[Any]:
         if hasattr(self.dll, "csmGetRenderOrders"):
             return self.dll.csmGetRenderOrders(model)
@@ -651,6 +679,24 @@ def resolve_cubism_core_dll(path: str | Path | None = None) -> Optional[Path]:
             root / "tools" / "CubismCore" / "Live2DCubismCore.dll",
         ]
     )
+
+    # Some live2d-py distributions bundle the native runtime inside the
+    # package rather than exposing it through the application directory.  Keep
+    # this as a late fallback so an explicit setting or project-local runtime
+    # always wins, while real Cubism Core export remains available out of the
+    # box when the wheel ships the DLL.
+    try:
+        import live2d
+
+        package_root = Path(live2d.__file__).resolve().parent
+        candidates.extend(
+            sorted(
+                package_root.rglob("Live2DCubismCore.dll"),
+                key=lambda item: len(item.parts),
+            )
+        )
+    except Exception:
+        pass
 
     for candidate in candidates:
         existing = _existing_file(candidate)

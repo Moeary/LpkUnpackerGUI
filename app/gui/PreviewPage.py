@@ -1,10 +1,13 @@
 import os
 import json
+import math
 import shutil
 import subprocess
 import sys
 import tempfile
+import uuid
 import zipfile
+from pathlib import Path
 
 from PySide6.QtWidgets import (
     QFrame,
@@ -12,6 +15,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QFileDialog,
     QWidget,
+    QMessageBox,
     QSplitter,
     QGridLayout,
     QLabel,
@@ -19,6 +23,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QInputDialog,
     QCompleter,
+    QStackedWidget,
 )
 from PySide6.QtCore import (
     Qt,
@@ -29,16 +34,25 @@ from PySide6.QtCore import (
     QPoint,
     QEvent,
     QStringListModel,
+    QSignalBlocker,
 )
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QColor, QPixmap
 from qfluentwidgets import (SubtitleLabel, BodyLabel, CaptionLabel, PushButton, Slider, CheckBox, SpinBox, InfoBar, InfoBarPosition,
                            CardWidget, SingleDirectionScrollArea, TextBrowser, ColorDialog, FluentIcon, IconWidget,
-                           ComboBox, EditableComboBox, LineEdit)
+                           ComboBox, EditableComboBox, LineEdit, SearchLineEdit, TransparentToolButton)
 
 from app.core.assetstudio_cli import AssetStudioCLI
-from app.core.model import prepare_model_json_for_preview, resolve_live2d_package
+from app.core.model import resolve_live2d_package
 from app.core.model.motions import load_live2d_motions
-from app.core.preview import prepare_preview_import
+from app.core.preview import prepare_preview_import, prepare_spine_preview_import, prepare_package_preview_import
+from app.core.spine_preview import (
+    SpinePreviewPlan,
+    SpineRuntimePolicy,
+    SPINE_COMPATIBILITY_VERSION,
+    SPINE_RUNTIME_SUPPORTED_VERSIONS,
+    discover_spine_runtime,
+)
+from app.core.spine_converter import discover_native_converter
 from app.core.preview.sources import (
     IMAGE_PREVIEW_EXTENSIONS,
     PACKAGE_PREVIEW_EXTENSIONS,
@@ -52,10 +66,46 @@ from app.core.preview.sources import (
     safe_export_name as _safe_export_name,
 )
 from app.core.settings_manager import SettingsManager
+from app.gui.SettingsPage import ToolchainInstallWorker
 from app.gui.ImagePreviewPanel import ImagePreviewPanel
 from app.gui.Live2DPreviewWindow import Live2DPreviewWindow
+from app.gui.SpinePreviewWidget import SpinePreviewWidget
+from app.gui.editor_workspace import EditorTabs, EditorViewportLayout, EditorComboBox
 from app.i18n import get_i18n, tr
 from app.paths import PROJECT_ROOT
+
+
+PREVIEW_LAYOUT_TEXT = {
+    "preview.layout.animation_parameters": "动画与参数",
+    "preview.layout.display_interaction": "显示与交互",
+    "preview.layout.animation": "动画",
+    "preview.layout.display": "显示",
+    "preview.parameter_search": "搜索动画参数 ID",
+    "preview.parameter_count": "显示 {shown} / {total} 个参数",
+    "preview.content_fit": "自动适配完整内容",
+    "preview.content_fit_hint": "首次载入与窗口变化时适配实际内容；手动缩放、平移或旋转后停止自动适配。",
+    "preview.auto_play_hint": "首次载入完成后播放第一个有效动作；切换动作时自动播放。冻结状态不会被初始自动播放解除。",
+    "preview.layout.empty": "载入资源后显示对应的预览控制。",
+    "preview.motion_freeze_hint": "冻结保留当前动画时刻；拖动时间修改姿态后，取消冻结将从头重新播放该动作。",
+    "preview.motion_playback_position": "{motion} · {current:.2f} / {total:.2f} 秒",
+    "preview.motion_not_playing_position": "未播放 · {current:.2f} / {total:.2f} 秒",
+}
+
+
+def _layout_text(key):
+    return tr(key, PREVIEW_LAYOUT_TEXT[key])
+
+try:
+    from shiboken6 import isValid as _is_qt_object_valid
+except ImportError:  # pragma: no cover - bundled with PySide6 in normal builds
+    def _is_qt_object_valid(obj) -> bool:
+        return obj is not None
+
+
+def _spine_thread_is_running(thread) -> bool:
+    """Read a worker state only while its wrapped C++ QThread is alive."""
+
+    return bool(thread is not None and _is_qt_object_valid(thread) and thread.isRunning())
 
 
 def _unique_path(path: str) -> str:
@@ -187,13 +237,13 @@ class DragDropArea(QFrame):
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.setStyleSheet("""
             DragDropArea {
-                border: 2px dashed #C8CDD6;
+                border: 2px dashed palette(mid);
                 border-radius: 8px;
-                background: #FAFBFD;
+                background: palette(alternate-base);
             }
             DragDropArea:hover {
                 border-color: #00A6B3;
-                background: #F5FBFC;
+                background: palette(base);
             }
         """)
 
@@ -290,11 +340,11 @@ class DragDropArea(QFrame):
             DragDropArea {
                 border: 2px solid #00A6B3;
                 border-radius: 8px;
-                background: #EFFBFC;
+                background: palette(base);
             }
             DragDropArea:hover {
                 border-color: #00A6B3;
-                background: #EFFBFC;
+                background: palette(base);
             }
         """)
 
@@ -302,13 +352,13 @@ class DragDropArea(QFrame):
         """拖拽离开事件"""
         self.setStyleSheet("""
             DragDropArea {
-                border: 2px dashed #C8CDD6;
+                border: 2px dashed palette(mid);
                 border-radius: 8px;
-                background: #FAFBFD;
+                background: palette(alternate-base);
             }
             DragDropArea:hover {
                 border-color: #00A6B3;
-                background: #F5FBFC;
+                background: palette(base);
             }
         """)
 
@@ -520,11 +570,51 @@ class ModelPreviewImportThread(QThread):
     def run(self):
         try:
             result = prepare_preview_import(self.source_path, self.temp_root)
+            self.editor_model_json = str(result.package.model_json)
             self.modelReady.emit(
                 str(result.preview_model_json),
                 str(result.temp_dir or ""),
                 self.source_path,
             )
+        except Exception as exc:
+            self.failed.emit(str(exc), self.source_path)
+
+
+class SpinePreviewImportThread(QThread):
+    """Prepare a disposable Spine asset without blocking the Qt event loop."""
+
+    previewReady = Signal(object, str)
+    failed = Signal(str, str)
+
+    def __init__(self, source_path: str, temp_root: str, runtime_root: str = "", parent=None):
+        super().__init__(parent)
+        self.source_path = source_path
+        self.temp_root = temp_root
+        self.runtime_root = runtime_root or None
+        # Captured by PreviewPage on the GUI thread before ``start``.  Keeping
+        # this value on the worker avoids observing a settings-page edit while
+        # an import is already in progress.
+        self._unify_version = False
+        self._runtime_policy = None
+        self.result = None
+
+    def run(self):
+        try:
+            if getattr(self, "_package_fallback", False):
+                result = prepare_package_preview_import(
+                    self.source_path, self.temp_root, self.runtime_root,
+                    should_continue=lambda: not self.isInterruptionRequested(),
+                    unify_version=self._unify_version,
+                    runtime_policy=self._runtime_policy,
+                )
+            else:
+                result = prepare_spine_preview_import(
+                    self.source_path, self.temp_root, self.runtime_root,
+                    unify_version=self._unify_version,
+                    runtime_policy=self._runtime_policy,
+                )
+            self.result = result
+            self.previewReady.emit(result, self.source_path)
         except Exception as exc:
             self.failed.emit(str(exc), self.source_path)
 
@@ -677,6 +767,7 @@ class FolderPreviewScanThread(QThread):
             "kind": "model",
             "path": preview_path,
             "prepared_model_json": preview_path,
+            "editor_model_json": str(result.package.model_json),
             "source_path": os.path.abspath(path),
             "source_dir": str(result.package.root_dir),
             "temp_dir": temp_dir,
@@ -724,6 +815,7 @@ class FolderPreviewScanThread(QThread):
                     "kind": "model",
                     "path": preview_path,
                     "prepared_model_json": preview_path,
+                    "editor_model_json": str(result.package.model_json),
                     "source_path": os.path.abspath(path),
                     "source_dir": str(result.package.root_dir),
                     "temp_dir": temp_dir,
@@ -764,12 +856,14 @@ class Live2DSettingsPanel(QFrame):
 
     settingsChanged = Signal(dict)
     requestRefreshParams = Signal()
+    fitRequested = Signal()
 
     def __init__(self, parent=None, mode: str = "display"):
         super().__init__(parent)
 
         self.mode = mode if mode in {"display", "parameters"} else "display"
         self.preview_window = None
+        self._spine_mode = False
 
         self.width_spinbox = None
         self.height_spinbox = None
@@ -782,6 +876,9 @@ class Live2DSettingsPanel(QFrame):
         self.scale_text_label = None
         self.scale_value_label = None
         self.scale_slider = None
+        self.antialias_check = None
+        self.fit_model_btn = None
+        self.content_fit_check = None
         self.offset_text_label = None
         self.position_x_label = None
         self.position_y_label = None
@@ -804,9 +901,17 @@ class Live2DSettingsPanel(QFrame):
         self.advanced_param_sliders = {}  # id -> (slider, label, scale)
         self.PARAM_SPECS = []
         self.param_specs_by_id = {}  # id -> spec dict
+        self._parameter_schema = None
+        self._parameter_row_widgets = {}
+        self._filtered_parameter_ids = []
+        self.parameter_search = None
+        self.parameter_count = None
         self.advanced_group = None
         self.adv_params_container = None
         self.adv_params_container_layout = None
+        self.window_group = None
+        self.model_group = None
+        self.interaction_group = None
 
         self.window_group_title = None
         self.window_size_label = None
@@ -833,6 +938,7 @@ class Live2DSettingsPanel(QFrame):
 
         # 创建滚动区域
         scroll = SingleDirectionScrollArea(orient=Qt.Vertical)
+        self.parameter_scroll = scroll
         scroll_widget = QWidget()
         scroll_layout = QVBoxLayout(scroll_widget)
         scroll_layout.setContentsMargins(0, 0, 0, 0)
@@ -842,6 +948,9 @@ class Live2DSettingsPanel(QFrame):
         model_group = self.create_model_settings_group()
         interaction_group = self.create_interaction_settings_group()
         advanced_group = self.create_advanced_settings_group()
+        self.window_group = window_group
+        self.model_group = model_group
+        self.interaction_group = interaction_group
         self.advanced_group = advanced_group
         if self.mode == "parameters":
             window_group.hide()
@@ -984,7 +1093,7 @@ class Live2DSettingsPanel(QFrame):
         self.scale_text_label = BodyLabel("", group)
         scale_layout.addWidget(self.scale_text_label)
         self.scale_slider = Slider(Qt.Horizontal, group)
-        self.scale_slider.setRange(25, 300)
+        self.scale_slider.setRange(25, 400)
         self.scale_slider.setValue(100)
         self.scale_value_label = BodyLabel("100%", group)
         self.scale_value_label.setMinimumWidth(48)
@@ -995,6 +1104,18 @@ class Live2DSettingsPanel(QFrame):
         scale_layout.addWidget(self.scale_slider, 1)
         scale_layout.addWidget(self.scale_value_label)
         layout.addLayout(scale_layout)
+        self.antialias_check = CheckBox("", group)
+        self.antialias_check.setChecked(True)
+        self.antialias_check.toggled.connect(lambda _: self._emit_settings())
+        layout.addWidget(self.antialias_check)
+        self.content_fit_check = CheckBox("", group)
+        self.content_fit_check.setChecked(True)
+        self.content_fit_check.toggled.connect(lambda _: self._emit_settings())
+        layout.addWidget(self.content_fit_check)
+        self.fit_model_btn = PushButton("", group)
+        self.fit_model_btn.clicked.connect(self.fit_model_to_view)
+        layout.addWidget(self.fit_model_btn)
+
 
         offset_layout = QGridLayout()
         offset_layout.setHorizontalSpacing(8)
@@ -1041,7 +1162,7 @@ class Live2DSettingsPanel(QFrame):
         self.bg_color_preview = QFrame(group)
         self.bg_color_preview.setFixedSize(24, 24)
         self.bg_color_preview.setStyleSheet(
-            f"QFrame{{border:1px solid #ccc; border-radius:4px; background:{self.selected_bg_color.name()};}}"
+            f"QFrame{{border:1px solid palette(mid); border-radius:4px; background:{self.selected_bg_color.name()};}}"
         )
         bg_layout.addWidget(self.bg_color_preview)
 
@@ -1056,6 +1177,31 @@ class Live2DSettingsPanel(QFrame):
         layout.addLayout(bg_layout)
 
         return group
+
+    def fit_model_to_view(self):
+        """Fit native content, retaining animation and pose."""
+        for control, value in ((self.scale_slider, 100), (self.rotation_slider, 0),
+                               (self.position_x_spinbox, 0), (self.position_y_spinbox, 0)):
+            control.blockSignals(True)
+            control.setValue(value)
+            control.blockSignals(False)
+        self.scale_value_label.setText("100%")
+        self.rotation_label.setText("0°")
+        if not self._spine_mode:
+            with QSignalBlocker(self.content_fit_check):
+                self.content_fit_check.setChecked(True)
+        self._emit_settings()
+        self.fitRequested.emit()
+
+    def sync_view_transform(self, state: dict):
+        for control, value in ((self.scale_slider, round(float(state["scale"]) * 100)),
+                               (self.rotation_slider, round(float(state["rotation"]))),
+                               (self.position_x_spinbox, round(float(state["offset_x"]) * 100)),
+                               (self.position_y_spinbox, round(float(state["offset_y"]) * 100))):
+            with QSignalBlocker(control):
+                control.setValue(value)
+        self.scale_value_label.setText(f"{self.scale_slider.value()}%")
+        self.rotation_label.setText(f"{self.rotation_slider.value()}°")
 
     def create_interaction_settings_group(self):
         """创建交互设置组"""
@@ -1101,6 +1247,12 @@ class Live2DSettingsPanel(QFrame):
         self.advanced_enable_check.toggled.connect(lambda _: self._emit_settings())
         layout.addWidget(self.advanced_enable_check)
 
+        self.parameter_search = SearchLineEdit(group)
+        self.parameter_search.textChanged.connect(self._filter_advanced_params)
+        layout.addWidget(self.parameter_search)
+        self.parameter_count = CaptionLabel(group)
+        layout.addWidget(self.parameter_count)
+
         # 容器用于放置动态参数滑条
         self.adv_params_container = QWidget(group)
         self.adv_params_container_layout = QGridLayout(self.adv_params_container)
@@ -1143,6 +1295,13 @@ class Live2DSettingsPanel(QFrame):
             self.model_group_title.setText(tr("preview.model_display_settings"))
         if self.rotation_text_label:
             self.rotation_text_label.setText(tr("preview.model_rotation"))
+        if self.antialias_check:
+            self.antialias_check.setText(tr("preview.antialias"))
+        if self.fit_model_btn:
+            self.fit_model_btn.setText(tr("preview.fit_model"))
+        if self.content_fit_check:
+            self.content_fit_check.setText(_layout_text("preview.content_fit"))
+            self.content_fit_check.setToolTip(_layout_text("preview.content_fit_hint"))
         if self.scale_text_label:
             self.scale_text_label.setText(tr("preview.model_scale"))
         if self.offset_text_label:
@@ -1171,6 +1330,27 @@ class Live2DSettingsPanel(QFrame):
             self.refresh_adv_btn.setText(tr("preview.refresh_current_model"))
         if self.reset_adv_btn:
             self.reset_adv_btn.setText(tr("preview.reset_advanced_params"))
+        if self.parameter_search:
+            self.parameter_search.setPlaceholderText(_layout_text("preview.parameter_search"))
+            self._update_parameter_count()
+
+    def set_spine_mode(self, active: bool):
+        """Show only display settings that have a meaning for Spine."""
+
+        active = bool(active)
+        self._spine_mode = active
+        if self.mode != "display":
+            return
+        if self.window_group:
+            # Window size controls are already hidden in this card; its
+            # opacity slider remains a valid Spine display setting.
+            self.window_group.setVisible(True)
+        if self.model_group:
+            self.model_group.setVisible(True)
+        if self.interaction_group:
+            self.interaction_group.setVisible(not active)
+        if self.content_fit_check:
+            self.content_fit_check.setVisible(not active)
 
     def _emit_settings(self):
         try:
@@ -1203,6 +1383,13 @@ class Live2DSettingsPanel(QFrame):
         meta: list of {id, type, value, min, max, default}
         尽可能保留用户当前已设定的值。
         """
+        ordered = sorted(meta_list, key=lambda item: str(item.get("id", "")))
+        schema = tuple((str(item.get("id", "")), float(item.get("min", 0)),
+                        float(item.get("max", 1)), float(item.get("default", 0))) for item in ordered)
+        if schema == self._parameter_schema:
+            self.sync_advanced_param_values(meta_list)
+            return
+        self._parameter_schema = schema
         # 尽可能保留用户当前已设定的值
         prev_values = {}
         for pid, (slider, _lbl, scale) in self.advanced_param_sliders.items():
@@ -1213,6 +1400,7 @@ class Live2DSettingsPanel(QFrame):
         self.advanced_param_sliders.clear()
         self.PARAM_SPECS = []
         self.param_specs_by_id.clear()
+        self._parameter_row_widgets.clear()
 
         # 缩放决定函数
         def decide_scale(vmin, vmax):
@@ -1224,7 +1412,7 @@ class Live2DSettingsPanel(QFrame):
             return 1
 
         # 构造控件，按id字母序排列以保持一致性
-        for p in sorted(meta_list, key=lambda x: str(x.get('id', ''))):
+        for p in ordered:
             pid = str(p.get('id', ''))
             pmin = float(p.get('min', 0.0))
             pmax = float(p.get('max', 1.0))
@@ -1292,10 +1480,38 @@ class Live2DSettingsPanel(QFrame):
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
             )
             self.advanced_param_sliders[pid] = (slider, val_label, scale)
+            self._parameter_row_widgets[pid] = (name_label, slider, val_label)
+        self._filter_advanced_params()
 
-    def sync_advanced_param_values(self, meta_list: list):
+    def _filter_advanced_params(self, *_args):
+        query = self.parameter_search.text().strip().casefold() if self.parameter_search else ""
+        self._filtered_parameter_ids = []
+        for parameter_id, widgets in self._parameter_row_widgets.items():
+            match = not query or query in parameter_id.casefold()
+            for widget in widgets:
+                widget.setVisible(match)
+            if match:
+                self._filtered_parameter_ids.append(parameter_id)
+        self._update_parameter_count()
+
+    def _update_parameter_count(self):
+        if self.parameter_count:
+            self.parameter_count.setText(tr("preview.parameter_count", PREVIEW_LAYOUT_TEXT["preview.parameter_count"],
+                                            shown=len(self._filtered_parameter_ids), total=len(self.advanced_param_sliders)))
+
+    def visible_parameter_ids(self) -> list[str]:
+        if not self.isVisible() or not self.adv_params_container.isVisible():
+            return []
+        viewport = self.parameter_scroll.viewport()
+        top = self.adv_params_container.mapTo(viewport, QPoint()).y()
+        height = viewport.height()
+        return [parameter_id for parameter_id in self._filtered_parameter_ids
+                if (slider := self.advanced_param_sliders[parameter_id][0]).y() + top < height
+                and slider.y() + top + slider.height() > 0]
+
+    def sync_advanced_param_values(self, meta_list: list | dict[str, float]):
         """Mirror current model values without emitting override changes."""
-        current_values = {
+        current_values = meta_list if isinstance(meta_list, dict) else {
             str(item.get("id", "")): float(item.get("value", 0.0))
             for item in meta_list
             if item.get("id")
@@ -1307,12 +1523,13 @@ class Live2DSettingsPanel(QFrame):
             value = current_values[pid]
             if spec:
                 value = max(spec["min"], min(spec["max"], value))
-            slider.blockSignals(True)
-            slider.setValue(int(round(value * scale)))
-            slider.blockSignals(False)
-            value_label.setText(
-                f"{value:.2f}" if scale != 1 else f"{int(round(value))}"
-            )
+            quantized = int(round(value * scale))
+            if slider.value() != quantized:
+                with QSignalBlocker(slider):
+                    slider.setValue(quantized)
+            text = f"{value:.2f}" if scale != 1 else f"{int(round(value))}"
+            if value_label.text() != text:
+                value_label.setText(text)
 
     def set_advanced_param_values(self, values: dict[str, float]):
         """Update visible parameter controls from a frozen motion timeline."""
@@ -1331,6 +1548,7 @@ class Live2DSettingsPanel(QFrame):
             'show_controls': bool(self.show_controls_check and self.show_controls_check.isVisible() and self.show_controls_check.isChecked()),
             'model_rotation': self.rotation_slider.value(),
             'model_scale': self.scale_slider.value() / 100.0,
+            'antialias': self.antialias_check.isChecked(),
             'model_offset_x': self.position_x_spinbox.value() / 100.0,
             'model_offset_y': self.position_y_spinbox.value() / 100.0,
             'transparent_bg': self.bg_transparent_check.isChecked(),
@@ -1339,6 +1557,8 @@ class Live2DSettingsPanel(QFrame):
             'auto_blink': self.auto_blink_check.isChecked(),
             'auto_breath': self.auto_breath_check.isChecked(),
         }
+        if self.content_fit_check is not None and not self._spine_mode:
+            settings["content_fit_enabled"] = self.content_fit_check.isChecked()
         # 高级参数
         adv_enabled = bool(self.advanced_enable_check.isChecked()) if self.advanced_enable_check else False
         settings['advanced_enabled'] = adv_enabled
@@ -1376,7 +1596,7 @@ class Live2DSettingsPanel(QFrame):
                 self.selected_bg_color = color
                 try:
                     self.bg_color_preview.setStyleSheet(
-                        f"QFrame{{border:1px solid #ccc; border-radius:4px; background:{color.name()};}}"
+                        f"QFrame{{border:1px solid palette(mid); border-radius:4px; background:{color.name()};}}"
                     )
                 except Exception:
                     pass
@@ -1390,8 +1610,207 @@ class Live2DSettingsPanel(QFrame):
         except Exception:
             pass
 
+class SpineAnimationControls(CardWidget):
+    """Native controls for the Spine renderer.
+
+    Live2D's motion widgets carry model-specific semantics and must not be
+    reused for Spine.  This card talks only to ``SpinePreviewWidget``'s small
+    native rendering API and keeps its own state when the preview is switched.
+    """
+
+    skinChanged = Signal(str)
+    animationChanged = Signal(str)
+    pausedChanged = Signal(bool)
+    loopChanged = Signal(bool)
+    timeChanged = Signal(float)
+    resetRequested = Signal()
+    exportRequested = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("spineAnimationControls")
+        self.setMinimumWidth(250)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        self.title = SubtitleLabel("", self)
+        layout.addWidget(self.title)
+        self.status = CaptionLabel("", self)
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+
+        scroll = SingleDirectionScrollArea(orient=Qt.Vertical)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.enableTransparentBackground()
+        inner = QWidget()
+        inner_layout = QVBoxLayout(inner)
+        inner_layout.setContentsMargins(0, 0, 0, 0)
+        inner_layout.setSpacing(8)
+
+        self.skin_label = BodyLabel("", inner)
+        inner_layout.addWidget(self.skin_label)
+        self.skin_combo = ComboBox(inner)
+        self.skin_combo.currentTextChanged.connect(self.skinChanged.emit)
+        inner_layout.addWidget(self.skin_combo)
+
+        self.animation_label = BodyLabel("", inner)
+        inner_layout.addWidget(self.animation_label)
+        self.animation_combo = ComboBox(inner)
+        self.animation_combo.currentTextChanged.connect(self.animationChanged.emit)
+        inner_layout.addWidget(self.animation_combo)
+
+        action_row = QHBoxLayout()
+        self.play_pause_btn = PushButton("", inner)
+        self.play_pause_btn.setCheckable(True)
+        self.play_pause_btn.toggled.connect(self.pausedChanged.emit)
+        action_row.addWidget(self.play_pause_btn, 1)
+        self.reset_btn = PushButton("", inner)
+        self.reset_btn.clicked.connect(self.resetRequested.emit)
+        action_row.addWidget(self.reset_btn, 1)
+        inner_layout.addLayout(action_row)
+
+        self.export_pose_btn = PushButton("", inner)
+        self.export_pose_btn.clicked.connect(self.exportRequested.emit)
+        inner_layout.addWidget(self.export_pose_btn)
+
+        self.loop_check = CheckBox("", inner)
+        self.loop_check.setChecked(True)
+        self.loop_check.toggled.connect(self.loopChanged.emit)
+        inner_layout.addWidget(self.loop_check)
+
+        time_row = QHBoxLayout()
+        self.time_label = BodyLabel("", inner)
+        time_row.addWidget(self.time_label)
+        self.time_value = CaptionLabel("0.00 / 0.00", inner)
+        time_row.addWidget(self.time_value, 1, Qt.AlignmentFlag.AlignRight)
+        inner_layout.addLayout(time_row)
+        self.time_slider = Slider(Qt.Horizontal, inner)
+        self.time_slider.setRange(0, 1000)
+        self.time_slider.valueChanged.connect(self._emit_time)
+        inner_layout.addWidget(self.time_slider)
+        inner_layout.addStretch(1)
+
+        scroll.setWidget(inner)
+        layout.addWidget(scroll, 1)
+        self._time_max = 0.0
+        self._ready = False
+        self.retranslate_ui()
+        self.clear()
+
+    def retranslate_ui(self):
+        self.title.setText(tr("preview.spine_animation_title"))
+        self.skin_label.setText(tr("preview.spine_skin"))
+        self.animation_label.setText(tr("preview.spine_animation"))
+        self.play_pause_btn.setText(
+            tr("preview.spine_play") if self.play_pause_btn.isChecked()
+            else tr("preview.spine_pause")
+        )
+        self.reset_btn.setText(tr("preview.spine_reset_pose"))
+        self.export_pose_btn.setText(tr("preview.spine_export_pose"))
+        self.loop_check.setText(tr("preview.spine_loop"))
+        self.time_label.setText(tr("preview.spine_time"))
+
+    def _emit_time(self, value: int):
+        if not self._ready or self._time_max <= 0:
+            return
+        self.timeChanged.emit(float(value) / 1000.0 * self._time_max)
+
+    def _set_combo_items(self, combo, values, selected=""):
+        names = [str(value.get("value", "") if isinstance(value, dict) else value or "")
+                 for value in values or []]
+        names = [name for name in names if name]
+        combo.blockSignals(True)
+        # Animation time updates must not rebuild the skin/animation menus.
+        if names != [combo.itemText(index) for index in range(combo.count())]:
+            combo.clear()
+            for name in names:
+                combo.addItem(name)
+        if combo.count():
+            index = combo.findText(str(selected or ""))
+            combo.setCurrentIndex(index if index >= 0 else 0)
+        combo.blockSignals(False)
+
+    def set_state(self, state: dict | None):
+        if not isinstance(state, dict):
+            self.clear()
+            return
+        preview_state = str(state.get("previewState") or "").lower()
+        mode = str(state.get("mode") or "").lower()
+        ready = preview_state == "ready"
+        self._ready = ready and mode in {"native", "runtime"}
+        if mode == "atlas":
+            self.status.setText(tr("preview.spine_atlas_controls_hint"))
+        elif preview_state == "error":
+            self.status.setText(str(state.get("previewError") or state.get("text") or ""))
+        elif ready:
+            self.status.setText(tr("preview.spine_controls_ready"))
+        else:
+            self.status.setText(tr("preview.spine_controls_loading"))
+        self._set_combo_items(self.skin_combo, state.get("skinOptions", []), state.get("selectedSkin", ""))
+        self._set_combo_items(self.animation_combo, state.get("animationOptions", []), state.get("selectedAnimation", ""))
+        self.skin_combo.setEnabled(self._ready and self.skin_combo.count() > 0)
+        self.animation_combo.setEnabled(self._ready and self.animation_combo.count() > 0)
+        self.play_pause_btn.setEnabled(self._ready and self.animation_combo.count() > 0)
+        self.loop_check.setEnabled(self._ready and self.animation_combo.count() > 0)
+        self.reset_btn.setEnabled(self._ready)
+        self.export_pose_btn.setEnabled(self._ready and bool(state.get("exportSupported", False)))
+        self.export_pose_btn.setToolTip(
+            "" if state.get("exportSupported") else tr("preview.spine_native_pose_unavailable")
+        )
+        self.play_pause_btn.blockSignals(True)
+        self.play_pause_btn.setChecked(bool(state.get("paused", False)))
+        self.play_pause_btn.blockSignals(False)
+        self.retranslate_ui()
+        self.loop_check.blockSignals(True)
+        self.loop_check.setChecked(bool(state.get("loop", True)))
+        self.loop_check.blockSignals(False)
+        try:
+            current = max(0.0, float(state.get("time", 0.0) or 0.0))
+            self._time_max = max(0.0, float(state.get("timeMax", 0.0) or 0.0))
+        except (TypeError, ValueError):
+            current, self._time_max = 0.0, 0.0
+        if not math.isfinite(current) or not math.isfinite(self._time_max):
+            current, self._time_max = 0.0, 0.0
+        if self._time_max > 0:
+            current = current % self._time_max if state.get("loop", True) else min(current, self._time_max)
+        else:
+            current = 0.0
+        self.time_slider.setEnabled(self._ready and self._time_max > 0)
+        if not self.time_slider.isSliderDown():
+            self.time_slider.blockSignals(True)
+            ratio = current / self._time_max if self._time_max > 0 else 0.0
+            self.time_slider.setValue(max(0, min(1000, int(round(ratio * 1000)))))
+            self.time_slider.blockSignals(False)
+        self.time_value.setText(f"{current:.2f} / {self._time_max:.2f}")
+
+    def clear(self):
+        self._ready = False
+        self._time_max = 0.0
+        self._set_combo_items(self.skin_combo, [])
+        self._set_combo_items(self.animation_combo, [])
+        for widget in (self.skin_combo, self.animation_combo, self.play_pause_btn,
+                       self.loop_check, self.time_slider, self.reset_btn, self.export_pose_btn):
+            widget.setEnabled(False)
+        self.play_pause_btn.blockSignals(True)
+        self.play_pause_btn.setChecked(False)
+        self.play_pause_btn.blockSignals(False)
+        self.loop_check.blockSignals(True)
+        self.loop_check.setChecked(True)
+        self.loop_check.blockSignals(False)
+        self.time_slider.blockSignals(True)
+        self.time_slider.setValue(0)
+        self.time_slider.blockSignals(False)
+        self.time_value.setText("0.00 / 0.00")
+        self.status.setText(tr("preview.spine_controls_loading"))
+        self.retranslate_ui()
+
+
 class PreviewPage(QFrame):
     poseSchemeRequested = Signal(dict)
+    editorRequested = Signal(str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1407,9 +1826,19 @@ class PreviewPage(QFrame):
         self.preview_stage_layout = None
         self.preview_stage_close_btn = None
         self.export_preview_btn = None
+        self.open_editor_btn = None
+        self._editor_source = None
+        self._editor_source_leases = {}
+        self._editor_leased_dirs = {}
+        self._deferred_preview_temp_dirs = set()
+        self._preview_page_active = None
+        self._native_playback_suspended = False
+        self._resume_spine_paused = False
         self.preview_dock_area = None
         self.preview_dock_layout = None
         self.preview_placeholder = None
+        self.spine_preview = None
+        self.spine_controls = None
         self.motion_group_title = None
         self.motion_group = None
         self.motion_combo = None
@@ -1429,19 +1858,27 @@ class PreviewPage(QFrame):
         self.motion_time_label = None
         self._timeline_sync = False
         self._freeze_syncing = False
+        self._frozen_parameter_values = {}
+        self._pose_slider_values = {}
         self.left_sidebar_btn = None
         self.right_sidebar_btn = None
         self.preview_splitter = None
         self.left_sidebar = None
         self.right_sidebar = None
         self._motion_items = []
+        self._live2d_source_generation = 0
+        self._live2d_ready_generation = None
+        self._live2d_initial_play_generation = None
+        self._pending_live2d_ready = None
+        self._live2d_load_in_progress = False
         self.drag_drop_area = None
         self.source_label = None
         self.source_edit = None
         self.source_file_btn = None
         self.source_folder_btn = None
-        self.image_limit_label = None
-        self.image_limit_spinbox = None
+        self.spine_runtime_label = None
+        self.spine_runtime_edit = None
+        self.spine_runtime_btn = None
         self.title_label = None
         self.main_layout = None
         self.current_model_path = None
@@ -1459,6 +1896,20 @@ class PreviewPage(QFrame):
         self._temp_model_json_path = None
         self._model_preview_thread = None
         self._model_preview_temp_dirs = []
+        self._spine_preview_thread = None
+        self._spine_preview_workers = []
+        self._spine_preview_generation = 0
+        self._spine_preview_temp_dirs = []
+        self._spine_runtime_install_worker = None
+        self._spine_runtime_retry_source = ""
+        self._spine_runtime_retry_package_fallback = False
+        self._spine_runtime_retry_compatibility = False
+        self._spine_runtime_retry_generation = 0
+        self._spine_runtime_prompt_enabled = True
+        self._active_spine_plan = None
+        self._active_spine_preview_key = ""
+        self._spine_mode = False
+        self._spine_sidebar_state = None
         self._image_preview_thread = None
         self._image_preview_temp_dirs = []
         self._archive_preview_thread = None
@@ -1477,6 +1928,16 @@ class PreviewPage(QFrame):
         self._advanced_enabled_before_freeze = False
         self._psd_project_context = None
         self._pending_psd_project_context = None
+        self._resource_mode = "empty"
+        self._live2d_load_timer = QTimer(self)
+        self._live2d_load_timer.setSingleShot(True)
+        self._live2d_load_timer.setInterval(50)
+        self._live2d_load_timer.timeout.connect(self.preview_current_model)
+        self._parameter_refresh_retries = 0
+        self._parameter_refresh_timer = QTimer(self)
+        self._parameter_refresh_timer.setSingleShot(True)
+        self._parameter_refresh_timer.setInterval(120)
+        self._parameter_refresh_timer.timeout.connect(lambda: self._refresh_parameter_controls(self._parameter_refresh_retries))
 
         self.setupUI()
         self.retranslate_ui()
@@ -1487,8 +1948,11 @@ class PreviewPage(QFrame):
             if app is not None:
                 app.aboutToQuit.connect(self._terminate_preview_process)
                 app.aboutToQuit.connect(self._destroy_embedded_live2d)
+                app.aboutToQuit.connect(self._destroy_embedded_spine)
                 app.aboutToQuit.connect(self._cleanup_temp_model_json)
                 app.aboutToQuit.connect(self._cleanup_model_preview_temp_dirs)
+                app.aboutToQuit.connect(self._cleanup_spine_preview_temp_dirs)
+                app.aboutToQuit.connect(self._cancel_spine_runtime_install)
                 app.aboutToQuit.connect(self._cleanup_image_preview_temp_dirs)
                 app.aboutToQuit.connect(self._cleanup_archive_preview_temp_dirs)
                 app.aboutToQuit.connect(self._cleanup_folder_preview_temp_dirs)
@@ -1496,7 +1960,7 @@ class PreviewPage(QFrame):
             pass
 
     def setupUI(self):
-        self.main_layout = QVBoxLayout(self)
+        self.main_layout = EditorViewportLayout(self)
         self.main_layout.setContentsMargins(20, 18, 20, 20)
         self.main_layout.setSpacing(12)
 
@@ -1522,24 +1986,25 @@ class PreviewPage(QFrame):
         splitter.setHandleWidth(8)
         splitter.setStyleSheet("""
             QSplitter::handle {
-                background: #E6EAF0;
+                background: palette(alternate-base);
                 border-radius: 3px;
             }
             QSplitter::handle:hover {
-                background: #BFC7D4;
+                background: palette(mid);
             }
         """)
 
         # 左侧：导入、设置和控制按钮
         left_widget = QWidget()
         self.left_sidebar = left_widget
-        left_widget.setMinimumWidth(320)
+        left_widget.setMinimumWidth(200)
         left_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(0, 10, 12, 0)
         left_layout.setSpacing(12)
 
         import_card = CardWidget(self)
+        self.source_card = import_card
         import_layout = QVBoxLayout(import_card)
         import_layout.setContentsMargins(12, 12, 12, 12)
         import_layout.setSpacing(8)
@@ -1555,7 +2020,7 @@ class PreviewPage(QFrame):
         self.source_edit.setMinimumHeight(34)
         import_layout.addWidget(self.source_edit)
 
-        source_button_row = QHBoxLayout()
+        source_button_row = QVBoxLayout()
         source_button_row.setSpacing(8)
         self.source_file_btn = PushButton("", import_card)
         self.source_file_btn.setIcon(FluentIcon.FOLDER)
@@ -1567,62 +2032,68 @@ class PreviewPage(QFrame):
         source_button_row.addWidget(self.source_folder_btn)
         import_layout.addLayout(source_button_row)
 
-        image_limit_row = QHBoxLayout()
-        image_limit_row.setSpacing(8)
-        self.image_limit_label = BodyLabel("", import_card)
-        self.image_limit_spinbox = SpinBox(import_card)
-        self.image_limit_spinbox.setRange(1, 500)
-        self.image_limit_spinbox.setValue(int(self.settings_manager.get("preview.image_limit", 48) or 48))
-        self.image_limit_spinbox.valueChanged.connect(self.on_preview_image_limit_changed)
-        image_limit_row.addWidget(self.image_limit_label)
-        image_limit_row.addWidget(self.image_limit_spinbox)
-        image_limit_row.addStretch(1)
-        import_layout.addLayout(image_limit_row)
+        spine_runtime_row = QHBoxLayout()
+        self.spine_runtime_label = BodyLabel("Spine runtime", import_card)
+        self.spine_runtime_edit = LineEdit(import_card)
+        self.spine_runtime_edit.setReadOnly(True)
+        self.spine_runtime_edit.setPlaceholderText("Official spine-ts core/webgl directory (optional)")
+        self.spine_runtime_btn = PushButton("Choose", import_card)
+        self.spine_runtime_btn.setIcon(FluentIcon.FOLDER)
+        self.spine_runtime_btn.clicked.connect(self.browse_spine_runtime)
+        spine_runtime_row.addWidget(self.spine_runtime_label)
+        spine_runtime_row.addWidget(self.spine_runtime_edit, 1)
+        spine_runtime_row.addWidget(self.spine_runtime_btn)
+        import_layout.addLayout(spine_runtime_row)
+        # Runtime selection belongs to Settings > Runtime.  Keep the preview
+        # page focused on the source and show only the resolved version/status
+        # in the model information card below.
+        for _widget in (self.spine_runtime_label, self.spine_runtime_edit, self.spine_runtime_btn):
+            _widget.setVisible(False)
+
         left_layout.addWidget(import_card)
 
         # 当前模型信息
         self.model_info_text_box = TextBrowser(self)
         self.model_info_text_box.setMinimumHeight(120)
-        self.model_info_text_box.setMaximumHeight(170)
-        self.model_info_text_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.model_info_text_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.model_info_text_box.setStyleSheet("""
             TextBrowser {
-                border: 1px solid #E3E6EA;
+                border: 1px solid palette(mid);
                 border-radius: 8px;
-                background: #FFFFFF;
+                background: palette(base);
                 padding: 8px;
             }
         """)
 
-        left_layout.addWidget(self.model_info_text_box)
 
-        # 左侧只保留导入、显示和交互设置。
+        # Display and interaction controls move into the format-aware right tabs.
         self.settings_panel = Live2DSettingsPanel(self, mode="display")
         self.settings_panel.settingsChanged.connect(self.on_settings_changed)
+        self.settings_panel.fitRequested.connect(self._fit_preview_model)
         self.settings_panel.requestRefreshParams.connect(self.on_request_refresh_params)
-        left_layout.addWidget(self.settings_panel, 1)
+        left_layout.addWidget(self.model_info_text_box, 1)
 
         # 控制按钮区域
-        button_layout = QHBoxLayout()
+        button_layout = QVBoxLayout()
         button_layout.setSpacing(10)
-        self.preview_btn = PushButton("", self)
+        self.preview_btn = PushButton("", import_card)
         self.preview_btn.setIcon(FluentIcon.PLAY)
         self.preview_btn.setEnabled(False)
         # 修改：接入冷却逻辑
         self.preview_btn.clicked.connect(self._on_preview_clicked)
 
-        self.close_all_btn = PushButton("", self)
+        self.close_all_btn = PushButton("", import_card)
         self.close_all_btn.setIcon(FluentIcon.CLOSE)
         self.close_all_btn.clicked.connect(self.close_preview_window)
 
         button_layout.addWidget(self.preview_btn, 1)
         button_layout.addWidget(self.close_all_btn, 1)
 
-        left_layout.addLayout(button_layout)
+        import_layout.insertLayout(3, button_layout)
 
         # 中间：统一的图片 / Live2D 预览舞台
         right_widget = QWidget()
-        right_widget.setMinimumWidth(520)
+        right_widget.setMinimumWidth(280)
         right_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         right_layout = QVBoxLayout(right_widget)
         right_layout.setContentsMargins(12, 10, 0, 0)
@@ -1636,46 +2107,43 @@ class PreviewPage(QFrame):
         self.preview_stage.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.preview_stage.setStyleSheet("""
             QFrame#previewStage {
-                border: 1px solid #DDE2EA;
+                border: 1px solid palette(mid);
                 border-radius: 8px;
-                background: #FAFBFD;
+                background: palette(alternate-base);
             }
         """)
         self.preview_stage_layout = QVBoxLayout(self.preview_stage)
         self.preview_stage_layout.setContentsMargins(12, 10, 12, 12)
         self.preview_stage_layout.setSpacing(8)
 
-        stage_toolbar = QHBoxLayout()
+        stage_toolbar = QVBoxLayout()
         stage_toolbar.setContentsMargins(0, 0, 0, 0)
         stage_toolbar.setSpacing(8)
-        stage_toolbar.addStretch(1)
-
-        self.export_preview_btn = PushButton("", self.preview_stage)
-        self.export_preview_btn.setIcon(FluentIcon.DOWNLOAD)
+        editor_toolbar = QHBoxLayout()
+        self.open_editor_btn = PushButton("", self.preview_stage)
+        self.open_editor_btn.setIcon(FluentIcon.EDIT)
+        self.open_editor_btn.clicked.connect(self._request_model_editor)
+        self.open_editor_btn.hide()
+        editor_toolbar.addWidget(self.open_editor_btn)
+        editor_toolbar.addStretch(1)
+        stage_toolbar.addLayout(editor_toolbar)
+        resource_toolbar = editor_toolbar
+        resource_toolbar.setSpacing(8)
+        self.export_preview_btn = TransparentToolButton(FluentIcon.DOWNLOAD, self.preview_stage)
+        self.export_preview_btn.setFixedSize(32, 32)
         self.export_preview_btn.setEnabled(False)
         self.export_preview_btn.clicked.connect(self.export_preview_resources)
-        stage_toolbar.addWidget(self.export_preview_btn, 0, Qt.AlignRight)
+        resource_toolbar.addWidget(self.export_preview_btn)
 
-        self.preview_stage_close_btn = PushButton("", self.preview_stage)
-        self.preview_stage_close_btn.setText("X")
-        self.preview_stage_close_btn.setFixedSize(34, 30)
-        self.preview_stage_close_btn.setStyleSheet("""
-            PushButton {
-                border: 1px solid #D0D7E2;
-                border-radius: 6px;
-                background: #FFFFFF;
-                color: #31363F;
-                font-size: 18px;
-                font-weight: 600;
-            }
-            PushButton:hover {
-                border-color: #F1A7A7;
-                background: #FDEBEC;
-                color: #C42B1C;
-            }
-        """)
+        self.preview_stage_close_btn = TransparentToolButton(FluentIcon.CLOSE, self.preview_stage)
+        self.preview_stage_close_btn.setFixedSize(32, 32)
         self.preview_stage_close_btn.clicked.connect(self.close_preview_window)
-        stage_toolbar.addWidget(self.preview_stage_close_btn, 0, Qt.AlignRight)
+        resource_toolbar.addWidget(self.preview_stage_close_btn)
+        self.resource_combo = EditorComboBox(self.preview_stage)
+        self.resource_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.resource_combo.currentIndexChanged.connect(self._resource_selected)
+        self.resource_combo.hide()
+        stage_toolbar.addWidget(self.resource_combo)
         self.preview_stage_layout.addLayout(stage_toolbar)
 
         self.preview_dock_area = QFrame(self.preview_stage)
@@ -1693,13 +2161,24 @@ class PreviewPage(QFrame):
 
         self.preview_placeholder = BodyLabel("", self.preview_dock_area)
         self.preview_placeholder.setAlignment(Qt.AlignCenter)
-        self.preview_placeholder.setStyleSheet("color: #68707D;")
+        self.preview_placeholder.setWordWrap(True)
+        self.preview_placeholder.setStyleSheet("color: palette(placeholder-text);")
         self.preview_dock_layout.addWidget(self.preview_placeholder, 1)
 
         self.image_preview_panel = ImagePreviewPanel(self.preview_dock_area)
         self.image_preview_panel.setVisible(False)
         self.image_preview_panel.itemActivated.connect(self.on_preview_item_activated)
+        self.image_preview_panel.itemsChanged.connect(self._sync_resource_selector)
         self.preview_dock_layout.addWidget(self.image_preview_panel, 1)
+        self.image_item_list = self.image_preview_panel.take_item_list()
+
+        self.spine_preview = SpinePreviewWidget(self.preview_dock_area)
+        self.spine_preview.setVisible(False)
+        self.spine_preview.documentLoaded.connect(self._on_spine_preview_document_loaded)
+        self.spine_preview.previewReady.connect(self._on_spine_preview_ready)
+        self.spine_preview.previewFailed.connect(self._on_spine_preview_error)
+        self.spine_preview.stateChanged.connect(self._on_spine_preview_state)
+        self.preview_dock_layout.addWidget(self.spine_preview, 1)
         self._ensure_embedded_live2d()
         self.preview_stage_layout.addWidget(self.preview_dock_area, 1)
 
@@ -1713,6 +2192,23 @@ class PreviewPage(QFrame):
         action_layout = QVBoxLayout(action_widget)
         action_layout.setContentsMargins(12, 10, 0, 0)
         action_layout.setSpacing(10)
+        self.resource_details_stack = QStackedWidget(action_widget)
+        self.resource_details_stack.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        action_layout.addWidget(self.resource_details_stack, 1)
+        self.empty_details = BodyLabel(action_widget)
+        self.empty_details.setWordWrap(True)
+        self.empty_details.setAlignment(Qt.AlignCenter)
+        self.resource_details_stack.addWidget(self.empty_details)
+        self.resource_details_stack.addWidget(self.image_item_list)
+        self.live2d_details = EditorTabs(action_widget)
+        self.spine_details = EditorTabs(action_widget)
+        self.resource_details_stack.addWidget(self.live2d_details)
+        self.resource_details_stack.addWidget(self.spine_details)
+        self.live2d_animation_tab = QWidget(self.live2d_details)
+        live2d_actions = EditorViewportLayout(self.live2d_animation_tab)
+        live2d_actions.setContentsMargins(0, 0, 0, 0)
+        live2d_actions.setSpacing(8)
+        self.live2d_details.addTab(self.live2d_animation_tab, "")
 
         self.motion_group = CardWidget(action_widget)
         motion_layout = QVBoxLayout(self.motion_group)
@@ -1738,7 +2234,7 @@ class PreviewPage(QFrame):
         motion_button_row.addWidget(self.play_motion_btn, 1)
         motion_layout.addLayout(motion_button_row)
 
-        motion_option_row = QHBoxLayout()
+        motion_option_row = QVBoxLayout()
         self.loop_motion_check = CheckBox("", self.motion_group)
         self.loop_motion_check.toggled.connect(self.on_motion_loop_changed)
         motion_option_row.addWidget(self.loop_motion_check)
@@ -1754,8 +2250,19 @@ class PreviewPage(QFrame):
         self.save_pose_scheme_btn.setVisible(False)
         self.motion_hint_label = BodyLabel("", self.motion_group)
         self.motion_hint_label.setWordWrap(True)
-        motion_layout.addWidget(self.motion_hint_label)
-        action_layout.addWidget(self.motion_group)
+        self.motion_hint_label.hide()
+        live2d_actions.addWidget(self.motion_group)
+
+        self.spine_controls = SpineAnimationControls(action_widget)
+        self.spine_controls.skinChanged.connect(self._on_spine_skin_changed)
+        self.spine_controls.animationChanged.connect(self._on_spine_animation_changed)
+        self.spine_controls.pausedChanged.connect(self._on_spine_paused_changed)
+        self.spine_controls.loopChanged.connect(self._on_spine_loop_changed)
+        self.spine_controls.timeChanged.connect(self._on_spine_time_changed)
+        self.spine_controls.resetRequested.connect(self._on_spine_reset_requested)
+        self.spine_controls.exportRequested.connect(self._on_spine_export_requested)
+        self.spine_controls.setVisible(False)
+        self.spine_details.addTab(self.spine_controls, "")
 
         self.advanced_panel = Live2DSettingsPanel(action_widget, mode="parameters")
         self.advanced_panel.settingsChanged.connect(self.on_advanced_settings_changed)
@@ -1791,13 +2298,17 @@ class PreviewPage(QFrame):
         self.motion_timeline.setRange(0, 1000)
         self.motion_timeline.valueChanged.connect(self._on_motion_timeline_slider_changed)
         timeline_layout.addWidget(self.motion_timeline)
-        timeline_detail = QHBoxLayout()
+        timeline_detail = QVBoxLayout()
         self.motion_time_spin = SpinBox(self.motion_timeline_frame)
+        self.motion_time_spin.setSymbolVisible(False)
+        self.motion_time_spin.setFixedWidth(126)
         self.motion_time_spin.setRange(0, 0)
         self.motion_time_spin.setSingleStep(33)
         self.motion_time_spin.setSuffix(" ms")
         self.motion_time_spin.valueChanged.connect(self._on_motion_timeline_spin_changed)
         self.motion_time_label = CaptionLabel("", self.motion_timeline_frame)
+        self.motion_time_label.setWordWrap(True)
+        self.motion_time_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         timeline_detail.addWidget(self.motion_time_spin)
         timeline_detail.addWidget(self.motion_time_label, 1)
         timeline_layout.addLayout(timeline_detail)
@@ -1805,8 +2316,19 @@ class PreviewPage(QFrame):
         pose_layout.addWidget(self.motion_timeline_frame)
         self.save_pose_scheme_btn.setParent(self.pose_controls_card)
         pose_layout.addWidget(self.save_pose_scheme_btn)
-        action_layout.addWidget(self.pose_controls_card)
-        action_layout.addWidget(self.advanced_panel, 1)
+        live2d_actions.addWidget(self.pose_controls_card)
+        live2d_actions.addWidget(self.advanced_panel, 1)
+        self._display_layouts = {}
+        for kind, tabs in (("live2d", self.live2d_details), ("spine", self.spine_details)):
+            host = QWidget(tabs)
+            display_layout = EditorViewportLayout(host)
+            display_layout.setContentsMargins(0, 0, 0, 0)
+            self._display_layouts[kind] = display_layout
+            tabs.addTab(host, "")
+        self._display_layouts["live2d"].addWidget(self.settings_panel, 1)
+        self.live2d_details.currentChanged.connect(self._on_preview_tab_changed)
+        self.advanced_panel.parameter_scroll.verticalScrollBar().valueChanged.connect(lambda _value: self._sync_live_parameter_controls())
+        self.advanced_panel.parameter_search.textChanged.connect(lambda _text: self._sync_live_parameter_controls())
 
         # 添加到分割器
         splitter.addWidget(left_widget)
@@ -1815,7 +2337,7 @@ class PreviewPage(QFrame):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
-        splitter.setSizes([380, 760, 380])
+        splitter.setSizes([230, 540, 320])
 
         self.main_layout.addWidget(splitter, 1)
         self.main_layout.setStretch(0, 0)
@@ -1840,6 +2362,7 @@ class PreviewPage(QFrame):
         self._parameter_sync_timer.setInterval(80)
         self._parameter_sync_timer.timeout.connect(self._sync_live_parameter_controls)
         self._set_motion_debug_visible(False)
+        self._set_resource_mode("empty")
         self._restore_preview_ui_state()
 
     def retranslate_ui(self):
@@ -1852,8 +2375,10 @@ class PreviewPage(QFrame):
             self.source_file_btn.setText(tr("preview.browse_files"))
         if self.source_folder_btn:
             self.source_folder_btn.setText(tr("preview.browse_folder"))
-        if self.image_limit_label:
-            self.image_limit_label.setText(tr("preview.image_limit_label"))
+        if self.spine_runtime_edit:
+            self.spine_runtime_edit.setText(
+                str(self.settings_manager.get("preview.spine_runtime_dir", "") or "")
+            )
         if self.preview_stage_title:
             self.preview_stage_title.setText(tr("preview.stage_title"))
         if self.preview_placeholder:
@@ -1861,10 +2386,17 @@ class PreviewPage(QFrame):
         self.preview_btn.setText(tr("preview.preview_model"))
         self.close_all_btn.setText(tr("preview.close_window"))
         if self.export_preview_btn:
-            self.export_preview_btn.setText(tr("preview.export_preview"))
+            self.export_preview_btn.setAccessibleName(tr("preview.export_preview"))
             self.export_preview_btn.setToolTip(tr("preview.export_preview_tooltip"))
         if self.preview_stage_close_btn:
             self.preview_stage_close_btn.setToolTip(tr("preview.close_window"))
+            self.preview_stage_close_btn.setAccessibleName(tr("preview.close_window"))
+        self.empty_details.setText(_layout_text("preview.layout.empty"))
+        for tabs, keys in ((self.live2d_details, ("animation_parameters", "display_interaction")),
+                           (self.spine_details, ("animation", "display"))):
+            for index, key in enumerate(keys):
+                tabs.setTabText(index, _layout_text(f"preview.layout.{key}"))
+        self.resource_combo.setToolTip(tr("preview.preview_item_list_title"))
         if self.motion_group_title:
             self.motion_group_title.setText(tr("preview.trigger_motion"))
         if self.motion_combo:
@@ -1875,18 +2407,21 @@ class PreviewPage(QFrame):
             self.loop_motion_check.setText(tr("preview.loop_motion"))
         if self.auto_play_motion_check:
             self.auto_play_motion_check.setText(tr("preview.auto_play_motion"))
+            self.auto_play_motion_check.setToolTip(_layout_text("preview.auto_play_hint"))
         if self.save_pose_scheme_btn:
             self.save_pose_scheme_btn.setText(tr("preview.save_psd_pose_scheme"))
         if self.pose_controls_title:
             self.pose_controls_title.setText(tr("preview.advanced_settings"))
         if self.freeze_motion_check:
             self.freeze_motion_check.setText(tr("preview.enable_advanced_overrides"))
+            self.freeze_motion_check.setToolTip(_layout_text("preview.motion_freeze_hint"))
         if self.refresh_pose_params_btn:
             self.refresh_pose_params_btn.setText(tr("preview.refresh_current_model"))
         if self.reset_pose_params_btn:
             self.reset_pose_params_btn.setText(tr("preview.reset_advanced_params"))
         if self.motion_hint_label:
             self.motion_hint_label.setText(tr("preview.trigger_motion_hint"))
+            self.play_motion_btn.setToolTip(tr("preview.trigger_motion_hint"))
         if self.image_preview_panel:
             self.image_preview_panel.retranslate_ui()
 
@@ -1896,7 +2431,10 @@ class PreviewPage(QFrame):
             self.settings_panel.retranslate_ui()
         if self.advanced_panel:
             self.advanced_panel.retranslate_ui()
+        if self.spine_controls:
+            self.spine_controls.retranslate_ui()
         self._update_sidebar_button_text()
+        self._update_editor_button()
 
         if not self.current_model_path and not (
             self.image_preview_panel and self.image_preview_panel.isVisible()
@@ -1908,11 +2446,226 @@ class PreviewPage(QFrame):
             self.motion_combo.setEnabled(False)
             self.play_motion_btn.setEnabled(False)
 
+    def _set_editor_source(self, kind: str | None = None, path: str | None = None):
+        self._editor_source = (kind, os.path.abspath(path)) if kind and path and os.path.isfile(path) else None
+        self._update_editor_button()
+
+    def _set_resource_mode(self, mode):
+        mode = mode if mode in {"live2d", "spine", "image"} else "empty"
+        if mode != self._resource_mode and mode != "live2d":
+            self._clear_live2d_controls()
+        self._resource_mode = mode
+        pages = {"empty": self.empty_details, "image": self.image_item_list,
+                 "live2d": self.live2d_details, "spine": self.spine_details}
+        self.resource_details_stack.setCurrentWidget(pages[mode])
+        for widget in (self.motion_group, self.pose_controls_card, self.advanced_panel):
+            widget.setVisible(mode == "live2d")
+        self.spine_controls.setVisible(mode == "spine")
+        if mode in self._display_layouts:
+            self._display_layouts[mode].addWidget(self.settings_panel, 1)
+            self.settings_panel.show()
+            self.settings_panel.set_spine_mode(mode == "spine")
+        if mode == "image":
+            self.image_item_list.show()
+
+    def _clear_live2d_controls(self):
+        self._live2d_source_generation += 1
+        self._live2d_ready_generation = None
+        self._pending_live2d_ready = None
+        self._live2d_load_timer.stop()
+        self._parameter_refresh_timer.stop()
+        if self._parameter_sync_timer:
+            self._parameter_sync_timer.stop()
+        self._frozen_parameter_values.clear()
+        self._pose_slider_values.clear()
+        if self.advanced_panel:
+            self.advanced_panel.rebuild_advanced_params([])
+            with QSignalBlocker(self.advanced_panel.advanced_enable_check):
+                self.advanced_panel.advanced_enable_check.setChecked(False)
+        if self.freeze_motion_check:
+            with QSignalBlocker(self.freeze_motion_check):
+                self.freeze_motion_check.setChecked(False)
+        if self.motion_combo:
+            self._populate_motion_controls([])
+        self._update_motion_timeline_visibility()
+
+    def _sync_resource_selector(self):
+        panel = self.image_preview_panel
+        if panel is None:
+            return
+        with QSignalBlocker(self.resource_combo):
+            self.resource_combo.clear()
+            for index, item in enumerate(panel._preview_items):
+                self.resource_combo.addItem(str(item.get("label") or Path(item.get("path", "")).name), userData=index)
+            self.resource_combo.setCurrentIndex(panel._current_index)
+        self.resource_combo.setVisible(len(panel._preview_items) > 1)
+
+    def _resource_selected(self, index):
+        item_index = self.resource_combo.itemData(index)
+        if item_index is not None:
+            self.on_preview_item_activated(int(item_index))
+
+    def _preview_parameters(self):
+        meta = self.live2d_preview.get_parameter_meta_list() if self.live2d_preview else []
+        return {str(item["id"]): float(item.get("value", 0)) for item in meta if item.get("id")}
+
+    def _on_preview_tab_changed(self, index):
+        self._update_parameter_sync_timer()
+        if index == 0:
+            self._sync_live_parameter_controls()
+
+    def _motion_playback_context(self):
+        getter = getattr(self.live2d_preview, "get_motion_playback_state", None)
+        state = getter() if callable(getter) else None
+        if state:
+            motion = next((item for item in self._motion_items
+                           if (str(item.get("group", "")), int(item.get("index", -1)))
+                           == (str(state.get("group", "")), int(state.get("index", -2)))), None)
+            return motion or state, state
+        return self._selected_motion_item(), None
+
+    def _update_editor_button(self):
+        button = self.open_editor_btn
+        if button is None:
+            return
+        valid = self._editor_source is not None and os.path.isfile(self._editor_source[1])
+        button.setVisible(valid)
+        button.setEnabled(valid)
+        if valid:
+            button.setText(tr(f"preview.open_{self._editor_source[0]}_editor"))
+
+    def current_editor_source(self):
+        if self._editor_source and os.path.isfile(self._editor_source[1]):
+            return self._editor_source
+        return None
+
+    def _request_model_editor(self):
+        source = self.current_editor_source()
+        if source is not None:
+            self.editorRequested.emit(*source)
+        else:
+            self._update_editor_button()
+
+    def acquire_editor_source(self, model_path: str):
+        """Lease preview workspaces while an editor copies its own session."""
+        source = Path(model_path).resolve()
+        roots = set()
+        for name in ("_model_preview_temp_dirs", "_spine_preview_temp_dirs", "_archive_preview_temp_dirs", "_folder_preview_temp_dirs"):
+            for directory in getattr(self, name, ()):
+                root = str(Path(directory).resolve())
+                if source.is_relative_to(Path(root)):
+                    roots.add(root)
+        for root in self._editor_leased_dirs:
+            if source.is_relative_to(Path(root)):
+                roots.add(root)
+        if not roots:
+            return None
+        token = uuid.uuid4().hex
+        self._editor_source_leases[token] = roots
+        for root in roots:
+            self._editor_leased_dirs[root] = self._editor_leased_dirs.get(root, 0) + 1
+        return token
+
+    def release_editor_source(self, token):
+        for root in self._editor_source_leases.pop(token, ()):
+            count = self._editor_leased_dirs.get(root, 0) - 1
+            if count > 0:
+                self._editor_leased_dirs[root] = count
+                continue
+            self._editor_leased_dirs.pop(root, None)
+            if root in self._deferred_preview_temp_dirs:
+                self._deferred_preview_temp_dirs.discard(root)
+                self._dispose_preview_temp_dir(root)
+
+    def _dispose_preview_temp_dir(self, directory):
+        root = str(Path(directory).resolve())
+        if self._editor_leased_dirs.get(root, 0):
+            self._deferred_preview_temp_dirs.add(root)
+            return
+        if os.path.isdir(root):
+            shutil.rmtree(root, ignore_errors=True)
+
+    def set_active(self, active: bool):
+        active = bool(active)
+        spine = self.spine_preview
+        if spine is not None:
+            timer = getattr(spine, "_status_timer", None)
+            if not active:
+                if not self._native_playback_suspended:
+                    self._resume_spine_paused = bool(getattr(spine, "_last_state", {}).get("paused", False))
+                spine.set_paused(True)
+                if timer is not None:
+                    timer.stop()
+            elif self._native_playback_suspended:
+                spine.set_paused(self._resume_spine_paused)
+                if timer is not None and getattr(spine, "_model", None) is not None:
+                    timer.start()
+        canvas = getattr(self.live2d_preview, "live2d_canvas", None)
+        activate_rendering = getattr(self.live2d_preview, "set_rendering_active", None)
+        if callable(activate_rendering):
+            activate_rendering(active)
+        elif canvas is not None:
+            timer_id = getattr(canvas, "_render_timer_id", None)
+            if not active and timer_id is not None:
+                canvas.killTimer(timer_id)
+                canvas._render_timer_id = None
+            elif active and timer_id is None:
+                canvas._render_timer_id = canvas.startTimer(int(1000 / 60))
+        if not active:
+            for timer in (self._parameter_sync_timer, self._parameter_refresh_timer, self._preview_dock_timer):
+                if timer is not None:
+                    timer.stop()
+        self._native_playback_suspended = not active
+        self._preview_page_active = active
+        if active:
+            self._update_parameter_sync_timer()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.set_active(True)
+
+    def hideEvent(self, event):
+        self.set_active(False)
+        super().hideEvent(event)
+
+    def prepare_shutdown(self):
+        """Finish or cancel import workers before any page is destroyed."""
+        workers = []
+        for name in ("_model_preview_thread", "_image_preview_thread", "_archive_preview_thread", "_folder_preview_thread", "_preview_export_thread"):
+            worker = getattr(self, name, None)
+            if worker is not None and _is_qt_object_valid(worker) and worker.isRunning():
+                workers.append(worker)
+        workers.extend(worker for worker in self._spine_preview_workers if worker is not None and _is_qt_object_valid(worker) and worker.isRunning() and worker not in workers)
+        for worker in workers:
+            worker.requestInterruption()
+        if any(not worker.wait(1500) for worker in workers):
+            return False
+        return True
+
+    def shutdown(self):
+        if not self.prepare_shutdown():
+            return False
+        self.set_active(False)
+        self._live2d_load_timer.stop()
+        self._parameter_refresh_timer.stop()
+        self._terminate_preview_process()
+        self._destroy_embedded_live2d()
+        self._destroy_embedded_spine()
+        # MainWindow releases editor leases after editor shutdown. A copying
+        # editor may still need the source even after this view is destroyed.
+        for cleanup in (self._cleanup_model_preview_temp_dirs, self._cleanup_spine_preview_temp_dirs, self._cleanup_image_preview_temp_dirs, self._cleanup_archive_preview_temp_dirs, self._cleanup_folder_preview_temp_dirs):
+            cleanup()
+        return True
+
     def _toggle_sidebar(self, side: str):
         widget = self.left_sidebar if side == "left" else self.right_sidebar
         if widget is None:
             return
         widget.setVisible(not widget.isVisible())
+        if side == "right":
+            self._update_parameter_sync_timer()
+            if widget.isVisible():
+                self._sync_live_parameter_controls()
         self._update_sidebar_button_text()
         self._save_preview_ui_state()
 
@@ -1932,6 +2685,8 @@ class PreviewPage(QFrame):
                 (panel.opacity_slider, int(state.get("opacity", 100))),
                 (panel.rotation_slider, int(state.get("rotation", 0))),
                 (panel.scale_slider, int(state.get("scale", 100))),
+                (panel.antialias_check, bool(state.get("antialias", True))),
+                (panel.content_fit_check, bool(state.get("content_fit", True))),
                 (panel.position_x_spinbox, int(state.get("offset_x", 0))),
                 (panel.position_y_spinbox, int(state.get("offset_y", 0))),
                 (panel.bg_transparent_check, bool(state.get("transparent_bg", True))),
@@ -1954,7 +2709,7 @@ class PreviewPage(QFrame):
             self.auto_play_motion_check.setChecked(bool(state.get("motion_auto_play", False)))
             self.auto_play_motion_check.blockSignals(False)
         if self.freeze_motion_check:
-            freeze_pose = bool(state.get("freeze_pose", False))
+            freeze_pose = False
             self.freeze_motion_check.blockSignals(True)
             self.freeze_motion_check.setChecked(freeze_pose)
             self.freeze_motion_check.blockSignals(False)
@@ -1975,31 +2730,180 @@ class PreviewPage(QFrame):
         selected_motion = ""
         if self.motion_combo and self.motion_combo.currentIndex() >= 0:
             selected_motion = str(self.motion_combo.currentData() or "")
-        self.settings_manager.set(
-            "preview.ui_state",
-            {
-                "opacity": panel.opacity_slider.value(),
-                "rotation": panel.rotation_slider.value(),
-                "scale": panel.scale_slider.value(),
-                "offset_x": panel.position_x_spinbox.value(),
-                "offset_y": panel.position_y_spinbox.value(),
-                "transparent_bg": panel.bg_transparent_check.isChecked(),
-                "mouse_tracking": panel.mouse_tracking_check.isChecked(),
-                "auto_blink": panel.auto_blink_check.isChecked(),
-                "auto_breath": panel.auto_breath_check.isChecked(),
-                "motion_loop": bool(self.loop_motion_check and self.loop_motion_check.isChecked()),
-                "motion_auto_play": bool(
-                    self.auto_play_motion_check and self.auto_play_motion_check.isChecked()
-                ),
-                "freeze_pose": bool(self.freeze_motion_check and self.freeze_motion_check.isChecked()),
-                "left_sidebar_visible": bool(self.left_sidebar and not self.left_sidebar.isHidden()),
-                "right_sidebar_visible": bool(self.right_sidebar and not self.right_sidebar.isHidden()),
-                "selected_motion": selected_motion,
-            },
+        ui_state = {
+            "opacity": panel.opacity_slider.value(),
+            "rotation": panel.rotation_slider.value(),
+            "scale": panel.scale_slider.value(),
+            "antialias": panel.antialias_check.isChecked(),
+            "content_fit": panel.content_fit_check.isChecked(),
+            "offset_x": panel.position_x_spinbox.value(),
+            "offset_y": panel.position_y_spinbox.value(),
+            "transparent_bg": panel.bg_transparent_check.isChecked(),
+            "mouse_tracking": panel.mouse_tracking_check.isChecked(),
+            "auto_blink": panel.auto_blink_check.isChecked(),
+            "auto_breath": panel.auto_breath_check.isChecked(),
+            "motion_loop": bool(self.loop_motion_check and self.loop_motion_check.isChecked()),
+            "motion_auto_play": bool(
+                self.auto_play_motion_check and self.auto_play_motion_check.isChecked()
+            ),
+            "freeze_pose": bool(self.freeze_motion_check and self.freeze_motion_check.isChecked()),
+            "left_sidebar_visible": bool(self.left_sidebar and not self.left_sidebar.isHidden()),
+            "right_sidebar_visible": bool(self.right_sidebar and not self.right_sidebar.isHidden()),
+            "selected_motion": selected_motion,
+        }
+        # SettingsPage owns the same JSON file through a separate manager.  A
+        # stale PreviewPage manager must not write its old runtime/tool values
+        # back merely because a display slider changed.
+        self._merge_latest_preview_settings(ui_state)
+        self.settings_manager.set("preview.ui_state", ui_state)
+
+    def _load_latest_preview_settings(self):
+        """Read the current settings snapshot without replacing the page cache.
+
+        PreviewPage and SettingsPage each have a SettingsManager instance.  A
+        fresh manager with the same settings file is the safest way to read a
+        runtime selected by SettingsPage without disturbing the live preview
+        UI state.  Lightweight diagnostic/test settings objects may not expose
+        ``settings_file`` or ``load_settings``; those continue to use their
+        in-memory values.
+        """
+
+        manager = self.settings_manager
+        settings_file = getattr(manager, "settings_file", None)
+        if settings_file:
+            try:
+                latest_manager = SettingsManager(settings_file=settings_file)
+                latest = getattr(latest_manager, "settings", None)
+                if isinstance(latest, dict):
+                    return latest
+            except Exception:
+                # A test/sandbox replacement may only support a no-argument
+                # constructor.  Fall through to its own loader/cache.
+                pass
+
+        loader = getattr(manager, "load_settings", None)
+        if callable(loader):
+            try:
+                latest = loader()
+                if isinstance(latest, dict):
+                    return latest
+            except Exception:
+                pass
+        return None
+
+    def _spine_runtime_dir_for_import(self) -> str:
+        """Get the runtime selected in SettingsPage immediately before import."""
+
+        manager = self.settings_manager
+        settings_file = getattr(manager, "settings_file", None)
+        latest = self._load_latest_preview_settings()
+        if isinstance(latest, dict):
+            preview = latest.get("preview")
+            if isinstance(preview, dict) and "spine_runtime_dir" in preview:
+                # Sandbox managers without a settings file are intentionally
+                # kept in memory, so a diagnostic can select a runtime by
+                # editing ``settings`` directly between imports.
+                if not settings_file and callable(getattr(manager, "load_settings", None)):
+                    current_ui = manager.get("preview.ui_state", {})
+                    manager.settings = latest
+                    if isinstance(current_ui, dict) and current_ui:
+                        manager.settings.setdefault("preview", {}).setdefault(
+                            "ui_state", {}
+                        ).update(current_ui)
+                return str(preview.get("spine_runtime_dir") or "").strip()
+        return str(manager.get("preview.spine_runtime_dir", "") or "").strip()
+
+    def _spine_preview_unify_for_import(self) -> bool:
+        """Compatibility alias for older integrations and tests."""
+
+        return self._spine_compatibility_mode_for_import()
+
+    def _spine_compatibility_mode_for_import(self) -> bool:
+        """Capture the unified Spine policy on the GUI thread."""
+
+        manager = self.settings_manager
+        latest = self._load_latest_preview_settings()
+        if isinstance(latest, dict):
+            section = latest.get("spine")
+            if isinstance(section, dict) and "compatibility_mode" in section:
+                return bool(section.get("compatibility_mode"))
+        getter = getattr(manager, "get_spine_compatibility_mode", None)
+        if callable(getter):
+            return bool(getter())
+        # A small compatibility fallback for test doubles created before the
+        # consolidated setting existed.
+        legacy = getattr(manager, "get_spine_preview_unify_version", None)
+        if callable(legacy):
+            return bool(legacy())
+        return bool(manager.get("spine.compatibility_mode", manager.get("spine_preview.unify_version", True)))
+
+    def _spine_selected_runtime_version_for_import(self) -> str:
+        """Capture the preserved off-mode runtime choice on the GUI thread."""
+
+        manager = self.settings_manager
+        latest = self._load_latest_preview_settings()
+        if isinstance(latest, dict):
+            section = latest.get("spine")
+            if isinstance(section, dict) and "runtime_version" in section:
+                value = str(section.get("runtime_version") or SPINE_COMPATIBILITY_VERSION).strip()
+                if value.startswith("4.0."):
+                    return "4.0"
+                return value
+        getter = getattr(manager, "get_spine_runtime_version", None)
+        if callable(getter):
+            return str(getter() or SPINE_COMPATIBILITY_VERSION)
+        value = str(manager.get("spine.runtime_version", SPINE_COMPATIBILITY_VERSION) or SPINE_COMPATIBILITY_VERSION)
+        return "4.0" if value.startswith("4.0.") else value
+
+    def _spine_runtime_policy_for_import(self, force_compatibility: bool | None = None) -> SpineRuntimePolicy:
+        compatibility = (
+            self._spine_compatibility_mode_for_import()
+            if force_compatibility is None
+            else bool(force_compatibility)
+        )
+        return SpineRuntimePolicy.from_values(
+            compatibility_mode=compatibility,
+            selected_version=self._spine_selected_runtime_version_for_import(),
+            runtime_root=self._spine_runtime_dir_for_import() or None,
+            prefer_installed=compatibility,
         )
 
-    def on_preview_image_limit_changed(self, value: int):
-        self.settings_manager.set("preview.image_limit", int(value))
+    def _merge_latest_preview_settings(self, ui_state: dict):
+        """Merge the current UI state into the newest persisted settings."""
+
+        latest = self._load_latest_preview_settings()
+        if not isinstance(latest, dict):
+            return
+        preview = latest.setdefault("preview", {})
+        if not isinstance(preview, dict):
+            preview = {}
+            latest["preview"] = preview
+        disk_ui_state = preview.get("ui_state")
+        merged_ui_state = dict(disk_ui_state) if isinstance(disk_ui_state, dict) else {}
+        merged_ui_state.update(ui_state)
+        preview["ui_state"] = merged_ui_state
+        self.settings_manager.settings = latest
+
+    def browse_spine_runtime(self):
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select official Spine runtime directory",
+            str(self.settings_manager.get("preview.spine_runtime_dir", "") or ""),
+        )
+        if not folder:
+            return
+        self.settings_manager.set("preview.spine_runtime_dir", folder)
+        if self.spine_runtime_edit:
+            self.spine_runtime_edit.setText(folder)
+        current = str(self.source_edit.text() or "") if self.source_edit else ""
+        if current and (
+            _is_spine_preview_source(current)
+            or os.path.splitext(current)[1].lower() in PACKAGE_PREVIEW_EXTENSIONS
+        ):
+            self.start_spine_preview_import(
+                current,
+                package_fallback=os.path.splitext(current)[1].lower() in PACKAGE_PREVIEW_EXTENSIONS,
+            )
 
     def browse_preview_file(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -2217,6 +3121,48 @@ class PreviewPage(QFrame):
         except Exception:
             pass
 
+    def _destroy_embedded_spine(self):
+        preview = self.spine_preview
+        self.spine_preview = None
+        if preview is None:
+            return
+        try:
+            if self.preview_dock_layout:
+                self.preview_dock_layout.removeWidget(preview)
+            preview.shutdown()
+            preview.close()
+            preview.deleteLater()
+        except Exception:
+            pass
+
+    def _clear_embedded_spine(self):
+        preview = self.spine_preview
+        self._active_spine_plan = None
+        self._active_spine_preview_key = ""
+        if self.spine_controls:
+            self.spine_controls.clear()
+        if preview is None:
+            self._set_spine_mode(False)
+            return
+        try:
+            preview.clear_preview()
+        except Exception:
+            pass
+        self._set_spine_mode(False)
+
+    def _set_spine_mode(self, active: bool):
+        """Swap controls by resource type without changing sidebar preferences."""
+        active = bool(active)
+        self._spine_mode = active
+        if active:
+            self._set_motion_debug_visible(False)
+            self._set_resource_mode("spine")
+        elif self._resource_mode == "spine":
+            self.spine_controls.clear()
+            self._set_resource_mode("empty")
+        self._spine_sidebar_state = None
+        self._update_sidebar_button_text()
+
     def _poll_preview_process(self):
         process = self.preview_process
         if process is None:
@@ -2236,9 +3182,14 @@ class PreviewPage(QFrame):
         self._last_preview_dock_rect = None
         self._set_motion_debug_visible(False)
 
-    def _show_stage_placeholder(self, text: str | None = None):
+    def _show_stage_placeholder(self, text: str | None = None, *, keep_editor_source=False):
+        if not keep_editor_source:
+            self._set_editor_source()
+        self._set_resource_mode("live2d" if keep_editor_source else "empty")
         if self.live2d_preview:
             self.live2d_preview.setVisible(False)
+        if self.spine_preview:
+            self.spine_preview.setVisible(False)
         if self.image_preview_panel:
             self.image_preview_panel.setVisible(False)
         if self.preview_placeholder:
@@ -2246,12 +3197,27 @@ class PreviewPage(QFrame):
             self.preview_placeholder.setVisible(True)
 
     def _show_image_stage(self):
+        self._set_editor_source()
+        self._set_resource_mode("image")
         if self.live2d_preview:
             self.live2d_preview.setVisible(False)
+        if self.spine_preview:
+            self.spine_preview.setVisible(False)
         if self.preview_placeholder:
             self.preview_placeholder.setVisible(False)
         if self.image_preview_panel:
             self.image_preview_panel.setVisible(True)
+
+    def _show_spine_stage(self):
+        if self.live2d_preview:
+            self.live2d_preview.setVisible(False)
+        if self.image_preview_panel:
+            self.image_preview_panel.setVisible(False)
+        if self.preview_placeholder:
+            self.preview_placeholder.setVisible(False)
+        if self.spine_preview:
+            self.spine_preview.setVisible(True)
+        self._set_spine_mode(True)
 
     def _set_preview_export_payload(
         self,
@@ -2328,7 +3294,7 @@ class PreviewPage(QFrame):
             tr("preview.export_failed_content", error=error),
         )
 
-    def _populate_motion_controls(self, motions: list[dict]):
+    def _populate_motion_controls(self, motions: list[dict], *, autoplay: bool = True):
         previous = str(self.motion_combo.currentData() or "") if self.motion_combo else ""
         if not previous:
             previous = str(
@@ -2360,7 +3326,7 @@ class PreviewPage(QFrame):
         selected_index = self.motion_combo.findData(previous) if previous else -1
         self.motion_combo.setCurrentIndex(selected_index if selected_index >= 0 else 0)
         self.motion_combo.blockSignals(False)
-        self._on_motion_selection_changed(self.motion_combo.currentIndex())
+        self._on_motion_selection_changed(self.motion_combo.currentIndex(), autoplay=autoplay)
 
     def _set_motion_debug_visible(self, visible: bool):
         if self.motion_group:
@@ -2369,11 +3335,7 @@ class PreviewPage(QFrame):
             self.pose_controls_card.setEnabled(bool(visible))
         if self.advanced_panel:
             self.advanced_panel.setEnabled(bool(visible))
-        if self._parameter_sync_timer:
-            if visible:
-                self._parameter_sync_timer.start()
-            else:
-                self._parameter_sync_timer.stop()
+        self._update_parameter_sync_timer()
 
     def play_selected_motion(self):
         if not self._motion_items or not self.motion_combo:
@@ -2403,7 +3365,7 @@ class PreviewPage(QFrame):
                 int(motion.get("index", 0)),
             )
 
-    def _on_motion_selection_changed(self, index: int):
+    def _on_motion_selection_changed(self, index: int, *, autoplay: bool = True):
         if not self.live2d_preview or index < 0 or index >= len(self._motion_items):
             return
         motion = self._motion_items[index]
@@ -2411,9 +3373,68 @@ class PreviewPage(QFrame):
             str(motion.get("group", "")),
             int(motion.get("index", 0)),
         )
-        if self.auto_play_motion_check and self.auto_play_motion_check.isChecked():
+        if (autoplay and not self._live2d_load_in_progress
+                and self._live2d_ready_generation == self._live2d_source_generation
+                and self.auto_play_motion_check and self.auto_play_motion_check.isChecked()):
             self.play_selected_motion()
         self._update_motion_timeline_visibility()
+        self._save_preview_ui_state()
+
+    def _connect_live2d_preview_events(self, preview):
+        if getattr(preview, "_general_preview_events_connected", False):
+            return
+        for name, handler in (("modelReady", self._on_live2d_model_ready),
+                              ("fitModeChanged", self._on_content_fit_mode_changed),
+                              ("contentFitApplied", self._on_content_fit_applied)):
+            signal = getattr(preview, name, None)
+            if signal is not None:
+                signal.connect(handler)
+        preview._general_preview_events_connected = True
+
+    def _on_live2d_model_ready(self, model_path: str, native_generation: int):
+        request = self._pending_live2d_ready
+        if request is None or self._resource_mode != "live2d" or self._live2d_load_in_progress:
+            return
+        expected_path, expected_native, source_generation = request
+        if (source_generation != self._live2d_source_generation or native_generation != expected_native
+                or os.path.normcase(os.path.abspath(model_path)) != os.path.normcase(expected_path)
+                or (self.sender() is not None and self.sender() is not self.live2d_preview)):
+            return
+        self._pending_live2d_ready = None
+        self._live2d_ready_generation = source_generation
+        self.on_motion_loop_changed(self.loop_motion_check.isChecked())
+        self.on_motion_freeze_changed(self.freeze_motion_check.isChecked())
+        self._on_motion_selection_changed(self.motion_combo.currentIndex(), autoplay=False)
+        if self._live2d_initial_play_generation == source_generation:
+            return
+        self._live2d_initial_play_generation = source_generation
+        if not self.auto_play_motion_check.isChecked() or self.freeze_motion_check.isChecked():
+            return
+        first = next((index for index, motion in enumerate(self._motion_items)
+                      if Path(str(motion.get("file") or "")).is_file()), None)
+        if first is not None:
+            with QSignalBlocker(self.motion_combo):
+                self.motion_combo.setCurrentIndex(first)
+            self._on_motion_selection_changed(first, autoplay=False)
+            self.play_selected_motion()
+
+    def _fit_preview_model(self):
+        if self._resource_mode == "live2d" and self.live2d_preview:
+            self.live2d_preview.fit_model()
+
+    def _on_content_fit_mode_changed(self, enabled: bool):
+        if self._resource_mode != "live2d" or (self.sender() is not None and self.sender() is not self.live2d_preview):
+            return
+        with QSignalBlocker(self.settings_panel.content_fit_check):
+            self.settings_panel.content_fit_check.setChecked(enabled)
+        self._save_preview_ui_state()
+
+    def _on_content_fit_applied(self, state: dict):
+        if (self._resource_mode != "live2d" or self.live2d_preview is None
+                or (self.sender() is not None and self.sender() is not self.live2d_preview)
+                or state.get("model_generation") != self.live2d_preview.model_load_generation()):
+            return
+        self.settings_panel.sync_view_transform(state)
         self._save_preview_ui_state()
 
     def _on_pose_freeze_toggled(self, frozen: bool):
@@ -2442,29 +3463,29 @@ class PreviewPage(QFrame):
         return self._motion_items[index] if 0 <= index < len(self._motion_items) else None
 
     def _update_motion_timeline_visibility(self):
-        motion = self._selected_motion_item()
+        motion, state = self._motion_playback_context()
         duration = float((motion or {}).get("duration") or 0.0)
-        visible = bool(
-            self.freeze_motion_check
-            and self.freeze_motion_check.isChecked()
-            and motion
-            and duration > 0.0
-        )
+        visible = bool(self._resource_mode == "live2d" and motion and duration > 0.0)
         if not self.motion_timeline_frame:
             return
         self.motion_timeline_frame.setVisible(visible)
         if not visible:
             return
         maximum_ms = max(1, int(round(duration * 1000)))
+        frozen = bool(self.freeze_motion_check and self.freeze_motion_check.isChecked())
+        self.motion_time_spin.setEnabled(frozen)
+        self.motion_timeline.setEnabled(frozen)
         self._timeline_sync = True
         try:
             self.motion_time_spin.setRange(0, maximum_ms)
-            current_ms = min(self.motion_time_spin.value(), maximum_ms)
+            current_ms = min(max(0, int(round(float((state or {}).get("time", 0)) * 1000))), maximum_ms)
             self.motion_time_spin.setValue(current_ms)
             self.motion_timeline.setValue(int(round(current_ms / maximum_ms * 1000)))
-            self.motion_time_label.setText(
-                tr("preview.motion_timeline_position", current=current_ms / 1000, total=duration)
-            )
+            key = "preview.motion_playback_position" if state else "preview.motion_not_playing_position"
+            self.motion_time_label.setText(tr(key, PREVIEW_LAYOUT_TEXT[key],
+                                            motion=f"{motion.get('group', '')}[{motion.get('index', 0)}]",
+                                            current=current_ms / 1000, total=duration))
+            self.motion_time_label.setToolTip(str(motion.get("display") or motion.get("group") or ""))
         finally:
             self._timeline_sync = False
 
@@ -2480,10 +3501,12 @@ class PreviewPage(QFrame):
         self._set_motion_timeline_ms(int(value))
 
     def _set_motion_timeline_ms(self, milliseconds: int):
-        motion = self._selected_motion_item()
+        # The combo may be a queued choice with auto-play off. Scrub the motion
+        # whose native clock is displayed, not a different selected item.
+        motion, _state = self._motion_playback_context()
         if not motion or not self.live2d_preview or not self.motion_time_spin:
             return
-        maximum = max(1, self.motion_time_spin.maximum())
+        maximum = max(1, int(round(float(motion.get("duration") or 0) * 1000)))
         target = min(max(0, int(milliseconds)), maximum)
         self._timeline_sync = True
         try:
@@ -2499,16 +3522,32 @@ class PreviewPage(QFrame):
         finally:
             self._timeline_sync = False
         values = self.live2d_preview.set_motion_time(motion, target / 1000)
-        if values and self.advanced_panel:
-            self.advanced_panel.set_advanced_param_values(values)
+        self._sync_live_parameter_controls(force=True)
+        if values and self.freeze_motion_check.isChecked():
+            self._capture_frozen_parameters()
+            self.live2d_preview.apply_settings({"advanced_enabled": True, "advanced_params": dict(self._frozen_parameter_values)})
 
     def on_motion_freeze_changed(self, frozen: bool):
         if not self.live2d_preview:
             return
+        canvas_frozen = getattr(self.live2d_preview, "live2d_canvas", None)
+        checker = getattr(canvas_frozen, "isMotionFrozen", None)
+        was_frozen = bool(checker()) if callable(checker) else bool(self._frozen_parameter_values)
         self.live2d_preview.set_motion_frozen(bool(frozen))
         if frozen:
-            self._sync_live_parameter_controls(force=True)
+            if not was_frozen:
+                self._sync_live_parameter_controls(force=True)
+                self._capture_frozen_parameters()
+        else:
+            self._frozen_parameter_values.clear()
+            self._pose_slider_values.clear()
         self._update_motion_timeline_visibility()
+
+    def _capture_frozen_parameters(self):
+        self._frozen_parameter_values = self._preview_parameters()
+        self._pose_slider_values = {parameter_id: slider.value() / float(scale)
+                                   for parameter_id, (slider, _label, scale)
+                                   in self.advanced_panel.advanced_param_sliders.items()}
 
     def on_motion_loop_changed(self, enabled: bool):
         if self.live2d_preview:
@@ -2523,37 +3562,74 @@ class PreviewPage(QFrame):
                 self.freeze_motion_check.setChecked(editing_pose)
                 self.freeze_motion_check.blockSignals(False)
             self.on_motion_freeze_changed(editing_pose)
-            self.live2d_preview.apply_settings(
-                self.advanced_panel.get_advanced_settings()
-            )
+            values = self.advanced_panel.get_advanced_settings()
+            if editing_pose:
+                for parameter_id, value in values.get("advanced_params", {}).items():
+                    if value != self._pose_slider_values.get(parameter_id):
+                        self._frozen_parameter_values[parameter_id] = float(value)
+                self._pose_slider_values = dict(values.get("advanced_params", {}))
+                values["advanced_params"] = dict(self._frozen_parameter_values)
+            self.live2d_preview.apply_settings(values)
+
+    def _update_parameter_sync_timer(self):
+        if self._parameter_sync_timer is None:
+            return
+        if (self._resource_mode == "live2d" and self._preview_page_active is not False
+                and self.isVisible() and self.right_sidebar.isVisible()
+                and self.live2d_details.currentIndex() == 0 and self.advanced_panel.isEnabled()):
+            self._parameter_sync_timer.start()
+        else:
+            self._parameter_sync_timer.stop()
 
     def _sync_live_parameter_controls(self, force: bool = False):
         if (
             self.live2d_preview is None
             or self.advanced_panel is None
-            or (self.freeze_motion_check and self.freeze_motion_check.isChecked() and not force)
+            or self._resource_mode != "live2d"
+            or (not force and (self._preview_page_active is False or not self.isVisible()
+                               or not self.right_sidebar.isVisible() or self.live2d_details.currentIndex() != 0))
         ):
             return
-        meta = self.live2d_preview.get_parameter_meta_list()
-        if not meta:
+        self._update_motion_timeline_visibility()
+        frozen = bool(self.freeze_motion_check and self.freeze_motion_check.isChecked())
+        if force or not self.advanced_panel.advanced_param_sliders:
+            meta = self.live2d_preview.get_parameter_meta_list()
+            if not meta:
+                return
+            if not self.advanced_panel.advanced_param_sliders:
+                self.advanced_panel.rebuild_advanced_params(meta)
+            self.advanced_panel.sync_advanced_param_values(meta)
             return
-        if not self.advanced_panel.advanced_param_sliders:
-            self.advanced_panel.rebuild_advanced_params(meta)
-        self.advanced_panel.sync_advanced_param_values(meta)
+        ids = self.advanced_panel.visible_parameter_ids()
+        if not ids:
+            return
+        if frozen:
+            values = {parameter_id: self._frozen_parameter_values[parameter_id]
+                      for parameter_id in ids if parameter_id in self._frozen_parameter_values}
+        else:
+            getter = getattr(self.live2d_preview, "get_parameter_values", None)
+            if callable(getter):
+                values = getter(ids)
+            else:
+                values = {item["id"]: float(item["value"]) for item in self.live2d_preview.get_parameter_meta_list()
+                          if item.get("id") in ids}
+        self.advanced_panel.sync_advanced_param_values(values)
+        if frozen:
+            for parameter_id in values:
+                slider, _label, scale = self.advanced_panel.advanced_param_sliders[parameter_id]
+                self._pose_slider_values[parameter_id] = slider.value() / float(scale)
 
     def _cleanup_temp_model_json(self):
-        """删除上一次创建的临时美化 model json（若存在）。"""
-        try:
-            if self._temp_model_json_path and os.path.isfile(self._temp_model_json_path):
-                os.remove(self._temp_model_json_path)
-        except Exception:
-            pass
+        """Forget the model reference; owned temporary directories clean it up."""
+        # current_model_path can point to a user's original model or a MOD
+        # export. Only directories tracked by the importer may be deleted.
+        self._temp_model_json_path = None
 
     def _cleanup_image_preview_temp_dirs(self):
         for temp_dir in list(self._image_preview_temp_dirs):
             try:
                 if temp_dir and os.path.isdir(temp_dir):
-                    shutil.rmtree(temp_dir)
+                    self._dispose_preview_temp_dir(temp_dir)
             except Exception:
                 pass
         self._image_preview_temp_dirs = []
@@ -2564,18 +3640,119 @@ class PreviewPage(QFrame):
         for temp_dir in list(self._model_preview_temp_dirs):
             try:
                 if temp_dir and os.path.isdir(temp_dir):
-                    shutil.rmtree(temp_dir)
+                    self._dispose_preview_temp_dir(temp_dir)
             except Exception:
                 pass
         self._model_preview_temp_dirs = []
         if self._preview_export_kind == "live2d":
             self._clear_preview_export_payload()
 
+    def _cleanup_spine_preview_temp_dirs(self):
+        """Cancel Spine imports and release their disposable workspaces.
+
+        A finished ``QThread`` may already have had its C++ object destroyed
+        while the Python wrapper is still referenced.  Always test validity
+        before touching it and clear the active pointer before scheduling
+        ``deleteLater()`` so a later import cannot call ``isRunning()`` on a
+        dangling wrapper.
+        """
+
+        self._spine_preview_generation += 1
+        running = []
+        processed = set()
+        for thread in list(self._spine_preview_workers):
+            if not _is_qt_object_valid(thread):
+                if thread is self._spine_preview_thread:
+                    self._spine_preview_thread = None
+                continue
+            if _spine_thread_is_running(thread):
+                thread.requestInterruption()
+                running.append(thread)
+            else:
+                processed.add(id(thread))
+                result = getattr(thread, "result", None)
+                temp_dir = getattr(result, "temp_dir", None)
+                if temp_dir:
+                    self._dispose_preview_temp_dir(temp_dir)
+                if thread is self._spine_preview_thread:
+                    self._spine_preview_thread = None
+                thread.deleteLater()
+        self._spine_preview_workers = running
+        current = self._spine_preview_thread
+        if current is not None and id(current) not in processed:
+            if not _is_qt_object_valid(current):
+                self._spine_preview_thread = None
+            elif _spine_thread_is_running(current):
+                current.requestInterruption()
+                if not any(current is item for item in running):
+                    running.append(current)
+                    self._spine_preview_workers = running
+            else:
+                result = getattr(current, "result", None)
+                temp_dir = getattr(result, "temp_dir", None)
+                if temp_dir:
+                    self._dispose_preview_temp_dir(temp_dir)
+                current.deleteLater()
+                self._spine_preview_thread = None
+
+        # A worker may still be writing a disposable extraction.  Leave its
+        # directory alone until finished() instead of deleting live files.
+        if running:
+            return
+        for temp_dir in list(self._spine_preview_temp_dirs):
+            try:
+                if temp_dir and os.path.isdir(temp_dir):
+                    self._dispose_preview_temp_dir(temp_dir)
+            except Exception:
+                pass
+        self._spine_preview_temp_dirs = []
+
+    def _cleanup_finished_spine_thread(self):
+        finished = []
+        running = []
+        for thread in list(self._spine_preview_workers):
+            if not _is_qt_object_valid(thread):
+                if thread is self._spine_preview_thread:
+                    self._spine_preview_thread = None
+                continue
+            if _spine_thread_is_running(thread):
+                running.append(thread)
+            else:
+                finished.append(thread)
+        self._spine_preview_workers = running
+        for thread in finished:
+            result = getattr(thread, "result", None)
+            temp_dir = getattr(result, "temp_dir", None)
+            is_current_result = (
+                getattr(thread, "_preview_generation", None) == self._spine_preview_generation
+            )
+            if temp_dir:
+                temp_dir = str(temp_dir)
+                if is_current_result:
+                    if temp_dir not in self._spine_preview_temp_dirs:
+                        self._spine_preview_temp_dirs.append(temp_dir)
+                else:
+                    self._dispose_preview_temp_dir(temp_dir)
+                    try:
+                        self._spine_preview_temp_dirs.remove(temp_dir)
+                    except ValueError:
+                        pass
+            if thread is self._spine_preview_thread:
+                # The active preview owns the result directory; the worker
+                # wrapper must not remain the active handle after finished.
+                self._spine_preview_thread = None
+            thread.deleteLater()
+        if self._spine_preview_workers:
+            return
+        # Active result directories belong to the embedded view and are
+        # removed by an explicit close/new import, never by an unrelated
+        # worker's late ``finished`` signal.
+
     def _cleanup_archive_preview_temp_dirs(self):
         for temp_dir in list(self._archive_preview_temp_dirs):
             try:
                 if temp_dir and os.path.isdir(temp_dir):
-                    shutil.rmtree(temp_dir)
+                    self._dispose_preview_temp_dir(temp_dir)
             except Exception:
                 pass
         self._archive_preview_temp_dirs = []
@@ -2584,7 +3761,7 @@ class PreviewPage(QFrame):
         for temp_dir in list(self._folder_preview_temp_dirs):
             try:
                 if temp_dir and os.path.isdir(temp_dir):
-                    shutil.rmtree(temp_dir)
+                    self._dispose_preview_temp_dir(temp_dir)
             except Exception:
                 pass
         self._folder_preview_temp_dirs = []
@@ -2602,10 +3779,7 @@ class PreviewPage(QFrame):
             return
 
         if _is_spine_preview_source(file_path):
-            self.show_error(
-                tr("preview.spine_not_supported_title"),
-                tr("preview.spine_not_supported_content"),
-            )
+            self.start_spine_preview_import(file_path)
             return
 
         if _is_archive_preview_source(file_path):
@@ -2625,10 +3799,16 @@ class PreviewPage(QFrame):
                 pass
 
         suffix = os.path.splitext(file_path)[1].lower()
-        if suffix in PACKAGE_PREVIEW_EXTENSIONS or (
+        if suffix in PACKAGE_PREVIEW_EXTENSIONS:
+            # Extract once in the worker, then route Spine or Live2D using
+            # that same workspace instead of decrypting a Live2D LPK twice.
+            self.start_spine_preview_import(file_path, package_fallback=True)
+            return
+
+        if (
             _is_unity_preview_source(file_path) and not os.path.isdir(file_path)
         ):
-            self.start_model_preview_import(file_path)
+            self.start_spine_preview_import(file_path, package_fallback=True)
             return
 
         if _is_image_file(file_path):
@@ -2638,13 +3818,552 @@ class PreviewPage(QFrame):
                 return
 
         if _is_unity_preview_source(file_path) and not _is_model_json(file_path):
-            self.start_unity_image_preview(file_path)
+            self.start_spine_preview_import(file_path, package_fallback=True)
             return
 
         self.show_error(
             tr("preview.invalid_file_type_title"),
             tr("preview.invalid_file_type_content")
         )
+
+    def start_spine_preview_import(
+        self,
+        source_path: str,
+        package_fallback: bool = False,
+        *,
+        force_compatibility: bool | None = None,
+        prompt_missing_runtime: bool = True,
+    ):
+        """Prepare a Spine source and open the local viewer in the stage."""
+        # Closing first invalidates the previous generation and requests
+        # interruption for an import that is still extracting.  A new
+        # generation is assigned only after that cancellation, so a late
+        # ready/failed signal from the old worker cannot reopen the stage.
+        self.close_preview_window()
+        self._spine_preview_generation += 1
+        generation = self._spine_preview_generation
+        self._cleanup_temp_model_json()
+        self._cleanup_model_preview_temp_dirs()
+        self._cleanup_image_preview_temp_dirs()
+        self._cleanup_archive_preview_temp_dirs()
+        self.current_model_path = None
+        self.preview_btn.setEnabled(False)
+        self._set_motion_debug_visible(False)
+        self._set_spine_mode(True)
+        if self.image_preview_panel:
+            self.image_preview_panel.clear()
+        self._show_stage_placeholder(tr("preview.stage_loading"))
+        self.model_info_text_box.setMarkdown(
+            tr("preview.spine_import_loading", source=source_path)
+        )
+        runtime_root = self._spine_runtime_dir_for_import()
+        runtime_policy = self._spine_runtime_policy_for_import(force_compatibility)
+        unify_version = bool(runtime_policy.compatibility_mode)
+        self._spine_runtime_prompt_enabled = bool(prompt_missing_runtime)
+        worker = SpinePreviewImportThread(
+            source_path,
+            self.settings_manager.get_temp_dir(),
+            runtime_root,
+            self,
+        )
+        worker._package_fallback = bool(package_fallback)
+        worker._unify_version = bool(unify_version)
+        worker._runtime_policy = runtime_policy
+        worker._preview_generation = generation
+        worker.previewReady.connect(
+            lambda result, source, w=worker, g=generation: self.on_spine_preview_ready(result, source, g, w)
+        )
+        worker.failed.connect(
+            lambda error, source, w=worker, g=generation: self.on_spine_preview_failed(error, source, g, w)
+        )
+        worker.finished.connect(self._cleanup_finished_spine_thread)
+        self._spine_preview_workers.append(worker)
+        self._spine_preview_thread = worker
+        worker.start()
+
+    def on_spine_preview_ready(self, result, source_path: str, generation=None, worker=None):
+        if generation is not None and generation != self._spine_preview_generation:
+            return
+        temp_dir = getattr(result, "temp_dir", None)
+        if temp_dir and str(temp_dir) not in self._spine_preview_temp_dirs:
+            self._spine_preview_temp_dirs.append(str(temp_dir))
+        try:
+            plan = getattr(result, "plan", None)
+            if (
+                isinstance(plan, SpinePreviewPlan)
+                and plan.runtime_missing
+                and bool(getattr(plan.asset, "has_skeleton", False))
+            ):
+                if self._spine_runtime_prompt_enabled:
+                    self.handle_missing_spine_runtime(
+                        plan,
+                        source_path,
+                        package_fallback=bool(getattr(worker, "_package_fallback", False)),
+                    )
+                else:
+                    self._on_spine_preview_error(plan.runtime_error or plan.reason)
+                return
+            preview_model = getattr(result, "preview_model_json", None)
+            if preview_model:
+                self.load_model_preview(str(preview_model), source_path,
+                                        editor_model_json=str(result.package.model_json))
+                return
+            self._open_spine_native_preview(result.plan)
+        except Exception as exc:
+            self._on_spine_preview_error(str(exc))
+
+    def _spine_runtime_choice_version(self, plan: SpinePreviewPlan) -> str:
+        requested = str(
+            plan.requested_runtime_version
+            or getattr(plan.asset, "spine_version", "")
+            or ""
+        ).strip()
+        if requested.startswith("3.8."):
+            return SPINE_COMPATIBILITY_VERSION if requested == SPINE_COMPATIBILITY_VERSION else requested
+        if requested == "4.0" or requested.startswith("4.0."):
+            return "4.0"
+        return requested
+
+    def _has_verified_spine_runtime(self, version: str) -> bool:
+        """Return whether the requested verified bridge is usable locally."""
+
+        family = "3.8" if version.startswith("3.8.") else "4.0" if version == "4.0" else ""
+        if not family:
+            return False
+        requested = version if family == "3.8" else "4.0"
+        roots = []
+        configured = self._spine_runtime_dir_for_import()
+        if configured:
+            roots.append(configured)
+        # ``discover_spine_runtime(None, ...)`` scans the managed catalog root
+        # and is also the fallback used by the core planner for a single
+        # family directory selected in Settings.
+        roots.append(None)
+        for root in roots:
+            try:
+                discover_spine_runtime(
+                    root,
+                    requested_family=family,
+                    requested_version=requested,
+                )
+            except Exception:
+                continue
+            return True
+        return False
+
+    def _spine_conversion_fallback_available(self, plan: SpinePreviewPlan) -> bool:
+        """Check the verified converter and target bridge before offering Convert."""
+
+        if not bool(getattr(plan.asset, "has_skeleton", False)):
+            return False
+        source_version = str(
+            getattr(plan.asset, "spine_version", "") or plan.requested_runtime_version or ""
+        ).strip()
+        source_family = source_version.rsplit(".", 1)[0] if source_version.count(".") >= 2 else ""
+        if source_family not in {"3.5", "3.6", "3.7", "3.8", "4.0", "4.1", "4.2"}:
+            return False
+        if source_version == SPINE_COMPATIBILITY_VERSION:
+            return False
+        try:
+            converter = discover_native_converter()
+        except Exception:
+            converter = None
+        return bool(converter and self._has_verified_spine_runtime(SPINE_COMPATIBILITY_VERSION))
+
+    def handle_missing_spine_runtime(
+        self,
+        plan: SpinePreviewPlan,
+        source_path: str,
+        *,
+        package_fallback: bool = False,
+    ) -> str:
+        """Show the explicit missing-runtime choices and dispatch one branch.
+
+        Return values are stable for tests and callers: ``download``,
+        ``convert`` or ``cancel``.  Download/build work is delegated to the
+        same QThread worker used by SettingsPage, so the modal decision never
+        performs network or CMake work on the GUI thread.
+        """
+
+        version = self._spine_runtime_choice_version(plan)
+        download_id = {
+            "3.8.75": "spine_native",
+            "4.0": "spine_native_4_0",
+        }.get(version)
+
+        box = QMessageBox(self)
+        box.setWindowTitle(tr("preview.spine_runtime_missing_title"))
+        box.setText(
+            tr(
+                "preview.spine_runtime_missing_content",
+                version=version,
+                error=plan.runtime_error or plan.reason,
+            )
+        )
+        download_button = box.addButton(
+            tr("preview.spine_runtime_download"), QMessageBox.ButtonRole.AcceptRole
+        )
+        convert_button = box.addButton(
+            tr("preview.spine_runtime_convert"), QMessageBox.ButtonRole.ActionRole
+        )
+        cancel_button = box.addButton(
+            tr("common.cancel"), QMessageBox.ButtonRole.RejectRole
+        )
+        # An unsupported family (for example 4.1) has no catalog download,
+        # but can still use the verified converter when its 3.8.75 bridge is
+        # already installed.  Conversely, a 3.8.75 source cannot be made
+        # playable by converting it again when that same bridge is missing.
+        download_button.setEnabled(download_id is not None)
+        convert_button.setEnabled(self._spine_conversion_fallback_available(plan))
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is download_button:
+            started = self._start_spine_runtime_install(
+                download_id,
+                retry_source=str(source_path),
+                retry_package_fallback=bool(package_fallback),
+                retry_compatibility=self._spine_compatibility_mode_for_import(),
+                retry_generation=self._spine_preview_generation,
+            )
+            return "download" if started else "cancel"
+        if clicked is convert_button:
+            self._spine_runtime_retry_source = str(source_path)
+            self._spine_runtime_retry_package_fallback = bool(package_fallback)
+            self._spine_runtime_retry_compatibility = True
+            self._spine_runtime_retry_generation = self._spine_preview_generation
+            # This is a one-import override and does not mutate the global
+            # compatibility toggle in SettingsManager.
+            self.start_spine_preview_import(
+                source_path,
+                package_fallback=package_fallback,
+                force_compatibility=True,
+                prompt_missing_runtime=False,
+            )
+            return "convert"
+
+        self._spine_runtime_retry_source = ""
+        self._spine_runtime_retry_package_fallback = False
+        self._spine_runtime_retry_compatibility = False
+        self._spine_runtime_retry_generation = 0
+        self._show_stage_placeholder(tr("preview.spine_runtime_cancelled"))
+        self.model_info_text_box.setMarkdown(tr("preview.spine_runtime_cancelled"))
+        return "cancel"
+
+    def _start_spine_runtime_install(
+        self,
+        package_id: str,
+        *,
+        retry_source: str | None = None,
+        retry_package_fallback: bool | None = None,
+        retry_compatibility: bool | None = None,
+        retry_generation: int | None = None,
+    ) -> bool:
+        worker = self._spine_runtime_install_worker
+        if worker is not None and _spine_thread_is_running(worker):
+            InfoBar.warning(
+                title=tr("settings.tool_download_busy_title"),
+                content=tr("settings.tool_download_busy"),
+                orient=Qt.Horizontal,
+                isClosable=True,
+                position=InfoBarPosition.TOP,
+                duration=4000,
+                parent=self,
+            )
+            return False
+        # Capture retry context on this worker.  The page-level fields are
+        # convenient for diagnostics, but late signals must be checked against
+        # the immutable worker context so a new source cannot be paired with an
+        # older download that happened to finish later.
+        retry_generation = (
+            self._spine_preview_generation
+            if retry_generation is None
+            else int(retry_generation)
+        )
+        retry_source = (
+            self._spine_runtime_retry_source
+            if retry_source is None
+            else str(retry_source)
+        )
+        retry_package_fallback = (
+            self._spine_runtime_retry_package_fallback
+            if retry_package_fallback is None
+            else bool(retry_package_fallback)
+        )
+        retry_compatibility = (
+            self._spine_runtime_retry_compatibility
+            if retry_compatibility is None
+            else bool(retry_compatibility)
+        )
+        worker = ToolchainInstallWorker(package_id, self)
+        worker._spine_retry_generation = retry_generation
+        worker._spine_retry_source = retry_source
+        worker._spine_retry_package_fallback = retry_package_fallback
+        worker._spine_retry_compatibility = retry_compatibility
+        self._spine_runtime_retry_source = retry_source
+        self._spine_runtime_retry_package_fallback = retry_package_fallback
+        self._spine_runtime_retry_compatibility = retry_compatibility
+        self._spine_runtime_retry_generation = retry_generation
+        self._spine_runtime_install_worker = worker
+        worker.progressChanged.connect(
+            lambda progress, w=worker: self._on_spine_runtime_install_progress(progress, w)
+        )
+        worker.resultReady.connect(
+            lambda result, w=worker: self._on_spine_runtime_install_result(result, w)
+        )
+        worker.failed.connect(
+            lambda message, w=worker: self._on_spine_runtime_install_failed(message, w)
+        )
+        worker.finished.connect(self._on_spine_runtime_install_finished)
+        self._show_stage_placeholder(tr("preview.spine_runtime_installing", version=package_id))
+        worker.start()
+        return True
+
+    def _on_spine_runtime_install_progress(self, progress, worker=None) -> None:
+        if worker is not None and worker is not self._spine_runtime_install_worker:
+            return
+        if worker is not None and getattr(worker, "_spine_retry_generation", None) != self._spine_preview_generation:
+            return
+        message = str(getattr(progress, "message", "") or getattr(progress, "phase", ""))
+        if message:
+            self.model_info_text_box.setMarkdown(message)
+
+    def _on_spine_runtime_install_result(self, result, worker=None) -> None:
+        if worker is not None and worker is not self._spine_runtime_install_worker:
+            return
+        retry_generation = getattr(
+            worker, "_spine_retry_generation", self._spine_runtime_retry_generation
+        )
+        if retry_generation != self._spine_preview_generation:
+            return
+        install_dir = Path(str(getattr(result, "install_dir", ""))).expanduser().resolve()
+        if not install_dir.is_dir():
+            self._on_spine_runtime_install_failed(
+                "Installed runtime directory is missing.", worker
+            )
+            return
+        # The preview resolver accepts either a family directory or the
+        # common parent.  Persist the common parent so both verified families
+        # remain discoverable after installing either package.
+        common_root = install_dir.parent if install_dir.name in {"3.8.75", "4.0"} else install_dir
+        setter = getattr(self.settings_manager, "set_spine_runtime_dir", None)
+        if callable(setter):
+            setter(str(common_root))
+        else:
+            self.settings_manager.set("preview.spine_runtime_dir", str(common_root))
+        if self.spine_runtime_edit:
+            self.spine_runtime_edit.setText(str(common_root))
+        source = getattr(worker, "_spine_retry_source", self._spine_runtime_retry_source)
+        if source:
+            self.start_spine_preview_import(
+                source,
+                package_fallback=getattr(
+                    worker,
+                    "_spine_retry_package_fallback",
+                    self._spine_runtime_retry_package_fallback,
+                ),
+                force_compatibility=getattr(
+                    worker,
+                    "_spine_retry_compatibility",
+                    self._spine_runtime_retry_compatibility,
+                ),
+                prompt_missing_runtime=False,
+            )
+
+    def _on_spine_runtime_install_failed(self, message: str, worker=None) -> None:
+        if worker is not None and worker is not self._spine_runtime_install_worker:
+            return
+        retry_generation = getattr(
+            worker, "_spine_retry_generation", self._spine_runtime_retry_generation
+        )
+        if retry_generation != self._spine_preview_generation:
+            return
+        self._show_stage_placeholder(
+            tr("preview.spine_runtime_install_failed", error=str(message))
+        )
+        self.model_info_text_box.setMarkdown(
+            tr("preview.spine_runtime_install_failed", error=str(message))
+        )
+        self.show_error(
+            tr("preview.spine_runtime_install_failed_title"),
+            tr("preview.spine_runtime_install_failed", error=str(message)),
+        )
+        self._spine_runtime_retry_source = ""
+        self._spine_runtime_retry_package_fallback = False
+        self._spine_runtime_retry_compatibility = False
+        self._spine_runtime_retry_generation = 0
+
+    def _on_spine_runtime_install_finished(self) -> None:
+        worker = self.sender()
+        if worker is self._spine_runtime_install_worker:
+            self._spine_runtime_install_worker = None
+        if worker is not None:
+            worker.deleteLater()
+
+    def is_spine_runtime_install_running(self) -> bool:
+        worker = self._spine_runtime_install_worker
+        if worker is None:
+            return False
+        try:
+            return bool(worker.isRunning())
+        except RuntimeError:
+            return False
+
+    def notify_close_while_spine_runtime_installing(self) -> bool:
+        if not self.is_spine_runtime_install_running():
+            return False
+        self._cancel_spine_runtime_install()
+        InfoBar.warning(
+            title=tr("settings.tool_download_busy_title"),
+            content=tr("settings.tool_download_busy"),
+            orient=Qt.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP,
+            duration=5000,
+            parent=self,
+        )
+        return True
+
+    def _cancel_spine_runtime_install(self) -> None:
+        # Invalidate both pending import results and a pending installer
+        # retry.  A late result from the worker must never reopen a preview
+        # after the user closed it or the application began to quit.
+        self._spine_preview_generation += 1
+        self._spine_runtime_retry_source = ""
+        self._spine_runtime_retry_package_fallback = False
+        self._spine_runtime_retry_compatibility = False
+        self._spine_runtime_retry_generation = 0
+        worker = self._spine_runtime_install_worker
+        if worker is None:
+            return
+        try:
+            if worker.isRunning():
+                worker.requestInterruption()
+        except RuntimeError:
+            pass
+
+    def on_spine_preview_failed(self, error: str, source_path: str, generation=None, worker=None):
+        if generation is not None and generation != self._spine_preview_generation:
+            return
+        self._clear_embedded_spine()
+        self._show_stage_placeholder(tr("preview.spine_import_failed_content", error=error))
+        self.model_info_text_box.setMarkdown(
+            tr("preview.spine_import_failed_content", error=error)
+        )
+        self.show_error(
+            tr("preview.spine_import_failed_title"),
+            tr("preview.spine_import_failed_content", error=error),
+        )
+
+    @staticmethod
+    def _spine_plan_reason(plan: SpinePreviewPlan) -> str:
+        """Render plan diagnostics, including any source-to-target warning."""
+
+        reason = str(plan.reason or "")
+        warnings = [str(item) for item in (plan.warnings or ()) if str(item)]
+        if warnings:
+            reason = "\n\n".join(part for part in (reason, "\n".join(f"- {item}" for item in warnings)) if part)
+        return reason
+
+    def _open_spine_native_preview(self, plan: SpinePreviewPlan):
+        if self.spine_preview is None:
+            raise RuntimeError("Native Spine preview widget is unavailable.")
+        self._active_spine_plan = plan
+        self._active_spine_preview_key = str(plan.asset.skeleton_path or plan.asset.root_dir)
+        if self.spine_controls:
+            self.spine_controls.clear()
+        self.model_info_text_box.setMarkdown(
+            tr(
+                "preview.spine_preview_loading",
+                version=plan.asset.spine_version or "unknown",
+                mode=plan.mode,
+                reason=self._spine_plan_reason(plan),
+            )
+        )
+        self.spine_preview.open_plan(plan)
+        editable_path = plan.asset.model_config_path or plan.asset.skeleton_path
+        self._set_editor_source("spine", str(editable_path) if editable_path else None)
+        if self._preview_page_active is False:
+            self.set_active(False)
+
+    def _on_spine_preview_document_loaded(self, url: str):
+        if not self._active_spine_preview_key or str(url) != self._active_spine_preview_key:
+            return
+        plan = self._active_spine_plan
+        if plan is None:
+            return
+        self._show_spine_stage()
+        if self.settings_panel:
+            self.spine_preview.set_view_settings(self.settings_panel.get_settings())
+        self.model_info_text_box.setMarkdown(
+            tr(
+                "preview.spine_preview_loading",
+                version=plan.asset.spine_version or "unknown",
+                mode=plan.mode,
+                reason=self._spine_plan_reason(plan),
+            )
+        )
+
+    def _on_spine_preview_ready(self, url: str):
+        if not self._active_spine_preview_key or str(url) != self._active_spine_preview_key:
+            return
+        plan = self._active_spine_plan
+        if plan is None:
+            return
+        self._show_spine_stage()
+        self.model_info_text_box.setMarkdown(
+            tr(
+                "preview.spine_preview_ready",
+                version=plan.asset.spine_version or "unknown",
+                mode=plan.mode,
+                reason=self._spine_plan_reason(plan),
+            )
+        )
+
+    def _on_spine_preview_state(self, state: dict):
+        """Mirror the page's renderer state into the native right sidebar."""
+
+        if not self._spine_mode or self._active_spine_plan is None:
+            return
+        if self.spine_controls:
+            self.spine_controls.set_state(state)
+
+    def _on_spine_skin_changed(self, name: str):
+        if self._spine_mode and self.spine_preview:
+            self.spine_preview.set_skin(name)
+
+    def _on_spine_animation_changed(self, name: str):
+        if self._spine_mode and self.spine_preview:
+            loop = bool(self.spine_controls and self.spine_controls.loop_check.isChecked())
+            self.spine_preview.set_animation(name, loop)
+
+    def _on_spine_paused_changed(self, paused: bool):
+        if self._spine_mode and self.spine_preview:
+            self.spine_preview.set_paused(paused)
+        if self.spine_controls:
+            self.spine_controls.retranslate_ui()
+
+    def _on_spine_loop_changed(self, loop: bool):
+        if self._spine_mode and self.spine_preview:
+            self.spine_preview.set_loop(loop)
+
+    def _on_spine_time_changed(self, value: float):
+        if self._spine_mode and self.spine_preview:
+            self.spine_preview.set_time(value)
+
+    def _on_spine_reset_requested(self):
+        if self._spine_mode and self.spine_preview:
+            self.spine_preview.reset_pose()
+
+    def _on_spine_export_requested(self):
+        if self._spine_mode and self.spine_preview:
+            self.spine_preview.export_pose_psd()
+
+    def _on_spine_preview_error(self, error: str):
+        self._clear_embedded_spine()
+        message = tr("preview.spine_web_error_content", error=str(error))
+        self._show_stage_placeholder(message)
+        self.model_info_text_box.setMarkdown(message)
+        self.show_error(tr("preview.spine_web_error_title"), message)
 
     def start_folder_preview_scan(self, folder_path: str):
         if self._folder_preview_thread is not None and self._folder_preview_thread.isRunning():
@@ -2685,9 +4404,8 @@ class PreviewPage(QFrame):
         self._folder_preview_thread.start()
 
     def current_preview_image_limit(self) -> int:
-        if self.image_limit_spinbox:
-            return int(self.image_limit_spinbox.value())
-        return int(self.settings_manager.get("preview.image_limit", 48) or 48)
+        self.settings_manager.reload_settings()
+        return max(1, min(500, int(self.settings_manager.get("preview.image_limit", 48) or 48)))
 
     def on_folder_preview_item_found(self, item: dict):
         self._preview_items.append(dict(item))
@@ -2743,6 +4461,7 @@ class PreviewPage(QFrame):
         item = self._preview_items[index]
         if self.image_preview_panel:
             self.image_preview_panel.set_current_index(index, emit=False)
+            self._sync_resource_selector()
             self.image_preview_panel.setVisible(True)
         if self.preview_placeholder:
             self.preview_placeholder.setVisible(False)
@@ -2752,16 +4471,25 @@ class PreviewPage(QFrame):
             self.activate_image_preview_item(item)
 
     def activate_model_preview_item(self, item: dict):
+        source_path = str(item.get("source_path") or item.get("path") or "")
+        # Folder scans may have prepared a Live2D candidate before the user
+        # activates it. Unity sources still go through the unified importer so
+        # a Spine TextAsset is not hidden behind the old Cubism-only path.
+        if source_path and _is_unity_preview_source(source_path) and not os.path.isdir(source_path):
+            self.start_spine_preview_import(source_path, package_fallback=True)
+            return
         prepared = item.get("prepared_model_json")
         if prepared and os.path.isfile(str(prepared)):
-            self.load_model_preview(str(prepared), str(item.get("source_path") or prepared))
+            self.load_model_preview(str(prepared), source_path or str(prepared),
+                                    editor_model_json=item.get("editor_model_json"))
             return
-        source_path = str(item.get("source_path") or item.get("path") or "")
         if source_path:
             self.start_model_preview_import(source_path)
 
     def activate_image_preview_item(self, item: dict):
         self._terminate_preview_process()
+        self._clear_embedded_spine()
+        self._show_image_stage()
         self.current_model_path = None
         self._set_motion_debug_visible(False)
         self.preview_btn.setEnabled(False)
@@ -2816,7 +4544,8 @@ class PreviewPage(QFrame):
             result = prepare_preview_import(temp_dir, self.settings_manager.get_temp_dir())
             if result.temp_dir:
                 self._model_preview_temp_dirs.append(str(result.temp_dir))
-            self.load_model_preview(str(result.preview_model_json), source_path)
+            self.load_model_preview(str(result.preview_model_json), source_path,
+                                    editor_model_json=str(result.package.model_json))
             return
         except Exception:
             pass
@@ -2869,7 +4598,9 @@ class PreviewPage(QFrame):
     def on_model_preview_import_ready(self, model_json_path: str, temp_dir: str, source_path: str):
         if temp_dir:
             self._model_preview_temp_dirs.append(temp_dir)
-        self.load_model_preview(model_json_path, source_path)
+        worker = self.sender() or self._model_preview_thread
+        self.load_model_preview(model_json_path, source_path,
+                                editor_model_json=getattr(worker, "editor_model_json", None))
 
     def on_model_preview_import_failed(self, error: str, source_path: str):
         if _is_unity_preview_source(source_path):
@@ -2880,12 +4611,17 @@ class PreviewPage(QFrame):
             tr("preview.model_import_failed_content", error=error),
         )
 
-    def load_model_preview(self, model_json_path: str, source_path: str | None = None):
+    def load_model_preview(self, model_json_path: str, source_path: str | None = None,
+                           *, editor_model_json: str | None = None):
+        self._clear_embedded_spine()
+        self._clear_live2d_controls()
+        self._set_resource_mode("live2d")
         self._psd_project_context = self._pending_psd_project_context
         self._pending_psd_project_context = None
         if self.save_pose_scheme_btn:
             self.save_pose_scheme_btn.setVisible(bool(self._psd_project_context))
         self.current_model_path = os.path.abspath(model_json_path)
+        self._set_editor_source("live2d", editor_model_json or self.current_model_path)
         self._temp_model_json_path = self.current_model_path
         self._cleanup_image_preview_temp_dirs()
 
@@ -2896,6 +4632,7 @@ class PreviewPage(QFrame):
                 "kind": "model",
                 "path": self.current_model_path,
                 "prepared_model_json": self.current_model_path,
+                "editor_model_json": editor_model_json or self.current_model_path,
                 "source_path": source_path or self.current_model_path,
                 "source_dir": model_dir,
                 "label": model_name,
@@ -2916,7 +4653,7 @@ class PreviewPage(QFrame):
             source_dir=model_dir,
             label=source_path or model_dir,
         )
-        QTimer.singleShot(50, self.preview_current_model)
+        self._live2d_load_timer.start()
         if not (self._preview_cooldown_timer and self._preview_cooldown_timer.isActive()):
             self.preview_btn.setEnabled(True)
 
@@ -3009,7 +4746,7 @@ class PreviewPage(QFrame):
 
     def on_unity_image_preview_ready(self, image_paths: list[str], temp_dir: str):
         if not image_paths:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            self._dispose_preview_temp_dir(temp_dir)
             self.show_error(
                 tr("preview.no_images_title"),
                 tr("preview.no_images_content"),
@@ -3021,7 +4758,7 @@ class PreviewPage(QFrame):
 
     def on_unity_image_preview_failed(self, error: str, temp_dir: str):
         self._pending_unity_preview_source_path = None
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        self._dispose_preview_temp_dir(temp_dir)
         self.show_error(
             tr("preview.unity_preview_failed_title"),
             tr("preview.unity_preview_failed_content", error=error),
@@ -3037,9 +4774,12 @@ class PreviewPage(QFrame):
             return False
 
         try:
+            self._live2d_load_in_progress = True
+            self._pending_live2d_ready = None
+            self._live2d_ready_generation = None
             self._terminate_preview_process()
             motions = self._load_motions_from_model_json(self.current_model_path)
-            self._populate_motion_controls(motions)
+            self._populate_motion_controls(motions, autoplay=False)
             if self.preview_placeholder:
                 self.preview_placeholder.setVisible(False)
             if self.image_preview_panel:
@@ -3048,7 +4788,10 @@ class PreviewPage(QFrame):
             preview = self._ensure_embedded_live2d()
             if preview is None or preview.live2d_canvas is None:
                 raise RuntimeError("Live2D OpenGL canvas could not be created.")
+            self._connect_live2d_preview_events(preview)
             preview.load_model(self.current_model_path)
+            generation = getattr(preview, "model_load_generation", lambda: 0)()
+            self._pending_live2d_ready = (self.current_model_path, generation, self._live2d_source_generation)
             settings = self.settings_panel.get_settings()
             settings.update(self.advanced_panel.get_advanced_settings())
             settings.update({
@@ -3060,54 +4803,39 @@ class PreviewPage(QFrame):
                 "motion_loop": bool(self.loop_motion_check and self.loop_motion_check.isChecked()),
             })
             preview.apply_settings(settings)
+            self._set_resource_mode("live2d")
             preview.show()
             self._set_motion_debug_visible(True)
-            self._on_motion_selection_changed(self.motion_combo.currentIndex())
-            QTimer.singleShot(120, lambda: self._refresh_parameter_controls(5))
+            self._on_motion_selection_changed(self.motion_combo.currentIndex(), autoplay=False)
+            self._parameter_refresh_retries = 5
+            self._parameter_refresh_timer.start()
             return True
         except Exception as exc:
+            self._pending_live2d_ready = None
             self._terminate_preview_process()
             self._set_motion_debug_visible(False)
-            self._show_stage_placeholder(tr("preview.stage_empty"))
+            self._show_stage_placeholder(tr("preview.stage_empty"), keep_editor_source=True)
             self.show_error(
                 tr("common.error"),
                 tr("preview_window.error_model_load_failed", error_type=type(exc).__name__, error=exc),
             )
             return False
+        finally:
+            self._live2d_load_in_progress = False
 
     def open_psd_project_preview(self, model_json_path: str, project_file: str):
         """Open a model with PSD provenance, enabling named pose export."""
-        try:
-            preview_model_json = prepare_model_json_for_preview(model_json_path)
-        except Exception as exc:
-            self.show_error(
-                tr("common.error"),
-                tr("preview_window.error_model_load_failed", error_type=type(exc).__name__, error=exc),
-            )
-            return
         self._pending_psd_project_context = {
             "project_file": os.path.abspath(project_file),
             "model_json": os.path.abspath(model_json_path),
         }
-        self.load_model_preview(str(preview_model_json), model_json_path)
+        self.start_model_preview_import(model_json_path)
 
     def open_model_preview_source(self, model_json_path: str):
         """Open a model sent by another workspace page without PSD context."""
-        try:
-            preview_model_json = prepare_model_json_for_preview(model_json_path)
-        except Exception as exc:
-            self.show_error(
-                tr("common.error"),
-                tr(
-                    "preview_window.error_model_load_failed",
-                    error_type=type(exc).__name__,
-                    error=exc,
-                ),
-            )
-            return
         self._pending_psd_project_context = None
         self._psd_project_context = None
-        self.load_model_preview(str(preview_model_json), model_json_path)
+        self.start_model_preview_import(model_json_path)
 
     def request_pose_scheme_save(self):
         context = dict(self._psd_project_context or {})
@@ -3142,7 +4870,9 @@ class PreviewPage(QFrame):
 
     def _refresh_parameter_controls(self, retries: int = 0):
         preview = self.live2d_preview
-        if preview is None or self.advanced_panel is None:
+        if (preview is None or self.advanced_panel is None or self._preview_page_active is False
+                or not self.isVisible() or not self.right_sidebar.isVisible()
+                or self.live2d_details.currentIndex() != 0):
             return
         meta = preview.get_parameter_meta_list()
         if meta:
@@ -3150,7 +4880,8 @@ class PreviewPage(QFrame):
             self.advanced_panel.sync_advanced_param_values(meta)
             return
         if retries > 0:
-            QTimer.singleShot(120, lambda: self._refresh_parameter_controls(retries - 1))
+            self._parameter_refresh_retries = retries - 1
+            self._parameter_refresh_timer.start()
 
     def on_preview_window_closed(self, window):
         """预览窗口关闭处理"""
@@ -3158,8 +4889,14 @@ class PreviewPage(QFrame):
             self.preview_process = None
 
     def close_preview_window(self):
-        """Close the current image or embedded Live2D preview."""
+        """Close the current image, Spine page, or embedded Live2D preview."""
+        # Invalidate the active import before clearing the page.  Otherwise a
+        # queued worker signal could recreate the Spine page after the user
+        # pressed the close button.
+        self._cleanup_spine_preview_temp_dirs()
+        self._cancel_spine_runtime_install()
         self._terminate_preview_process()
+        self._clear_embedded_spine()
         self._populate_motion_controls([])
         self._set_motion_debug_visible(False)
         self._clear_preview_export_payload()
@@ -3179,14 +4916,16 @@ class PreviewPage(QFrame):
 
     def on_settings_changed(self, settings: dict):
         """Apply display settings directly to the embedded OpenGL widget."""
-        if self.live2d_preview:
+        if self._spine_mode and self.spine_preview:
+            self.spine_preview.set_view_settings(settings)
+        elif self.live2d_preview:
             self.live2d_preview.apply_settings(settings)
         self._save_preview_ui_state()
 
     def on_request_refresh_params(self):
         """Refresh motions and parameter metadata from the embedded model."""
         if self.current_model_path:
-            self._populate_motion_controls(self._load_motions_from_model_json(self.current_model_path))
+            self._populate_motion_controls(self._load_motions_from_model_json(self.current_model_path), autoplay=False)
             self._refresh_parameter_controls(2)
         else:
             self._populate_motion_controls([])

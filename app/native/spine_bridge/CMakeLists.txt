@@ -1,0 +1,36 @@
+cmake_minimum_required(VERSION 3.20)
+project(spine_bridge CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+if(NOT DEFINED SPINE_ROOT)
+    message(FATAL_ERROR "SPINE_ROOT must point to the official spine-cpp/spine-cpp source directory")
+endif()
+
+file(GLOB RUNTIME_SOURCES "${SPINE_ROOT}/src/spine/*.cpp")
+if(NOT RUNTIME_SOURCES)
+    message(FATAL_ERROR "No spine-cpp sources found under ${SPINE_ROOT}")
+endif()
+
+add_library(spine_runtime STATIC ${RUNTIME_SOURCES})
+target_include_directories(spine_runtime PUBLIC "${SPINE_ROOT}/include")
+set_target_properties(spine_runtime PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+add_library(spine_bridge SHARED spine_bridge.cpp)
+target_include_directories(spine_bridge PRIVATE "${SPINE_ROOT}/include")
+target_compile_definitions(spine_bridge PRIVATE SPINE_BRIDGE_BUILD)
+if(SPINE_BRIDGE_RUNTIME_40)
+    target_compile_definitions(spine_bridge PRIVATE SPINE_BRIDGE_RUNTIME_40)
+endif()
+target_link_libraries(spine_bridge PRIVATE spine_runtime)
+set_target_properties(spine_bridge PROPERTIES PREFIX "")
+
+if(MSVC)
+    target_compile_options(spine_runtime PRIVATE /W3)
+    target_compile_options(spine_bridge PRIVATE /W3)
+else()
+    target_compile_options(spine_runtime PRIVATE -fvisibility=hidden)
+    target_compile_options(spine_bridge PRIVATE -fvisibility=hidden)
+endif()

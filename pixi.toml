@@ -8,8 +8,14 @@ platforms = ["win-64"]
 [tasks]
 start = "python -m app.main"
 cli = "python -m app.cli"
-build = "python scripts/build_nuitka.py"
-build-gcc = "python scripts/build_nuitka.py --compiler mingw"
+mcp-animation = "python -m app.mcp_server"
+native-converter = "pwsh -NoProfile -ExecutionPolicy Bypass -File third_party/wang606_spine_converter/build_native.ps1"
+native-spine = "python scripts/build_native.py --all"
+native-live2d = "python scripts/build_live2d_native.py"
+native-build = { depends-on = ["native-converter", "native-spine", "native-live2d"], cmd = "python scripts/verify_native_build.py --require-notices" }
+native-verify = "python scripts/verify_native_build.py --require-notices"
+build = { depends-on = ["native-build"], cmd = "python scripts/build_nuitka.py --require-native" }
+build-gcc = { depends-on = ["native-build"], cmd = "python scripts/build_nuitka.py --compiler mingw --require-native" }
 check = "python scripts/check_sources.py"
 
 [dependencies]
@@ -21,15 +27,14 @@ pip = ">=25.0.0,<26"
 PySide6 = ">=6.6.0"
 filetype = ">=1.0.0"
 Pillow = ">=9.0.0"
-"live2d-py" = ">=0.5.4"
+"live2d-py" = "==0.7.0"
 numpy = ">=1.21.0"
-PyOpenGL = ">=3.1.0"
+PyOpenGL = "==3.1.10"
 Nuitka = ">=2.8.4"
-fastapi = ">=0.115.0"
-uvicorn = ">=0.30.0"
-websockets = ">=12.0"
 requests = ">=2.31.0"
 "ordered-set" = ">=4.1.0"
 zstandard = ">=0.23.0"
 opencv-python = ">=4.13.0.92, <5"
 psd-tools = ">=1.17.0, <2"
+pyopengl-accelerate = "==3.1.10"
+mcp = ">=1.28, <2"

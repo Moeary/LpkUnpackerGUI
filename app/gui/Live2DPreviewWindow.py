@@ -1,4 +1,5 @@
 import os
+import math
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QApplication, QLabel, QSizeGrip, QFrame, QSizePolicy)
 from PySide6.QtCore import Signal, QPoint, QRect, Qt, QEvent, QTimer, QUrl
 from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QCursor
@@ -82,11 +83,15 @@ class Live2DPreviewWindow(QWidget):
     """无边框的Live2D模型预览窗口"""
 
     closed = Signal()  # 窗口关闭信号
+    modelReady = Signal(str, int)
+    fitModeChanged = Signal(bool)
+    contentFitApplied = Signal(dict)
 
     def __init__(self, model_path=None, parent=None, embedded: bool = False):
         super().__init__(parent)
         self.model_path = model_path
         self._embedded = bool(embedded)
+        self._editor_mode = False
         self.i18n = get_i18n()
         self.live2d_canvas = None
         self.live2d_container = None
@@ -101,6 +106,8 @@ class Live2DPreviewWindow(QWidget):
         self._motion_items = []
         self._dock_rect = None
         self._fit_to_dock = False
+        self._display_transform = {"model_scale": 1.0, "model_offset_x": 0.0,
+                                   "model_offset_y": 0.0, "model_rotation": 0.0}
         self._requested_canvas_size = (400, 300)
         self._show_hit_areas = False
         self._resize_margin = 12
@@ -202,6 +209,9 @@ class Live2DPreviewWindow(QWidget):
         # Keep left-click model interaction; context menus are disabled.
         self.live2d_canvas.setMouseTracking(True)
         self.live2d_canvas.installEventFilter(self)
+        self.live2d_canvas.modelFrameReady.connect(self._on_model_frame_ready)
+        self.live2d_canvas.fitModeChanged.connect(self.fitModeChanged.emit)
+        self.live2d_canvas.contentFitApplied.connect(self._on_content_fit_applied)
         self.live2d_container.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         layout.addWidget(self.live2d_container)
         self.hit_area_overlay = HitAreaOverlay(self)
@@ -229,6 +239,33 @@ class Live2DPreviewWindow(QWidget):
             self.hit_area_overlay.set_regions(self._load_hit_regions())
             self.hit_area_overlay.set_active_region(None)
         return True
+
+    def _on_model_frame_ready(self, model_path: str, generation: int):
+        # First-frame readiness can occur inside paintGL. Defer UI playback
+        # until that draw has completed, retaining this exact load identity.
+        QTimer.singleShot(0, self, lambda: self._emit_model_ready(model_path, generation))
+
+    def _emit_model_ready(self, model_path: str, generation: int):
+        if (not self._released and self.model_path
+                and os.path.normcase(os.path.abspath(model_path)) == os.path.normcase(self.model_path)
+                and generation == self.model_load_generation()):
+            self.modelReady.emit(model_path, generation)
+
+    def model_load_generation(self) -> int:
+        return self.live2d_canvas.modelLoadGeneration() if self.live2d_canvas else 0
+
+    def fit_model(self) -> bool:
+        return bool(self.live2d_canvas and self.live2d_canvas.fitToContent(auto_resize=True))
+
+    def get_content_fit_state(self) -> dict:
+        return self.live2d_canvas.getContentFitState() if self.live2d_canvas else {}
+
+    def _on_content_fit_applied(self, state: dict):
+        self._display_transform.update({"model_scale": float(state["scale"]),
+                                        "model_offset_x": float(state["offset_x"]),
+                                        "model_offset_y": float(state["offset_y"]),
+                                        "model_rotation": float(state["rotation"])})
+        self.contentFitApplied.emit(state)
 
     def unload_model(self):
         self.model_path = None
@@ -537,6 +574,10 @@ class Live2DPreviewWindow(QWidget):
         return {"id": hit_id or label, "name": label, "rect": rect, "words": words}
 
     def eventFilter(self, obj, event):
+        if self._editor_mode and obj is self.live2d_canvas and event.type() in (
+            QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease,
+        ):
+            return False
         if obj in {self.quick_motion_panel, self.quick_motion_title} and self.quick_motion_panel:
             try:
                 if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
@@ -847,18 +888,27 @@ class Live2DPreviewWindow(QWidget):
         if 'opacity' in settings and self.live2d_canvas:
             self.live2d_canvas.setCanvasOpacity(settings['opacity'])
 
-        # 模型旋转
-        if 'model_rotation' in settings and self.live2d_canvas:
-            self.live2d_canvas.setRotationAngle(settings['model_rotation'])
+        if 'antialias' in settings and self.live2d_canvas:
+            self.live2d_canvas.setAntialias(settings['antialias'])
 
-        if self.live2d_canvas and any(
-            key in settings for key in ('model_scale', 'model_offset_x', 'model_offset_y')
-        ):
-            self.live2d_canvas.setModelTransform(
-                float(settings.get('model_scale', 1.0)),
-                float(settings.get('model_offset_x', 0.0)),
-                float(settings.get('model_offset_y', 0.0)),
-            )
+        if self.live2d_canvas:
+            was_fitted = bool(self.get_content_fit_state().get("enabled"))
+            transform = {**self._display_transform,
+                         **{key: float(settings[key]) for key in self._display_transform if key in settings}}
+            changed = {key for key, value in transform.items()
+                       if not math.isclose(value, self._display_transform[key], rel_tol=0,
+                                           abs_tol=.5 if key == "model_rotation" else .005)}
+            if "model_rotation" in changed:
+                self.live2d_canvas.setRotationAngle(transform["model_rotation"])
+            if changed - {"model_rotation"}:
+                self.live2d_canvas.setModelTransform(transform["model_scale"], transform["model_offset_x"],
+                                                     transform["model_offset_y"])
+            if changed:
+                self._display_transform = transform
+            if "content_fit_enabled" in settings and not (was_fitted and changed):
+                enabled = bool(settings["content_fit_enabled"])
+                if enabled != bool(self.get_content_fit_state().get("enabled")):
+                    self.live2d_canvas.setContentFitEnabled(enabled)
 
         # 背景透明/颜色
         if self.live2d_canvas and ('transparent_bg' in settings or 'bg_color' in settings):
@@ -892,6 +942,21 @@ class Live2DPreviewWindow(QWidget):
             return []
         return self.live2d_canvas.getParameterMetaList()
 
+    def get_parameter_values(self, parameter_ids) -> dict[str, float]:
+        """Read current values without rebuilding static metadata or updating the model."""
+        if not self.live2d_canvas:
+            return {}
+        getter = getattr(self.live2d_canvas, "getParameterValues", None)
+        if callable(getter):
+            return getter(parameter_ids)
+        ids = set(parameter_ids)
+        return {item["id"]: float(item["value"]) for item in self.get_parameter_meta_list() if item["id"] in ids}
+
+    def get_motion_playback_state(self) -> dict | None:
+        if not self.live2d_canvas:
+            return None
+        return self.live2d_canvas.getMotionPlaybackState()
+
     def set_motion_frozen(self, frozen: bool):
         if self.live2d_canvas:
             self.live2d_canvas.setMotionFrozen(bool(frozen))
@@ -904,6 +969,26 @@ class Live2DPreviewWindow(QWidget):
         if not self.live2d_canvas:
             return {}
         return self.live2d_canvas.setMotionTime(motion, float(seconds))
+
+    def set_editor_mode(self, enabled: bool = True):
+        self._editor_mode = bool(enabled)
+        if self.live2d_canvas:
+            self.live2d_canvas.setEditorInteraction(enabled)
+
+    def set_rendering_active(self, active: bool):
+        if self.live2d_canvas:
+            self.live2d_canvas.setRenderingActive(active)
+
+    def set_part_opacity_overrides(self, values: dict[str, float], defaults: dict[str, float] | None = None):
+        if self.live2d_canvas:
+            self.live2d_canvas.setPartOpacityOverrides(values, defaults)
+
+    def supports_drawable_opacity_overrides(self) -> bool:
+        return bool(self.live2d_canvas and self.live2d_canvas.supportsDrawableOpacityOverrides())
+
+    def set_drawable_opacity_overrides(self, values: dict[str, float]):
+        if self.live2d_canvas:
+            self.live2d_canvas.setDrawableOpacityOverrides(values)
 
     def toggle_control_panel(self):
         """切换控制面板显示/隐藏"""
@@ -927,7 +1012,7 @@ class Live2DPreviewWindow(QWidget):
         self.resize(max(240, min(int(width), max_w)), max(240, min(int(height), max_h)))
 
     def apply_dock_geometry(self, rect: dict):
-        if not rect:
+        if self._embedded or not rect:
             return
         try:
             x = int(rect.get("x", self.x()))

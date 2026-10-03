@@ -1,0 +1,12 @@
+- module-name: 'app.core.live2d_preview_native'
+  dlls:
+    - from_filenames:
+        relative_path: '../../runtime/tools/live2d_native/opacity-v1'
+        prefixes:
+          - '_v3cpp'
+          - 'LpkPreviewCubismCore'
+        suffixes:
+          - 'pyd'
+          - 'dll'
+      dest_path: 'tools/live2d_native/opacity-v1'
+      when: 'win32'

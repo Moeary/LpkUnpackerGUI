@@ -1,0 +1,530 @@
+from __future__ import annotations
+
+import copy
+import hashlib
+import importlib
+import json
+import os
+from pathlib import Path
+from types import SimpleNamespace
+import tempfile
+import unittest
+from unittest.mock import patch
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PIL import Image
+from PySide6.QtCore import QPoint, Qt, Signal, QTimer
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication, QWidget
+
+from app.core.settings_manager import SettingsManager
+from app.gui.PreviewPage import PreviewPage
+from tests.test_editor_navigation import DummySpinePreview
+
+
+class FakeNativePreview(QWidget):
+    modelReady = Signal(str, int)
+    fitModeChanged = Signal(bool)
+    contentFitApplied = Signal(dict)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.live2d_canvas = SimpleNamespace()
+        self.meta = [{"id": "ParamAngleX", "min": -30, "max": 30, "default": 0, "value": 0}]
+        self.settings = {}
+        self.part_calls = []
+        self.motion_times = []
+        self.motion_seek_items = []
+        self.failure = None
+        self.playback = None
+        self.meta_reads = 0
+        self.value_reads = []
+        self.generation = 0
+        self.auto_finish = True
+        self.play_calls = []
+        self.fit_calls = 0
+        self.fit_state = {"enabled": False, "scale": 1.0, "offset_x": 0.0,
+                          "offset_y": 0.0, "rotation": 0.0, "model_generation": 0}
+
+    def load_model(self, path):
+        if self.failure:
+            raise self.failure
+        self.loaded = path
+        self.generation += 1
+        generation = self.generation
+        if self.auto_finish:
+            QTimer.singleShot(0, self, lambda: self.modelReady.emit(path, generation))
+
+    def finish_load(self, path=None, generation=None):
+        self.modelReady.emit(path or self.loaded, self.generation if generation is None else generation)
+
+    def model_load_generation(self):
+        return self.generation
+
+    def play_motion(self, group, index):
+        self.play_calls.append((group, index))
+
+    def fit_model(self):
+        self.fit_calls += 1
+        self.fit_state.update(enabled=True, scale=1.75, offset_x=-.15,
+                              offset_y=.1, model_generation=self.generation)
+        self.fitModeChanged.emit(True)
+        self.contentFitApplied.emit(dict(self.fit_state))
+        return True
+
+    def unload_model(self):
+        pass
+
+    def apply_settings(self, settings):
+        self.settings.update(settings)
+        if "content_fit_enabled" in settings:
+            self.fit_state["enabled"] = settings["content_fit_enabled"]
+
+    def get_parameter_meta_list(self):
+        self.meta_reads += 1
+        return copy.deepcopy(self.meta)
+
+    def get_parameter_values(self, parameter_ids):
+        ids = list(parameter_ids)
+        self.value_reads.append(ids)
+        return {item["id"]: float(item["value"]) for item in self.meta if item["id"] in ids}
+
+    def set_motion_frozen(self, value):
+        self.frozen = value
+
+    def set_motion_loop(self, value):
+        self.loop = value
+
+    def set_selected_motion(self, group, index):
+        self.motion = group, index
+
+    def set_motion_time(self, motion, time):
+        self.motion_times.append(time)
+        self.motion_seek_items.append(copy.deepcopy(motion))
+        self.meta[0]["value"] = 12.5
+        self.playback = dict(motion, time=time, frozen=True, scrubbed=True)
+        return {"ParamAngleX": 12.5}
+
+    def get_motion_playback_state(self):
+        return copy.deepcopy(self.playback)
+
+    def set_part_opacity_overrides(self, values, defaults):
+        self.part_calls.append((dict(values), dict(defaults)))
+
+    def set_rendering_active(self, active):
+        self.active = active
+
+    def shutdown(self):
+        pass
+
+
+class PreviewControlsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="preview-controls-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        settings_file = self.root / "settings.json"
+
+        class TempSettings(SettingsManager):
+            def __init__(self, *args, **kwargs):
+                super().__init__(settings_file)
+
+        self.module = importlib.import_module("app.gui.PreviewPage")
+        with patch.object(self.module, "SettingsManager", TempSettings), patch.object(self.module, "SpinePreviewWidget", DummySpinePreview), patch.object(PreviewPage, "_ensure_embedded_live2d", return_value=None):
+            self.page = PreviewPage()
+        self.native = FakeNativePreview(self.page.preview_dock_area)
+        self.page.live2d_preview = self.native
+        self.page.preview_dock_layout.addWidget(self.native)
+        self.page._ensure_embedded_live2d = lambda: self.native
+        self.page.resize(1040, 760)
+        self.page.show()
+        self.app.processEvents()
+        self.addCleanup(self.dispose)
+        self.model = self.root / "character.model3.json"
+        self.model.write_text(json.dumps({"Version": 3, "FileReferences": {"Moc": "character.moc3", "Textures": ["texture.png"]}}), encoding="utf-8")
+        (self.root / "character.moc3").write_bytes(b"fake-moc")
+        Image.new("RGBA", (32, 32), (40, 80, 120, 255)).save(self.root / "texture.png")
+        self.motion = {"group": "Idle", "index": 0, "display": "Idle / 0", "duration": 2}
+        motion_path = self.root / "idle.motion3.json"
+        motion_path.write_text(json.dumps({"Meta": {"Duration": 2}, "Curves": [
+            {"Target": "Parameter", "Id": "ParamAngleX", "Segments": [0, 0, 0, 2, 20]},
+            {"Target": "Model", "Id": "ParamOther", "Segments": [0, 0, 0, 2, 1]},
+        ]}), encoding="utf-8")
+        self.motion["file"] = str(motion_path)
+
+    def dispose(self):
+        self.page.shutdown()
+        self.page.close()
+        self.page.deleteLater()
+        self.app.processEvents()
+
+    def load_live(self):
+        with patch.object(self.module.InfoBar, "success"), patch.object(self.page, "_load_motions_from_model_json", return_value=[self.motion]):
+            self.page.load_model_preview(str(self.model))
+            self.page._live2d_load_timer.stop()
+            self.assertTrue(self.page.preview_current_model())
+        self.page._parameter_refresh_timer.stop()
+        self.page._refresh_parameter_controls()
+        self.app.processEvents()
+
+    def test_live_controls_freeze_seek_parameters_are_reachable_on_right(self):
+        self.load_live()
+        page = self.page
+        self.assertIs(page.resource_details_stack.currentWidget(), page.live2d_details)
+        for widget in (page.settings_panel, page.motion_group, page.advanced_panel, page.pose_controls_card):
+            self.assertTrue(page.right_sidebar.isAncestorOf(widget))
+            self.assertFalse(page.left_sidebar.isAncestorOf(widget))
+        page.freeze_motion_check.click()
+        self.assertTrue(self.native.frozen)
+        self.assertTrue(page.motion_timeline_frame.isVisible())
+        self.assertEqual(page.motion_time_spin.maximum(), 2000)
+        page.motion_time_spin.setValue(1250)
+        self.assertEqual(self.native.motion_times[-1], 1.25)
+        slider, _, scale = page.advanced_panel.advanced_param_sliders["ParamAngleX"]
+        self.assertEqual(slider.value() / scale, 12.5)
+        top = page.motion_time_spin.mapTo(page, QPoint())
+        self.assertGreater(top.x(), page.preview_stage.x())
+        self.assertLess(top.y() + page.motion_time_spin.height(), page.height())
+        page.set_active(False)
+        self.assertFalse(page._parameter_sync_timer.isActive())
+        page.set_active(True)
+        self.assertTrue(page._parameter_sync_timer.isActive())
+
+    def test_clock_is_visible_while_playing_and_tracks_native_identity(self):
+        self.load_live()
+        page = self.page
+        self.assertTrue(page.motion_timeline_frame.isVisible())
+        self.assertFalse(page.motion_time_spin.isEnabled())
+        other = dict(self.motion, group="TapBody", index=1, duration=4)
+        page._motion_items.append(other)
+        self.native.playback = dict(other, time=1.25, playing=True)
+        page._sync_live_parameter_controls()
+        self.assertEqual(page.motion_combo.currentIndex(), 0)  # selection is not proof of playback
+        self.assertEqual(page.motion_time_spin.value(), 1250)
+        self.assertEqual(page.motion_time_spin.maximum(), 4000)
+        self.assertIn("TapBody[1]", page.motion_time_label.text())
+        page.freeze_motion_check.click()
+        self.assertEqual(page.motion_time_spin.value(), 1250)
+        self.assertTrue(page.motion_time_spin.isEnabled())
+        page._sync_live_parameter_controls()
+        self.assertEqual(page.motion_time_spin.value(), 1250)
+        page.freeze_motion_check.click()
+        self.assertEqual(page.motion_time_spin.value(), 1250)
+
+    def test_freeze_preserves_exact_native_values_until_that_parameter_is_edited(self):
+        self.load_live()
+        self.native.meta[0]["value"] = 3.14159265
+        self.native.meta.append({"id": "ParamOther", "min": -30, "max": 30, "default": 0, "value": 2.71828183})
+        self.page._refresh_parameter_controls()
+        self.page.freeze_motion_check.click()
+        self.assertEqual(self.native.settings["advanced_params"], {"ParamAngleX": 3.14159265, "ParamOther": 2.71828183})
+        slider, _, scale = self.page.advanced_panel.advanced_param_sliders["ParamAngleX"]
+        slider.setValue(int(12.5 * scale))
+        self.assertEqual(self.native.settings["advanced_params"], {"ParamAngleX": 12.5, "ParamOther": 2.71828183})
+
+    def test_selected_motion_without_autoplay_does_not_change_displayed_seek_identity(self):
+        self.load_live()
+        page = self.page
+        other = dict(self.motion, group="TapBody", index=1, duration=4)
+        page.auto_play_motion_check.setChecked(False)
+        page._populate_motion_controls([self.motion, other])
+        self.native.playback = dict(self.motion, time=.75, playing=True)
+        page.motion_combo.setCurrentIndex(1)
+        page._sync_live_parameter_controls()
+        self.assertIn("Idle[0]", page.motion_time_label.text())
+        page.freeze_motion_check.click()
+        page.motion_timeline.setValue(625)
+        self.assertEqual(self.native.motion_times[-1], 1.25)
+        self.assertEqual(self.native.motion_seek_items[-1]["group"], "Idle")
+        self.assertIn("Idle[0]", page.motion_time_label.text())
+
+    def test_two_mouse_tabs_and_search_retain_current_animation_parameters(self):
+        self.load_live()
+        self.native.meta[0]["value"] = 3.14159265
+        self.native.meta.append({"id": "ParamOther", "min": 0, "max": 1, "value": .125})
+        self.page._refresh_parameter_controls()
+        page = self.page
+        self.assertEqual(page.live2d_details.count(), 2)
+        self.assertFalse(hasattr(page, "artmesh_panel"))
+        for index in (1, 0, 1, 0):
+            item = page.live2d_details.pivot.widget(page.live2d_details._keys[index])
+            page.live2d_details.tab_scroll.ensureWidgetVisible(item, 8, 0)
+            self.app.processEvents()
+            QTest.mouseClick(item, Qt.LeftButton)
+            self.app.processEvents()
+            self.assertEqual(page.live2d_details.currentIndex(), index)
+        panel = page.advanced_panel
+        panel.parameter_search.setText("Other")
+        self.app.processEvents()
+        self.assertEqual(panel.visible_parameter_ids(), ["ParamOther"])
+        self.assertTrue(panel.advanced_param_sliders["ParamAngleX"][0].isHidden())
+        self.native.meta[-1]["value"] = .875
+        reads = self.native.meta_reads
+        page._sync_live_parameter_controls()
+        self.assertEqual(self.native.meta_reads, reads)
+        self.assertEqual(self.native.value_reads[-1], ["ParamOther"])
+        slider, _, scale = panel.advanced_param_sliders["ParamOther"]
+        self.assertEqual(slider.value() / scale, .88)
+        page.freeze_motion_check.click()
+        self.assertEqual(self.native.settings["advanced_params"]["ParamAngleX"], 3.14159265)
+        self.assertEqual(self.native.settings["advanced_params"]["ParamOther"], .875)
+
+    def test_removed_artmesh_never_loads_extra_core_and_preview_is_read_only(self):
+        self.load_live()
+        source_files = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                        for path in self.root.iterdir() if path.name != "settings.json"}
+        with patch("app.gui.PreviewArtMeshPanel.CubismCore") as core:
+            for index in (1, 0, 1, 0):
+                self.page.live2d_details.setCurrentIndex(index)
+                self.page._sync_live_parameter_controls()
+            self.page.freeze_motion_check.click()
+            slider, _, _ = self.page.advanced_panel.advanced_param_sliders["ParamAngleX"]
+            slider.setValue(750)
+            core.assert_not_called()
+        self.assertEqual(source_files, {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                                       for path in self.root.iterdir() if path.name != "settings.json"})
+        self.assertFalse(self.native.part_calls)
+
+    def test_switching_formats_clears_animation_parameter_overrides(self):
+        self.load_live()
+        page = self.page
+        page.freeze_motion_check.setChecked(True)
+        page._show_spine_stage()
+        self.assertIs(page.resource_details_stack.currentWidget(), page.spine_details)
+        self.assertTrue(page.pose_controls_card.isHidden())
+        self.assertFalse(self.native.part_calls)
+        self.assertFalse(page.advanced_panel.advanced_param_sliders)
+        self.assertFalse(page.freeze_motion_check.isChecked())
+        page._show_image_stage()
+        self.assertIs(page.resource_details_stack.currentWidget(), page.image_item_list)
+        self.assertTrue(page.open_editor_btn.isHidden())
+        self.load_live()
+        slider, _, scale = page.advanced_panel.advanced_param_sliders["ParamAngleX"]
+        self.assertEqual(slider.value() / scale, 0)
+
+    def test_hidden_tabs_sidebar_and_page_do_not_read_or_refresh_parameters(self):
+        self.load_live()
+        page = self.page
+        page.live2d_details.setCurrentIndex(1)
+        self.native.meta_reads = 0
+        self.native.value_reads.clear()
+        for _ in range(20):
+            page._sync_live_parameter_controls()
+        page._refresh_parameter_controls(retries=5)
+        self.assertFalse(page._parameter_sync_timer.isActive())
+        self.assertEqual(self.native.meta_reads, 0)
+        self.assertFalse(self.native.value_reads)
+        page.live2d_details.setCurrentIndex(0)
+        page._toggle_sidebar("right")
+        self.native.value_reads.clear()
+        for _ in range(20):
+            page._sync_live_parameter_controls()
+        self.assertFalse(page._parameter_sync_timer.isActive())
+        self.assertFalse(self.native.value_reads)
+        page._toggle_sidebar("right")
+        page.set_active(False)
+        self.native.value_reads.clear()
+        page._sync_live_parameter_controls()
+        self.assertFalse(page._parameter_sync_timer.isActive())
+        self.assertFalse(self.native.value_reads)
+        self.assertFalse(page._parameter_refresh_timer.isActive())
+
+    def test_unchanged_values_and_static_schema_preserve_widgets_without_writes(self):
+        self.load_live()
+        panel = self.page.advanced_panel
+        slider, label, _ = panel.advanced_param_sliders["ParamAngleX"]
+        with patch.object(slider, "setValue", wraps=slider.setValue) as write_value, \
+                patch.object(label, "setText", wraps=label.setText) as write_text:
+            panel.sync_advanced_param_values(self.native.meta)
+            write_value.assert_not_called()
+            write_text.assert_not_called()
+            self.native.meta[0]["value"] = 7.5
+            self.page._refresh_parameter_controls()
+            self.assertIs(panel.advanced_param_sliders["ParamAngleX"][0], slider)
+            self.assertEqual(write_value.call_count, 1)
+            self.assertEqual(write_text.call_count, 1)
+
+    def test_scrolling_reads_only_newly_visible_parameter_rows(self):
+        self.native.meta = [{"id": f"Param{index:03d}", "min": -30, "max": 30,
+                             "default": 0, "value": 0} for index in range(486)]
+        self.load_live()
+        panel = self.page.advanced_panel
+        first_ids = panel.visible_parameter_ids()
+        self.assertTrue(first_ids)
+        self.assertLess(len(first_ids), 30)
+        self.native.meta[-1]["value"] = 7.125
+        reads = self.native.meta_reads
+        panel.parameter_scroll.verticalScrollBar().setValue(panel.parameter_scroll.verticalScrollBar().maximum())
+        self.app.processEvents()
+        self.page._sync_live_parameter_controls()
+        last_ids = self.native.value_reads[-1]
+        self.assertIn("Param485", last_ids)
+        self.assertLess(len(last_ids), 30)
+        self.assertFalse(set(first_ids) & set(last_ids))
+        self.assertEqual(self.native.meta_reads, reads)
+        slider, _, scale = panel.advanced_param_sliders["Param485"]
+        self.assertEqual(slider.value(), int(round(7.125 * scale)))
+
+    def test_source_actions_are_at_top_and_existing_log_is_last_left_widget(self):
+        page = self.page
+        self.assertTrue(page.source_card.isAncestorOf(page.preview_btn))
+        self.assertTrue(page.source_card.isAncestorOf(page.close_all_btn))
+        self.assertLess(page.preview_btn.mapTo(page, QPoint()).y(), page.model_info_text_box.mapTo(page, QPoint()).y())
+        layout = page.left_sidebar.layout()
+        self.assertIs(layout.itemAt(layout.count() - 1).widget(), page.model_info_text_box)
+
+    def start_pending_source(self, motions, model=None):
+        with patch.object(self.module.InfoBar, "success"), \
+                patch.object(self.page, "_load_motions_from_model_json", return_value=motions):
+            self.page.load_model_preview(str(model or self.model))
+            self.page._live2d_load_timer.stop()
+            self.assertTrue(self.page.preview_current_model())
+
+    def test_initial_autoplay_waits_for_first_frame_chooses_first_available_and_runs_once(self):
+        self.native.auto_finish = False
+        self.page.auto_play_motion_check.setChecked(True)
+        self.page.loop_motion_check.setChecked(True)
+        absent = dict(self.motion, group="Missing", file=str(self.root / "missing.motion3.json"))
+        later = dict(self.motion, group="Later", index=2)
+        self.page.settings_manager.set("preview.ui_state.selected_motion", "Later::2")
+        self.start_pending_source([absent, self.motion, later])
+        self.assertFalse(self.native.play_calls)
+        self.native.finish_load()
+        self.assertEqual(self.native.play_calls, [("Idle", 0)])
+        self.assertEqual(self.page.motion_combo.currentIndex(), 1)
+        self.assertTrue(self.native.loop)
+        self.native.finish_load()
+        with patch.object(self.page, "_load_motions_from_model_json", return_value=[absent, self.motion, later]):
+            self.page.on_request_refresh_params()
+        self.assertEqual(self.native.play_calls, [("Idle", 0)])
+        self.page.motion_combo.setCurrentIndex(2)
+        self.page.motion_combo.currentIndexChanged.emit(2)
+        self.assertEqual(self.native.play_calls[-1], ("Later", 2))
+        self.page.auto_play_motion_check.setChecked(False)
+        self.page.motion_combo.setCurrentIndex(1)
+        self.page.motion_combo.currentIndexChanged.emit(1)
+        self.assertEqual(len(self.native.play_calls), 2)
+
+    def test_initial_autoplay_off_empty_missing_or_frozen_do_not_play(self):
+        self.native.auto_finish = False
+        cases = [(False, [self.motion], False), (True, [], False),
+                 (True, [dict(self.motion, file=str(self.root / "absent.json"))], False),
+                 (True, [self.motion], True)]
+        for enabled, motions, frozen in cases:
+            with self.subTest(enabled=enabled, count=len(motions), frozen=frozen):
+                self.page.auto_play_motion_check.setChecked(enabled)
+                self.start_pending_source(motions)
+                self.page.freeze_motion_check.setChecked(frozen)
+                self.native.finish_load()
+                self.assertFalse(self.native.play_calls)
+                self.assertEqual(self.native.frozen, frozen)
+
+    def test_model_switch_retry_and_stale_generations_cannot_start_old_motion(self):
+        self.native.auto_finish = False
+        self.page.auto_play_motion_check.setChecked(True)
+        self.start_pending_source([self.motion])
+        old_generation = self.native.generation
+        other_model = self.root / "other.model3.json"
+        other_model.write_bytes(self.model.read_bytes())
+        other_motion = dict(self.motion, group="Other", index=3)
+        self.start_pending_source([other_motion], other_model)
+        current_generation = self.native.generation
+        self.native.finish_load(str(self.model), old_generation)
+        self.assertFalse(self.native.play_calls)
+        self.native.finish_load()
+        self.assertEqual(self.native.play_calls, [("Other", 3)])
+        with patch.object(self.page, "_load_motions_from_model_json", return_value=[other_motion]):
+            self.assertTrue(self.page.preview_current_model())
+        self.native.finish_load(str(other_model), current_generation)
+        self.native.finish_load()
+        self.assertEqual(self.native.play_calls, [("Other", 3)])
+        self.page._show_image_stage()
+        self.native.finish_load()
+        self.assertEqual(self.native.play_calls, [("Other", 3)])
+
+    def test_fit_button_uses_native_content_fit_and_synchronizes_view_settings(self):
+        self.load_live()
+        self.page.live2d_details.setCurrentIndex(1)
+        self.page.freeze_motion_check.setChecked(True)
+        pose = dict(self.page._frozen_parameter_values)
+        self.page.settings_panel.fit_model_btn.click()
+        self.assertEqual(self.native.fit_calls, 1)
+        panel = self.page.settings_panel
+        self.assertTrue(panel.content_fit_check.isChecked())
+        self.assertEqual(panel.scale_slider.value(), 175)
+        self.assertEqual(panel.position_x_spinbox.value(), -15)
+        self.assertEqual(panel.position_y_spinbox.value(), 10)
+        self.assertTrue(self.page.freeze_motion_check.isChecked())
+        self.assertEqual(self.page._frozen_parameter_values, pose)
+        self.assertTrue(self.page.settings_manager.get("preview.ui_state.content_fit"))
+        panel.content_fit_check.setChecked(False)
+        self.assertFalse(self.native.settings["content_fit_enabled"])
+        self.assertFalse(self.page.settings_manager.get("preview.ui_state.content_fit"))
+        self.page._show_spine_stage()
+        self.assertTrue(panel.content_fit_check.isHidden())
+        self.assertNotIn("content_fit_enabled", panel.get_settings())
+
+    def test_images_keep_large_center_vertical_thumbnails_and_navigation(self):
+        page = self.page
+        paths = []
+        for index in range(3):
+            path = self.root / f"image-{index}.png"
+            Image.new("RGBA", (200, 150), (index * 70, 90, 120, 255)).save(path)
+            paths.append(str(path))
+        page.load_image_preview(paths, str(self.root), temporary=False)
+        self.app.processEvents()
+        panel = page.image_preview_panel
+        self.assertIs(page.resource_details_stack.currentWidget(), page.image_item_list)
+        self.assertTrue(page.right_sidebar.isAncestorOf(panel.side_panel))
+        y = [widget.mapTo(page, QPoint()).y() for widget in panel._list_items]
+        self.assertEqual(y, sorted(set(y)))
+        panel.next_btn.click()
+        self.assertEqual(panel._current_index, 1)
+        self.assertEqual(page.resource_combo.currentIndex(), 1)
+        QTest.mouseClick(panel._list_items[2], Qt.LeftButton)
+        self.assertEqual(panel._current_index, 2)
+        panel.actual_btn.click()
+        self.assertFalse(panel._fit_to_window)
+        panel.fit_btn.click()
+        self.assertTrue(panel._fit_to_window)
+        self.assertFalse(panel._current_pixmap.isNull())
+        self.assertTrue(page.open_editor_btn.isHidden())
+
+    def test_renderer_failure_keeps_editor_source_and_reports_error(self):
+        self.load_live()
+        self.native.failure = RuntimeError("GPU failed")
+        with patch.object(self.page, "show_error") as error:
+            self.assertFalse(self.page.preview_current_model())
+            self.assertIn("GPU failed", error.call_args.args[1])
+        self.assertEqual(self.page.current_editor_source(), ("live2d", str(self.model)))
+        self.assertFalse(self.page.open_editor_btn.isHidden())
+
+    def test_render_companion_routes_complete_model_to_editor_and_mixed_image_clears_it(self):
+        rendered = self.root / "character.preview.json"
+        document = json.loads(self.model.read_text(encoding="utf-8"))
+        document["FileReferences"]["Motions"] = {"Commands": [{"Command": "start_mtn Idle"}]}
+        self.model.write_text(json.dumps(document), encoding="utf-8")
+        filtered = copy.deepcopy(document)
+        filtered["FileReferences"]["Motions"] = {}
+        rendered.write_text(json.dumps(filtered), encoding="utf-8")
+        with patch.object(self.module.InfoBar, "success"):
+            self.page.load_model_preview(str(rendered), editor_model_json=str(self.model))
+        self.page._live2d_load_timer.stop()
+        self.assertEqual(self.page.current_editor_source(), ("live2d", str(self.model)))
+        self.assertEqual(self.page.current_model_path, str(rendered))
+        image = self.root / "texture.png"
+        self.page._preview_items.append({"kind": "image", "path": str(image), "source_dir": str(self.root)})
+        self.page.image_preview_panel.load_items(self.page._preview_items)
+        self.page.activate_preview_item(1)
+        self.assertEqual(self.page._resource_mode, "image")
+        self.assertIsNone(self.page.current_editor_source())
+        self.assertIs(self.page.resource_details_stack.currentWidget(), self.page.image_item_list)
+
+
+if __name__ == "__main__":
+    unittest.main()

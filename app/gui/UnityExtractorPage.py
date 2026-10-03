@@ -17,6 +17,7 @@ from qfluentwidgets import (
 
 from app.core.extract import ExtractMode, run_extraction_batch
 from app.core.settings_manager import SettingsManager
+from app.core.spine_converter import SpineConversionOptions
 from app.i18n import get_i18n, tr
 
 
@@ -41,6 +42,9 @@ class AssetStudioExportThread(QThread):
                 mode,
                 progress=self._on_progress,
                 log=self.logMessage.emit,
+                spine_conversion=SpineConversionOptions(
+                    **SettingsManager().get_spine_conversion_options()
+                ),
             )
             self.extractionFinished.emit(result)
         except Exception as exc:

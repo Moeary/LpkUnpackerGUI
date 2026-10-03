@@ -36,6 +36,10 @@ class ExtractItemResult:
     message: str = ""
     error: str | None = None
     children: list["ExtractItemResult"] = field(default_factory=list)
+    # Directories created by this extraction invocation.  A batch may reuse a
+    # parent output directory, so consumers must use this explicit scope
+    # instead of recursively scanning ``output_dir`` for newly produced files.
+    extracted_dirs: list[Path] = field(default_factory=list)
 
 
 @dataclass
