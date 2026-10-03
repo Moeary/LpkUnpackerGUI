@@ -4,9 +4,9 @@
 
 它最初用于解包 Live2DViewerEX 的 LPK 文件，如今支持资源提取与预览、Live2D / Spine 轻编辑、PSD 分层编辑与贴图回写，以及 Live2DViewerEX MOD 制作。无论来源是 LPK、WPK、Unity 资源、压缩包还是已经解包的模型目录，都可以从同一个程序开始处理。
 
-> 当前主要面向 Windows。少部分早期 LPK 可能使用未知的密钥生成或加密方式，仍然无法解包。
+> 当前主要面向 Windows。本文和截图对应当前源码；已发布版本的功能以对应 Release 说明为准。少部分早期 LPK 可能使用未知的密钥生成或加密方式，仍然无法解包。
 
-遇到问题时，请先搜索或提交 [Issues](https://github.com/ihopenot/LpkUnpacker/issues)。
+遇到问题时，请先搜索或提交 [Issues](https://github.com/Moeary/LpkUnpackerGUI/issues)。
 
 ## 主要模块
 
@@ -32,7 +32,7 @@
 
 ### 使用已编译版本
 
-1. 从 [Releases](https://github.com/ihopenot/LpkUnpacker/releases) 下载最新的 `LpkUnpackerGUI.exe`。
+1. 从 [Releases](https://github.com/Moeary/LpkUnpackerGUI/releases) 下载最新的 `LpkUnpackerGUI.exe`。
 2. 运行程序。
 3. 先在“资源预览”打开来源；发现有效 Live2D / Spine 模型后，点击“打开 Live2D 编辑器”或“打开 Spine 编辑器”。也可直接从主侧栏进入编辑器或资源解包；PSD 任务位于 Live2D 编辑器的“外观”。
 4. 大部分来源都可以直接拖入对应页面；输出目录可在设置中统一修改。
@@ -66,7 +66,9 @@ pixi run mcp-animation --workspace "D:\AnimationWorkspace" --transport streamabl
 
 “查看 / 复制 / 另存指南”会生成包含实际连接、输出目录与完整工具 schema 的 Markdown，AI 也可读取 MCP resource `lpk-animation://guide`。输入模型可在其他目录；保存仅限输出工作目录内的新副本，不覆盖原模型。连接示例、工具调用顺序和限制见 [动画 MCP 使用说明](assets/docs/animation-mcp.md)；仓库 [AI 指南](assets/docs/animation-ai-guide.md) 是模板，应用生成的是本机实际配置。
 
-通用皮肤核心已预留供后续 MCP 接入的服务接口；本轮没有新增皮肤 MCP 工具，现有动画服务保持不变。
+![本地动画 MCP 连接、服务与指南设置](assets/readme/Animation_MCP.png)
+
+MCP 当前提供动画编辑工具；通用皮肤操作通过图形界面完成。
 
 ## 一、资源提取与预览
 
@@ -104,9 +106,9 @@ LPK 已支持 `STD_1_0` 及更早的常见格式。Steam 创意工坊中的 LPK 
 - 批量扫描 Steam 创意工坊内容。
 - 自动整理不同来源的输出目录，并记录成功、失败、跳过和导出数量。
 
-LPK 解包演示：
+资源解包页可直接选择是否在提取后生成 Spine 3.8.75 副本：
 
-![LPK 解包演示](assets/readme/Unpack_Demo.gif)
+![资源解包与提取，包括 Spine 3.8.75 转换选项](assets/readme/Resource_Extraction.png)
 
 ### 统一资源预览
 
@@ -121,6 +123,12 @@ LPK 解包演示：
 - 发现有效模型后打开对应编辑器；图片预览不显示编辑器按钮。
 
 默认启用的“Spine 兼容模式”统一使用 `3.8.75`：预览把其他版本转换到缓存副本，资源解包页首次使用时据此初始化转换勾选项，之后以该页勾选状态为准；转换时可在官方 CLI 可用时独立生成 `.spine` 编辑工程。可在“Spine 工具”关闭兼容模式，使用与来源匹配的已验证原生运行时。跨版本转换可能改变动画、约束或曲线效果，界面会显示源版本到 `3.8.75` 的提示；从预览进入编辑器时使用当前实际预览的模型与依赖资源。
+
+![统一资源预览与左侧模型信息](assets/readme/Resource_Preview.png)
+
+图片数量限制在“工具设置 → 其他”中调整，范围为 1–500，默认 48；修改后在下一次扫描时生效。
+
+![工具设置中的图片预览数量上限](assets/readme/Preview_Settings.png)
 
 ### 从预览进入编辑器
 
@@ -141,6 +149,8 @@ LPK 解包演示：
 
 “导出 → 完整 Live2D 模型”导出当前模型、当前编辑动作和所选皮肤；默认可选含未收录修改的当前工作贴图。该输出不夹带皮肤库、PSD 或 MOD 编辑子工程，也不新增 ViewerEX 换装命令。顶部“保存工程”将动作、工作图集、皮肤目录及 PSD / ViewerEX 子工程另存为完整工程副本，供搬移后重开继续编辑；当前保存范围始终是新目录副本。“ViewerEX 点击换装”使用高级工程的第一张主卡片、贴图映射与触发部位；要以当前编辑作为基准，请按“添加当前皮肤 → 设为主模型 → 重新检查所有贴图映射与触发部位 → 导出”操作。
 
+![Spine 原生预览、骨骼属性与动画时间线](assets/readme/Spine_Editor.png)
+
 ### Spine 图集能力
 
 Spine 图集部件已并入 Spine 编辑器。选择部件可查看原始尺寸、导出 PNG 或用同尺寸 PNG 替换；旋转、裁边与预乘 Alpha 由共享 atlas core 处理。另存时写入独立副本，原始 atlas、骨骼文件和源贴图保持不变。
@@ -151,19 +161,15 @@ Spine 图集部件已并入 Spine 编辑器。选择部件可查看原始尺寸�
 
 “Spine 版本转换”入口直接调用随项目源码构建的 native DLL，不需要外部 EXE 或网页运行时。它支持 `.json`、`.skel` 和只包含唯一骨骼的目录，输出可选 JSON 或 SKEL，默认目标为完整版本 `3.8.75`；转换结果始终写入独立副本，可直接送入资源预览检查。默认转换曲线，必要时可选择移除曲线。跨版本转换可能丢失或改变动画、约束及曲线效果，不能保证无损或还原 `.spine` 工程。固定上游提交、PolyForm 许可证和构建方法见 [`assets/docs/spine-converter.md`](assets/docs/spine-converter.md)。
 
-软件渲染预览：
-
-![Live2D 软件渲染预览](assets/readme/Software_Rendering.gif)
-
 ## 二、Live2D PSD 工程
 
 PSD 工作台用于把运行时 Live2D 资源转换为可编辑图层，并把修改后的 PSD 重新写回模型贴图。
 
-进入“外观”即可查看下方常驻的“生成 / 回写 / 历史”工作流；上下区域及上方左右两栏可拖动并记住布局。首次在后台准备私有且不可变的 PSD 基准，名称与姿态、模式、画布尺寸默认可见，项目与路径等高级配置从“工程与设置”进入。任务进度、阶段、结果与错误共用底部反馈，详情可展开。PSD 计算在独立子进程中运行，异常退出时保留已有工程并允许重试；此前底层堆异常未稳定复现，不能认定其根因已消除。根工程入口为 `model.json`，皮肤库与 PSD / MOD 子工程随顶部“保存工程”一起保存；旧 PSD/MOD 工程可以导入为独立副本。
+进入“外观”即可查看常驻的“生成 / 回写 / 历史”工作流；宽屏左侧为皮肤与图集、右侧为 PSD，窄屏自动改为上下排列，分隔条可拖动并记住布局。首次在后台准备私有且不可变的 PSD 基准，名称与姿态、模式、画布尺寸默认可见，项目与路径等高级配置从“工程与设置”进入。任务进度、阶段、结果与错误共用底部反馈，详情可展开。PSD 计算在独立子进程中运行，异常退出时保留已有工程并允许重试；此前底层堆异常未稳定复现，不能认定其根因已消除。根工程入口为 `model.json`，皮肤库与 PSD / MOD 子工程随顶部“保存工程”一起保存；旧 PSD/MOD 工程可以导入为独立副本。
 
-Live2D PSD 预览图:
+Live2D 外观与 PSD 工作流：
 
-![](assets/readme/PSD_Workflow.jpg)
+![Live2D 编辑器中的皮肤、图集与 PSD 生成工作流](assets/readme/Live2D_Appearance.png)
 
 另存后的工程结构：
 
@@ -238,9 +244,9 @@ PSD 工作台中的“ArtMesh 静态检查器”可从导出的 metadata 打开�
 
 MOD 工程位于 Live2D 编辑器“导出 → ViewerEX 点击换装”，是 Live2DViewerEX 专用的高级流程：按工程主模型与贴图映射生成多个版本，并绑定 ArtMesh/HitArea 作为点击换装入口。普通皮肤管理与单皮肤完整模型导出无需创建此工程。高级工程使用 `project.live2dviewer_mod.json` 保存，不修改原始来源。
 
-Live2DViewerEX MOD 预览图:
+Live2DViewerEX 换装导出工作流：
 
-![](assets/readme/Live2DViewerEX_MOD_Workflow.jpg)
+![Live2D 编辑器内的 ViewerEX 换装工作流](assets/readme/ViewerEX_Workflow.png)
 
 编辑器中的 MOD 子工程位于根工程的 `mods/`，随根 `model.json` 一起保存和重开。旧版单独 MOD 工程的默认位置为：
 
@@ -380,5 +386,8 @@ AssetStudio/AssetStudioModCLI 作为外部命令行工具随包提供，采用 M
 - [x] 多 PSD 优先级合成和回写版本预览
 - [x] Live2DViewerEX 多皮肤 MOD 工程
 - [x] ArtMesh 换装触发、多贴图映射及创意工坊目录导出
+- [x] 通用皮肤管理、选区 PSD 与完整工程另存
+- [x] 本地动画 MCP（Streamable HTTP / stdio）
+- [x] 提取后可选批量转换 Spine 3.8.75
 - [ ] 更完整地还原游戏中的 Live2D/Spine 资源结构
 - [ ] 提升复杂 ArtMesh、隐藏内容和特殊混合模式的 PSD 还原精度
