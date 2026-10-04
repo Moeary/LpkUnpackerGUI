@@ -136,6 +136,112 @@ class Live2DEditorPageTests(unittest.TestCase):
         self.assertTrue(self.page.mod_panel._compact)
         self.assertTrue(hasattr(self.page.mod_panel, "export_button"))
 
+    def test_selection_gestures_have_independent_keyboard_history_and_text_undo(self):
+        from PySide6.QtWidgets import QLineEdit
+        self.open()
+        self.page.resize(1040, 760)
+        self.page.show()
+        self.page.tabs.setCurrentWidget(self.page.artmesh_tab)
+        self.app.processEvents()
+        inspector = self.page.artmesh_inspector
+        inspector.reset_selection_history()
+        model_history = len(self.page.session._undo)
+        inspector.select_entries(["ArtMeshFace"])
+        self.page.clear_artmesh_selection()
+        inspector.entry_list.setFocus()
+        QTest.keyClick(inspector.entry_list, Qt.Key_Z, Qt.ControlModifier)
+        self.assertEqual(inspector.selected_drawable_ids(), ["ArtMeshFace"])
+        QTest.keyClick(inspector.entry_list, Qt.Key_Z, Qt.ControlModifier | Qt.ShiftModifier)
+        self.assertEqual(inspector.selected_drawable_ids(), [])
+        self.assertEqual(len(self.page.session._undo), model_history)
+        inspector.undo_selection()
+        inspector.load_snapshot(self.page.session.mesh_data, self.page.session.texture_paths)
+        inspector.redo_selection()
+        self.assertEqual(inspector.selected_drawable_ids(), [])
+        edit = QLineEdit(self.page.artmesh_tab)
+        edit.show()
+        edit.setFocus()
+        QTest.keyClicks(edit, "hello")
+        QTest.keyClick(edit, Qt.Key_Z, Qt.ControlModifier)
+        self.assertEqual(edit.text(), "")
+        self.assertEqual(inspector.selected_drawable_ids(), [])
+        edit.deleteLater()
+
+    def test_recovery_keeps_dirty_restores_copy_and_explicit_save_retires_checkpoint(self):
+        from app.core.editor_recovery import RecoveryStore
+        from app.core.settings_manager import SettingsManager
+        self.open()
+        recovery = self.page.recovery
+        recovery.store = RecoveryStore(self.root / "recovery")
+        recovery.settings = SettingsManager(self.root / "recovery-settings.json")
+        self.page.session.save_named_selection("Face", ["ArtMeshFace"])
+        self.page.session.preview_parameter("ParamAngleY", 14)
+        recovery.tick(force=True)
+        deadline = time.monotonic() + 10
+        while recovery._job and time.monotonic() < deadline:
+            self.app.processEvents()
+            QTest.qWait(10)
+        self.assertFalse(recovery._job, recovery.error)
+        self.assertFalse(recovery.error)
+        self.assertTrue(self.page.session.dirty)
+        self.assertTrue(recovery.last_time)
+        self.assertEqual(len(recovery.store.records()), 1)
+        record = recovery.store.records()[0]
+        with patch("app.gui.Live2DPreviewWindow.Live2DPreviewWindow", _Preview), patch.object(self.page, "_confirm_session_changes", return_value=True):
+            self.assertTrue(recovery.restore(record))
+            deadline = time.monotonic() + 10
+            while recovery._job and time.monotonic() < deadline:
+                self.app.processEvents()
+                QTest.qWait(10)
+        self.assertTrue(recovery.recovered, recovery.error)
+        self.assertTrue(self.page.session.dirty)
+        self.assertEqual(self.page.session.parameter_overrides["ParamAngleY"], 14)
+        self.assertEqual(self.page.session.named_selections(), {"Face": ["ArtMeshFace"]})
+        self.assertIsNotNone(self.page.save_copy(str(self.root / "saved-recovery")))
+        self.assertEqual(recovery.store.records(), [])
+        self.assertFalse(self.page.session.dirty)
+
+    def test_recovery_drops_stale_worker_result(self):
+        from app.core.editor_recovery import RecoveryStore, capture_recovery
+        self.open()
+        recovery = self.page.recovery
+        recovery.store = RecoveryStore(self.root / "recovery")
+        self.page.session.preview_parameter("ParamAngleY", 3)
+        recovery._token = (recovery.identity, recovery._signature())
+        record = recovery.store.prepare(recovery.identity, capture_recovery(self.page.session, "live2d"))
+        self.page.session.preview_parameter("ParamAngleY", 7)
+        recovery._checkpoint_done(record, "")
+        self.assertEqual(recovery.store.records(), [])
+
+    def test_rebinding_shortcuts_applies_immediately_and_can_disable(self):
+        from app.core.settings_manager import SettingsManager
+        from app.gui.editor_preferences import ShortcutSettingsCard
+        from PySide6.QtGui import QKeySequence
+        self.open()
+        self.page.show()
+        self.page.tabs.setCurrentWidget(self.page.artmesh_tab)
+        self.app.processEvents()
+        settings = SettingsManager(self.root / "shortcut-settings.json")
+        self.page.shortcuts.settings = settings
+        self.page.shortcuts.reload()
+        card = ShortcutSettingsCard("live2d", settings)
+        try:
+            card.edits["clear"].setKeySequence(QKeySequence("F7"))
+            card.save()
+            inspector = self.page.artmesh_inspector
+            inspector.select_entries(["ArtMeshFace"])
+            QTest.keyClick(inspector.entry_list, Qt.Key_Escape)
+            self.assertEqual(inspector.selected_drawable_ids(), ["ArtMeshFace"])
+            QTest.keyClick(inspector.entry_list, Qt.Key_F7)
+            self.assertEqual(inspector.selected_drawable_ids(), [])
+            card.edits["clear"].clear()
+            card.save()
+            inspector.select_entries(["ArtMeshFace"])
+            QTest.keyClick(inspector.entry_list, Qt.Key_F7)
+            self.assertEqual(inspector.selected_drawable_ids(), ["ArtMeshFace"])
+        finally:
+            card.deleteLater()
+
     def test_named_selection_controls_save_recall_update_and_undo(self):
         from app.gui.artmesh_selection_tools import SelectionNameDialog
         self.open()

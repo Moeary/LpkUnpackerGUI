@@ -905,7 +905,8 @@ class Live2DCanvas(ADPOpenGLCanvas):
         return super().mouseReleaseEvent(event)
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Escape and self._selection_mode != "none":
+        if (not getattr(self, "external_selection_shortcuts", False)
+                and event.key() == Qt.Key.Key_Escape and self._selection_mode != "none"):
             self._selection_drag = None
             self._last_selection_region = None
             self.update()

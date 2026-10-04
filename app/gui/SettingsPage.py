@@ -994,11 +994,18 @@ class SettingsPage(QFrame):
         self.mcp_port_spin.valueChanged.connect(self._mcp_preferences_changed)
         self.mcp_workspace_edit.editingFinished.connect(self._mcp_preferences_changed)
 
+        from app.gui.editor_preferences import RecoverySettingsCard, ShortcutSettingsCard
+        self.recovery_settings_card = RecoverySettingsCard(self.settings_manager, self.settings_content)
+        self.live2d_shortcuts_card = ShortcutSettingsCard("live2d", self.settings_manager, self.settings_content)
+        self.spine_shortcuts_card = ShortcutSettingsCard("spine", self.settings_manager, self.settings_content)
+        right_column.addWidget(self.recovery_settings_card)
+        right_column.addWidget(self.live2d_shortcuts_card)
+        right_column.addWidget(self.spine_shortcuts_card)
         main_layout.addStretch(1)
         self._settings_categories = [
-            ("general", [general_card, runtime_card]),
-            ("live2d", [cubism_card, photoshop_card]),
-            ("spine", [spine_card]),
+            ("general", [general_card, runtime_card, self.recovery_settings_card]),
+            ("live2d", [cubism_card, photoshop_card, self.live2d_shortcuts_card]),
+            ("spine", [spine_card, self.spine_shortcuts_card]),
             ("resources", [archive_card, asset_card, download_card]),
             ("ai", [mcp_card, connection_card, guide_card]),
             ("other", [texture_card]),

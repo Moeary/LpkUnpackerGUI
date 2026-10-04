@@ -142,7 +142,14 @@ class ArtMeshSelectionTools(QWidget):
         self.save_button.setMaximumWidth(110)
         self.more_button = TransparentToolButton(FluentIcon.MORE, self)
         self.more_button.setFixedSize(30, 30)
-        for widget in (self.combo, self.save_button, self.more_button):
+        self.undo_button = TransparentToolButton(FluentIcon.RETURN, self)
+        self.redo_button = TransparentToolButton(FluentIcon.ROTATE, self)
+        for button in (self.undo_button, self.redo_button):
+            button.setFixedSize(26, 30)
+        self.undo_button.clicked.connect(inspector.undo_selection)
+        self.redo_button.clicked.connect(inspector.redo_selection)
+        inspector.selectionIdsChanged.connect(self._history_changed)
+        for widget in (self.combo, self.save_button, self.undo_button, self.redo_button, self.more_button):
             row.addWidget(widget, 1 if widget is self.combo else 0)
         layout.addLayout(row)
         row = QHBoxLayout()
@@ -172,7 +179,14 @@ class ArtMeshSelectionTools(QWidget):
         self.retranslate_ui()
         self.refresh(None, False)
 
+    def _history_changed(self, *_args):
+        self.undo_button.setEnabled(bool(self.inspector.selection_history.past))
+        self.redo_button.setEnabled(bool(self.inspector.selection_history.future))
+
     def retranslate_ui(self, *_args):
+        self.undo_button.setToolTip(tr("editor.shortcuts.selection_undo", default="撤销选区"))
+        self.redo_button.setToolTip(tr("editor.shortcuts.selection_redo", default="重做选区"))
+        self._history_changed()
         self.combo.setAccessibleName(selection_text("saved"))
         self.save_button.setText(selection_text("save"))
         self.save_button.setToolTip(selection_text("save_hint"))

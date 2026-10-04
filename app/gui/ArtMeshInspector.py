@@ -8,6 +8,8 @@ to audit before editing or repacking.
 
 from __future__ import annotations
 
+from app.core.selection_history import SelectionHistory
+
 import json
 import math
 import re
@@ -213,6 +215,7 @@ class _MeshCanvas(QWidget):
         self.setMinimumSize(100, 100)
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
     def set_scene(
         self,
@@ -359,6 +362,7 @@ class _MeshCanvas(QWidget):
         painter.end()
 
     def mousePressEvent(self, event) -> None:
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
         if event.button() == Qt.MouseButton.MiddleButton:
             self._pan_anchor = QPointF(event.position())
             self._selection_anchor = None
@@ -504,6 +508,8 @@ class ArtMeshInspector(QWidget):
         self.selected_index = -1
         self.selected_indices: set[int] = set()
         self._dynamic_shared_ids = None
+        self.selection_history = SelectionHistory()
+        self._replaying_selection = False
         self._texture_pixmaps = {}
         self._selection_alpha_cache = {}
         self._atlas_geometry_cache = {}
@@ -844,6 +850,7 @@ class ArtMeshInspector(QWidget):
     def load_snapshot(self, snapshot: Mapping[str, Any], texture_paths,
                       *, selected_ids=None) -> bool:
         """Use an in-memory current pose without writing inspector metadata."""
+        primary = getattr(self.current_entry(), "drawable_id", None)
         previous = self.selected_drawable_ids() if selected_ids is None else list(selected_ids)
         self._loading = True
         try:
@@ -876,7 +883,11 @@ class ArtMeshInspector(QWidget):
             self._loading = False
         available = {entry.drawable_id for entry in self.entries}
         ids = [identifier for identifier in previous if identifier in available]
-        self.select_entries(ids)
+        self._replaying_selection = True
+        try:
+            self.select_entries(ids, primary_id=primary)
+        finally:
+            self._replaying_selection = False
         if self._dynamic_shared_ids is not None:
             self.set_shared_highlights(self._dynamic_shared_ids)
         self.metadataChanged.emit("")
@@ -1420,9 +1431,32 @@ class ArtMeshInspector(QWidget):
             self.entry_list.blockSignals(False)
             self._loading = False
         self._update_views()
+        if not self._replaying_selection:
+            self.selection_history.record(self._selection_state())
         self.selectionIdsChanged.emit(self.selected_drawable_ids())
         self.selectionChanged.emit(self.current_entry())
         return [self.entries[by_id[identifier]] for identifier in ids if identifier in by_id]
+
+    def _selection_state(self):
+        return (tuple(self.selected_drawable_ids()), getattr(self.current_entry(), "drawable_id", None))
+
+    def reset_selection_history(self):
+        self.selection_history.reset(self._selection_state())
+
+    def undo_selection(self):
+        self._restore_selection_history(self.selection_history.undo())
+
+    def redo_selection(self):
+        self._restore_selection_history(self.selection_history.redo())
+
+    def _restore_selection_history(self, state):
+        if state is None:
+            return
+        self._replaying_selection = True
+        try:
+            self.select_entries(state[0], primary_id=state[1])
+        finally:
+            self._replaying_selection = False
 
     def apply_selection(self, drawable_ids, mode="replace", primary_id=None):
         """Apply UV, list or preview gestures to the same final selection."""

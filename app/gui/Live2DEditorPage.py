@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QFileSystemWatcher, QPoint, QProcess, QSignalBlocker, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QBrush, QColor, QDesktopServices, QImage, QKeySequence, QPainter, QPixmap, QShortcut
+from PySide6.QtGui import QBrush, QColor, QDesktopServices, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QDialog, QFileDialog,
     QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel,
@@ -32,6 +32,8 @@ from app.gui.live2d_appearance import (
     SharedTaskFeedback, appearance_text,
 )
 from app.gui.PsdReconstructionPage import PsdReconstructionPage
+from app.gui.editor_shortcuts import EditorShortcutRouter
+from app.gui.editor_recovery import EditorRecoveryController
 from app.gui.editor_timeline import AnimationTimelineEditor
 from app.gui.editor_actions import ActionComboBox, ActionDeleteDialog, ActionNameDialog, action_text, close_editor_popup
 from app.gui.editor_dialogs import EditorMessageBox as QMessageBox, EditorTextDialog, ThemedEditorDialog as MessageBoxBase
@@ -224,6 +226,8 @@ class Live2DEditorPage(QFrame):
         self._parameter_commit_timer.setInterval(250)
         self._parameter_commit_timer.timeout.connect(self._flush_parameter_edit)
         self._build_ui()
+        self.recovery = EditorRecoveryController(self, "live2d")
+        self.layout().insertWidget(1, self.recovery.bar)
         self.retranslate_ui()
         self.i18n.languageChanged.connect(self.retranslate_ui)
         self._update_actions()
@@ -445,10 +449,7 @@ class Live2DEditorPage(QFrame):
         if hasattr(self.mod_panel, "taskStateChanged"):
             self.mod_panel.taskStateChanged.connect(self._task_state_changed)
         root.addWidget(self.task_feedback)
-        for sequence, action in ((QKeySequence.Undo, self.undo), (QKeySequence.Redo, self.redo), (QKeySequence.Save, self._choose_save_copy)):
-            shortcut = QShortcut(sequence, self)
-            shortcut.setContext(Qt.WidgetWithChildrenShortcut)
-            shortcut.activated.connect(action)
+        self.shortcuts = EditorShortcutRouter(self, "live2d")
         self._apply_control_style()
 
     def _apply_control_style(self):
@@ -810,7 +811,7 @@ class Live2DEditorPage(QFrame):
             if not self.return_to_current_model(reload=False, announce=False):
                 raise RuntimeError(_text("editor.live2d.return_failed"))
             self.session = candidate
-            self.clear_artmesh_selection()
+            self.clear_artmesh_selection(reset_history=True)
             if self.preview is None:
                 from app.gui.Live2DPreviewWindow import Live2DPreviewWindow
                 self.preview = Live2DPreviewWindow(str(candidate.model_path), self.stage, embedded=True)
@@ -1284,7 +1285,7 @@ class Live2DEditorPage(QFrame):
         previous_mod_id = self._mod_preview_model_id
         try:
             self._preview_session = candidate
-            self.clear_artmesh_selection()
+            self.clear_artmesh_selection(reset_history=True)
             self.preview.load_model(str(candidate.model_path))
             self._native_return_pending = False
             readonly_label = appearance_text("editor.appearance.preview_readonly", name=request["label"])
@@ -1384,7 +1385,7 @@ class Live2DEditorPage(QFrame):
             return True
         try:
             self._preview_session = None
-            self.clear_artmesh_selection()
+            self.clear_artmesh_selection(reset_history=True)
             self._preview_context = ""
             if reload and self.preview and self.session:
                 self.preview.load_model(str(self.session.model_path))
@@ -1918,7 +1919,7 @@ class Live2DEditorPage(QFrame):
         if mode == "none":
             self.clear_artmesh_selection()
 
-    def clear_artmesh_selection(self):
+    def clear_artmesh_selection(self, _checked=False, *, reset_history=False):
         self._selection_region = None
         self._selection_region_key = None
         self._selected_drawable_ids = []
@@ -1930,6 +1931,8 @@ class Live2DEditorPage(QFrame):
         if canvas and hasattr(canvas, "setSelectionMode"):
             canvas.setSelectionMode("none")
         self.artmesh_inspector.select_entries([])
+        if reset_history:
+            self.artmesh_inspector.reset_selection_history()
         self.artmesh_image.clear()
         self.local_preview_button.setEnabled(False)
         self.part_opacity.setEnabled(False)
@@ -2755,6 +2758,7 @@ class Live2DEditorPage(QFrame):
                 self.session.accept_texture_change(index)
             self._flush_subprojects()
             self.last_saved_copy = self.session.save_copy(output_dir)
+            self.recovery.note_saved(self.last_saved_copy["model_path"])
             self.mod_panel.set_source(str(self.session.model_path))
             self._status(_text("editor.live2d.saved", path=output_dir))
             self._update_actions()
@@ -2779,6 +2783,8 @@ class Live2DEditorPage(QFrame):
                                      QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel, QMessageBox.Cancel)
         if answer == QMessageBox.Save:
             return self._choose_save_copy()
+        if answer == QMessageBox.Discard:
+            self.recovery.note_discard()
         return answer == QMessageBox.Discard
 
     def confirm_discard_or_save(self) -> bool:
@@ -2823,6 +2829,7 @@ class Live2DEditorPage(QFrame):
                 self._closing = False
                 return False
         watched = self.texture_watcher.files() + self.texture_watcher.directories()
+        self.recovery.shutdown()
         self.selection_tools.shutdown()
         if watched:
             self.texture_watcher.removePaths(watched)
@@ -2889,6 +2896,8 @@ class Live2DEditorPage(QFrame):
                 self._error(exc)
 
     def _update_actions(self):
+        if hasattr(self, "recovery"):
+            self.recovery.refresh()
         session = self.session
         self.save_button.setEnabled(bool(session))
         self.undo_button.setEnabled(bool(session and session.can_undo))

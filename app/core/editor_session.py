@@ -171,6 +171,8 @@ class SpineEditorSession:
         self.original_source = original_source
         self.original_root = original_source.parent
         self._temporary = temporary
+        from app.core.live2d_editor_export import WorkspaceAssetLifetime
+        self._asset_lifetime = WorkspaceAssetLifetime(temporary)
         self.workspace = Path(temporary.name)
         self.preview_root = self.workspace / "preview"
         self._textures: dict[str, bytes] = {}
@@ -584,7 +586,7 @@ class SpineEditorSession:
     def close(self):
         if not self._closed:
             self._closed = True
-            self._temporary.cleanup()
+            self._asset_lifetime.close()
 
 
 __all__ = ["SpineEditorSession", "BONE_FIELDS", "decode_bone_track", "encode_bone_track",
