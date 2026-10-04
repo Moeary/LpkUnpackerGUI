@@ -6,6 +6,9 @@ on:
       - 'v*'  # Trigger when pushing tags like v1.0.0
   workflow_dispatch:  # Allow manual trigger
 
+permissions:
+  contents: read
+
 jobs:
   build_windows:
     name: Build Windows
@@ -63,6 +66,27 @@ jobs:
         if (-not (Get-Command cl -ErrorAction SilentlyContinue)) {
           throw "The MSVC C++ compiler was not activated by msvc-dev-cmd."
         }
+
+    - name: Set up pinned Live2D MinGW toolchain
+      shell: pwsh
+      run: |
+        $url = "https://github.com/skeeto/w64devkit/releases/download/v1.23.0/w64devkit-1.23.0.zip"
+        $expectedHash = "5c7dce6762be3e0dba648a9317790444c0e2f1ef3e677315c115727d7a549539"
+        $archive = Join-Path $env:RUNNER_TEMP "w64devkit-1.23.0.zip"
+        $extractRoot = Join-Path $env:RUNNER_TEMP "live2d-toolchain"
+        Invoke-WebRequest -Uri $url -OutFile $archive
+        $actualHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actualHash -ne $expectedHash) {
+          throw "w64devkit checksum mismatch: $actualHash"
+        }
+        Expand-Archive -LiteralPath $archive -DestinationPath $extractRoot -Force
+        $toolchainBin = Join-Path $extractRoot "w64devkit/bin"
+        foreach ($tool in @("gcc", "g++", "gendef", "dlltool", "mingw32-make")) {
+          if (-not (Test-Path -LiteralPath (Join-Path $toolchainBin "$tool.exe") -PathType Leaf)) {
+            throw "Live2D build tool is missing: $tool"
+          }
+        }
+        $toolchainBin >> $env:GITHUB_PATH
 
     - name: Cache pinned Spine source archives
       uses: actions/cache@v4
@@ -139,6 +163,8 @@ jobs:
     needs: [build_windows]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
     - name: Download Windows artifact
       uses: actions/download-artifact@v4
