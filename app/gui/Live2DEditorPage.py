@@ -326,6 +326,9 @@ class Live2DEditorPage(QFrame):
         self.psd_panel.repackModRequested.connect(self.send_psd_version_to_mod)
         self.psd_panel.projectChanged.connect(self._psd_project_changed)
         self.psd_panel.repackSkinReady.connect(self._psd_skin_ready)
+        self.psd_panel.comparison_mesh_provider = self._psd_comparison_mesh
+        self.psd_panel.editWorkingTextureRequested.connect(self._edit_external_texture)
+        self.psd_panel.edit_working_png_button.show()
         variant_signal = getattr(self.psd_panel, "repackVariantRequested", None)
         if variant_signal is not None:
             variant_signal.connect(self._psd_variant_dialog)
@@ -1032,6 +1035,22 @@ class Live2DEditorPage(QFrame):
 
     def apply_psd_version(self, token: str) -> bool:
         return bool(self.save_psd_version_as_skin(token))
+
+    def _psd_comparison_mesh(self):
+        import hashlib
+        from app.core.psd_reconstructor import resolve_live2d_source
+        self._flush_parameter_edit()
+        self.timeline.set_playing(False)
+        scene = self._selection_scene()
+        if not scene:
+            return None
+        snapshot = copy.deepcopy(scene["snapshot"])
+        session = self._preview_session or self.session
+        if session:
+            source = resolve_live2d_source(session.model_path)
+            if source.moc3:
+                snapshot["comparison_moc_sha256"] = hashlib.sha256(source.moc3.read_bytes()).hexdigest()
+        return snapshot
 
     def _find_psd_skin(self, token: str):
         if not self.session or not self.psd_panel.current_project:
@@ -1983,6 +2002,14 @@ class Live2DEditorPage(QFrame):
             raise RuntimeError(_text("editor.live2d.pick_invisible", ids=", ".join(invisible)))
         return scene
 
+    def _selection_export_options(self, count):
+        from app.gui.psd_export_dialog import SelectionPsdDialog
+        dialog = SelectionPsdDialog(count, self, mode=self.psd_panel.mode_combo.currentData())
+        accepted = self._exec_action_dialog(dialog) == QDialog.Accepted
+        options = dialog.options() if accepted else None
+        dialog.deleteLater()
+        return options
+
     def export_selected_artmeshes(self) -> bool:
         if not self.session or self._preview_session or not self._selected_drawable_ids or self._projects_busy():
             return False
@@ -1990,7 +2017,11 @@ class Live2DEditorPage(QFrame):
             self._flush_parameter_edit()
             self.timeline.set_playing(False)
             identifiers = list(self._selected_drawable_ids)
-            scene = self._selection_export_scene(identifiers)
+            options = self._selection_export_options(len(identifiers))
+            if not options:
+                return False
+            scene = (self._selection_scene() if options["mode"] == "atlas-components"
+                     else self._selection_export_scene(identifiers))
             if scene is None:
                 return False
             region = (dict(self._selection_region) if self._selection_region and self._selection_cache
@@ -1998,7 +2029,7 @@ class Live2DEditorPage(QFrame):
             if not self.open_psd_workspace():
                 return False
             return self.psd_panel.export_selected_artmeshes(identifiers, scene["pose"], region,
-                                                          mesh_data=scene["snapshot"])
+                                                          mesh_data=scene["snapshot"], **options)
         except Exception as exc:
             self._error(exc)
             return False

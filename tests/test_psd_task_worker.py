@@ -113,7 +113,7 @@ class PsdTaskWorkerTests(unittest.TestCase):
         self.assertFalse(self.page.findChildren(QSplitter))
         self.assertIsNone(self.page.preview_dialog)
         self.assertEqual(self.page.workflow_tabs.count(), 4)
-        self.assertEqual(self.page.mode_combo.count(), 3)
+        self.assertEqual(self.page.mode_combo.count(), 2)
         self.page.configure_task_embedding()
         for index, task in enumerate(("export", "repack", "history", "advanced")):
             self.page.show_task(task)

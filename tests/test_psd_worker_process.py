@@ -123,7 +123,7 @@ class PsdWorkerProcessTests(unittest.TestCase):
         self.app.processEvents()
         self.assertTrue(self.page.mode_combo.isVisible())
         self.assertTrue(self.page.mesh_canvas_spin.isVisible())
-        self.assertEqual(self.page.mode_combo.count(), 3)
+        self.assertEqual(self.page.mode_combo.count(), 2)
         self.assertEqual(self.page.mesh_canvas_spin.value(), 2048)
         before = (copy.deepcopy(self.session.project.modified), copy.deepcopy(self.session._undo), self.hashes(self.model.parent))
         target = self.session.root / "psd-new"

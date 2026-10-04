@@ -404,6 +404,7 @@ def reconstruct_live2d_psd(
     selected_drawable_ids: list[str] | None = None,
     selection_region: Any = None,
     mesh_data: Mapping[str, Any] | None = None,
+    atlas_layout: str = "packed",
 ) -> ReconstructionResult:
     mode = str(mode or "mesh").strip().lower()
     if mode not in {"mesh", "atlas-components", "atlas-artmesh"}:
@@ -419,8 +420,10 @@ def reconstruct_live2d_psd(
     source_info = resolve_live2d_source(Path(source))
     if mesh_data is not None:
         source_info.mesh_data = dict(mesh_data)
-    if selected_drawable_ids is not None and mode != "mesh":
-        raise PsdReconstructionError("Drawable selection is available only for mesh pose PSD export.")
+    if selected_drawable_ids is not None and mode not in {"mesh", "atlas-components"}:
+        raise PsdReconstructionError("Use mesh or atlas-components for selected ArtMeshes.")
+    if atlas_layout not in {"packed", "original"}:
+        raise PsdReconstructionError("Atlas layout must be packed or original.")
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -434,7 +437,7 @@ def reconstruct_live2d_psd(
 
     _emit(progress, 20, f"Loaded {len(textures)} texture atlas file(s)")
 
-    if mode in {"mesh", "atlas-artmesh"} and (
+    if (mode in {"mesh", "atlas-artmesh"} or selected_drawable_ids is not None) and (
         not source_info.mesh_data or (mode == "mesh" and parameter_values and mesh_data is None)
     ):
         try:
@@ -454,7 +457,7 @@ def reconstruct_live2d_psd(
             warnings.append(f"Cubism Core drawable export unavailable: {exc}")
 
     selection = None
-    if selected_drawable_ids is not None:
+    if selected_drawable_ids is not None and mode == "mesh":
         if not source_info.mesh_data:
             raise PsdReconstructionError("Selected pose PSD export requires Cubism drawable geometry.")
         from app.core.psd_selection import PsdSelectionError, prepare_selection, selection_uv_constraints
@@ -482,7 +485,19 @@ def reconstruct_live2d_psd(
                             + ". Repack will reject edits affecting those shared texels.")
         source_info.mesh_data = selected_mesh
 
-    if mode == "mesh" and source_info.mesh_data:
+    if mode == "atlas-components" and selected_drawable_ids is not None:
+        from app.core.psd_atlas_selection import build_selected_atlas
+        from app.core.psd_selection import PsdSelectionError
+        if not source_info.mesh_data:
+            raise PsdReconstructionError("Selected atlas export requires Cubism drawable geometry.")
+        try:
+            layers, size, layer_metadata, selection = build_selected_atlas(
+                cv2, source_info.mesh_data, selected_drawable_ids, textures,
+                packed=atlas_layout == "packed", limits=limits,
+            )
+        except PsdSelectionError as exc:
+            raise PsdReconstructionError(str(exc)) from exc
+    elif mode == "mesh" and source_info.mesh_data:
         layers, size, layer_metadata = _render_mesh_layers(
             cv2, source_info.mesh_data, textures, progress, limits, texture_pixels, selection
         )
@@ -530,7 +545,7 @@ def reconstruct_live2d_psd(
         "atlas-artmesh": "atlas_artmesh",
     }[mode]
     if selection is not None:
-        suffix = "selected_pose"
+        suffix = "selected_pose" if mode == "mesh" else "selected_atlas"
     psd_path = output_path / f"{model_name}_{suffix}.psd"
     metadata_path = output_path / f"{model_name}_{suffix}.lpkpsd.json"
     _emit(progress, 90, f"Preparing PSD with {len(layers)} layer(s)")
@@ -641,8 +656,8 @@ def repack_atlas_png_from_psd(
     mode = str(metadata.get("mode") or "")
     if not isinstance(allow_shared_uv, bool):
         raise PsdReconstructionError("allow_shared_uv must be an explicit boolean.")
-    if allow_shared_uv and (mode != "mesh" or not metadata.get("selection")):
-        raise PsdReconstructionError("Shared UV consent is available only for a selected pose PSD.")
+    if allow_shared_uv and (mode not in {"mesh", "atlas-components"} or not metadata.get("selection")):
+        raise PsdReconstructionError("Shared UV consent is available only for a selected PSD.")
     if mode not in {"atlas-components", "atlas-artmesh", "mesh"}:
         raise PsdReconstructionError(
             "Only mesh, atlas-components, or atlas-artmesh PSD metadata can be repacked."
@@ -672,7 +687,7 @@ def repack_atlas_png_from_psd(
     _validate_psd_layers(psd_layers, texture_pixels, limits, "PSD repack")
     _emit(progress, 10, f"Loaded PSD: {psd_file}")
 
-    if mode == "mesh":
+    if mode == "mesh" or (mode == "atlas-components" and metadata.get("selection")):
         selection = metadata.get("selection")
         if selection is not None and (
             int(psd.width) != int(metadata.get("canvas", {}).get("width", 0))
@@ -681,7 +696,8 @@ def repack_atlas_png_from_psd(
             raise PsdReconstructionError(
                 "Selected pose PSD canvas size changed. Keep the original canvas and layer positions."
             )
-        return _repack_mesh_psd_layers(
+        repack = _repack_selected_mesh_psd_layers if mode == "atlas-components" else _repack_mesh_psd_layers
+        return repack(
             psd,
             psd_layers,
             textures,
@@ -1030,6 +1046,8 @@ def _repack_selected_mesh_psd_layers(
 
     if not isinstance(selection, Mapping) or selection.get("version") != 1:
         raise PsdReconstructionError("Unsupported selected pose PSD metadata.")
+    atlas_selection = selection.get("policy") == "selected-atlas-pieces"
+    result_mode = "atlas-repack" if atlas_selection else "mesh-repack"
     cv2 = _require_cv2()
     _configure_opencv(cv2, limits)
     canvases, warnings = _load_mesh_repack_canvases(
@@ -1045,7 +1063,7 @@ def _repack_selected_mesh_psd_layers(
 
     def reject(message: str, affected: list[str]) -> None:
         _write_json(output_path / "repack_report.json", {
-            "mode": "mesh-repack", "status": "rejected", "metadata": str(metadata_file),
+            "mode": result_mode, "status": "rejected", "metadata": str(metadata_file),
             "reason": message, "affected_unselected_ids": affected,
             "selection": dict(selection), "output_paths": [],
         })
@@ -1071,16 +1089,21 @@ def _repack_selected_mesh_psd_layers(
             metadata_file, info, image, left, top, edited.shape[:2], baseline_origin=(left, top),
         )
         try:
-            factor = decode_visibility(info.get("visibility_factor") or {}, edited.shape[:2])
+            if not atlas_selection:
+                factor = decode_visibility(info.get("visibility_factor") or {}, edited.shape[:2])
             if np.array_equal(edited, baseline):
                 continue
-            vertices = np.asarray(info["vertices"], dtype=np.float32) * _metadata_coordinate_scale(info)
-            vertices -= np.asarray([left, top], dtype=np.float32)
             canvas = canvases[texture_index]
-            candidate = apply_pose_delta(
-                cv2, edited, baseline, factor, canvas, vertices, info["uvs"], info["indices"],
-                original_canvases[texture_index],
-            )
+            if atlas_selection:
+                from app.core.psd_atlas_selection import apply_atlas_delta
+                candidate, factor = apply_atlas_delta(cv2, edited, baseline, canvas, info)
+            else:
+                vertices = np.asarray(info["vertices"], dtype=np.float32) * _metadata_coordinate_scale(info)
+                vertices -= np.asarray([left, top], dtype=np.float32)
+                candidate = apply_pose_delta(
+                    cv2, edited, baseline, factor, canvas, vertices, info["uvs"], info["indices"],
+                    original_canvases[texture_index],
+                )
             changed = np.any(candidate != canvas, axis=2)
             uv_left, uv_top, allowed = uv_region(
                 cv2, info["uvs"], info["indices"], (canvas.shape[1], canvas.shape[0]),
@@ -1126,7 +1149,7 @@ def _repack_selected_mesh_psd_layers(
         else:
             Image.fromarray(canvas, "RGBA").save(target, format="PNG")
         outputs.append(target)
-    report = {"mode": "mesh-repack", "status": "completed", "metadata": str(metadata_file),
+    report = {"mode": result_mode, "status": "completed", "metadata": str(metadata_file),
               "output_paths": [str(path) for path in outputs], "change_regions": change_regions,
               "conflicts": [], "shared_regions": selection.get("shared_regions") or [],
               "selection": dict(selection), "allow_shared_uv": allow_shared_uv,
@@ -1137,7 +1160,7 @@ def _repack_selected_mesh_psd_layers(
     _write_json(report_path, report)
     _emit(progress, 100, f"Atlas PNG written: {output_path}")
     return ReconstructionResult(
-        psd_path=outputs[0], layer_count=len(layers_metadata), mode="mesh-repack", warnings=warnings,
+        psd_path=outputs[0], layer_count=len(layers_metadata), mode=result_mode, warnings=warnings,
         metadata_path=metadata_file, output_paths=outputs,
         texture_outputs={int(texture["index"]): output for texture, output in zip(textures, outputs)},
         change_regions=change_regions, shared_regions=report["shared_regions"], report=report,

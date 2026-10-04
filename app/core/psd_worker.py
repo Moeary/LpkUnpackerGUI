@@ -268,6 +268,10 @@ def _execute(job: dict, job_dir: Path) -> dict:
                                            repack_multiple_psds)
     def progress(value, message):
         print(json.dumps({"psd_event": "progress", "value": value, "message": str(message)}, ensure_ascii=False), flush=True)
+    if job.get("operation") == "compare":
+        from app.core.psd_comparison import build_comparison
+        return build_comparison(job["metadata_path"], job["texture_outputs"], job_dir / "comparison",
+                                mesh_data=job.get("mesh_data"), progress=progress)
     if job.get("operation") == "initialize":
         request = _restore_snapshot(job["snapshot"])
         project = create_project_from_snapshot_request(request.export_request, job["project_dir"],
@@ -299,7 +303,8 @@ def _execute(job: dict, job_dir: Path) -> dict:
         result = reconstruct_live2d_psd(source, output, mode=mode, parameter_values=job.get("parameter_values"),
                                        pose_name=job.get("pose_name"), output_name=job.get("output_name"),
                                        selected_drawable_ids=job.get("selected_drawable_ids"),
-                                       selection_region=job.get("selection_region"), mesh_data=job.get("mesh_data"), **common)
+                                       selection_region=job.get("selection_region"), mesh_data=job.get("mesh_data"),
+                                       atlas_layout=job.get("atlas_layout", "packed"), **common)
     encoded = _encode_result(result)
     if stage:
         finalize_pose_export_stage(stage, result)

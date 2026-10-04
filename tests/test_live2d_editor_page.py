@@ -112,6 +112,10 @@ class Live2DEditorPageTests(unittest.TestCase):
         self.psd_settings_patch.start()
         self.addCleanup(self.psd_settings_patch.stop)
         self.page = Live2DEditorPage()
+        selection_options = patch.object(self.page, "_selection_export_options",
+                                         return_value={"mode": "mesh", "atlas_layout": "packed"})
+        selection_options.start()
+        self.addCleanup(selection_options.stop)
         self.addCleanup(self._cleanup_page)
 
     def _cleanup_page(self):
@@ -759,7 +763,7 @@ class Live2DEditorPageTests(unittest.TestCase):
         self.assertEqual((self.page.width(), self.page.height()), (1040, 760))
         self.assertFalse(self.page.hasHeightForWidth())
 
-    def test_psd_three_exports_use_current_snapshot_preserve_prior_baseline(self):
+    def test_psd_two_exports_use_current_snapshot_preserve_prior_baseline(self):
         from PIL import Image
         self.open()
         self.page.session.create_motion("NewAction", 2)
@@ -767,7 +771,7 @@ class Live2DEditorPageTests(unittest.TestCase):
         psd = self.page.psd_panel
         schemes = []
         old_bytes = {}
-        for mode in ("mesh", "atlas-components", "atlas-artmesh"):
+        for mode in ("mesh", "atlas-components"):
             psd.mode_combo.setCurrentIndex(psd._combo_index_by_data(psd.mode_combo, mode))
             psd.start_reconstruction()
             self._wait_psd_worker()
@@ -783,7 +787,7 @@ class Live2DEditorPageTests(unittest.TestCase):
                 replacement = self.root / "new-texture.png"
                 Image.new("RGBA", (32, 32), (220, 20, 70, 255)).save(replacement)
                 self.assertTrue(self.page.replace_texture(0, str(replacement)))
-        self.assertEqual(len({scheme["id"] for scheme in schemes}), 3)
+        self.assertEqual(len({scheme["id"] for scheme in schemes}), 2)
         self.assertEqual(Image.open(psd.current_project.project_dir / schemes[0]["source_textures"][0]).getpixel((0, 0)), (30, 60, 90, 255))
         self.assertEqual(Image.open(psd.current_project.project_dir / schemes[-1]["source_textures"][0]).getpixel((0, 0)), (220, 20, 70, 255))
         for path, data in old_bytes.items():
@@ -894,14 +898,14 @@ class Live2DEditorPageTests(unittest.TestCase):
         owned_first = psd.current_project.project_file
         self.assertTrue(owned_first.is_relative_to(self.page.session.root / "psd"))
         self.assertNotEqual(owned_first, first.project_file)
-        psd.mode_combo.setCurrentIndex(psd._combo_index_by_data(psd.mode_combo, "atlas-artmesh"))
+        psd.mode_combo.setCurrentIndex(psd._combo_index_by_data(psd.mode_combo, "atlas-components"))
         psd.mark_project_dirty()
         select(second.project_file)
         owned_second = psd.current_project.project_file
         self.assertNotEqual(owned_second, owned_first)
         select(owned_first)
         self.assertEqual(psd.current_project.project_file, owned_first)
-        self.assertEqual(psd.mode_combo.currentData(), "atlas-artmesh")
+        self.assertEqual(psd.mode_combo.currentData(), "atlas-components")
         select(owned_second)
         self.assertEqual(psd.current_project.project_file, owned_second)
         self.assertEqual(psd._compact_scrolls[3].horizontalScrollBar().maximum(), 0)
