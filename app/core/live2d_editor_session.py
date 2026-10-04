@@ -322,6 +322,7 @@ class Live2DEditorSession:
             self.part_overrides: dict[str, float] = {}
             self.drawable_visibility_overrides: dict[str, bool] = {}
             self.drawable_opacity_overrides: dict[str, float] = {}
+            self._named_selections: dict[str, list[str]] = {}
             self._core_model = None
             self.mesh_data = copy.deepcopy(info.mesh_data)
             try:
@@ -335,6 +336,14 @@ class Live2DEditorSession:
             if manifest.is_file():
                 state = _read_json(manifest)
                 if state.get("format") == "LpkUnpacker.Live2DEditor" and state.get("version") in (1, 2):
+                    # Keep missing IDs: opening with incomplete geometry must
+                    # not silently destroy the user's saved selection sets.
+                    selections = state.get("named_selections", {})
+                    if isinstance(selections, dict):
+                        for name, ids in selections.items():
+                            if isinstance(name, str) and name.strip() and isinstance(ids, list):
+                                self._named_selections[name] = list(dict.fromkeys(
+                                    value for value in ids if isinstance(value, str) and value))
                     known = {p["id"]: p for p in self.parameters}
                     self.parameter_overrides = {k: float(v) for k, v in state.get("pose_parameters", {}).items()
                                                 if k in known and known[k]["min"] <= float(v) <= known[k]["max"]}
@@ -396,6 +405,7 @@ class Live2DEditorSession:
                 "parts": self.part_overrides, "textures": self._texture_data,
                 "drawable_visibility": self.drawable_visibility_overrides,
                 "drawable_opacity": self.drawable_opacity_overrides,
+                "named_selections": self._named_selections,
                 "skins": self._skins.state,
                 "original_bindings": self.original_bindings,
                 "deleted_original_bindings": self._deleted_original_bindings}
@@ -422,6 +432,7 @@ class Live2DEditorSession:
         self.part_overrides = state["parts"]
         self.drawable_visibility_overrides = state.get("drawable_visibility", {})
         self.drawable_opacity_overrides = state.get("drawable_opacity", {})
+        self._named_selections = state.get("named_selections", {})
         self._texture_data = state["textures"]
         self._skins.state = state["skins"]
         self.original_bindings = state["original_bindings"]
@@ -531,6 +542,44 @@ class Live2DEditorSession:
     @property
     def dirty(self) -> bool:
         return self.parameter_preview_pending or self._signature() != self._saved_signature
+
+    def named_selections(self) -> dict[str, list[str]]:
+        return copy.deepcopy(self._named_selections)
+
+    def save_named_selection(self, name: str, identifiers, *, replace=False) -> None:
+        name = self._selection_name(name)
+        if name in self._named_selections and not replace:
+            raise AnimationEditingError("A selection with this name already exists.")
+        ids = list(dict.fromkeys(identifiers))
+        known = {item["id"] for item in (self.mesh_data or {}).get("drawables", [])}
+        if not ids or any(identifier not in known for identifier in ids):
+            raise AnimationEditingError("Select at least one valid ArtMesh.")
+        self._record(lambda: self._named_selections.__setitem__(name, ids))
+
+    def _selection_name(self, name: str, previous=None) -> str:
+        name = str(name).strip()
+        if not name or len(name) > 80:
+            raise AnimationEditingError("Selection names must contain 1–80 characters.")
+        if any(key != previous and key != name and key.casefold() == name.casefold()
+               for key in self._named_selections):
+            raise AnimationEditingError("A selection with this name already exists.")
+        return name
+
+    def rename_named_selection(self, previous: str, name: str) -> None:
+        name = self._selection_name(name, previous)
+        if previous not in self._named_selections:
+            raise AnimationEditingError("Selection no longer exists.")
+        if name != previous and name in self._named_selections:
+            raise AnimationEditingError("A selection with this name already exists.")
+        def rename():
+            self._named_selections = {name if key == previous else key: ids
+                                      for key, ids in self._named_selections.items()}
+        self._record(rename)
+
+    def delete_named_selection(self, name: str) -> None:
+        if name not in self._named_selections:
+            raise AnimationEditingError("Selection no longer exists.")
+        self._record(lambda: self._named_selections.pop(name))
 
     def _pose_history(self) -> dict:
         state = {"_history_kind": "pose", "parameters": dict(self.parameter_overrides),
@@ -1226,6 +1275,8 @@ class Live2DEditorSession:
                          "source_path": str(self.source_path), "pose_parameters": self.parameter_overrides,
                          "preview_part_opacity": self.part_overrides, "warnings": self.warnings,
                          "authoring_source": None, "model": "model.json", "projects": projects}
+                if self._named_selections:
+                    state["named_selections"] = self.named_selections()
                 if self.drawable_visibility_overrides:
                     state["preview_drawable_visibility"] = dict(self.drawable_visibility_overrides)
                 if self.drawable_opacity_overrides:

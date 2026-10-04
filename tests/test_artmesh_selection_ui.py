@@ -86,6 +86,28 @@ class ArtMeshSelectionUiTests(unittest.TestCase):
         self.assertEqual(inspector.overview_scroll.horizontalScrollBar().maximum(), 0)
         self.assertLessEqual(inspector.minimumSizeHint().width(), 410)
 
+    def test_native_highlights_follow_transform_keep_roles_and_clear_without_scene_access(self):
+        canvas = Live2DCanvas()
+        self.widgets.append(canvas)
+        canvas.resize(400, 400)
+        canvas._fbo_width = canvas._fbo_height = 400
+        canvas.model = SimpleNamespace(_model=SimpleNamespace(GetMvp=lambda: np.eye(4).flatten(order="F")))
+        snapshot = _snapshot()
+        snapshot["drawables"][0].update(vertices=[[0, 0], [100, 0], [100, 100], [0, 100]],
+                                          indices=[0, 1, 2, 0, 2, 3])
+        provider = Mock(return_value={"snapshot": snapshot, "texture_paths": self.paths})
+        canvas.setSelectionSceneProvider(provider)
+        canvas.setSelectionHighlights(["face"], ["face", "ear"])
+        selected, related = canvas._selection_highlight_lines()
+        self.assertEqual(len(selected), 4)  # no internal triangulation diagonal
+        self.assertEqual(len(related), 3)
+        for line in selected:
+            self.assertTrue(0 <= line.x1() <= 400 and 0 <= line.y1() <= 400)
+        canvas.setSelectionHighlights([], [])
+        provider.reset_mock()
+        self.assertEqual(canvas._selection_highlight_lines(), ([], []))
+        provider.assert_not_called()
+
     def test_overlap_candidates_can_choose_back_layer_and_refresh_keeps_multiselection(self):
         inspector = ArtMeshInspector()
         self.widgets.append(inspector)

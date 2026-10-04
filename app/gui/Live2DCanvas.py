@@ -7,8 +7,8 @@ import numpy as np
 from typing import Optional, List, Dict, Any
 
 from PySide6.QtOpenGL import QOpenGLWindow
-from PySide6.QtCore import QPointF, Qt, Signal
-from PySide6.QtGui import QGuiApplication, QPalette
+from PySide6.QtCore import QLineF, QPointF, Qt, Signal
+from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPalette, QPen
 import OpenGL.GL as GL
 from abc import abstractmethod
 
@@ -659,6 +659,9 @@ class Live2DCanvas(ADPOpenGLCanvas):
         self._editor_interaction = False
         self._selection_mode = "none"
         self._selection_scene_provider = None
+        self._highlight_selected = set()
+        self._highlight_related = set()
+        self._highlight_edges = {}
         self._selection_alpha_cache = {}
         self._selection_drag = None
         self._selection_shift = False
@@ -1208,7 +1211,68 @@ class Live2DCanvas(ADPOpenGLCanvas):
         self.regionPicked.emit(hits, region)
         return hits
 
+    def setSelectionHighlights(self, selected, related=()):
+        selected, related = set(selected), set(related) - set(selected)
+        if (selected, related) != (self._highlight_selected, self._highlight_related):
+            self._highlight_selected, self._highlight_related = selected, related
+            self._highlight_edges.clear()
+            self.update()
+
+    def _selection_highlight_lines(self):
+        if not self.model or not self._selection_scene_provider:
+            return [], []
+        if not self._highlight_selected and not self._highlight_related:
+            return [], []
+        scene = self.getSelectionScene()
+        coordinates = self._selection_coordinates(scene.snapshot)
+        selected, related = [], []
+        for drawable in scene.drawables:
+            identifier = drawable.get("id")
+            if identifier not in self._highlight_selected and identifier not in self._highlight_related:
+                continue
+            vertices, indices = drawable.get("vertices", []), drawable.get("indices", [])
+            key = identifier, tuple(indices)
+            if key not in self._highlight_edges:
+                counts = {}
+                for offset in range(0, len(indices) - 2, 3):
+                    triangle = indices[offset:offset + 3]
+                    if any(index < 0 or index >= len(vertices) for index in triangle):
+                        continue
+                    for a, b in zip(triangle, triangle[1:] + triangle[:1]):
+                        edge = tuple(sorted((a, b)))
+                        counts[edge] = counts.get(edge, 0) + 1
+                self._highlight_edges[key] = [edge for edge, count in counts.items() if count == 1]
+            output = selected if identifier in self._highlight_selected else related
+            for a, b in self._highlight_edges[key]:
+                if max(a, b) < len(vertices):
+                    p, q = coordinates.canvas_to_window(vertices[a]), coordinates.canvas_to_window(vertices[b])
+                    if all(math.isfinite(v) for v in (*p, *q)):
+                        output.append(QLineF(QPointF(*p), QPointF(*q)))
+        return selected, related
+
+    def _draw_selection_highlights(self):
+        try:
+            selected, related = self._selection_highlight_lines()
+        except (ValueError, RuntimeError, np.linalg.LinAlgError):
+            return  # model load / close may temporarily lack a valid MVP
+        if not selected and not related:
+            return
+        # QOpenGLWindow is a paint device: paint directly on the native surface
+        # after composition, so the overlay stays above WindowContainer on Windows.
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            if related:
+                painter.setPen(QPen(QColor(255, 125, 54), 2, Qt.PenStyle.DashLine))
+                painter.drawLines(related)
+            if selected:
+                painter.setPen(QPen(QColor(255, 218, 70), 2))
+                painter.drawLines(selected)
+        finally:
+            painter.end()
+
     def draw_overlay(self, width, height, dpr):
+        self._draw_selection_highlights()
         if self._selection_drag is not None and self._effective_selection_mode() == "rectangle":
             first, last = self._selection_drag
             points = [(first.x(), first.y()), (last.x(), first.y()),

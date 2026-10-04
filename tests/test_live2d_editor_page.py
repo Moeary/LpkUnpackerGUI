@@ -136,6 +136,34 @@ class Live2DEditorPageTests(unittest.TestCase):
         self.assertTrue(self.page.mod_panel._compact)
         self.assertTrue(hasattr(self.page.mod_panel, "export_button"))
 
+    def test_named_selection_controls_save_recall_update_and_undo(self):
+        from app.gui.artmesh_selection_tools import SelectionNameDialog
+        self.open()
+        self.page.tabs.setCurrentWidget(self.page.artmesh_tab)
+        inspector, controls = self.page.artmesh_inspector, self.page.selection_tools
+        inspector.select_entries(["ArtMeshFace"])
+        self.assertTrue(controls.save_button.isEnabled())
+        def enter_name(dialog):
+            dialog.name_edit.setText("面部")
+            dialog.accept()
+            return dialog.result()
+        with patch.object(SelectionNameDialog, "exec", enter_name):
+            controls.save_button.click()
+        self.assertEqual(self.page.session.named_selections(), {"面部": ["ArtMeshFace"]})
+        self.assertEqual(controls.combo.currentData(), "面部")
+        self.assertIn("*", self.page.title_label.text())
+        inspector.select_entries([])
+        controls.combo.activated.emit(1)
+        self.assertEqual(inspector.selected_drawable_ids(), ["ArtMeshFace"])
+        self.assertEqual(len(self.page.session._undo), 1)
+        controls.save_selection(replace=True)
+        self.assertEqual(len(self.page.session._undo), 1)
+        self.page.undo()
+        self.assertEqual(controls.combo.count(), 1)
+        self.assertFalse(self.page.session.dirty)
+        self.page.redo()
+        self.assertEqual(controls.combo.count(), 2)
+
     def test_viewport_resize_does_not_propagate_hidden_tabs_preferred_height(self):
         host = QWidget()
         layout = QVBoxLayout(host)

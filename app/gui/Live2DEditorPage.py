@@ -23,6 +23,7 @@ from qfluentwidgets import (
 
 from app.core.live2d_editor_session import Live2DEditorSession
 from app.gui.ArtMeshInspector import ArtMeshInspector
+from app.gui.artmesh_selection_tools import ArtMeshSelectionTools
 from app.gui.ImagePreviewPanel import ImageZoomScrollArea
 from app.gui.live2d_editor_panels import ProjectBoundModPage
 from app.gui.live2d_skin_controls import SkinCatalogControls, SkinDropFrame, SkinNameDialog, TexturePreviewLabel, skin_text
@@ -537,6 +538,12 @@ class Live2DEditorPage(QFrame):
         inspector = self.artmesh_inspector
         inspector.selectionChanged.connect(self._artmesh_selected)
         inspector.selectionIdsChanged.connect(self._artmesh_selection_changed)
+        self.selection_tools = ArtMeshSelectionTools(inspector, self.artmesh_tab)
+        self.selection_tools.changed.connect(self._update_actions)
+        self.selection_tools.failed.connect(self._error)
+        self.selection_tools.message.connect(self._status)
+        self.selection_tools.highlightsChanged.connect(self._sync_selection_highlights)
+        layout.addWidget(self.selection_tools)
         self.drawable_controls = QWidget(self.artmesh_tab)
         batch = QGridLayout(self.drawable_controls)
         self.drawable_controls_layout = batch
@@ -1943,6 +1950,9 @@ class Live2DEditorPage(QFrame):
         self.selection_count.setText(_text("editor.live2d.pick_count", count=len(self._selected_drawable_ids)))
         self._update_drawable_controls()
 
+        self.selection_tools.refresh(self.session, bool(self.session and not self._preview_session
+                                     and not self._projects_busy()), context=self._preview_session or self.session)
+
     def _artmesh_selection_changed(self, identifiers: list):
         self._selected_drawable_ids = list(dict.fromkeys(str(identifier) for identifier in identifiers))
         # A UV/list/candidate gesture no longer describes the earlier rectangle.
@@ -1950,6 +1960,13 @@ class Live2DEditorPage(QFrame):
         self._selection_region = None
         self._selection_region_key = None
         self._update_selection_actions()
+
+    def _sync_selection_highlights(self, related=None):
+        canvas = self.preview.live2d_canvas if self.preview else None
+        if canvas and hasattr(canvas, "setSelectionHighlights"):
+            active = self.tabs.currentWidget() is self.artmesh_tab
+            canvas.setSelectionHighlights(self._selected_drawable_ids if active else [],
+                                          self.selection_tools._related if active else [])
 
     def _native_drawables_picked(self, identifiers: list, mode: str = "replace"):
         self._selection_region = None
@@ -2806,6 +2823,7 @@ class Live2DEditorPage(QFrame):
                 self._closing = False
                 return False
         watched = self.texture_watcher.files() + self.texture_watcher.directories()
+        self.selection_tools.shutdown()
         if watched:
             self.texture_watcher.removePaths(watched)
         if self.preview:
@@ -2854,6 +2872,7 @@ class Live2DEditorPage(QFrame):
     def _tab_changed(self, *_args):
         if self._binding_projects:
             return
+        self._sync_selection_highlights()
         if hasattr(self, "workspace"):
             index = self.tabs.currentIndex()
             self.workspace.set_task_context(("animation", "selection", "appearance", "export")[index],
@@ -2885,6 +2904,7 @@ class Live2DEditorPage(QFrame):
         self.mod_tab.setEnabled(bool(session))
         self.motion_combo.setEnabled(bool(session and session.project.motions))
         self._update_selection_actions()
+        self._sync_selection_highlights()
         dirty = bool(session and (session.dirty or self.psd_panel._project_dirty or self.mod_panel._dirty))
         self.title_label.setText(_text("editor.live2d.title") + (" *" if dirty else ""))
         self.title_label.setToolTip(_text("editor.live2d.modified" if dirty else "editor.live2d.clean"))
