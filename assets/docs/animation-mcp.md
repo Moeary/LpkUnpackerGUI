@@ -2,7 +2,7 @@
 
 AI 客户端可通过本地 MCP 工具检查模型、新建或克隆动作、读取与修改关键帧，再保存为独立模型包。原始文件保持不变；生成副本可以放回程序的资源预览页播放。
 
-服务使用官方 Python MCP SDK 的 `FastMCP`，依赖为 `mcp>=1.28,<2`，当前锁文件为 1.30.0，兼容项目的 Python 3.10。SDK v2 已更名为 `MCPServer`，因此这里保留明确的版本上限。[官方 v1 文档](https://py.sdk.modelcontextprotocol.io/v1/)、[官方迁移说明](https://github.com/modelcontextprotocol/python-sdk/blob/main/docs/migration.md)。
+服务使用官方 Python MCP SDK 的 `FastMCP`，依赖为 `mcp>=1.28,<2`，当前锁文件为 1.30.0，兼容项目的 Python 3.13。SDK v2 已更名为 `MCPServer`，因此这里保留明确的版本上限。[官方 v1 文档](https://py.sdk.modelcontextprotocol.io/v1/)、[官方迁移说明](https://github.com/modelcontextprotocol/python-sdk/blob/main/docs/migration.md)。
 
 ## 启动和连接
 
