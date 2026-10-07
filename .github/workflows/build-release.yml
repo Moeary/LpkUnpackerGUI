@@ -99,6 +99,15 @@ jobs:
         restore-keys: |
           spine-native-
 
+    - name: Cache pinned Live2D source archives
+      uses: actions/cache@v4
+      with:
+        # Archives are SHA256-verified by scripts/build_live2d_native.py on every use.
+        path: |
+          runtime/tools/live2d_native/source/*.zip
+          runtime/tools/live2d_native/source/*.tar.gz
+        key: live2d-native-source-${{ hashFiles('third_party/live2d_native/SOURCE_METADATA.json') }}
+
     - name: Cache Nuitka downloads
       uses: actions/cache@v4
       with:
