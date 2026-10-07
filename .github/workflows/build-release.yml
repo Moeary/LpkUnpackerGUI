@@ -122,14 +122,23 @@ jobs:
       
     - name: Verify build output
       id: verify
+      shell: pwsh
       run: |
-        $exe = Get-ChildItem -Path "build" -Recurse -Filter "LpkUnpackerGUI.exe" | Select-Object -First 1
-        if (-Not $exe) {
-          Write-Error "Build failed: LpkUnpackerGUI.exe not found under build/"
-          exit 1
+        # Onefile EXE at build/, plus the payload it packs kept in build/main.dist.
+        $exe = Join-Path $PWD "build/LpkUnpackerGUI.exe"
+        $dist = Join-Path $PWD "build/main.dist"
+        if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+          throw "Build failed: onefile build/LpkUnpackerGUI.exe not found."
         }
-        echo "DIST_DIR=$($exe.Directory.FullName)" >> $env:GITHUB_OUTPUT
-        Write-Host "Build successful: $($exe.FullName)"
+        if (-not (Test-Path -LiteralPath (Join-Path $dist "LpkUnpackerGUI.exe") -PathType Leaf)) {
+          throw "Build failed: onefile payload build/main.dist not found."
+        }
+        if (-not (Test-Path -LiteralPath (Join-Path $dist "tools/AssetStudioCLI/AssetStudioModCLI.exe") -PathType Leaf)) {
+          throw "AssetStudioModCLI.exe is missing from the onefile payload."
+        }
+        echo "EXE_PATH=$exe" >> $env:GITHUB_OUTPUT
+        echo "DIST_DIR=$dist" >> $env:GITHUB_OUTPUT
+        Write-Host ("Build successful: {0} ({1:N1} MiB)" -f $exe, ((Get-Item $exe).Length / 1MB))
 
     - name: Verify bundled native artifacts
       shell: pwsh
@@ -152,21 +161,22 @@ jobs:
     
     - name: Package build output
       id: package
+      shell: pwsh
       run: |
         if ("${{ github.ref }}" -match '^refs/tags/(.+)$') {
           $version = $matches[1]
         } else {
           $version = "${{ github.sha }}".Substring(0, 7)
         }
-        $zipName = "LpkUnpacker-$version-windows-x64.zip"
-        Compress-Archive -Path "${{ steps.verify.outputs.DIST_DIR }}/*" -DestinationPath $zipName -CompressionLevel Optimal
-        echo "ZIP_NAME=$zipName" >> $env:GITHUB_OUTPUT
+        $exeName = "LpkUnpacker-$version-windows-x64.exe"
+        Copy-Item -LiteralPath "${{ steps.verify.outputs.EXE_PATH }}" -Destination $exeName
+        echo "EXE_NAME=$exeName" >> $env:GITHUB_OUTPUT
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: windows-x64-binary
-        path: ${{ steps.package.outputs.ZIP_NAME }}
+        path: ${{ steps.package.outputs.EXE_NAME }}
 
     - name: Upload build logs on failure
       if: failure()
@@ -198,7 +208,7 @@ jobs:
       uses: softprops/action-gh-release@v2
       with:
         files: |
-          LpkUnpacker-*-windows-x64.zip
+          LpkUnpacker-*-windows-x64.exe
         generate_release_notes: true
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

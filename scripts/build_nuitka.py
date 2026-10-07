@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib.metadata
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -87,7 +88,9 @@ def build_nuitka_args(compiler: str, *, require_native: bool = False) -> list[st
         sys.executable,
         "-m",
         "nuitka",
-        "--standalone",
+        # One EXE that extracts itself to a temporary directory per launch;
+        # app.paths keeps runtime/ beside the EXE instead of in that folder.
+        "--onefile",
         "--assume-yes-for-downloads",
         *compiler_args,
         "--enable-plugin=pyside6",
@@ -97,7 +100,8 @@ def build_nuitka_args(compiler: str, *, require_native: bool = False) -> list[st
         # GUI from Explorer still creates no console with attach mode.
         "--windows-console-mode=attach",
         "--include-data-dir=./assets=assets",
-        "--include-data-dir=./app/tools/AssetStudioCLI=tools/AssetStudioCLI",
+        # Data dirs silently drop .exe/.dll files; AssetStudio needs both.
+        "--include-raw-dir=./app/tools/AssetStudioCLI=tools/AssetStudioCLI",
         "--include-data-dir=./app/i18n/locales=app/i18n/locales",
         "--include-package=qfluentwidgets",
         "--include-package=filetype",
@@ -114,8 +118,9 @@ def build_nuitka_args(compiler: str, *, require_native: bool = False) -> list[st
         "--windows-icon-from-ico=assets/app/icon.ico",
         "--nofollow-import-to=matplotlib,scipy,pandas,tkinter",
         "--python-flag=no_site",
-        # FastMCP builds tool descriptions from docstrings at runtime.
-        "--remove-output",
+        # FastMCP builds tool descriptions from docstrings at runtime, so do
+        # not pass --python-flag=no_docstrings.  build/main.dist is kept (no
+        # --remove-output) so release checks can inspect the onefile payload.
         "app/main.py",
     ]
     native_converter = ROOT / "runtime" / "tools" / "SpineSkeletonDataConverter" / "lpk_spine_converter.dll"
@@ -154,7 +159,7 @@ def build_nuitka_args(compiler: str, *, require_native: bool = False) -> list[st
 
 
 def run_msvc_build(vsdevcmd: Path, nuitka_args: list[str]) -> int:
-    """Activate MSVC in a temporary batch file, then invoke Nuitka.
+    r"""Activate MSVC in a temporary batch file, then invoke Nuitka.
 
     Passing the complete ``call "...\VsDevCmd.bat" && ...`` expression as a
     list element makes Python escape its embedded quotes as ``\"`` on
@@ -197,10 +202,19 @@ def main() -> int:
 
     nuitka_args = build_nuitka_args(args.compiler, require_native=args.require_native)
     if args.compiler == "mingw":
-        return subprocess.call(nuitka_args, cwd=ROOT, stdin=subprocess.DEVNULL)
+        result = subprocess.call(nuitka_args, cwd=ROOT, stdin=subprocess.DEVNULL)
+    else:
+        result = run_msvc_build(find_vsdevcmd(), nuitka_args)
+    if result == 0:
+        remove_intermediate_build_dirs()
+    return result
 
-    vsdevcmd = find_vsdevcmd()
-    return run_msvc_build(vsdevcmd, nuitka_args)
+
+def remove_intermediate_build_dirs(build_root: Path | None = None) -> None:
+    """Drop C sources/objects but keep main.dist, the onefile payload."""
+    build_root = build_root or ROOT / "build"
+    for name in ("main.build", "main.onefile-build"):
+        shutil.rmtree(build_root / name, ignore_errors=True)
 
 
 if __name__ == "__main__":
