@@ -82,6 +82,9 @@ with _protocol_stdout() as protocol:
     os.write(1, b"native diagnostic\\n")
     libc = ctypes.CDLL("msvcrt" if os.name == "nt" else None)
     libc.printf(b"buffered diagnostic\\n")
+    # Exit-time flushing of the legacy msvcrt buffer varies by machine; flush
+    # explicitly so the test checks where the bytes go, not when.
+    libc.fflush(None)
     protocol.write(json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}) + "\\n")
 """
         result = subprocess.run(
