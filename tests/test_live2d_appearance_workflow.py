@@ -260,7 +260,11 @@ class Live2DAppearanceWorkflowTests(unittest.TestCase):
             for path in (first, first.parent, first, first.parent):
                 page._queue_texture_reload(str(path))
             self.assertEqual(page._pending_textures, {0})
-            QTest.qWait(420)
+            # The 350 ms debounce can fire late on a loaded machine or CI runner.
+            deadline = time.monotonic() + 5
+            while not accept.call_args_list and time.monotonic() < deadline:
+                QTest.qWait(20)
+            QTest.qWait(100)
             self.assertEqual([call.args[0] for call in accept.call_args_list], [0])
             self.assertEqual(page.preview.reloads, before + 1)
             self.assertIn(str(first), page.texture_watcher.files())

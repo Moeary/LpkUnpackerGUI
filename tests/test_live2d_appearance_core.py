@@ -346,8 +346,11 @@ class DetachedExportTests(_AppearanceFixture, unittest.TestCase):
         self.session.set_parameter("ParamAngleY", 8)
         request = self.session.capture_export_snapshot()
         self.addCleanup(request.close)
+        # Patch the class, not just load_moc: constructing CubismCore needs the
+        # optional Core DLL, which clean CI checkouts do not have.
         with patch.object(self.session, "snapshot_mesh", side_effect=AssertionError("worker touched live Core")), \
-             patch("app.core.cubism_core.CubismCore.load_moc", return_value=WorkerModel()):
+             patch("app.core.cubism_core.CubismCore") as worker_core:
+            worker_core.return_value.load_moc.return_value = WorkerModel()
             with ThreadPoolExecutor(max_workers=1) as pool:
                 output = pool.submit(request.write, self.root / "worker_core").result(timeout=30)
         self.assertNotEqual(called[0][0], main_thread)
