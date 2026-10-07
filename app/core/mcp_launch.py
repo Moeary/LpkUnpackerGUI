@@ -8,7 +8,7 @@ import socket
 import sys
 from typing import Literal
 
-from app.paths import ASSETS_DIR, PROJECT_ROOT
+from app.paths import ASSETS_DIR, PROJECT_ROOT, app_executable, is_packaged
 
 
 DEFAULT_MCP_PORT = 8765
@@ -61,8 +61,9 @@ def animation_mcp_launch(
     if transport not in ("stdio", "streamable-http"):
         raise ValueError("MCP transport must be stdio or streamable-http")
     validate_mcp_port(port)
-    packaged = bool(getattr(sys, "frozen", False) or "__compiled__" in globals())
-    executable = Path(sys.executable)
+    packaged = is_packaged()
+    # MCP clients store this command; never hand them a onefile temp path.
+    executable = app_executable() if packaged else Path(sys.executable)
     if not packaged and executable.name.lower() == "pythonw.exe":
         console_python = executable.with_name("python.exe")
         if console_python.is_file():

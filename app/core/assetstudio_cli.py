@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
-from app.paths import PROJECT_ROOT
+from app.paths import BUNDLE_ROOT, PROJECT_ROOT
 
 
 ASSETSTUDIO_EXE_NAME = "AssetStudioModCLI.exe"
@@ -161,18 +161,14 @@ class AssetStudioCLI:
         if env_path:
             candidates.append(Path(env_path))
 
-        candidates.extend(
-            [
-                PROJECT_ROOT / "tools" / "AssetStudioCLI" / ASSETSTUDIO_EXE_NAME,
-                PROJECT_ROOT / "app" / "tools" / "AssetStudioCLI" / ASSETSTUDIO_EXE_NAME,
-            ]
-        )
-
-        if getattr(__import__("sys"), "frozen", False):
-            import sys
-
-            exe_root = Path(sys.executable).resolve().parent
-            candidates.insert(0, exe_root / "tools" / "AssetStudioCLI" / ASSETSTUDIO_EXE_NAME)
+        # A copy placed beside the EXE wins over the one bundled in the build.
+        for root in dict.fromkeys((PROJECT_ROOT, BUNDLE_ROOT)):
+            candidates.extend(
+                [
+                    root / "tools" / "AssetStudioCLI" / ASSETSTUDIO_EXE_NAME,
+                    root / "app" / "tools" / "AssetStudioCLI" / ASSETSTUDIO_EXE_NAME,
+                ]
+            )
 
         for candidate in candidates:
             if candidate.is_file():

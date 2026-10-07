@@ -48,7 +48,7 @@ from app.core.spine_editor import (
     SpineEditorProjectResult,
     create_spine_editor_project,
 )
-from app.paths import PROJECT_ROOT
+from app.paths import BUNDLE_ROOT, PROJECT_ROOT
 
 
 UPSTREAM_REPOSITORY_URL = "https://github.com/wang606/SpineSkeletonDataConverter"
@@ -179,7 +179,8 @@ def discover_native_converter(explicit: str | os.PathLike[str] | None = None) ->
         # Older settings may still contain the removed EXE path. Ignore that
         # legacy value and continue with the bundled runtime candidates.
 
-    candidates = [PROJECT_ROOT / relative for relative in _NATIVE_CONVERTER_RELATIVE_PATHS]
+    candidates = [root / relative for root in dict.fromkeys((PROJECT_ROOT, BUNDLE_ROOT))
+                  for relative in _NATIVE_CONVERTER_RELATIVE_PATHS]
     # Development builds are accepted, but only at the known third-party path;
     # no repository-wide walk or executable discovery is performed.
     candidates.append(

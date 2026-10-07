@@ -11,7 +11,7 @@ from pathlib import Path
 import struct
 import sys
 
-from app.paths import PROJECT_ROOT
+from app.paths import BUNDLE_ROOT, PROJECT_ROOT
 
 _DLL_DIRECTORY_HANDLES = []
 _STATUS = {"supported": False, "reason": "Preview runtime has not been selected.", "path": None}
@@ -21,8 +21,10 @@ def runtime_candidates():
     selected = os.environ.get("LPK_LIVE2D_NATIVE_DIR")
     if selected:
         return [Path(selected).expanduser().resolve()]
-    return [PROJECT_ROOT / "tools/live2d_native/opacity-v1",
-            PROJECT_ROOT / "runtime/tools/live2d_native/opacity-v1"]
+    # Builds ship the runtime under tools/; source checkouts build it in runtime/.
+    return list(dict.fromkeys([BUNDLE_ROOT / "tools/live2d_native/opacity-v1",
+                               PROJECT_ROOT / "tools/live2d_native/opacity-v1",
+                               PROJECT_ROOT / "runtime/tools/live2d_native/opacity-v1"]))
 
 
 def validate_preview_runtime(root: Path) -> dict:

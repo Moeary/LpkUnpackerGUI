@@ -72,7 +72,7 @@ from app.gui.Live2DPreviewWindow import Live2DPreviewWindow
 from app.gui.SpinePreviewWidget import SpinePreviewWidget
 from app.gui.editor_workspace import EditorTabs, EditorViewportLayout, EditorComboBox
 from app.i18n import get_i18n, tr
-from app.paths import PROJECT_ROOT
+from app.paths import is_packaged
 
 
 PREVIEW_LAYOUT_TEXT = {
@@ -2991,7 +2991,8 @@ class PreviewPage(QFrame):
 
     def _preview_command_args(self) -> list[str]:
         language = getattr(self.i18n, "language", "en_US")
-        if getattr(sys, "frozen", False):
+        # Nuitka does not set sys.frozen; the compiled EXE has no "-m".
+        if is_packaged():
             return [
                 sys.executable,
                 "--preview-process",
