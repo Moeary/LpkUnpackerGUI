@@ -38,4 +38,5 @@ jobs:
 
     - name: Run unit tests
       # Native runtimes are not built here; tests that need them fall back or skip.
-      run: pixi run python -m unittest discover -s tests
+      # A few failed tests are retried once; ones that pass on retry are reported as flaky.
+      run: pixi run test

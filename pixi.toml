@@ -17,6 +17,7 @@ native-verify = "python scripts/verify_native_build.py --require-notices"
 build = { depends-on = ["native-build"], cmd = "python scripts/build_nuitka.py --require-native" }
 build-gcc = { depends-on = ["native-build"], cmd = "python scripts/build_nuitka.py --compiler mingw --require-native" }
 check = "python scripts/check_sources.py"
+test = "python scripts/run_tests.py"
 
 [dependencies]
 python = "3.13.*"
