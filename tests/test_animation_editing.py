@@ -82,9 +82,9 @@ class AnimationEditingTests(unittest.TestCase):
             {"time": 1, "value": 1}, {"time": 2, "value": 0},
         ])
         result = project.save_copy(self.root / "out")
-        saved_model = json.loads(Path(result["model_path"]).read_text())
+        saved_model = json.loads(Path(result["model_path"]).read_text(encoding="utf-8"))
         rel = saved_model["FileReferences"]["Motions"]["Crouch"][0]["File"]
-        motion = json.loads((Path(result["output_dir"]) / rel).read_text())
+        motion = json.loads((Path(result["output_dir"]) / rel).read_text(encoding="utf-8"))
         self.assertEqual(motion["Curves"][0]["Segments"], [0, 0, 2, 1, 1, 0, 2, 0])
         self.assertEqual(motion["Meta"]["CurveCount"], 1)
         self.assertEqual(motion["Meta"]["TotalSegmentCount"], 2)
@@ -110,8 +110,8 @@ class AnimationEditingTests(unittest.TestCase):
         project.clone_animation("Idle[0]", "Edited")
         project.set_keyframes("Edited", "ParamKnee", "value", [{"time": 0, "value": 0}, {"time": 2, "value": 1}])
         result = project.save_copy(self.root / "copy")
-        self.assertEqual(json.loads((Path(result["output_dir"]) / "idle.motion3.json").read_text()), original)
-        edited = json.loads(Path(result["animation_paths"][0]).read_text())
+        self.assertEqual(json.loads((Path(result["output_dir"]) / "idle.motion3.json").read_text(encoding="utf-8")), original)
+        edited = json.loads(Path(result["animation_paths"][0]).read_text(encoding="utf-8"))
         self.assertEqual(edited["Curves"][1], original["Curves"][1])
         self.assertEqual(edited["UserData"], original["UserData"])
 
@@ -128,7 +128,7 @@ class AnimationEditingTests(unittest.TestCase):
 
     def test_inventory_hash_mismatch_is_rejected(self):
         model, inventory = self.live2d()
-        payload = json.loads(inventory.read_text())
+        payload = json.loads(inventory.read_text(encoding="utf-8"))
         payload["moc_sha256"] = "0" * 64
         self.write_json(inventory, payload)
         with self.assertRaises(AnimationEditingError):
@@ -175,7 +175,7 @@ class AnimationEditingTests(unittest.TestCase):
                 project.set_keyframes("Crouch", "hip", "rotate", [{"time": 0, "angle": -12}])
                 project.set_keyframes("Crouch", "hip", "scale", [{"time": 0, "x": 1, "y": 0.9}])
                 result = project.save_copy(self.root / version)
-                saved = json.loads(Path(result["skeleton_path"]).read_text())
+                saved = json.loads(Path(result["skeleton_path"]).read_text(encoding="utf-8"))
                 self.assertEqual(saved["bones"][1]["y"], 20)
                 timeline = saved["animations"]["Crouch"]["bones"]["hip"]
                 self.assertEqual(timeline["translate"][1]["y"], -10)
@@ -200,7 +200,7 @@ class AnimationEditingTests(unittest.TestCase):
         project.clone_animation("Idle", "Crouch")
         project.set_keyframes("Crouch", "hip", "translate", [{"time": 0, "x": 0, "y": -10}])
         result = project.save_copy(self.root / "copy")
-        saved = json.loads(Path(result["skeleton_path"]).read_text())
+        saved = json.loads(Path(result["skeleton_path"]).read_text(encoding="utf-8"))
         self.assertEqual(saved["animations"]["Idle"], animation)
         self.assertEqual(saved["animations"]["Crouch"]["slots"], animation["slots"])
         self.assertEqual(saved["animations"]["Crouch"]["ik"], animation["ik"])
@@ -227,7 +227,7 @@ class AnimationEditingTests(unittest.TestCase):
         project.clone_animation("Idle", "Copy")
         project.set_keyframes("Copy", "hip", "rotate", [{"time": 0, "angle": 1}])
         result = project.save_copy(self.root / "copy")
-        data = json.loads(Path(result["skeleton_path"]).read_text())
+        data = json.loads(Path(result["skeleton_path"]).read_text(encoding="utf-8"))
         self.assertEqual(data["animations"]["Copy"]["bones"]["hip"]["translate"], timeline)
 
     def test_invalid_keyframes_do_not_change_project(self):
@@ -309,7 +309,7 @@ class AnimationEditingTests(unittest.TestCase):
     def test_nonfinite_json_rejected(self):
         model = self.spine()
         for value in ["NaN", "Infinity", "1e999"]:
-            model.write_text('{"skeleton":{"spine":"3.8.75"},"bones":[{"name":"root","x":' + value + '}]}')
+            model.write_text('{"skeleton":{"spine":"3.8.75"},"bones":[{"name":"root","x":' + value + '}]}', encoding="utf-8")
             with self.subTest(value=value), self.assertRaises(AnimationEditingError):
                 create_animation_project(model)
 
@@ -332,7 +332,7 @@ class AnimationEditingTests(unittest.TestCase):
         project.create_animation("Move", duration=1)
         project.set_keyframes("Move", "root", "rotate", [{"time": 0, "angle": 5}])
         result = project.save_copy(self.root / "copy")
-        saved_wrapper = json.loads(Path(result["model_path"]).read_text())
+        saved_wrapper = json.loads(Path(result["model_path"]).read_text(encoding="utf-8"))
         self.assertEqual(saved_wrapper["skeleton"], "model.json")
         self.assertEqual(saved_wrapper["motions"]["Move"][0]["file"], "Move")
         self.assertEqual((Path(result["output_dir"]) / "model.skel").read_bytes(), binary.read_bytes())

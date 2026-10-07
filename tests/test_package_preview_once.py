@@ -14,7 +14,7 @@ class PackagePreviewOnceTests(unittest.TestCase):
             def extract(sources, destination, mode, **kwargs):
                 self.assertNotIn("spine_conversion", kwargs)
                 model = Path(destination) / "model0.json"
-                model.write_text(json.dumps({"Version": 3, "FileReferences": {"Moc": "model.moc3"}}))
+                model.write_text(json.dumps({"Version": 3, "FileReferences": {"Moc": "model.moc3"}}), encoding="utf-8")
                 return SimpleNamespace(has_failures=False)
             with patch("app.core.preview.session.run_extraction_batch", side_effect=extract) as run:
                 result = prepare_package_preview_import("sample.lpk", root)
@@ -26,7 +26,7 @@ class PackagePreviewOnceTests(unittest.TestCase):
     def test_cancel_removes_only_disposable_workspace(self):
         with tempfile.TemporaryDirectory() as root:
             keep = Path(root) / "keep.txt"
-            keep.write_text("unrelated")
+            keep.write_text("unrelated", encoding="utf-8")
             with patch("app.core.preview.session.run_extraction_batch", return_value=SimpleNamespace(has_failures=False)):
                 with self.assertRaisesRegex(RuntimeError, "cancelled"):
                     prepare_package_preview_import("sample.lpk", root, should_continue=lambda: False)

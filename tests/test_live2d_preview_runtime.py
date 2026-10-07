@@ -22,20 +22,20 @@ class Live2DPreviewRuntimeTests(unittest.TestCase):
             test_build_nuitka.BuildNuitkaTests._write_required_native_inputs(root)
             runtime = root / "runtime/tools/live2d_native/opacity-v1"
             metadata_path = runtime / "live2d_native.json"
-            original = json.loads(metadata_path.read_text())
+            original = json.loads(metadata_path.read_text(encoding="utf-8"))
             validate_preview_runtime(runtime)
             for key, value in (("upstream_version", "0.8.0"), ("drawable_opacity_api_version", 2),
                                ("python_abi", "cp39"), ("architecture", "win32")):
-                metadata_path.write_text(json.dumps(dict(original, **{key: value})))
+                metadata_path.write_text(json.dumps(dict(original, **{key: value})), encoding="utf-8")
                 with self.assertRaisesRegex(RuntimeError, "version/API/ABI"):
                     validate_preview_runtime(runtime)
-            metadata_path.write_text(json.dumps(original))
+            metadata_path.write_text(json.dumps(original), encoding="utf-8")
             (runtime / "_v3cpp.pyd").write_bytes(b"changed")
             with self.assertRaisesRegex(RuntimeError, "SHA256 mismatch"):
                 validate_preview_runtime(runtime)
             (runtime / "_v3cpp.pyd").write_bytes(b"extension")
             original["files"]["../escape.dll"] = "0" * 64
-            metadata_path.write_text(json.dumps(original))
+            metadata_path.write_text(json.dumps(original), encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "escaping"):
                 validate_preview_runtime(runtime)
 
@@ -81,7 +81,7 @@ class Live2DPreviewRuntimeTests(unittest.TestCase):
                 "assert not hasattr(runtime.Model, 'SetDrawableOpacityOverrides')")
         env = dict(os.environ, LPK_DISABLE_DRAWABLE_OPACITY="1")
         completed = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env, capture_output=True, text=True,
-                                   timeout=30, check=True)
+                                   timeout=30, check=True, encoding="utf-8")
         line = next(line for line in completed.stdout.splitlines() if line.startswith("STATUS="))
         result = json.loads(line.removeprefix("STATUS="))
         self.assertFalse(result["supported"])

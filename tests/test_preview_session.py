@@ -22,14 +22,14 @@ class DirectLive2DPreviewCopyTests(unittest.TestCase):
         (self.source / "motions" / "idle.json").write_text(json.dumps({
             "Version": 3, "Meta": {"Duration": 1, "CurveCount": 99},
             "Curves": [{"Target": "Parameter", "Id": "ParamAngleX", "Segments": [0, 0, 0, 1, 5]}],
-        }))
+        }), encoding="utf-8")
         self.model = self.source / "model0.json"
         self.menu = {"Name": "Viewer menu", "Command": "start_mtn init#9:init;start_mtn Idle",
                      "Choices": [{"Text": "Next", "NextMtn": "Idle#1"}]}
         self.model.write_text(json.dumps({"Version": 3, "FileReferences": {
             "Moc": "model.moc3", "Motions": {"Idle": [self.menu, {"File": "motions/idle.json"}]}},
-            "Options": {"ViewerOption": True}}))
-        (self.source / "PSD-notes.txt").write_text("complete package side file")
+            "Options": {"ViewerOption": True}}), encoding="utf-8")
+        (self.source / "PSD-notes.txt").write_text("complete package side file", encoding="utf-8")
         self.temp_root = self.root / "previews"
 
     def hashes(self):
@@ -43,13 +43,13 @@ class DirectLive2DPreviewCopyTests(unittest.TestCase):
         self.assertTrue(result.temp_dir.is_relative_to(self.temp_root))
         self.assertEqual(result.package.model_json.parent, result.temp_dir)
         self.assertNotEqual(result.preview_model_json, result.package.model_json)
-        full = json.loads(result.package.model_json.read_text())
-        filtered = json.loads(result.preview_model_json.read_text())
+        full = json.loads(result.package.model_json.read_text(encoding="utf-8"))
+        filtered = json.loads(result.preview_model_json.read_text(encoding="utf-8"))
         self.assertEqual(full["FileReferences"]["Motions"]["Idle"][0], self.menu)
         self.assertEqual(filtered["FileReferences"]["Motions"]["Idle"], [{"File": "motions/idle.json"}])
         self.assertTrue(full["Options"]["ViewerOption"])
-        self.assertEqual((result.temp_dir / "PSD-notes.txt").read_text(), "complete package side file")
-        motion = json.loads((result.temp_dir / "motions" / "idle.json").read_text())
+        self.assertEqual((result.temp_dir / "PSD-notes.txt").read_text(encoding="utf-8"), "complete package side file")
+        motion = json.loads((result.temp_dir / "motions" / "idle.json").read_text(encoding="utf-8"))
         self.assertEqual(motion["Meta"]["CurveCount"], 1)
         self.assertEqual(self.hashes(), before)
         # The caller owns this returned copy and may release it independently.
@@ -60,7 +60,7 @@ class DirectLive2DPreviewCopyTests(unittest.TestCase):
     def test_normalization_failure_cleans_only_new_copy(self):
         self.temp_root.mkdir()
         keep = self.temp_root / "other-import.txt"
-        keep.write_text("other import")
+        keep.write_text("other import", encoding="utf-8")
         before = self.hashes()
         with patch("app.core.preview.session.prepare_model_json_for_preview", side_effect=RuntimeError("normalize failed")):
             with self.assertRaisesRegex(RuntimeError, "normalize failed"):
@@ -77,10 +77,10 @@ class DirectLive2DPreviewCopyTests(unittest.TestCase):
 
     def test_real_escaping_motion_file_is_rejected_before_normalization(self):
         outside = self.root / "outside.json"
-        outside.write_text((self.source / "motions" / "idle.json").read_text())
-        data = json.loads(self.model.read_text())
+        outside.write_text((self.source / "motions" / "idle.json").read_text(encoding="utf-8"), encoding="utf-8")
+        data = json.loads(self.model.read_text(encoding="utf-8"))
         data["FileReferences"]["Motions"]["Idle"] = [{"File": "../outside.json"}]
-        self.model.write_text(json.dumps(data))
+        self.model.write_text(json.dumps(data), encoding="utf-8")
         before = self.hashes()
         outside_bytes = outside.read_bytes()
         with self.assertRaises(Live2DPackageError):

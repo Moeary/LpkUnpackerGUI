@@ -333,7 +333,7 @@ class DetachedExportTests(_AppearanceFixture, unittest.TestCase):
         self.assertEqual(modified_item["Command"], "keep_displayed_command")
         self.assertEqual(modified_item["FadeInTime"], .7)
         self.assertEqual(len(result["FileReferences"]["Motions"]["Idle"]), 2)
-        self.assertEqual(json.loads((new.parent / EDITOR_MANIFEST).read_text())["pose_parameters"], {"ParamAngleY": 14})
+        self.assertEqual(json.loads((new.parent / EDITOR_MANIFEST).read_text(encoding="utf-8"))["pose_parameters"], {"ParamAngleY": 14})
         self.assertEqual(before_hashes, hashes(model.parent))
 
     def test_worker_core_is_fresh_and_not_live_session_core(self):
@@ -355,7 +355,7 @@ class DetachedExportTests(_AppearanceFixture, unittest.TestCase):
                 output = pool.submit(request.write, self.root / "worker_core").result(timeout=30)
         self.assertNotEqual(called[0][0], main_thread)
         self.assertEqual(called[0][1], {"ParamAngleY": 8})
-        self.assertEqual(json.loads((output.parent / "model.drawables.json").read_text())["parameters"], {"ParamAngleY": 8})
+        self.assertEqual(json.loads((output.parent / "model.drawables.json").read_text(encoding="utf-8"))["parameters"], {"ParamAngleY": 8})
 
     def test_snapshot_output_refuses_source_existing_and_request_release(self):
         request = self.session.capture_export_snapshot(self.root / "destination")

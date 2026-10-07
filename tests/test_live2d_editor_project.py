@@ -33,14 +33,14 @@ class Live2DEditorProjectTests(unittest.TestCase):
         self.assertEqual(snapshot.name, "model.json")
         data = json.loads(snapshot.read_text(encoding="utf-8"))
         self.assertTrue((snapshot.parent / data["FileReferences"]["Motions"]["NewPose"][0]["File"]).is_file())
-        self.assertEqual(json.loads((snapshot.parent / EDITOR_MANIFEST).read_text())["projects"], {})
+        self.assertEqual(json.loads((snapshot.parent / EDITOR_MANIFEST).read_text(encoding="utf-8"))["projects"], {})
         with self.assertRaises(AnimationEditingError):
             self.session.export_snapshot(snapshot.parent)
 
     def test_external_psd_baselines_survive_move_cleanup_and_actual_repack(self):
         legacy = psd_project.create_project_from_source(self.model, "Legacy", output_root=self.root / "legacy")
         exported = reconstruct_live2d_psd(self.model, self.root / "external_export", mode="mesh")
-        original_meta = json.loads(exported.metadata_path.read_text())
+        original_meta = json.loads(exported.metadata_path.read_text(encoding="utf-8"))
         legacy = psd_project.record_psd_export(legacy, exported.psd_path, exported.metadata_path,
                                              "mesh", exported.layer_count)
         self.session.create_motion("Retained", 2)
@@ -48,7 +48,7 @@ class Live2DEditorProjectTests(unittest.TestCase):
         attached = self.session.attach_psd_project(legacy.project_file)
         entry = attached.data["psd_exports"][0]
         meta_path = psd_project.resolve_project_path(attached, entry["metadata"])
-        attached_meta = json.loads(meta_path.read_text())
+        attached_meta = json.loads(meta_path.read_text(encoding="utf-8"))
         self.assertEqual(attached_meta["source_model_summary"]["sha256"], original_meta["source_model_summary"]["sha256"])
         self.assertFalse(Path(attached_meta["source_model_summary"]["path"]).is_absolute())
         output = self.session.save_copy(self.root / "saved")
@@ -69,7 +69,7 @@ class Live2DEditorProjectTests(unittest.TestCase):
             self.assertEqual(actual.convert("RGBA").tobytes(), baseline.convert("RGBA").tobytes())
         self.assertEqual(reopened.keyframes("Retained[0]", "ParamAngleY")[0]["value"], 12)
         # Relocation must retain baseline validation, including digest and overwrite protection.
-        metadata = json.loads(meta_path.read_text())
+        metadata = json.loads(meta_path.read_text(encoding="utf-8"))
         source_texture = (meta_path.parent / metadata["source_root"] / "texture.png").resolve()
         with self.assertRaisesRegex(PsdReconstructionError, "overwrite"):
             repack_atlas_png_from_psd(psd_project.resolve_project_path(attached, entry["psd"]),
@@ -136,7 +136,7 @@ class Live2DEditorProjectTests(unittest.TestCase):
     def test_manifest_cannot_escape_managed_project_tree(self):
         (self.model.parent / EDITOR_MANIFEST).write_text(json.dumps({
             "format": "LpkUnpacker.Live2DEditor", "version": 2,
-            "projects": {"psd": {"file": "../outside/project.lpkpsd_project.json"}}}))
+            "projects": {"psd": {"file": "../outside/project.lpkpsd_project.json"}}}), encoding="utf-8")
         with self.assertRaises(AnimationEditingError):
             Live2DEditorSession(self.model)
 
@@ -147,9 +147,9 @@ class Live2DEditorTextureTransactionTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.model = make_model(self.root / "source")
-        data = json.loads(self.model.read_text())
+        data = json.loads(self.model.read_text(encoding="utf-8"))
         data["FileReferences"]["Textures"].append("second.png")
-        self.model.write_text(json.dumps(data))
+        self.model.write_text(json.dumps(data), encoding="utf-8")
         Image.new("RGBA", (16, 16), (40, 70, 20, 255)).save(self.model.parent / "second.png")
         self.session = Live2DEditorSession(self.model)
         self.addCleanup(self.session.close)
@@ -183,13 +183,13 @@ class Live2DEditorTextureTransactionTests(unittest.TestCase):
         with self.assertRaisesRegex(AnimationEditingError, "different MOC3"):
             self.session.apply_texture_package(package)
         moc.write_bytes(original_moc)
-        data = json.loads(package.read_text())
+        data = json.loads(package.read_text(encoding="utf-8"))
         data["FileReferences"]["Textures"].reverse()
-        package.write_text(json.dumps(data))
+        package.write_text(json.dumps(data), encoding="utf-8")
         with self.assertRaisesRegex(AnimationEditingError, "order"):
             self.session.validate_texture_package(package)
         data["FileReferences"]["Textures"].reverse()
-        package.write_text(json.dumps(data))
+        package.write_text(json.dumps(data), encoding="utf-8")
         Image.new("RGBA", (15, 16), "red").save(package.parent / "second.png")
         with self.assertRaisesRegex(AnimationEditingError, "size changed"):
             self.session.apply_texture_package(package)

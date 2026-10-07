@@ -56,7 +56,7 @@ class EditorRecoveryTests(unittest.TestCase):
     def test_spine_capture_is_detached_and_keeps_assets_alive(self):
         source = self.root / "spine.json"
         source.write_text(json.dumps({"skeleton": {"spine": "3.8.75"}, "bones": [{"name": "root"}],
-                                      "slots": [], "skins": [], "animations": {}}))
+                                      "slots": [], "skins": [], "animations": {}}), encoding="utf-8")
         session = SpineEditorSession.open(source)
         self.addCleanup(session.close)
         session.set_bone_transform("root", {"x": 42})
@@ -95,5 +95,5 @@ class EditorRecoveryTests(unittest.TestCase):
     def test_malformed_manifest_is_ignored(self):
         directory = self.store.directory(self.identity)
         directory.mkdir(parents=True)
-        (directory / "checkpoint-invalid.json").write_text("[]")
+        (directory / "checkpoint-invalid.json").write_text("[]", encoding="utf-8")
         self.assertEqual(self.store.records(), [])
