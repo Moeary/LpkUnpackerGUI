@@ -14,7 +14,30 @@ from app.core.extract.package_classifier import (
     _classify_entry_json,
 )
 from app.core.lpk_loader import LpkDecryptError, LpkLoader
-from app.core.utils import decrypt, guess_type, is_spine_atlas_data
+from app.core.utils import decrypt, genkey, guess_type, hashed_filename, is_spine_atlas_data, normalize
+
+_PACK_ID = "com.example.pack"
+_MODEL_A = "a" * 32 + ".bin"
+_MODEL_B = "b" * 32 + ".bin"
+_TEXTURE = "c" * 32 + ".bin"
+_PNG = b"\x89PNG\r\n\x1a\n" + b"\0" * 64
+
+
+def _write_std2_lpk(path: Path, characters: list, models: dict) -> Path:
+    """Write a minimal encrypted STD2_0 package; LPK encryption is symmetric."""
+
+    def encrypt(name: str, data: bytes) -> bytes:
+        return decrypt(genkey(_PACK_ID + name), data)
+
+    with zipfile.ZipFile(path, "w") as bundle:
+        bundle.writestr(
+            hashed_filename("config.mlve"),
+            json.dumps({"type": "STD2_0", "id": _PACK_ID, "list": characters}),
+        )
+        for name, model in models.items():
+            bundle.writestr(name, encrypt(name, json.dumps(model).encode()))
+        bundle.writestr(_TEXTURE, encrypt(_TEXTURE, _PNG))
+    return path
 
 
 class LpkClassifierTests(unittest.TestCase):
@@ -208,6 +231,66 @@ class LpkLoaderTests(unittest.TestCase):
         lines = rewritten.splitlines()
         self.assertEqual(lines[0], "texture-one.png")
         self.assertEqual(lines[6], "texture-two.png")
+
+
+class LpkExtractTests(unittest.TestCase):
+    def test_std2_package_extracts_without_steam_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lpk = _write_std2_lpk(
+                root / "pack.lpk",
+                [{"character": "hero", "costume": [{"path": _MODEL_A}]}],
+                {_MODEL_A: {"textures": [_TEXTURE]}},
+            )
+            created = LpkLoader(str(lpk), None).extract(str(root / "out"))
+
+            self.assertEqual(created, [str(root / "out" / "hero")])
+            model = json.loads((root / "out/hero/model0.json").read_text(encoding="utf-8"))
+            self.assertEqual(model["textures"], ["textures_0_0.png"])
+            self.assertEqual((root / "out/hero/textures_0_0.png").read_bytes(), _PNG)
+
+    def test_model_keys_cannot_write_outside_output_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lpk = _write_std2_lpk(
+                root / "pack.lpk",
+                [{"character": "hero", "costume": [{"path": _MODEL_A}]}],
+                {_MODEL_A: {"../../escaped": _TEXTURE}},
+            )
+            output = root / "nested" / "out"
+            with self.assertRaisesRegex(ValueError, "escapes the output directory"):
+                LpkLoader(str(lpk), None).extract(str(output))
+
+            self.assertEqual(list(root.glob("escaped*")), [])
+            self.assertEqual(list((root / "nested").glob("escaped*")), [])
+
+    def test_each_character_directory_is_self_contained(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lpk = _write_std2_lpk(
+                root / "pack.lpk",
+                [
+                    {"character": "first", "costume": [{"path": _MODEL_A}]},
+                    {"character": "second", "costume": [{"path": _MODEL_B}]},
+                ],
+                {_MODEL_A: {"textures": [_TEXTURE]}, _MODEL_B: {"textures": [_TEXTURE]}},
+            )
+            LpkLoader(str(lpk), None).extract(str(root / "out"))
+
+            for character in ("first", "second"):
+                folder = root / "out" / character
+                self.assertEqual(
+                    sorted(path.name for path in folder.iterdir()),
+                    ["model0.json", "textures_0_0.png"],
+                )
+                model = json.loads((folder / "model0.json").read_text(encoding="utf-8"))
+                self.assertTrue((folder / model["textures"][0]).is_file())
+
+    def test_dot_only_names_do_not_resolve_to_parent_directories(self):
+        self.assertEqual(normalize(".."), "unnamed")
+        self.assertEqual(normalize("../.."), "unnamed")
+        self.assertEqual(normalize(" . "), "unnamed")
+        self.assertEqual(normalize("v1.0"), "v1.0")
 
 
 if __name__ == "__main__":
