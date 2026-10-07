@@ -12,6 +12,7 @@ import copy
 import hashlib
 import io
 import json
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -518,6 +519,97 @@ class SpineEditorSession:
         buffer = io.BytesIO()
         image.save(buffer, format="PNG")
         self._change(lambda: self._textures.update({relative: buffer.getvalue()}))
+
+    # Whole-atlas PSD round trip -------------------------------------------
+    def _atlas_references(self) -> dict[str, Path]:
+        return {relative: path for relative, path in self.project.references.items()
+                if path.name.lower().endswith((".atlas", ".atlas.txt", ".atlas.bytes"))}
+
+    def _materialize_atlases(self, stage: Path) -> dict[str, Path]:
+        """Copy each atlas with its pages as currently edited (undo-aware)."""
+        from app.core.spine_atlas import parse_atlas
+        result = {}
+        for relative, path in self._atlas_references().items():
+            target = stage / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+            for page in parse_atlas(path).pages:
+                source = (path.parent / page.name).resolve()
+                destination = target.parent / page.name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                edited = self._textures.get(source.relative_to(self.project.source_root).as_posix())
+                if edited is not None:
+                    destination.write_bytes(edited)
+                else:
+                    shutil.copy2(source, destination)
+            result[relative] = target
+        return result
+
+    def export_atlas_psd(self, output: str | Path) -> list[Path]:
+        """Export every atlas region as one layer group of a PSD per atlas.
+
+        Each group is named by its region and sits at its atlas position, so
+        import_atlas_psd() can write the edits back losslessly.  Edits made in
+        this session are included; the source package is never touched.
+        """
+        from app.core.spine_atlas import extract_spine_atlas
+        output = Path(output).expanduser().resolve()
+        if output.exists() and any(output.iterdir()):
+            raise AnimationEditingError("Choose an empty folder for the PSD export.")
+        stage = Path(tempfile.mkdtemp(prefix="atlas-psd-", dir=self.workspace))
+        try:
+            atlases = self._materialize_atlases(stage)
+            if not atlases:
+                raise AnimationEditingError("This Spine model has no atlas to export.")
+            psd_paths = []
+            for relative, atlas_path in atlases.items():
+                folder = output if len(atlases) == 1 else output / re.sub(r"[^\w.-]+", "_", Path(relative).stem)
+                result = extract_spine_atlas(atlas_path, folder, write_psd=True)
+                metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+                # The staged atlas is temporary; the PSD binds to the session
+                # atlas by its package-relative path instead.
+                metadata["editor_atlas"] = relative
+                result.metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                psd_paths.append(result.psd_path)
+            return psd_paths
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
+
+    def import_atlas_psd(self, psd_path: str | Path) -> list[str]:
+        """Write the edited layers of an exported atlas PSD back (one undo step).
+
+        Only regions whose pixels differ from the exported baseline change,
+        so later edits to other regions survive.  Returns the changed region
+        names.
+        """
+        from app.core.spine_atlas import parse_atlas, writeback_spine_atlas
+        psd_path = Path(psd_path).expanduser().resolve()
+        metadata_path = psd_path.with_name("spine_atlas.json")
+        if not metadata_path.is_file():
+            raise AnimationEditingError("spine_atlas.json must stay next to the exported PSD.")
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        atlases = self._atlas_references()
+        relative = metadata.get("editor_atlas") or (next(iter(atlases)) if len(atlases) == 1 else None)
+        if relative not in atlases:
+            raise AnimationEditingError("This PSD was not exported from an atlas of the open model.")
+        stage = Path(tempfile.mkdtemp(prefix="atlas-psd-", dir=self.workspace))
+        try:
+            staged_atlas = self._materialize_atlases(stage)[relative]
+            result = writeback_spine_atlas(metadata_path, psd_path, stage / "written", atlas_path=staged_atlas)
+            if not result.changed_regions:
+                return []
+            atlas = parse_atlas(staged_atlas)
+            changed_pages = {atlas.region(region_id).page_index for region_id in result.changed_regions}
+            source_atlas = atlases[relative]
+            updates = {}
+            for page in atlas.pages:
+                if page.index in changed_pages:
+                    source = (source_atlas.parent / page.name).resolve()
+                    updates[source.relative_to(self.project.source_root).as_posix()] = result.page_paths[page.index].read_bytes()
+            self._change(lambda: self._textures.update(updates))
+            return [atlas.region(region_id).name for region_id in result.changed_regions]
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
 
     def prepare_preview(self):
         """Write an edited render copy, preserving source and export inputs."""

@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QFrame, QStackedWidget, QTreeWidgetItem, QVBoxLayout, QWidget, QSizePolicy,
 )
 from qfluentwidgets import (
-    BodyLabel as QLabel, CaptionLabel, CheckBox as QCheckBox,
+    Action, BodyLabel as QLabel, CaptionLabel, CheckBox as QCheckBox,
     DoubleSpinBox as QDoubleSpinBox, FluentIcon, ListWidget as QListWidget,
     PrimaryPushButton, PushButton as QPushButton, RoundMenu, ScrollArea as QScrollArea,
     SearchLineEdit, SubtitleLabel, TransparentToolButton, TreeWidget as QTreeWidget,
@@ -30,6 +30,7 @@ from app.gui.editor_actions import ActionComboBox, ActionDeleteDialog, ActionNam
 from app.gui.editor_dialogs import EditorMessageBox as QMessageBox
 from app.gui.editor_workspace import (
     EditorComboBox as QComboBox, EditorSplitter, EditorTabs, EditorViewportLayout, EditorWorkspace,
+    ViewZoomControls,
 )
 from app.i18n import get_i18n, tr
 from app.gui.theme import transparent_scroll_area
@@ -91,6 +92,18 @@ SPINE_EDITOR_TEXT = {
     "spine_editor.shear": "倾斜",
     "spine_editor.advanced": "更多属性",
     "spine_editor.search": "搜索骨骼、插槽或部件",
+    "spine_editor.psd": "PSD",
+    "spine_editor.psd_hint": "把全部图集部件导出为一个 PSD 编辑，再回写到当前模型",
+    "spine_editor.psd_export": "导出整体 PSD…",
+    "spine_editor.psd_import": "从 PSD 回写…",
+    "spine_editor.psd_export_dialog": "选择用于保存 PSD 的空文件夹",
+    "spine_editor.psd_import_dialog": "选择之前导出并已编辑的 spine_atlas.psd",
+    "spine_editor.psd_exported": "已导出 PSD：{path}（保留同目录的 spine_atlas.json 与 psd_baseline 以便回写）",
+    "spine_editor.psd_imported": "已从 PSD 回写 {count} 个部件：{names}",
+    "spine_editor.psd_unchanged": "PSD 中没有改动的部件，模型保持不变",
+    "spine_editor.pick_hint": "在预览中单击可选中该处的部件；Ctrl+滚轮缩放，按住中键拖动平移",
+    "spine_editor.picked": "已选中部件：{name}",
+    "spine_editor.pick_none": "单击处没有可见的部件",
 }
 
 
@@ -420,7 +433,19 @@ class SpineEditorPage(QWidget):
         view_controls = QHBoxLayout()
         view_controls.addWidget(self.skin_label)
         view_controls.addWidget(self.skin_combo)
+        # Whole-atlas PSD round trip: export every part, edit, write back.
+        self.psd_button = QPushButton(FluentIcon.PHOTO, "", self)
+        self.psd_menu = RoundMenu(parent=self)
+        self.psd_export_action = Action(FluentIcon.SAVE_AS, "", self)
+        self.psd_import_action = Action(FluentIcon.SYNC, "", self)
+        self.psd_export_action.triggered.connect(lambda _checked=False: self.export_atlas_psd())
+        self.psd_import_action.triggered.connect(lambda _checked=False: self.import_atlas_psd())
+        self.psd_menu.addActions([self.psd_export_action, self.psd_import_action])
+        self.psd_button.clicked.connect(lambda: self.psd_menu.exec(self.psd_button.mapToGlobal(QPoint(0, self.psd_button.height()))))
+        view_controls.addWidget(self.psd_button)
         view_controls.addStretch(1)
+        self.zoom_controls = ViewZoomControls(self)
+        view_controls.addWidget(self.zoom_controls)
         view_controls.addSpacing(28)
         stage_layout.addLayout(view_controls)
         self.preview_stack = QStackedWidget(self)
@@ -538,6 +563,13 @@ class SpineEditorPage(QWidget):
         self.atlas_inspector.replaceRequested.connect(self._replace_region)
         self.atlas_inspector.exportRequested.connect(self._export_region)
         self.preview.previewFailed.connect(self._preview_failed)
+        self.preview.set_view_interaction(True)
+        self.preview.set_pick_enabled(True)
+        self.preview.regionPicked.connect(self._preview_picked)
+        self.preview.viewScaleChanged.connect(self.zoom_controls.set_scale)
+        self.zoom_controls.zoomInRequested.connect(lambda: self.preview.zoom_by(self.preview.ZOOM_STEP))
+        self.zoom_controls.zoomOutRequested.connect(lambda: self.preview.zoom_by(1 / self.preview.ZOOM_STEP))
+        self.zoom_controls.resetRequested.connect(self.preview.reset_view)
         self.recovery = EditorRecoveryController(self, "spine")
         self.layout().insertWidget(1, self.recovery.bar)
         self.shortcuts = EditorShortcutRouter(self, "spine")
@@ -1026,6 +1058,94 @@ class SpineEditorPage(QWidget):
             except Exception as exc:
                 self._report_error(exc)
 
+    # Whole-atlas PSD round trip ------------------------------------------
+    def export_atlas_psd(self, output: str | None = None) -> bool:
+        if not self.session or self.loading:
+            return False
+        if output is None:
+            output = QFileDialog.getExistingDirectory(self, _text("spine_editor.psd_export_dialog"),
+                                                      str(self.session.original_source.parent))
+        if not output:
+            return False
+        try:
+            paths = self.session.export_atlas_psd(output)
+        except Exception as exc:
+            self._report_error(exc)
+            return False
+        self.status_label.setText(_text("spine_editor.psd_exported", path="; ".join(str(path) for path in paths)))
+        return True
+
+    def import_atlas_psd(self, source: str | None = None) -> bool:
+        if not self.session or self.loading:
+            return False
+        if source is None:
+            source, _filter = QFileDialog.getOpenFileName(self, _text("spine_editor.psd_import_dialog"),
+                                                          str(self.session.original_source.parent), "PSD (*.psd)")
+        if not source:
+            return False
+        names: list[str] = []
+        if not self._edit(lambda: names.extend(self.session.import_atlas_psd(source))):
+            return False
+        self.status_label.setText(_text("spine_editor.psd_imported", count=len(names), names=", ".join(names[:8])
+                                        + ("…" if len(names) > 8 else "")) if names else _text("spine_editor.psd_unchanged"))
+        return True
+
+    # Click-to-pick in the preview ----------------------------------------
+    def _preview_picked(self, result):
+        if not self.session:
+            return
+        if result is None:
+            self.status_label.setText(_text("spine_editor.pick_none"))
+            return
+        tab = self.tabs.currentIndex()
+        if tab == 2:
+            item = next((self.atlas_list.item(index) for index in range(self.atlas_list.count())
+                         if self.atlas_list.item(index).data(Qt.ItemDataRole.UserRole)[1] == result.region_id), None)
+            if item is not None:
+                self.atlas_list.setCurrentItem(item)
+                self.atlas_list.scrollToItem(item)
+        else:
+            slot = self._slot_for_region(result.name)
+            if slot is None:
+                self.status_label.setText(_text("spine_editor.pick_none"))
+                return
+            if tab == 1:
+                item = next((self.layers.item(index) for index in range(self.layers.count())
+                             if self.layers.item(index).data(Qt.ItemDataRole.UserRole) == slot), None)
+                if item is not None:
+                    self.layers.setCurrentItem(item)
+                    self.layers.scrollToItem(item)
+            else:
+                item = next((node for node in self._structure_items()
+                             if node.data(0, Qt.ItemDataRole.UserRole) == ("slot", slot)), None)
+                if item is not None:
+                    self.tree.setCurrentItem(item)
+                    self.tree.scrollToItem(item)
+        self.status_label.setText(_text("spine_editor.picked", name=result.name))
+
+    def _slot_for_region(self, region: str) -> str | None:
+        """The slot drawing ``region`` now; the topmost one when several can."""
+        raw = self.session.document.get("skins", {})
+        skins = [(item.get("name"), item.get("attachments", {})) for item in raw] if isinstance(raw, list) else list(raw.items())
+        skin = self.skin_combo.currentText()
+        candidates = []
+        for name, attachments in skins:
+            if skin and name not in {skin, "default"}:
+                continue
+            for slot, entries in (attachments or {}).items():
+                for attachment, data in (entries or {}).items():
+                    data = data if isinstance(data, dict) else {}
+                    if (data.get("path") or data.get("name") or attachment) == region:
+                        candidates.append((slot, attachment))
+        if not candidates:
+            return None
+        animation, seconds = self.animation_name, self.timeline.current_time
+        shown = [slot for slot, attachment in candidates
+                 if self.session.attachment_at(slot, animation, seconds) == attachment]
+        order = self.session.draw_order_at(animation, seconds)
+        pool = shown or [slot for slot, _attachment in candidates]
+        return max(pool, key=lambda slot: order.index(slot) if slot in order else -1)
+
     def undo(self):
         if self.session:
             self.pause_playback()
@@ -1095,6 +1215,7 @@ class SpineEditorPage(QWidget):
         self.duration_spin.setEnabled(opened and bool(self.animation_name) and not busy)
         self.animation_combo.setEnabled(opened and not busy)
         self.skin_combo.setEnabled(opened and not busy)
+        self.psd_button.setEnabled(opened and not busy)
         self.model_splitter.setEnabled(not busy)
         self.timeline.setEnabled(opened and not busy)
 
@@ -1169,6 +1290,12 @@ class SpineEditorPage(QWidget):
                             (self.duration_spin, "duration"), (self.track_combo, "track"), (self.channel_combo, "track")):
             widget.setToolTip(_text(f"spine_editor.{key}"))
         self.search_edit.setPlaceholderText(_text("spine_editor.search"))
+        self.psd_button.setText(_text("spine_editor.psd"))
+        self.psd_button.setToolTip(_text("spine_editor.psd_hint"))
+        self.psd_export_action.setText(_text("spine_editor.psd_export"))
+        self.psd_import_action.setText(_text("spine_editor.psd_import"))
+        self.zoom_controls.retranslate_ui()
+        self.preview.setToolTip(_text("spine_editor.pick_hint"))
         # Shown while no model/track list is loaded, like the Live2D track picker.
         self.track_combo.setPlaceholderText(_text("spine_editor.track_placeholder"))
         self.animation_combo.retranslate_ui()

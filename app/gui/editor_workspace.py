@@ -30,6 +30,10 @@ WORKSPACE_TEXT = {
     "editor.workspace.show": "恢复{panel}",
     "editor.workspace.empty": "面板已收起，可在上方恢复预览、编辑面板或时间轴",
     "editor.workspace.resize": "拖动调整面板宽度或高度；双击重置布局",
+    "editor.workspace.zoom_in": "放大",
+    "editor.workspace.zoom_out": "缩小",
+    "editor.workspace.zoom_reset": "重置视图",
+    "editor.workspace.zoom_hint": "Ctrl+滚轮在光标处缩放；按住鼠标中键拖动平移",
 }
 
 
@@ -295,6 +299,52 @@ class _Grip(QSplitterHandle):
     def mouseDoubleClickEvent(self, event):  # noqa: N802
         self.resetRequested.emit()
         event.accept()
+
+
+class ViewZoomControls(QWidget):
+    """Zoom out / percentage / zoom in / reset for a preview canvas.
+
+    The canvas owns the actual view; this only requests changes and shows
+    the factor it reports back through set_scale().
+    """
+
+    zoomInRequested = Signal()
+    zoomOutRequested = Signal()
+    resetRequested = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        self.zoom_out_button = TransparentToolButton(FluentIcon.ZOOM_OUT, self)
+        self.scale_label = CaptionLabel("100%", self)
+        self.scale_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.scale_label.setMinimumWidth(42)
+        self.zoom_in_button = TransparentToolButton(FluentIcon.ZOOM_IN, self)
+        self.reset_button = TransparentToolButton(FluentIcon.FIT_PAGE, self)
+        for button in (self.zoom_out_button, self.zoom_in_button, self.reset_button):
+            button.setFixedSize(28, 28)
+        layout.addWidget(self.zoom_out_button)
+        layout.addWidget(self.scale_label)
+        layout.addWidget(self.zoom_in_button)
+        layout.addWidget(self.reset_button)
+        self.zoom_out_button.clicked.connect(self.zoomOutRequested)
+        self.zoom_in_button.clicked.connect(self.zoomInRequested)
+        self.reset_button.clicked.connect(self.resetRequested)
+        self.retranslate_ui()
+
+    def set_scale(self, scale: float):
+        self.scale_label.setText(f"{round(float(scale) * 100)}%")
+
+    def retranslate_ui(self):
+        hint = _text("editor.workspace.zoom_hint")
+        for button, key in ((self.zoom_out_button, "zoom_out"), (self.zoom_in_button, "zoom_in"),
+                            (self.reset_button, "zoom_reset")):
+            name = _text(f"editor.workspace.{key}")
+            button.setToolTip(name + "\n" + hint)
+            button.setAccessibleName(name)
+        self.scale_label.setToolTip(hint)
 
 
 class EditorSplitter(QSplitter):

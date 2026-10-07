@@ -294,6 +294,76 @@ class SpineEditorPageTests(unittest.TestCase):
         self.assertTrue(all(not worker.isRunning() for worker in self.page._workers))
         self.assertIsNone(self.page.session)
 
+    def open_with_parts(self):
+        from PIL import Image
+        Image.new("RGBA", (8, 8), (255, 100, 0, 255)).save(self.source / "page.png")
+        region = "{}\n  rotate: false\n  xy: {},0\n  size: 4,4\n  orig: 4,4\n  offset: 0,0\n  index: -1\n"
+        (self.source / "model.atlas").write_text(
+            "page.png\nsize: 8,8\nformat: RGBA8888\nfilter: Linear,Linear\nrepeat: none\n"
+            + region.format("arm", 0) + region.format("face", 4), encoding="utf-8")
+        self.model.write_text(json.dumps({"skeleton": {"spine": "3.8.75"},
+            "bones": [{"name": "root"}, {"name": "hip", "parent": "root"}],
+            "slots": [{"name": "back", "bone": "hip", "attachment": "arm"},
+                      {"name": "front", "bone": "hip", "attachment": "face"},
+                      {"name": "spare", "bone": "root"}],
+            "skins": [{"name": "default", "attachments": {
+                "back": {"arm": {"width": 4, "height": 4}},
+                "front": {"face": {"width": 4, "height": 4}},
+                "spare": {"face_alt": {"path": "face", "width": 4, "height": 4}}}}],
+            "animations": {}}), encoding="utf-8")
+        self.open()
+
+    def test_preview_pick_selects_the_part_in_the_active_tab(self):
+        from app.core.spine_pick import PickResult
+        self.open_with_parts()
+        region_id = next(self.page.atlas_list.item(i).data(Qt.UserRole)[1] for i in range(self.page.atlas_list.count())
+                         if self.page.atlas_list.item(i).text() == "face")
+        face = PickResult(region_id=region_id, name="face", page=0, pixel=(5, 1))
+
+        self.page.tabs.setCurrentIndex(2)
+        self.page.preview.regionPicked.emit(face)
+        self.assertEqual(self.page.atlas_list.currentItem().text(), "face")
+        self.assertEqual(self.page._selection[0], "atlas")
+
+        # "spare" can show the same region but has no attachment set up, so
+        # the slot actually drawing it ("front") is chosen.
+        self.page.tabs.setCurrentIndex(1)
+        self.page.preview.regionPicked.emit(face)
+        self.assertEqual(self.page._selection, ("slot", "front"))
+
+        self.page.tabs.setCurrentIndex(0)
+        self.page.preview.regionPicked.emit(face)
+        self.assertEqual(self.page.tree.currentItem().data(0, Qt.UserRole), ("slot", "front"))
+        self.assertIn("face", self.page.status_label.text())
+
+        self.page.preview.regionPicked.emit(None)
+        self.assertEqual(self.page._selection, ("slot", "front"))  # a miss keeps the selection
+
+    def test_psd_menu_exports_and_writes_back_through_history(self):
+        from PIL import Image
+        from psd_tools import PSDImage
+        from psd_tools.api.layers import PixelLayer
+        self.open_with_parts()
+        self.assertTrue(self.page.psd_button.isEnabled())
+        output = self.root / "psd"
+        self.assertTrue(self.page.export_atlas_psd(str(output)))
+        psd_path = output / "spine_atlas.psd"
+        psd = PSDImage.open(psd_path)
+        face_id = next(self.page.atlas_list.item(i).data(Qt.UserRole)[1] for i in range(self.page.atlas_list.count())
+                       if self.page.atlas_list.item(i).text() == "face")
+        group = next(layer for layer in psd if layer.is_group() and layer.name == face_id)
+        base = next(iter(group))
+        group.remove(base)
+        group.append(PixelLayer.frompil(Image.new("RGBA", base.size, (0, 0, 255, 255)), psd,
+                                        name="base", top=base.top, left=base.left))
+        psd.save(psd_path)
+        self.assertTrue(self.page.import_atlas_psd(str(psd_path)))
+        self.assertTrue(self.page.session.dirty)
+        self.assertIn("face", self.page.status_label.text())
+        self.assertTrue(self.page.undo_button.isEnabled())
+        self.page.undo()
+        self.assertFalse(self.page.session.dirty)
+
 
 if __name__ == "__main__":
     unittest.main()

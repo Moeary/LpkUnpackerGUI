@@ -159,6 +159,49 @@ class SpineEditorSessionTests(unittest.TestCase):
         self.assertEqual(session.region_image(item["atlas"], item["id"]).getpixel((0, 0)), (255, 100, 0, 255))
         self.assertEqual(self.hashes(), before)
 
+    def test_whole_atlas_psd_roundtrip_writes_only_edited_regions_as_one_undo_step(self):
+        from PIL import Image
+        from psd_tools import PSDImage
+        from psd_tools.api.layers import PixelLayer
+        model = self.model()
+        before = self.hashes()
+        session = self.open(model)
+        item = session.atlas_regions()[0]
+        # An edit made before the export is part of the exported PSD.
+        replacement = self.root / "replacement.png"
+        Image.new("RGBA", (4, 4), (20, 200, 40, 255)).save(replacement)
+        session.replace_atlas_region(item["atlas"], item["id"], replacement)
+        [psd_path] = session.export_atlas_psd(self.root / "psd")
+        self.assertTrue((psd_path.parent / "spine_atlas.json").is_file())
+        with self.assertRaises(AnimationEditingError):
+            session.export_atlas_psd(self.root / "psd")  # never mixes into a used folder
+
+        self.assertEqual(session.import_atlas_psd(psd_path), [])  # untouched PSD changes nothing
+        history = len(session._undo)
+
+        psd = PSDImage.open(psd_path)
+        group = next(layer for layer in psd if layer.is_group())
+        base = next(iter(group))
+        painted = PixelLayer.frompil(Image.new("RGBA", base.size, (0, 0, 255, 255)), psd,
+                                     name="base", top=base.top, left=base.left)
+        group.remove(base)
+        group.append(painted)
+        psd.save(psd_path)
+
+        self.assertEqual(session.import_atlas_psd(psd_path), ["body"])
+        self.assertEqual(len(session._undo), history + 1)
+        self.assertEqual(session.region_image(item["atlas"], item["id"]).getpixel((1, 1)), (0, 0, 255, 255))
+        session.undo()
+        self.assertEqual(session.region_image(item["atlas"], item["id"]).getpixel((1, 1)), (20, 200, 40, 255))
+        self.assertEqual(self.hashes(), before)
+
+    def test_psd_import_rejects_a_psd_without_its_metadata(self):
+        session = self.open(self.model())
+        stray = self.root / "stray.psd"
+        stray.write_bytes(b"8BPS")
+        with self.assertRaises(AnimationEditingError):
+            session.import_atlas_psd(stray)
+
     def test_export_does_not_overwrite_source_or_existing_directory(self):
         session = self.open(self.model())
         for target in (self.source, self.source / "child", self.root):

@@ -7,7 +7,7 @@ import numpy as np
 from typing import Optional, List, Dict, Any
 
 from PySide6.QtOpenGL import QOpenGLWindow
-from PySide6.QtCore import QLineF, QPointF, Qt, Signal
+from PySide6.QtCore import QEvent, QLineF, QPointF, Qt, Signal
 from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPalette, QPen
 import OpenGL.GL as GL
 from abc import abstractmethod
@@ -123,9 +123,19 @@ def create_canvas_framebuffer(width, height):
 class ADPOpenGLCanvas(QOpenGLWindow):
     fitModeChanged = Signal(bool)
     contentFitApplied = Signal(dict)
+    # Interactive zoom/pan changed the view; carries getContentFitState().
+    viewTransformChanged = Signal(dict)
+
+    VIEW_ZOOM_STEP = 1.25
+    VIEW_MIN_SCALE = 0.25
+    VIEW_MAX_SCALE = 8.0
 
     def __init__(self):
         super().__init__()
+        self._view_interaction = False
+        self._view_pan_last = None
+        # View before the first interactive zoom/pan; resetView() returns to it.
+        self._view_home = None
         self.__canvas_opacity = 1.0
         self.__rotation_angle = 0.0
         self.__model_scale = 1.0
@@ -479,6 +489,7 @@ class ADPOpenGLCanvas(QOpenGLWindow):
             raise ValueError("Content fill must be between 0 and 1")
         if getattr(self, "model", None) is None and not getattr(self, "model_path", None):
             return False
+        self._view_home = None
         was_enabled = self._content_fit_enabled
         self._content_fit_enabled = bool(auto_resize)
         if was_enabled != self._content_fit_enabled:
@@ -496,6 +507,8 @@ class ADPOpenGLCanvas(QOpenGLWindow):
 
     def setContentFitEnabled(self, enabled: bool):
         enabled = bool(enabled)
+        if enabled:
+            self._view_home = None  # a fresh fit is the new starting view
         changed = enabled != self._content_fit_enabled
         self._content_fit_enabled = enabled
         if not enabled:
@@ -533,6 +546,7 @@ class ADPOpenGLCanvas(QOpenGLWindow):
 
     def setModelTransform(self, scale: float, offset_x: float, offset_y: float):
         """Apply responsive model scale and offsets at the final composition pass."""
+        self._view_home = None  # explicit settings define a new starting view
         self.setContentFitEnabled(False)
         self.__model_scale = max(0.25, min(4.0, float(scale)))
         self.__model_offset = (
@@ -540,6 +554,108 @@ class ADPOpenGLCanvas(QOpenGLWindow):
             max(-1.0, min(1.0, -float(offset_y))),
         )
         self.update()
+
+    # Interactive view (editor): Ctrl+wheel zoom, middle-button pan ---------
+    def setViewInteraction(self, enabled: bool):
+        self._view_interaction = bool(enabled)
+        self._view_pan_last = None
+
+    def viewScale(self) -> float:
+        return float(self.__model_scale)
+
+    def _view_aspect_factors(self) -> tuple[float, float]:
+        width, height = max(1, self.width()), max(1, self.height())
+        canvas_width, canvas_height = max(1, self._fbo_width), max(1, self._fbo_height)
+        viewport_aspect, canvas_aspect = width / height, canvas_width / canvas_height
+        return ((viewport_aspect / canvas_aspect, 1.0) if viewport_aspect >= canvas_aspect
+                else (1.0, canvas_aspect / viewport_aspect))
+
+    def _set_view(self, scale: float, offset: tuple[float, float]):
+        # Panning a zoomed model must reach its edges, so the offset range
+        # grows with the scale (setModelTransform keeps its narrower range).
+        limit = max(1.0, scale)
+        if self._view_home is None:
+            self._view_home = (float(self.__model_scale), tuple(self.__model_offset), self._content_fit_enabled)
+        # Leave fit mode without setContentFitEnabled(), which would also
+        # discard the home snapshot taken above.
+        was_fitted, self._content_fit_enabled = self._content_fit_enabled, False
+        self._content_fit_pending = False
+        self._content_fit_status = "manual"
+        if was_fitted:
+            self.fitModeChanged.emit(False)
+        self.__model_scale = scale
+        self.__model_offset = (max(-limit, min(limit, offset[0])), max(-limit, min(limit, offset[1])))
+        self.update()
+        self.viewTransformChanged.emit(self.getContentFitState())
+
+    def zoomBy(self, factor: float, anchor: tuple[float, float] | None = None):
+        """Zoom around ``anchor`` (window pixels; default: centre), keeping the
+        model point under it in place."""
+        scale = float(self.__model_scale)
+        new_scale = max(self.VIEW_MIN_SCALE, min(self.VIEW_MAX_SCALE, scale * float(factor)))
+        if math.isclose(new_scale, scale):
+            return
+        width, height = max(1, self.width()), max(1, self.height())
+        x, y = anchor if anchor is not None else (width / 2.0, height / 2.0)
+        sx, sy = self._view_aspect_factors()
+        # Same screen->source mapping as windowPointToModel().
+        centred = ((float(x) / width - .5) * sx, (.5 - float(y) / height) * sy)
+        ratio = new_scale / scale
+        offset = tuple(c - (c - o) * ratio for c, o in zip(centred, self.__model_offset))
+        self._set_view(new_scale, offset)
+
+    def panBy(self, dx: float, dy: float):
+        width, height = max(1, self.width()), max(1, self.height())
+        sx, sy = self._view_aspect_factors()
+        ox, oy = self.__model_offset
+        self._set_view(float(self.__model_scale), (ox + dx / width * sx, oy - dy / height * sy))
+
+    def resetView(self):
+        """Undo interactive zoom/pan: back to the view the user started from."""
+        home, self._view_home = self._view_home, None
+        if home is None:
+            return
+        scale, offset, fitted = home
+        if fitted:
+            self.setContentFitEnabled(True)
+        else:
+            self.__model_scale = scale
+            self.__model_offset = offset
+            self.update()
+        self.viewTransformChanged.emit(self.getContentFitState())
+
+    def wheelEvent(self, event):  # noqa: N802
+        if self._view_interaction and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            steps = event.angleDelta().y() / 120.0
+            if steps:
+                position = event.position()
+                self.zoomBy(self.VIEW_ZOOM_STEP ** steps, (position.x(), position.y()))
+            event.accept()
+            return
+        super().wheelEvent(event)
+
+    def _view_pan_event(self, event) -> bool:
+        """Handle middle-button panning; returns True when the event was used."""
+        if not self._view_interaction:
+            return False
+        kind = event.type()
+        if kind == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.MiddleButton:
+            self._view_pan_last = QPointF(event.position())
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        elif kind == QEvent.Type.MouseMove and self._view_pan_last is not None:
+            position = QPointF(event.position())
+            delta = position - self._view_pan_last
+            self._view_pan_last = position
+            self.panBy(delta.x(), delta.y())
+        elif (kind == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.MiddleButton
+              and self._view_pan_last is not None):
+            self._view_pan_last = None
+            selecting = getattr(self, "_selection_mode", "none") != "none"
+            self.setCursor(Qt.CursorShape.CrossCursor if selecting else Qt.CursorShape.ArrowCursor)
+        else:
+            return False
+        event.accept()
+        return True
 
     def windowPointToModel(self, x: float, y: float) -> tuple[float, float]:
         """Legacy screen-to-FBO mapping; these are not Cubism canvas pixels."""
@@ -849,6 +965,8 @@ class Live2DCanvas(ADPOpenGLCanvas):
         self._mouse_follow_enabled = bool(enable)
 
     def mouseMoveEvent(self, event):
+        if self._view_pan_event(event):
+            return
         if self._effective_selection_mode() != "none":
             if self._selection_drag is not None:
                 self._selection_drag[1] = QPointF(event.position())
@@ -871,6 +989,8 @@ class Live2DCanvas(ADPOpenGLCanvas):
         return super().mouseMoveEvent(event)
 
     def mousePressEvent(self, event):
+        if self._view_pan_event(event):
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             if self._effective_selection_mode() != "none":
                 if self.model is not None:
@@ -888,6 +1008,8 @@ class Live2DCanvas(ADPOpenGLCanvas):
         return super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if self._view_pan_event(event):
+            return
         if event.button() == Qt.MouseButton.LeftButton and self._selection_drag is not None:
             first, _ = self._selection_drag
             last = QPointF(event.position())

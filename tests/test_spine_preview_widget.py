@@ -504,6 +504,34 @@ class SpinePreviewWidgetTests(unittest.TestCase):
         self.assertTrue(event.ignored)
         self.assertTrue(preview.notified)
 
+    def test_zoom_keeps_the_anchor_point_and_pan_and_reset_move_the_view(self):
+        widget = SpinePreviewWidget()
+        widget.resize(400, 300)
+        widget._base_bounds = (-100.0, -50.0, 200.0, 300.0)
+        scales = []
+        widget.viewScaleChanged.connect(scales.append)
+        anchor = (100.0, 80.0)
+        before = widget.view_to_skeleton(*anchor)
+        spacing_before = widget.view_to_skeleton(110, 80)[0] - before[0]
+        widget.zoom_by(2.0, anchor)
+        after = widget.view_to_skeleton(*anchor)
+        self.assertAlmostEqual(before[0], after[0], places=4)
+        self.assertAlmostEqual(before[1], after[1], places=4)
+        self.assertEqual(scales, [2.0])
+        # Ten pixels now cover half the skeleton distance.
+        self.assertAlmostEqual(widget.view_to_skeleton(110, 80)[0] - after[0], spacing_before / 2.0, places=4)
+        point = widget.view_to_skeleton(200, 150)
+        widget.pan_by(20, -10)
+        moved = widget.view_to_skeleton(220, 140)
+        self.assertAlmostEqual(point[0], moved[0], places=4)
+        self.assertAlmostEqual(point[1], moved[1], places=4)
+        widget.zoom_by(1000)
+        self.assertEqual(widget.view_scale(), widget.MAX_ZOOM)
+        widget.reset_view()
+        self.assertEqual(widget.view_scale(), 1.0)
+        self.assertEqual(widget.view_to_skeleton(200, 150), (0.0, 100.0))  # centre of the bounds
+        widget.deleteLater()
+
 
 if __name__ == "__main__":
     unittest.main()

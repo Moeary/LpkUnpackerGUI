@@ -12,6 +12,7 @@ import ctypes
 import math
 import os
 import time
+from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QTimer, Qt, Signal
@@ -194,6 +195,24 @@ if OPENGL_AVAILABLE:
                             pass
             return super().grabFramebuffer()
 
+        # View interaction lives on the owner; the native child window only
+        # forwards its input there, falling back to Qt's default handling.
+        def wheelEvent(self, event):  # noqa: N802
+            if not self._owner._canvas_wheel(event):
+                super().wheelEvent(event)
+
+        def mousePressEvent(self, event):  # noqa: N802
+            if not self._owner._canvas_press(event):
+                super().mousePressEvent(event)
+
+        def mouseMoveEvent(self, event):  # noqa: N802
+            if not self._owner._canvas_move(event):
+                super().mouseMoveEvent(event)
+
+        def mouseReleaseEvent(self, event):  # noqa: N802
+            if not self._owner._canvas_release(event):
+                super().mouseReleaseEvent(event)
+
         def resizeGL(self, width: int, height: int):  # noqa: N802
             # ``paintGL`` owns the viewport.  Qt can deliver a late resize
             # callback while a QOpenGLWindow is being closed, when no context
@@ -290,6 +309,14 @@ class SpinePreviewWidget(QFrame):
     previewFailed = Signal(str)
     statusChanged = Signal(str, str)
     stateChanged = Signal(dict)
+    # Emitted with the new zoom factor (1.0 = fitted) after a view change.
+    viewScaleChanged = Signal(float)
+    # Emitted with a PickResult (or None) when a click selects a part.
+    regionPicked = Signal(object)
+
+    ZOOM_STEP = 1.25
+    MIN_ZOOM = 0.1
+    MAX_ZOOM = 20.0
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -311,6 +338,14 @@ class SpinePreviewWidget(QFrame):
         }
         self._last_tick = time.monotonic()
         self._textures_uploaded = False
+        # Editor-only interaction: Ctrl+wheel zoom, middle-drag pan, click pick.
+        self._view_interaction = False
+        self._pick_enabled = False
+        self._press_pos = None
+        self._pan_last = None
+        self._pick_regions: dict[int, list] = {}
+        self._pick_page_sizes: dict[int, tuple[int, int]] = {}
+        self._pick_alpha: dict[int, Any] = {}
         self._status_timer = QTimer(self)
         self._status_timer.setInterval(16)
         self._status_timer.setTimerType(Qt.TimerType.PreciseTimer)
@@ -383,6 +418,7 @@ class SpinePreviewWidget(QFrame):
         try:
             self._model = SpineNativeModel(library, skeleton, atlas_paths[0], getattr(asset, "skeleton_format", None))
             self._base_bounds = self._model.bounds()
+            self._load_pick_regions(atlas_paths[0])
             self._textures_uploaded = False
             self._last_state = self._make_state()
             self.documentLoaded.emit(target)
@@ -408,6 +444,7 @@ class SpinePreviewWidget(QFrame):
         self._plan = None
         self._url = ""
         self._last_state = {}
+        self._pick_regions, self._pick_page_sizes, self._pick_alpha = {}, {}, {}
         self._textures_uploaded = False
         self._renderer_ready = False
         self._ready_emitted = False
@@ -465,6 +502,187 @@ class SpinePreviewWidget(QFrame):
             ) if key in settings
         })
         self._refresh_canvas()
+
+    # View interaction ---------------------------------------------------
+    def set_view_interaction(self, enabled: bool) -> None:
+        """Allow Ctrl+wheel zoom and middle-button pan on the canvas."""
+        self._view_interaction = bool(enabled)
+
+    def set_pick_enabled(self, enabled: bool) -> None:
+        """Let a left click pick the atlas part under the cursor."""
+        self._pick_enabled = bool(enabled)
+
+    def view_scale(self) -> float:
+        return float(self._settings.get("model_scale", 1.0))
+
+    def zoom_by(self, factor: float, anchor: tuple[float, float] | None = None) -> None:
+        """Zoom around ``anchor`` (canvas pixels; default: the centre).
+
+        The skeleton point under the anchor stays where it is, so zooming
+        towards the cursor inspects the detail the user points at.
+        """
+        scale = self.view_scale()
+        new_scale = min(self.MAX_ZOOM, max(self.MIN_ZOOM, scale * float(factor)))
+        if math.isclose(new_scale, scale):
+            return
+        width, height = self._canvas_size()
+        ax, ay = anchor if anchor is not None else (width / 2.0, height / 2.0)
+        ndc_x, ndc_y = 2.0 * ax / width - 1.0, 1.0 - 2.0 * ay / height
+        ratio = new_scale / scale
+        offset_x = float(self._settings.get("model_offset_x", 0.0)) * 2.0
+        offset_y = -float(self._settings.get("model_offset_y", 0.0)) * 2.0
+        offset_x = ndc_x - (ndc_x - offset_x) * ratio
+        offset_y = ndc_y - (ndc_y - offset_y) * ratio
+        self._settings.update(model_scale=new_scale, model_offset_x=offset_x / 2.0, model_offset_y=-offset_y / 2.0)
+        self._view_changed()
+
+    def pan_by(self, dx: float, dy: float) -> None:
+        width, height = self._canvas_size()
+        self._settings["model_offset_x"] = float(self._settings.get("model_offset_x", 0.0)) + dx / width
+        self._settings["model_offset_y"] = float(self._settings.get("model_offset_y", 0.0)) + dy / height
+        self._view_changed()
+
+    def reset_view(self) -> None:
+        self._settings.update(model_scale=1.0, model_offset_x=0.0, model_offset_y=0.0)
+        self._view_changed()
+
+    def _view_changed(self) -> None:
+        self._request_canvas_update()
+        self.viewScaleChanged.emit(self.view_scale())
+
+    def _canvas_size(self) -> tuple[float, float]:
+        surface = self.canvas if self.canvas is not None and hasattr(self.canvas, "width") else self
+        return max(1.0, float(surface.width())), max(1.0, float(surface.height()))
+
+    def _view_parameters(self, width: float, height: float) -> tuple[float, ...]:
+        """(kx, ky, cos, sin, offset_x, offset_y, centre_x, centre_y) of the view.
+
+        NDC = (kx, ky) * R(rotation) * (skeleton - centre) + offset.  The
+        ratios are size-independent, so logical and device pixels agree.
+        """
+        bx, by, bw, bh = self._base_bounds
+        fit = 0.9 * min(width / max(1.0, bw), height / max(1.0, bh))
+        model_scale = max(0.01, float(self._settings.get("model_scale", 1.0)))
+        rotation = math.radians(float(self._settings.get("model_rotation", 0.0)))
+        return (fit * 2.0 / width * model_scale, fit * 2.0 / height * model_scale,
+                math.cos(rotation), math.sin(rotation),
+                float(self._settings.get("model_offset_x", 0.0)) * 2.0,
+                -float(self._settings.get("model_offset_y", 0.0)) * 2.0,
+                bx + bw / 2.0, by + bh / 2.0)
+
+    def view_to_skeleton(self, x: float, y: float) -> tuple[float, float]:
+        """Map a canvas pixel to skeleton coordinates (inverse of the shader)."""
+        width, height = self._canvas_size()
+        kx, ky, cosine, sine, offset_x, offset_y, centre_x, centre_y = self._view_parameters(width, height)
+        u = (2.0 * x / width - 1.0 - offset_x) / kx
+        v = (1.0 - 2.0 * y / height - offset_y) / ky
+        return centre_x + cosine * u + sine * v, centre_y - sine * u + cosine * v
+
+    def pick_at(self, x: float, y: float):
+        """Return the topmost visible atlas part at a canvas pixel, or None."""
+        if self._model is None or not self._pick_regions or np is None:
+            return None
+        from app.core.spine_pick import pick_region
+        result = self._model.render_into()
+        vertex_buffer, vertex_count, _ib, _ic, batch_buffer, batch_count = result
+        if vertex_buffer is None or vertex_count <= 0 or batch_buffer is None:
+            return None
+        vertices = np.ctypeslib.as_array(vertex_buffer)[:vertex_count].view(np.float32).reshape(vertex_count, 8)
+        batches = [(int(batch_buffer[i].vertex_offset), int(batch_buffer[i].vertex_count), int(batch_buffer[i].page))
+                   for i in range(batch_count)]
+        return pick_region(vertices, batches, self.view_to_skeleton(x, y), self._pick_page_sizes,
+                           self._pick_regions, alpha_at=self._texel_alpha)
+
+    def _load_pick_regions(self, atlas_path) -> None:
+        """Index atlas regions by native page so a click can name its part."""
+        from app.core.spine_atlas import parse_atlas
+        from app.core.spine_pick import PickRegion, regions_by_page
+        self._pick_regions, self._pick_page_sizes, self._pick_alpha = {}, {}, {}
+        try:
+            atlas = parse_atlas(atlas_path)
+        except Exception:
+            return  # picking is optional; the preview itself still works
+        pages = {Path(page.path).name: index for index, page in enumerate(self._model.pages)} if self._model else {}
+        for page in atlas.pages:
+            index = pages.get(Path(page.name).name, page.index)
+            native = self._model.pages[index] if self._model and index < len(self._model.pages) else None
+            self._pick_page_sizes[index] = (int(native.width if native and native.width else page.width or 0),
+                                            int(native.height if native and native.height else page.height or 0))
+        self._pick_regions = regions_by_page(
+            PickRegion(region.region_id, region.name,
+                       pages.get(Path(atlas.pages[region.page_index].name).name, region.page_index),
+                       region.x, region.y, *region.physical_size)
+            for region in atlas.regions)
+
+    def _texel_alpha(self, page: int, x: int, y: int) -> int:
+        if page not in self._pick_alpha:
+            alpha = None
+            try:
+                with Image.open(self._model.pages[page].path) as image:
+                    alpha = image.convert("RGBA").getchannel("A")
+            except Exception:
+                pass
+            self._pick_alpha[page] = alpha
+        alpha = self._pick_alpha[page]
+        if alpha is None or not (0 <= x < alpha.width and 0 <= y < alpha.height):
+            return 255  # unknown alpha: trust the geometry
+        return int(alpha.getpixel((x, y)))
+
+    # Canvas input (forwarded by the native child window) ----------------
+    def _canvas_wheel(self, event) -> bool:
+        if not (self._view_interaction and self._model is not None
+                and event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            return False
+        steps = event.angleDelta().y() / 120.0
+        if steps:
+            position = event.position()
+            self.zoom_by(self.ZOOM_STEP ** steps, (position.x(), position.y()))
+        event.accept()
+        return True
+
+    def _canvas_press(self, event) -> bool:
+        if self._model is None:
+            return False
+        position = event.position()
+        if self._view_interaction and event.button() == Qt.MouseButton.MiddleButton:
+            self._pan_last = (position.x(), position.y())
+            if self.canvas is not None and hasattr(self.canvas, "setCursor"):
+                self.canvas.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return True
+        if self._pick_enabled and event.button() == Qt.MouseButton.LeftButton:
+            self._press_pos = (position.x(), position.y())
+            event.accept()
+            return True
+        return False
+
+    def _canvas_move(self, event) -> bool:
+        if self._pan_last is None:
+            return False
+        position = event.position()
+        self.pan_by(position.x() - self._pan_last[0], position.y() - self._pan_last[1])
+        self._pan_last = (position.x(), position.y())
+        event.accept()
+        return True
+
+    def _canvas_release(self, event) -> bool:
+        position = event.position()
+        if self._pan_last is not None and event.button() == Qt.MouseButton.MiddleButton:
+            self._pan_last = None
+            if self.canvas is not None and hasattr(self.canvas, "unsetCursor"):
+                self.canvas.unsetCursor()
+            event.accept()
+            return True
+        if self._press_pos is not None and event.button() == Qt.MouseButton.LeftButton:
+            start, self._press_pos = self._press_pos, None
+            if abs(position.x() - start[0]) + abs(position.y() - start[1]) < 4:
+                try:
+                    self.regionPicked.emit(self.pick_at(position.x(), position.y()))
+                except Exception as exc:  # a pick must never break the preview
+                    self.statusChanged.emit("info", f"Spine part pick failed: {exc}")
+            event.accept()
+            return True
+        return False
 
     def _refresh_canvas(self) -> None:
         self._request_canvas_update()
@@ -625,29 +843,19 @@ class SpinePreviewWidget(QFrame):
             return
         width = max(1, int(canvas.width() * float(canvas.devicePixelRatio())))
         height = max(1, int(canvas.height() * float(canvas.devicePixelRatio())))
-        bx, by, bw, bh = self._base_bounds
-        center_x, center_y = bx + bw / 2.0, by + bh / 2.0
-        fit = 0.9 * min(width / max(1.0, bw), height / max(1.0, bh))
-        model_scale = max(0.01, float(self._settings.get("model_scale", 1.0)))
-        rotation = math.radians(float(self._settings.get("model_rotation", 0.0)))
-        cosine, sine = math.cos(rotation), math.sin(rotation)
-        offset_x = float(self._settings.get("model_offset_x", 0.0)) * 2.0
-        offset_y = -float(self._settings.get("model_offset_y", 0.0)) * 2.0
+        # Shared with view_to_skeleton(), so a click maps to what is drawn.
+        kx, ky, cosine, sine, offset_x, offset_y, center_x, center_y = self._view_parameters(width, height)
         # Keep skeleton-space positions in the VBO and perform fit/scale/
         # rotation/offset in the vertex shader.  ``render_into`` exposes the
         # native POD buffer as a zero-copy float view, so the 32k vertices do
         # not pass through a Python tuple or per-vertex loop each frame.
         vertex_array = np.ctypeslib.as_array(vertex_buffer)[:vertex_count].view(np.float32).reshape(vertex_count, 8)
         transform = np.asarray((
-            fit * 2.0 / width * model_scale * cosine,
-            fit * 2.0 / height * model_scale * sine,
-            0.0, 0.0,
-            -fit * 2.0 / width * model_scale * sine,
-            fit * 2.0 / height * model_scale * cosine,
-            0.0, 0.0,
+            kx * cosine, ky * sine, 0.0, 0.0,
+            -kx * sine, ky * cosine, 0.0, 0.0,
             0.0, 0.0, 1.0, 0.0,
-            offset_x - fit * 2.0 / width * model_scale * (cosine * center_x - sine * center_y),
-            offset_y - fit * 2.0 / height * model_scale * (sine * center_x + cosine * center_y),
+            offset_x - kx * (cosine * center_x - sine * center_y),
+            offset_y - ky * (sine * center_x + cosine * center_y),
             0.0, 1.0,
         ), dtype=np.float32)
         # The bridge expands each triangle index into a contiguous vertex so

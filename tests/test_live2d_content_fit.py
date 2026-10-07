@@ -238,6 +238,38 @@ class ContentFitCanvasTests(unittest.TestCase):
         self.assertEqual(states[0]["status"], "readback-error")
         self.assertEqual(states[0]["error"], "read failed")
 
+    def test_interactive_zoom_keeps_anchor_pans_and_resets_to_the_starting_view(self):
+        canvas = self.canvas
+        states = []
+        canvas.viewTransformChanged.connect(states.append)
+        canvas.setModelTransform(1.2, 0.1, -0.05)
+        start = canvas.getContentFitState()
+        anchor = (300.0, 90.0)
+        before = canvas.windowPointToModel(*anchor)
+        canvas.zoomBy(2.0, anchor)
+        np.testing.assert_allclose(canvas.windowPointToModel(*anchor), before, atol=1e-6)
+        self.assertAlmostEqual(canvas.viewScale(), 2.4)
+        self.assertEqual(states[-1]["scale"], canvas.viewScale())
+        grabbed = canvas.windowPointToModel(200, 150)
+        canvas.panBy(30, -20)
+        np.testing.assert_allclose(canvas.windowPointToModel(230, 130), grabbed, atol=1e-6)
+        canvas.zoomBy(100)
+        self.assertEqual(canvas.viewScale(), canvas.VIEW_MAX_SCALE)
+        canvas.resetView()
+        state = canvas.getContentFitState()
+        self.assertAlmostEqual(state["scale"], start["scale"])
+        self.assertAlmostEqual(state["offset_x"], start["offset_x"])
+        self.assertAlmostEqual(state["offset_y"], start["offset_y"])
+        canvas.resetView()  # nothing left to undo
+        self.assertAlmostEqual(canvas.viewScale(), start["scale"])
+
+    def test_reset_after_zooming_a_fitted_view_restores_fit_mode(self):
+        self.canvas.setContentFitEnabled(True)
+        self.canvas.zoomBy(1.5)
+        self.assertFalse(self.canvas.getContentFitState()["enabled"])
+        self.canvas.resetView()
+        self.assertTrue(self.canvas.getContentFitState()["enabled"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -39,6 +39,7 @@ from app.gui.editor_actions import ActionComboBox, ActionDeleteDialog, ActionNam
 from app.gui.editor_dialogs import EditorMessageBox as QMessageBox, EditorTextDialog, ThemedEditorDialog as MessageBoxBase
 from app.gui.editor_workspace import (
     PANEL_CORNER_RESERVE, EditorComboBox, EditorViewportLayout, EditorWorkspace, FluentEditorTabs,
+    ViewZoomControls,
 )
 from app.i18n import get_i18n, tr
 from app.gui.theme import transparent_scroll_area
@@ -291,6 +292,11 @@ class Live2DEditorPage(QFrame):
             button.setFixedSize(28, 28)
             selection_layout.addWidget(button)
         selection_layout.addWidget(self.selection_count, 1)
+        self.zoom_controls = ViewZoomControls(self.selection_toolbar)
+        self.zoom_controls.zoomInRequested.connect(lambda: self._zoom_preview(1.25))
+        self.zoom_controls.zoomOutRequested.connect(lambda: self._zoom_preview(1 / 1.25))
+        self.zoom_controls.resetRequested.connect(self._reset_preview_view)
+        selection_layout.addWidget(self.zoom_controls)
         selection_layout.addWidget(self.export_selection_button)
         self.point_select_button.clicked.connect(lambda checked=False: self.set_artmesh_selection_mode("point" if checked else "none"))
         self.rect_select_button.clicked.connect(lambda checked=False: self.set_artmesh_selection_mode("rectangle" if checked else "none"))
@@ -699,6 +705,7 @@ class Live2DEditorPage(QFrame):
         layout.addWidget(self.texture_scroll)
 
     def retranslate_ui(self, *_args):
+        self.zoom_controls.retranslate_ui()
         labels = {
             self.title_label: "title", self.open_button: "open", self.save_button: "save",
             self.empty_label: "empty",
@@ -839,6 +846,9 @@ class Live2DEditorPage(QFrame):
                     canvas.regionPicked.connect(self._native_region_picked)
                     canvas.selectionFailed.connect(self._error)
                     canvas.selectionCancelled.connect(self.clear_artmesh_selection)
+                if hasattr(canvas, "viewTransformChanged"):
+                    canvas.viewTransformChanged.connect(self._sync_zoom_label)
+                    canvas.contentFitApplied.connect(self._sync_zoom_label)
                 self.stage_layout.addWidget(self.preview, 1)
             else:
                 try:
@@ -1957,6 +1967,26 @@ class Live2DEditorPage(QFrame):
         self.part_opacity.setEnabled(False)
         self.part_visible.setEnabled(False)
         self._update_selection_actions()
+
+    def _preview_canvas(self):
+        return getattr(self.preview, "live2d_canvas", None) if self.preview else None
+
+    def _zoom_preview(self, factor: float):
+        canvas = self._preview_canvas()
+        if canvas is not None and hasattr(canvas, "zoomBy"):
+            canvas.zoomBy(factor)
+
+    def _reset_preview_view(self):
+        canvas = self._preview_canvas()
+        if canvas is not None and hasattr(canvas, "resetView"):
+            canvas.resetView()
+
+    def _sync_zoom_label(self, state=None):
+        scale = (state or {}).get("scale")
+        if scale is None:
+            canvas = self._preview_canvas()
+            scale = canvas.viewScale() if canvas is not None and hasattr(canvas, "viewScale") else 1.0
+        self.zoom_controls.set_scale(float(scale))
 
     def _update_selection_actions(self):
         available = bool(self.session and self.preview)

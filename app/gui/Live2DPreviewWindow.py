@@ -212,6 +212,8 @@ class Live2DPreviewWindow(QWidget):
         self.live2d_canvas.modelFrameReady.connect(self._on_model_frame_ready)
         self.live2d_canvas.fitModeChanged.connect(self.fitModeChanged.emit)
         self.live2d_canvas.contentFitApplied.connect(self._on_content_fit_applied)
+        # Interactive zoom/pan must not be undone by the next apply_settings().
+        self.live2d_canvas.viewTransformChanged.connect(self._on_content_fit_applied)
         self.live2d_container.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         layout.addWidget(self.live2d_container)
         self.hit_area_overlay = HitAreaOverlay(self)
@@ -974,6 +976,7 @@ class Live2DPreviewWindow(QWidget):
         self._editor_mode = bool(enabled)
         if self.live2d_canvas:
             self.live2d_canvas.setEditorInteraction(enabled)
+            self.live2d_canvas.setViewInteraction(enabled)
 
     def set_rendering_active(self, active: bool):
         if self.live2d_canvas:
