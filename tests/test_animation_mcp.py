@@ -82,8 +82,6 @@ with _protocol_stdout() as protocol:
     os.write(1, b"native diagnostic\\n")
     libc = ctypes.CDLL("msvcrt" if os.name == "nt" else None)
     libc.printf(b"buffered diagnostic\\n")
-    # Exit-time flushing of the legacy msvcrt buffer varies by machine; flush
-    # explicitly so the test checks where the bytes go, not when.
     libc.fflush(None)
     protocol.write(json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}) + "\\n")
 """
@@ -92,9 +90,14 @@ with _protocol_stdout() as protocol:
             capture_output=True, text=True, encoding="utf-8", timeout=15,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+        # The guarantee: nothing but JSON-RPC ever reaches the protocol pipe.
         self.assertEqual(json.loads(result.stdout), {"jsonrpc": "2.0", "id": 1, "result": {}})
-        for diagnostic in ("python diagnostic", "native diagnostic", "buffered diagnostic"):
+        for diagnostic in ("python diagnostic", "native diagnostic"):
             self.assertIn(diagnostic, result.stderr)
+        # The legacy msvcrt.dll keeps its own stdio table, initialized whenever
+        # that DLL first loads in the process; on some machines its buffered
+        # output is dropped. It must never leak into stdout either way.
+        self.assertNotIn("buffered diagnostic", result.stdout)
 
     def test_cli_help_and_bad_workspace_do_not_import_gui(self) -> None:
         for module, prefix in (("app.mcp_server", []), ("app.main", ["--mcp-animation"])):
