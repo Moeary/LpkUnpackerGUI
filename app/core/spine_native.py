@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from app.paths import PROJECT_ROOT
+from app.paths import BUNDLE_ROOT, PROJECT_ROOT
 
 
 class SpineNativeError(RuntimeError):
@@ -100,6 +100,7 @@ def find_native_library(runtime_root: str | os.PathLike[str] | None = None,
         # ``spine_native`` is the installer-owned package root; the older
         # ``spine/native`` layout remains supported for development builds.
         package_roots.extend((project_tools_root / "spine_native",
+                              *([BUNDLE_ROOT / "tools" / "spine_native"] if BUNDLE_ROOT != PROJECT_ROOT else []),
                               tools_root / "spine_native",
                               tools_root / "spine" / "native"))
         for package_root in package_roots:

@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QFileSystemWatcher, QPoint, QProcess, QSignalBlocker, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QBrush, QColor, QDesktopServices, QImage, QKeySequence, QPainter, QPixmap, QShortcut
+from PySide6.QtGui import QBrush, QColor, QDesktopServices, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QDialog, QFileDialog,
     QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel,
@@ -23,6 +23,7 @@ from qfluentwidgets import (
 
 from app.core.live2d_editor_session import Live2DEditorSession
 from app.gui.ArtMeshInspector import ArtMeshInspector
+from app.gui.artmesh_selection_tools import ArtMeshSelectionTools
 from app.gui.ImagePreviewPanel import ImageZoomScrollArea
 from app.gui.live2d_editor_panels import ProjectBoundModPage
 from app.gui.live2d_skin_controls import SkinCatalogControls, SkinDropFrame, SkinNameDialog, TexturePreviewLabel, skin_text
@@ -31,6 +32,8 @@ from app.gui.live2d_appearance import (
     SharedTaskFeedback, appearance_text,
 )
 from app.gui.PsdReconstructionPage import PsdReconstructionPage
+from app.gui.editor_shortcuts import EditorShortcutRouter
+from app.gui.editor_recovery import EditorRecoveryController
 from app.gui.editor_timeline import AnimationTimelineEditor
 from app.gui.editor_actions import ActionComboBox, ActionDeleteDialog, ActionNameDialog, action_text, close_editor_popup
 from app.gui.editor_dialogs import EditorMessageBox as QMessageBox, EditorTextDialog, ThemedEditorDialog as MessageBoxBase
@@ -223,6 +226,8 @@ class Live2DEditorPage(QFrame):
         self._parameter_commit_timer.setInterval(250)
         self._parameter_commit_timer.timeout.connect(self._flush_parameter_edit)
         self._build_ui()
+        self.recovery = EditorRecoveryController(self, "live2d")
+        self.layout().insertWidget(1, self.recovery.bar)
         self.retranslate_ui()
         self.i18n.languageChanged.connect(self.retranslate_ui)
         self._update_actions()
@@ -326,6 +331,9 @@ class Live2DEditorPage(QFrame):
         self.psd_panel.repackModRequested.connect(self.send_psd_version_to_mod)
         self.psd_panel.projectChanged.connect(self._psd_project_changed)
         self.psd_panel.repackSkinReady.connect(self._psd_skin_ready)
+        self.psd_panel.comparison_mesh_provider = self._psd_comparison_mesh
+        self.psd_panel.editWorkingTextureRequested.connect(self._edit_external_texture)
+        self.psd_panel.edit_working_png_button.show()
         variant_signal = getattr(self.psd_panel, "repackVariantRequested", None)
         if variant_signal is not None:
             variant_signal.connect(self._psd_variant_dialog)
@@ -441,10 +449,7 @@ class Live2DEditorPage(QFrame):
         if hasattr(self.mod_panel, "taskStateChanged"):
             self.mod_panel.taskStateChanged.connect(self._task_state_changed)
         root.addWidget(self.task_feedback)
-        for sequence, action in ((QKeySequence.Undo, self.undo), (QKeySequence.Redo, self.redo), (QKeySequence.Save, self._choose_save_copy)):
-            shortcut = QShortcut(sequence, self)
-            shortcut.setContext(Qt.WidgetWithChildrenShortcut)
-            shortcut.activated.connect(action)
+        self.shortcuts = EditorShortcutRouter(self, "live2d")
         self._apply_control_style()
 
     def _apply_control_style(self):
@@ -534,6 +539,12 @@ class Live2DEditorPage(QFrame):
         inspector = self.artmesh_inspector
         inspector.selectionChanged.connect(self._artmesh_selected)
         inspector.selectionIdsChanged.connect(self._artmesh_selection_changed)
+        self.selection_tools = ArtMeshSelectionTools(inspector, self.artmesh_tab)
+        self.selection_tools.changed.connect(self._update_actions)
+        self.selection_tools.failed.connect(self._error)
+        self.selection_tools.message.connect(self._status)
+        self.selection_tools.highlightsChanged.connect(self._sync_selection_highlights)
+        layout.addWidget(self.selection_tools)
         self.drawable_controls = QWidget(self.artmesh_tab)
         batch = QGridLayout(self.drawable_controls)
         self.drawable_controls_layout = batch
@@ -800,7 +811,7 @@ class Live2DEditorPage(QFrame):
             if not self.return_to_current_model(reload=False, announce=False):
                 raise RuntimeError(_text("editor.live2d.return_failed"))
             self.session = candidate
-            self.clear_artmesh_selection()
+            self.clear_artmesh_selection(reset_history=True)
             if self.preview is None:
                 from app.gui.Live2DPreviewWindow import Live2DPreviewWindow
                 self.preview = Live2DPreviewWindow(str(candidate.model_path), self.stage, embedded=True)
@@ -1033,6 +1044,22 @@ class Live2DEditorPage(QFrame):
     def apply_psd_version(self, token: str) -> bool:
         return bool(self.save_psd_version_as_skin(token))
 
+    def _psd_comparison_mesh(self):
+        import hashlib
+        from app.core.psd_reconstructor import resolve_live2d_source
+        self._flush_parameter_edit()
+        self.timeline.set_playing(False)
+        scene = self._selection_scene()
+        if not scene:
+            return None
+        snapshot = copy.deepcopy(scene["snapshot"])
+        session = self._preview_session or self.session
+        if session:
+            source = resolve_live2d_source(session.model_path)
+            if source.moc3:
+                snapshot["comparison_moc_sha256"] = hashlib.sha256(source.moc3.read_bytes()).hexdigest()
+        return snapshot
+
     def _find_psd_skin(self, token: str):
         if not self.session or not self.psd_panel.current_project:
             return None
@@ -1258,7 +1285,7 @@ class Live2DEditorPage(QFrame):
         previous_mod_id = self._mod_preview_model_id
         try:
             self._preview_session = candidate
-            self.clear_artmesh_selection()
+            self.clear_artmesh_selection(reset_history=True)
             self.preview.load_model(str(candidate.model_path))
             self._native_return_pending = False
             readonly_label = appearance_text("editor.appearance.preview_readonly", name=request["label"])
@@ -1358,7 +1385,7 @@ class Live2DEditorPage(QFrame):
             return True
         try:
             self._preview_session = None
-            self.clear_artmesh_selection()
+            self.clear_artmesh_selection(reset_history=True)
             self._preview_context = ""
             if reload and self.preview and self.session:
                 self.preview.load_model(str(self.session.model_path))
@@ -1892,7 +1919,7 @@ class Live2DEditorPage(QFrame):
         if mode == "none":
             self.clear_artmesh_selection()
 
-    def clear_artmesh_selection(self):
+    def clear_artmesh_selection(self, _checked=False, *, reset_history=False):
         self._selection_region = None
         self._selection_region_key = None
         self._selected_drawable_ids = []
@@ -1904,6 +1931,8 @@ class Live2DEditorPage(QFrame):
         if canvas and hasattr(canvas, "setSelectionMode"):
             canvas.setSelectionMode("none")
         self.artmesh_inspector.select_entries([])
+        if reset_history:
+            self.artmesh_inspector.reset_selection_history()
         self.artmesh_image.clear()
         self.local_preview_button.setEnabled(False)
         self.part_opacity.setEnabled(False)
@@ -1924,6 +1953,9 @@ class Live2DEditorPage(QFrame):
         self.selection_count.setText(_text("editor.live2d.pick_count", count=len(self._selected_drawable_ids)))
         self._update_drawable_controls()
 
+        self.selection_tools.refresh(self.session, bool(self.session and not self._preview_session
+                                     and not self._projects_busy()), context=self._preview_session or self.session)
+
     def _artmesh_selection_changed(self, identifiers: list):
         self._selected_drawable_ids = list(dict.fromkeys(str(identifier) for identifier in identifiers))
         # A UV/list/candidate gesture no longer describes the earlier rectangle.
@@ -1931,6 +1963,13 @@ class Live2DEditorPage(QFrame):
         self._selection_region = None
         self._selection_region_key = None
         self._update_selection_actions()
+
+    def _sync_selection_highlights(self, related=None):
+        canvas = self.preview.live2d_canvas if self.preview else None
+        if canvas and hasattr(canvas, "setSelectionHighlights"):
+            active = self.tabs.currentWidget() is self.artmesh_tab
+            canvas.setSelectionHighlights(self._selected_drawable_ids if active else [],
+                                          self.selection_tools._related if active else [])
 
     def _native_drawables_picked(self, identifiers: list, mode: str = "replace"):
         self._selection_region = None
@@ -1983,6 +2022,14 @@ class Live2DEditorPage(QFrame):
             raise RuntimeError(_text("editor.live2d.pick_invisible", ids=", ".join(invisible)))
         return scene
 
+    def _selection_export_options(self, count):
+        from app.gui.psd_export_dialog import SelectionPsdDialog
+        dialog = SelectionPsdDialog(count, self, mode=self.psd_panel.mode_combo.currentData())
+        accepted = self._exec_action_dialog(dialog) == QDialog.Accepted
+        options = dialog.options() if accepted else None
+        dialog.deleteLater()
+        return options
+
     def export_selected_artmeshes(self) -> bool:
         if not self.session or self._preview_session or not self._selected_drawable_ids or self._projects_busy():
             return False
@@ -1990,7 +2037,11 @@ class Live2DEditorPage(QFrame):
             self._flush_parameter_edit()
             self.timeline.set_playing(False)
             identifiers = list(self._selected_drawable_ids)
-            scene = self._selection_export_scene(identifiers)
+            options = self._selection_export_options(len(identifiers))
+            if not options:
+                return False
+            scene = (self._selection_scene() if options["mode"] == "atlas-components"
+                     else self._selection_export_scene(identifiers))
             if scene is None:
                 return False
             region = (dict(self._selection_region) if self._selection_region and self._selection_cache
@@ -1998,7 +2049,7 @@ class Live2DEditorPage(QFrame):
             if not self.open_psd_workspace():
                 return False
             return self.psd_panel.export_selected_artmeshes(identifiers, scene["pose"], region,
-                                                          mesh_data=scene["snapshot"])
+                                                          mesh_data=scene["snapshot"], **options)
         except Exception as exc:
             self._error(exc)
             return False
@@ -2707,6 +2758,7 @@ class Live2DEditorPage(QFrame):
                 self.session.accept_texture_change(index)
             self._flush_subprojects()
             self.last_saved_copy = self.session.save_copy(output_dir)
+            self.recovery.note_saved(self.last_saved_copy["model_path"])
             self.mod_panel.set_source(str(self.session.model_path))
             self._status(_text("editor.live2d.saved", path=output_dir))
             self._update_actions()
@@ -2731,6 +2783,8 @@ class Live2DEditorPage(QFrame):
                                      QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel, QMessageBox.Cancel)
         if answer == QMessageBox.Save:
             return self._choose_save_copy()
+        if answer == QMessageBox.Discard:
+            self.recovery.note_discard()
         return answer == QMessageBox.Discard
 
     def confirm_discard_or_save(self) -> bool:
@@ -2775,6 +2829,8 @@ class Live2DEditorPage(QFrame):
                 self._closing = False
                 return False
         watched = self.texture_watcher.files() + self.texture_watcher.directories()
+        self.recovery.shutdown()
+        self.selection_tools.shutdown()
         if watched:
             self.texture_watcher.removePaths(watched)
         if self.preview:
@@ -2823,6 +2879,7 @@ class Live2DEditorPage(QFrame):
     def _tab_changed(self, *_args):
         if self._binding_projects:
             return
+        self._sync_selection_highlights()
         if hasattr(self, "workspace"):
             index = self.tabs.currentIndex()
             self.workspace.set_task_context(("animation", "selection", "appearance", "export")[index],
@@ -2839,6 +2896,8 @@ class Live2DEditorPage(QFrame):
                 self._error(exc)
 
     def _update_actions(self):
+        if hasattr(self, "recovery"):
+            self.recovery.refresh()
         session = self.session
         self.save_button.setEnabled(bool(session))
         self.undo_button.setEnabled(bool(session and session.can_undo))
@@ -2854,6 +2913,7 @@ class Live2DEditorPage(QFrame):
         self.mod_tab.setEnabled(bool(session))
         self.motion_combo.setEnabled(bool(session and session.project.motions))
         self._update_selection_actions()
+        self._sync_selection_highlights()
         dirty = bool(session and (session.dirty or self.psd_panel._project_dirty or self.mod_panel._dirty))
         self.title_label.setText(_text("editor.live2d.title") + (" *" if dirty else ""))
         self.title_label.setToolTip(_text("editor.live2d.modified" if dirty else "editor.live2d.clean"))

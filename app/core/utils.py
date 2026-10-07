@@ -17,7 +17,8 @@ def hashed_filename(s: str) -> str:
 def normalize(s: str) -> str:
     s = ''.join(c for c in s if ord(c) >= 32 or c == ' ')
     s = re.sub(r'[\\/<>:"|?*]', '', s)
-    if not s.strip():
+    # "." and ".." would resolve to the output directory or its parent.
+    if not s.strip().strip("."):
         s = "unnamed"
     return s
 

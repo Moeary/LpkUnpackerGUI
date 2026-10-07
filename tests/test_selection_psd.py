@@ -268,7 +268,7 @@ class SelectedPosePsdTests(unittest.TestCase):
             root = Path(directory)
             model, _, mesh = self.make_source(root)
             original = reconstruct_live2d_psd(model, root / "original", mesh_data=mesh)
-            with self.assertRaisesRegex(PsdReconstructionError, "only for a selected pose PSD"):
+            with self.assertRaisesRegex(PsdReconstructionError, "only for a selected PSD"):
                 repack_atlas_png_from_psd(original.psd_path, root / "rejected", allow_shared_uv=True)
 
     def test_both_selected_atlases_can_be_edited_and_paint_child_is_bound(self):

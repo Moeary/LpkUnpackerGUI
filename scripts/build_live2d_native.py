@@ -27,8 +27,12 @@ def download(pin, cache):
     if not path.is_file():
         path.parent.mkdir(parents=True, exist_ok=True)
         print(f"Download {pin['url']}", flush=True)
-        with urllib.request.urlopen(pin["url"], timeout=60) as response, path.open("wb") as output:
+        # cubism.live2d.com sits behind Cloudflare, which rejects the default Python-urllib agent with 403.
+        request = urllib.request.Request(pin["url"], headers={"User-Agent": "LpkUnpackerGUI-build/1"})
+        partial = path.with_name(path.name + ".part")
+        with urllib.request.urlopen(request, timeout=60) as response, partial.open("wb") as output:
             shutil.copyfileobj(response, output)
+        partial.replace(path)
     if sha256(path) != pin["sha256"]:
         raise RuntimeError(f"Pinned archive SHA256 mismatch: {path}")
     return path

@@ -152,7 +152,7 @@ turned
     straight.putpixel((1, 0), (30, 90, 190, 255))
     # Make the source page in the representation declared by pma:true.
     pma = Image.new("RGBA", straight.size)
-    for point, (red, green, blue, alpha) in enumerate(straight.getdata()):
+    for point, (red, green, blue, alpha) in enumerate(straight.get_flattened_data()):
         pma.putpixel(
             (point % straight.width, point // straight.width),
             ((red * alpha + 127) // 255, (green * alpha + 127) // 255, (blue * alpha + 127) // 255, alpha),

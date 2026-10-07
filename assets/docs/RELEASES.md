@@ -48,13 +48,14 @@ git push origin v1.1.0
 
 #### 构建环境
 - 系统: Windows Latest
-- Python: 3.10
-- 编译器: Nuitka
+- Python: 3.13（见 `pixi.toml`）
+- 编译器: Nuitka（onefile 单文件）
 
 #### 输出
-- 可执行文件: `LpkUnpackerGUI-v{version}.exe`
+- 单文件可执行程序: `LpkUnpacker-v{version}-windows-x64.exe`
 - 自动创建 Release 页面
 - 自动上传 EXE 文件
+- 程序每次启动时把内置组件解压到临时目录，退出后清理；设置、输出、日志和恢复点保存在 EXE 同目录的 `runtime/`
 
 ### 版本号规范
 
@@ -66,7 +67,7 @@ git push origin v1.1.0
 
 **Q: 编译失败了怎么办？**
 - 查看 Actions 日志找出错误
-- 检查 Python 版本是否为 3.10
+- 检查 Python 版本是否为 3.13
 - 确保 `pixi.toml` 和 `pixi.lock` 中的依赖都正确
 
 **Q: 如何重新编译某个版本？**

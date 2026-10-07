@@ -671,8 +671,11 @@ def resolve_cubism_core_dll(path: str | Path | None = None) -> Optional[Path]:
 
     root = Path(__file__).resolve().parents[2]
     candidates = []
-    if getattr(sys, "frozen", False):
-        candidates.append(Path(sys.executable).resolve().parent / "tools" / "CubismCore" / "Live2DCubismCore.dll")
+    from app.paths import PROJECT_ROOT, is_packaged
+
+    if is_packaged():
+        # A user-supplied Core placed beside the EXE (outside a onefile bundle).
+        candidates.append(PROJECT_ROOT / "tools" / "CubismCore" / "Live2DCubismCore.dll")
     candidates.extend(
         [
             root / "app" / "tools" / "CubismCore" / "Live2DCubismCore.dll",

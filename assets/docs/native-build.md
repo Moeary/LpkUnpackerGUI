@@ -14,6 +14,14 @@ Visual Studio 2022 with its Desktop C++ workload, or w64devkit/MinGW with
 `g++` and `mingw32-make` on `PATH`.  The CI workflow activates the Visual
 Studio developer environment before running Pixi.
 
+The Live2D preview overlay additionally requires CMake 3.26+ and x64
+MinGW-w64 (`gcc`, `g++`, `gendef`, `dlltool`, `mingw32-make`). CI downloads
+w64devkit 1.23.0 with a pinned SHA256 and adds its tools to `PATH`; MSVC
+remains the compiler for the Spine converter and Nuitka. For local builds,
+put these tools on `PATH` or pass `--toolchain-dir` to
+`scripts/build_live2d_native.py`. See the [overlay notice](../../third_party/live2d_native/THIRD_PARTY_NOTICES.md)
+for its pinned sources and licensing.
+
 The converter script selects a generator from the active compiler environment
 unless `-Generator` is supplied.  Its persistent CMake directories are kept
 separate (`runtime/build/spine-converter-msvc` and

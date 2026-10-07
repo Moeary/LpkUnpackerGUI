@@ -253,6 +253,9 @@ class _TimelineCanvas(QWidget):
             self.editor.add_keyframe()
 
     def keyPressEvent(self, event):  # noqa: N802
+        if getattr(self.editor, "external_shortcuts", False):
+            super().keyPressEvent(event)
+            return
         if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
             self.editor.delete_selected()
         elif event.key() == Qt.Key.Key_Space:

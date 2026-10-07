@@ -43,7 +43,8 @@ def load_all_motion_path_from_model_dir(model_dir: str) -> list[str]:
 
 def load_motion_from_path(path: str) -> dict:
     """通过motion3.json文件的路径导入"""
-    return json.load(open(path, 'r'))
+    with open(path, 'r', encoding='utf-8-sig') as f:
+        return json.load(f)
 
 
 def copy_modify_from_motion(motion_path: str, save_root: str = "./out/motions") -> None:
@@ -60,5 +61,5 @@ def copy_modify_from_motion(motion_path: str, save_root: str = "./out/motions") 
     motion["Meta"]["TotalPointCount"] = point_count
     if not os.path.exists(save_root):
         os.makedirs(save_root)
-    with open(os.path.join(save_root, os.path.split(motion_path)[-1]), "w") as f:
+    with open(os.path.join(save_root, os.path.split(motion_path)[-1]), "w", encoding="utf-8") as f:
         f.write(json.dumps(motion, indent=2, ensure_ascii=True))

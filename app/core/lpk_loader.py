@@ -112,6 +112,20 @@ def _looks_like_atlas_image_name(value: str) -> bool:
     return value.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"))
 
 
+def _contained_path(root, relative) -> Path:
+    """Join *relative* under *root* and refuse anything that escapes it.
+
+    Output names come from keys inside the decrypted model JSON, so a crafted
+    package could otherwise use ``..`` or an absolute path to write elsewhere.
+    """
+
+    base = Path(root).resolve()
+    target = (base / relative).resolve()
+    if not target.is_relative_to(base) or target == base:
+        raise ValueError(f"LPK output path escapes the output directory: {relative!r}")
+    return target
+
+
 class LpkDecryptError(RuntimeError):
     """Structured, non-interactive LPK decryption failure.
 
@@ -187,6 +201,11 @@ class LpkLoader():
         created_dirs = []
         try:
             if self.lpkType in ["STD2_0", "STM_1_0"]:
+                # Each output directory must be self-contained: a model or
+                # texture shared by two characters is recovered into both.
+                # Characters that map to the same directory (for example a
+                # Steam ``title``) share one table so model ids stay unique.
+                states = {}
                 for chara in self.mlve_config["list"]:
                     if self.lpkType == "STM_1_0" and hasattr(self, 'config') and 'title' in self.config:
                         chara_name = self.config["title"]
@@ -194,7 +213,9 @@ class LpkLoader():
                         chara_name = chara["character"] if chara["character"] != "" else "character"
                     subdir =  os.path.join(outputdir, normalize(chara_name))
                     safe_mkdir(subdir)
-                    created_dirs.append(subdir)
+                    if subdir not in created_dirs:
+                        created_dirs.append(subdir)
+                    self.entrys, self.trans, self._trans_normalized = states.setdefault(subdir, ({}, {}, {}))
 
                     for i in range(len(chara["costume"])):
                         logger.info(f"extracting {chara_name}_costume_{i}")
@@ -253,7 +274,10 @@ class LpkLoader():
         if not filename:
             return
 
-        self.check_decrypt(filename)
+        # Only Steam packs depend on a config fileId that may need recovery;
+        # STD2_0 keys are derived from config.mlve alone.
+        if self.lpkType == "STM_1_0":
+            self.check_decrypt(filename)
 
         self.extract_model_json(filename, dir)
 
@@ -412,6 +436,7 @@ class LpkLoader():
         existing = self._lookup_trans(filename)
         if existing:
             return existing
+        _contained_path(subdir, output_name)
         _, suffix = self.recovery(filename, os.path.join(subdir, output_name))
         target = output_name + suffix
         self._register_trans(filename, target)

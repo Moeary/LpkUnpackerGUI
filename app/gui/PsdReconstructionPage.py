@@ -180,6 +180,7 @@ class PsdReconstructionThread(QThread):
         mesh_data: dict | None = None,
         allow_shared_uv: bool = False,
         pose_stage_request: dict | None = None,
+        atlas_layout: str = "packed",
     ):
         super().__init__()
         self.source_path = source_path
@@ -195,6 +196,7 @@ class PsdReconstructionThread(QThread):
         self.selection_region = copy.deepcopy(selection_region)
         self.mesh_data = copy.deepcopy(mesh_data)
         self.allow_shared_uv = bool(allow_shared_uv)
+        self.atlas_layout = atlas_layout
         # This is a plain-data request captured by the GUI before the thread
         # starts.  The worker never calls a provider, QWidget, or editor
         # session.  On success ``pose_stage`` is committed by the page after
@@ -234,7 +236,7 @@ class PsdReconstructionThread(QThread):
             job = {name: getattr(self, name) for name in (
                 "source_path", "output_dir", "mode", "metadata_path", "parameter_values", "pose_name",
                 "output_name", "resource_limits", "multi_psd_paths", "selected_drawable_ids",
-                "selection_region", "mesh_data", "allow_shared_uv")}
+                "selection_region", "mesh_data", "allow_shared_uv", "atlas_layout")}
             if self.pose_stage_request:
                 parent = Path(self.pose_stage_request["project_dir"]) / ".psd-staging"
                 parent.mkdir(parents=True, exist_ok=True)
@@ -489,6 +491,7 @@ class PsdReconstructionPage(QFrame):
     texturePreviewRequested = Signal(object)
     contextChanged = Signal(object)
     repackVariantRequested = Signal(str)
+    editWorkingTextureRequested = Signal()
     # Stable compact-workbench contract.  The dict contains only plain data:
     # ``task`` (e.g. ``selection-export``), ``state`` (starting/preparing/
     # running/succeeded/failed), ``busy``, ``progress`` and ``message``.
@@ -503,6 +506,8 @@ class PsdReconstructionPage(QFrame):
         self._compact = bool(compact)
         self._task_embedded = False
         self._version_skin_provider = None
+        self.comparison_mesh_provider = None
+        self._last_comparison_request = None
         self._task_result_committed = False
         self._task_progress = 0
         self._task_state = "idle"
@@ -864,7 +869,6 @@ class PsdReconstructionPage(QFrame):
         self.mode_combo = (EditorComboBox if self._compact else ComboBox)(self.mode_frame)
         self.mode_combo.addItem("", userData="mesh")
         self.mode_combo.addItem("", userData="atlas-components")
-        self.mode_combo.addItem(tr("psd.mode.atlas_artmesh"), userData="atlas-artmesh")
         self.mode_combo.currentIndexChanged.connect(self.on_mode_changed)
         self.mode_combo.setMinimumWidth(0)
         self.mode_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
@@ -1007,6 +1011,15 @@ class PsdReconstructionPage(QFrame):
         self.repack_output_layout.addWidget(self.repack_output_label)
         self.repack_output_layout.addWidget(self.repack_output_edit)
         self.repack_card_layout.addLayout(self.repack_output_layout)
+        self.compare_repack_button = PushButton(tr("psd.compare.open"), self.repack_card)
+        self.compare_repack_button.setEnabled(False)
+        self.compare_repack_button.clicked.connect(lambda: self.open_comparison())
+        self.repack_card_layout.addWidget(self.compare_repack_button)
+        self.edit_working_png_button = PushButton(tr("psd.edit.working_png"), self.repack_card)
+        self.edit_working_png_button.setToolTip(tr("psd.edit.working_png_hint"))
+        self.edit_working_png_button.clicked.connect(self.editWorkingTextureRequested)
+        self.edit_working_png_button.hide()
+        self.repack_card_layout.addWidget(self.edit_working_png_button)
 
 
     def _build_action_controls(self, parent, layout):
@@ -1019,10 +1032,6 @@ class PsdReconstructionPage(QFrame):
         self.open_photoshop_button = PushButton("", parent)
         self.open_photoshop_button.setEnabled(False)
         self.open_photoshop_button.clicked.connect(self.open_current_psd_in_photoshop)
-        # Kept for compatibility with older signal paths, but it is no longer
-        # part of the layout.  Leaving a parented visible widget here caused
-        # the stray button at the page's top-left corner.
-        self.open_photoshop_button.setVisible(False)
         self.artmesh_inspector_button = PushButton("", parent)
         self.artmesh_inspector_button.clicked.connect(self.open_artmesh_inspector)
         self.artmesh_inspector_button.setEnabled(False)
@@ -1035,6 +1044,7 @@ class PsdReconstructionPage(QFrame):
         self.action_layout.addWidget(self.artmesh_inspector_button, 0, 1)
         self.action_layout.addWidget(self.open_output_button, 1, 0)
         self.action_layout.addWidget(self.preview_toggle_button, 1, 1)
+        self.action_layout.addWidget(self.open_photoshop_button, 2, 0, 1, 2)
         layout.addLayout(self.action_layout)
 
         self.progress_layout = QHBoxLayout()
@@ -1089,6 +1099,10 @@ class PsdReconstructionPage(QFrame):
         self.preview_hint_label = CaptionLabel("", self.preview_control_frame)
         self.preview_hint_label.setWordWrap(True)
         self.preview_control_layout.addWidget(self.preview_hint_label)
+        self.compare_history_button = PushButton(tr("psd.compare.open"), self.preview_control_frame)
+        self.compare_history_button.setEnabled(False)
+        self.compare_history_button.clicked.connect(lambda: self.open_comparison(history=True))
+        self.preview_control_layout.addWidget(self.compare_history_button)
 
 
     def _build_motion_card(self, parent):
@@ -1273,6 +1287,8 @@ class PsdReconstructionPage(QFrame):
             self.action_layout.removeWidget(button)
             tools.addWidget(button)
         self._compact_pages[3][1].addWidget(self.tools_card)
+        self.action_layout.removeWidget(self.open_photoshop_button)
+        self.export_card_layout.addWidget(self.open_photoshop_button)
         for _content, layout in self._compact_pages:
             layout.addStretch(1)
         self.stage_label.setMinimumWidth(0)
@@ -1344,8 +1360,9 @@ class PsdReconstructionPage(QFrame):
         help_layout = QVBoxLayout(self.export_help_frame)
         help_layout.setContentsMargins(0, 0, 0, 0)
         help_layout.setSpacing(5)
-        for label in (self.export_preset_hint, self.mode_hint_label, self.mesh_canvas_hint_label):
+        for label in (self.export_preset_hint, self.mesh_canvas_hint_label):
             help_layout.addWidget(label)
+        self.export_card_layout.insertWidget(2, self.mode_hint_label)
         self.export_card_layout.addWidget(self.export_help_frame)
         self.export_help_frame.hide()
         self.mode_frame.hide()
@@ -1599,7 +1616,6 @@ class PsdReconstructionPage(QFrame):
         self.mode_label.setText(tr("psd.mode"))
         self.mode_combo.setItemText(0, tr("psd.mode.mesh_pose"))
         self.mode_combo.setItemText(1, tr("psd.mode.editable_atlas"))
-        self.mode_combo.setItemText(2, tr("psd.mode.atlas_artmesh"))
         self.mesh_canvas_label.setText(tr("psd.mesh_canvas.max_dimension"))
         self.mesh_canvas_preset_combo.setItemText(2, tr("psd.mesh_canvas.custom"))
         self.mesh_canvas_spin.setSpecialValueText("0 px" if self._compact else tr("psd.mesh_canvas.original"))
@@ -1611,6 +1627,10 @@ class PsdReconstructionPage(QFrame):
         self.reconstruct_button.setText(tr("psd.reconstruct_button"))
         self.open_output_button.setText(tr("psd.open_output_folder"))
         self.open_photoshop_button.setText(tr("psd.pose.open_photoshop"))
+        for button in (self.compare_repack_button, self.compare_history_button):
+            button.setText(tr("psd.compare.open"))
+        self.edit_working_png_button.setText(tr("psd.edit.working_png"))
+        self.edit_working_png_button.setToolTip(tr("psd.edit.working_png_hint"))
         self.artmesh_inspector_button.setText(tr("psd.inspector.title"))
         self.preview_toggle_button.setText(
             tr("psd.preview.hide") if (self.preview_dialog is not None and self.preview_dialog.isVisible()) else tr("psd.preview.show")
@@ -2068,7 +2088,8 @@ class PsdReconstructionPage(QFrame):
         if ready:
             self.unifiedPreviewRequested.emit(*ready)
 
-    def export_selected_artmeshes(self, drawable_ids, pose, region=None, *, mesh_data=None) -> bool:
+    def export_selected_artmeshes(self, drawable_ids, pose, region=None, *, mesh_data=None,
+                                 mode=None, atlas_layout="packed", output_name=None) -> bool:
         """Export a frozen selection and pose through one private worker stage."""
         if self.is_busy():
             self.append_log(_workspace_text("psd.selection.busy"))
@@ -2091,7 +2112,8 @@ class PsdReconstructionPage(QFrame):
                 raise ValueError("Pose parameters and opacities must be finite.")
             if (parts or drawables) and mesh_data is None:
                 raise ValueError("Current opacity overrides require the editor's exact drawable pose snapshot.")
-            name = self._prompt_non_empty_name(
+            mode = mode or self.mode_combo.currentData() or "mesh"
+            name = output_name or self._prompt_non_empty_name(
                 "psd.project.new_dialog_title", "psd.export.name", _workspace_text("psd.selection.default_name"))
             if not name:
                 return False
@@ -2113,13 +2135,14 @@ class PsdReconstructionPage(QFrame):
             self.set_workflow("export")
             self.last_output_dir = str(self.current_project.project_dir / "psd" / scheme_id)
             self.output_edit.setText(self.last_output_dir)
-            self.append_log(_workspace_text("psd.selection.hint"))
+            self.append_log(tr("psd.selection.atlas_hint") if mode == "atlas-components"
+                            else _workspace_text("psd.selection.hint"))
             self._start_worker(PsdReconstructionThread(
-                str(self.current_project.base_model_json), self.last_output_dir, "mesh",
+                str(self.current_project.base_model_json), self.last_output_dir, mode,
                 parameter_values=parameters, pose_name=name, output_name=scheme_id,
                 resource_limits=self.settings_manager.get("psd.resource_limits", {}),
                 selected_drawable_ids=ids, selection_region=region, mesh_data=exact_mesh,
-                pose_stage_request=stage_request))
+                pose_stage_request=stage_request, atlas_layout=atlas_layout))
             return True
         except Exception as exc:
             self.on_reconstruction_error(str(exc))
@@ -2404,6 +2427,12 @@ class PsdReconstructionPage(QFrame):
                 message = tr("psd.task.refresh_failed", default=PSD_WORKSPACE_TEXT["psd.task.refresh_failed"], error=message)
             self.on_reconstruction_error(message)
             return
+        if result.mode in {"mesh-repack", "atlas-repack", "multi-repack"} and result.metadata_path and result.texture_outputs:
+            self._last_comparison_request = {
+                "metadata_path": str(result.metadata_path),
+                "texture_outputs": {int(index): str(path) for index, path in result.texture_outputs.items()},
+            }
+            self.compare_repack_button.setEnabled(True)
         if (self._compact and result.mode in {"multi-repack", "mesh-repack", "atlas-repack"}
                 and self.pending_repack_id and self.current_project
                 and find_repack_entry(self.current_project, self.pending_repack_id)):
@@ -2472,6 +2501,8 @@ class PsdReconstructionPage(QFrame):
             not busy and self._artmesh_metadata_path() is not None
         )
         self.repack_photoshop_button.setEnabled(not busy and bool(self.selected_repack_psd_path()))
+        self.open_photoshop_button.setEnabled(not busy and bool(self.last_psd_path)
+                                             and Path(self.last_psd_path).is_file())
         self.texture_name_edit.setEnabled(not busy)
         self.new_project_button.setEnabled(not busy)
         self.save_project_button.setEnabled(not busy)
@@ -2481,6 +2512,8 @@ class PsdReconstructionPage(QFrame):
         self.output_button.setEnabled(not busy and self.workflow != "repack")
         self.output_edit.setReadOnly(self._compact or self.workflow == "repack")
         self.mode_combo.setEnabled(not busy)
+        self.compare_repack_button.setEnabled(not busy and self._last_comparison_request is not None)
+        self.edit_working_png_button.setEnabled(not busy and self.current_project is not None)
         self.mesh_canvas_spin.setEnabled(not busy)
         self.mesh_canvas_preset_combo.setEnabled(not busy)
         self.export_flow_button.setEnabled(not busy)
@@ -2725,8 +2758,6 @@ class PsdReconstructionPage(QFrame):
             self.mode_hint_label.setText("")
         elif mode == "atlas-components":
             self.mode_hint_label.setText(tr("psd.mode_hint.atlas_components"))
-        elif mode == "atlas-artmesh":
-            self.mode_hint_label.setText(tr("psd.mode_hint.atlas_artmesh"))
         else:
             self.mode_hint_label.setText(tr("psd.mode_hint.mesh_pose"))
         if self._compact and hasattr(self, "export_help_button"):
@@ -2774,7 +2805,7 @@ class PsdReconstructionPage(QFrame):
             if stamp:
                 try:
                     metadata = json.loads(path.read_text(encoding="utf-8"))
-                    if metadata.get("mode") == "mesh" and isinstance(metadata.get("selection"), dict):
+                    if metadata.get("mode") in {"mesh", "atlas-components"} and isinstance(metadata.get("selection"), dict):
                         ids = sorted({str(item["unselected_id"]) for item in metadata["selection"].get("shared_regions", [])
                                       if isinstance(item, dict) and item.get("unselected_id")})
                 except (OSError, ValueError, TypeError):
@@ -2880,6 +2911,36 @@ class PsdReconstructionPage(QFrame):
         if os.path.isdir(self.last_output_dir):
             QDesktopServices.openUrl(QUrl.fromLocalFile(self.last_output_dir))
 
+    def _history_comparison_request(self):
+        token = self.preview_source_token()
+        if not self.current_project or not token.startswith("repack:"):
+            return None
+        entry = find_repack_entry(self.current_project, token.split(":", 1)[1])
+        if not entry or not entry.get("metadata") or not entry.get("texture_outputs"):
+            return None
+        return {"metadata_path": str(resolve_project_path(self.current_project, entry["metadata"])),
+                "texture_outputs": {int(index): str(resolve_project_path(self.current_project, path))
+                                    for index, path in entry["texture_outputs"].items()}}
+
+    def open_comparison(self, *, history=False):
+        if self.is_busy():
+            return
+        request = self._history_comparison_request() if history else self._last_comparison_request
+        if not request:
+            return
+        try:
+            from app.gui.psd_comparison_dialog import PsdComparisonDialog
+            from app.gui.editor_dialogs import exec_editor_dialog
+            request = copy.deepcopy(request)
+            if callable(self.comparison_mesh_provider):
+                request["mesh_data"] = self.comparison_mesh_provider()
+            dialog = PsdComparisonDialog(request, self)
+            exec_editor_dialog(dialog)
+            dialog.deleteLater()
+        except Exception as exc:
+            InfoBar.error(title=tr("common.error"), content=str(exc), parent=self,
+                          position=InfoBarPosition.TOP, duration=5000)
+
     def open_current_psd_in_photoshop(self):
         psd_path = Path(self.last_psd_path) if self.last_psd_path else None
         if not psd_path or not psd_path.is_file():
@@ -2887,18 +2948,15 @@ class PsdReconstructionPage(QFrame):
             value = str((scheme or {}).get("psd") or "")
             psd_path = resolve_project_path(self.current_project, value) if value and self.current_project else None
         photoshop = Path(self.settings_manager.get_photoshop_executable())
-        if not photoshop.is_file():
-            InfoBar.warning(
-                title=tr("common.warning"),
-                content=tr("psd.pose.photoshop_not_configured"),
-                parent=self,
-                position=InfoBarPosition.TOP,
-                duration=4000,
-            )
-            return
         if not psd_path or not psd_path.is_file():
             return
-        QProcess.startDetached(str(photoshop), [str(psd_path)])
+        if photoshop.is_file():
+            opened, _pid = QProcess.startDetached(str(photoshop), [str(psd_path)])
+        else:
+            opened = QDesktopServices.openUrl(QUrl.fromLocalFile(str(psd_path)))
+        if not opened:
+            InfoBar.warning(title=tr("common.error"), content=tr("psd.edit.open_failed"),
+                            parent=self, position=InfoBarPosition.TOP, duration=5000)
 
     def pose_scheme_for_psd(self, psd_path: str | Path) -> dict | None:
         if not self.current_project:
@@ -3304,6 +3362,8 @@ class PsdReconstructionPage(QFrame):
         self.on_reconstruction_error(error)
 
     def set_current_project(self, project: Live2DPSDProject):
+        self._last_comparison_request = None
+        self.compare_repack_button.setEnabled(False)
         self.close_project_preview()
         self._ui_refreshing = True
         self.current_project = project
@@ -3322,10 +3382,10 @@ class PsdReconstructionPage(QFrame):
         )
         self.output_edit.setText(self.last_output_dir)
         self.texture_name_edit.setText(str(ui_state.get("texture_name") or ""))
-        mode_index = self._combo_index_by_data(
-            self.mode_combo,
-            str(ui_state.get("export_mode") or "mesh"),
-        )
+        export_mode = str(ui_state.get("export_mode") or "mesh")
+        if export_mode == "atlas-artmesh":
+            export_mode = "atlas-components"
+        mode_index = self._combo_index_by_data(self.mode_combo, export_mode)
         if mode_index >= 0:
             self.mode_combo.setCurrentIndex(mode_index)
         self.manual_repack_psd = ""
@@ -3349,6 +3409,8 @@ class PsdReconstructionPage(QFrame):
 
     def bind_project(self, project: Live2DPSDProject | None):
         """Bind the owner editor's isolated child project without opening a model."""
+        self._last_comparison_request = None
+        self.compare_repack_button.setEnabled(False)
         if project is not None:
             self.set_current_project(project)
             return
@@ -3652,6 +3714,7 @@ class PsdReconstructionPage(QFrame):
         )
 
     def update_preview_controls(self):
+        self.compare_history_button.setEnabled(not self._is_busy and self._history_comparison_request() is not None)
         if not hasattr(self, "preview_live2d_button"):
             return
         has_project = self.current_project is not None

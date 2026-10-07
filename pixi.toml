@@ -17,20 +17,21 @@ native-verify = "python scripts/verify_native_build.py --require-notices"
 build = { depends-on = ["native-build"], cmd = "python scripts/build_nuitka.py --require-native" }
 build-gcc = { depends-on = ["native-build"], cmd = "python scripts/build_nuitka.py --compiler mingw --require-native" }
 check = "python scripts/check_sources.py"
+test = "python scripts/run_tests.py"
 
 [dependencies]
-python = "3.10.*"
+python = "3.13.*"
 pip = ">=25.0.0,<26"
 
 [pypi-dependencies]
 "PySide6-Fluent-Widgets" = ">=1.4.0"
-PySide6 = ">=6.6.0"
+PySide6 = ">=6.8.0"
 filetype = ">=1.0.0"
-Pillow = ">=9.0.0"
+Pillow = ">=12.1.0"
 "live2d-py" = "==0.7.0"
-numpy = ">=1.21.0"
+numpy = ">=2.1.0"
 PyOpenGL = "==3.1.10"
-Nuitka = ">=2.8.4"
+Nuitka = ">=4.1"
 requests = ">=2.31.0"
 "ordered-set" = ">=4.1.0"
 zstandard = ">=0.23.0"

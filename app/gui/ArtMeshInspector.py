@@ -8,6 +8,8 @@ to audit before editing or repacking.
 
 from __future__ import annotations
 
+from app.core.selection_history import SelectionHistory
+
 import json
 import math
 import re
@@ -16,7 +18,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from PySide6.QtCore import QEvent, QItemSelectionModel, QPointF, QRectF, QSignalBlocker, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QPolygonF, QTransform
+from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPen, QPixmap, QPolygonF, QTransform
 from PySide6.QtWidgets import (
     QDialog,
     QAbstractItemView,
@@ -213,6 +215,7 @@ class _MeshCanvas(QWidget):
         self.setMinimumSize(100, 100)
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
     def set_scene(
         self,
@@ -307,16 +310,18 @@ class _MeshCanvas(QWidget):
             painter.setPen(QPen(QColor("#9aa6b5"), 1))
             painter.drawText(target, Qt.AlignmentFlag.AlignCenter, tr("psd.inspector.static_hint"))
 
-        for index, entry in enumerate(self.entries):
+        ordered = sorted(enumerate(self.entries), key=lambda pair:
+                         (pair[0] in self.selected_indices, pair[0] in self.shared_indices))
+        for index, entry in ordered:
             selected = index in self.selected_indices
-            if self.mode == "pose" and self.image_polygon is not None and not selected:
+            shared = index in self.shared_indices
+            if self.mode == "pose" and self.image_polygon is not None and not selected and not shared:
                 # The model itself is the selection guide. Drawing every mesh
                 # edge on a thousand-drawable model obscures the visible parts.
                 continue
             triangles = self._entry_triangles(entry)
             if not triangles:
                 continue
-            shared = index in self.shared_indices
             if selected:
                 color = QColor(255, 218, 70, 210)
                 width_px = 3
@@ -325,12 +330,18 @@ class _MeshCanvas(QWidget):
                 width_px = 2
             else:
                 hue = (index * 47) % 360
-                color = QColor.fromHsv(hue, 180, 235, 170)
+                color = (QColor(140, 150, 160, 55) if self.shared_indices else
+                         QColor.fromHsv(hue, 180, 235, 170))
                 width_px = 1
             pen = QPen(color, width_px)
             if shared and not selected:
                 pen.setStyle(Qt.PenStyle.DashLine)
             painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            if self.mode == "atlas" and self.shared_indices and (selected or shared):
+                tint = QColor(color)
+                tint.setAlpha(40)
+                painter.setBrush(tint)
             if self.mode == "pose" and self.image_polygon is not None:
                 edges = {}
                 for triangle in triangles:
@@ -351,6 +362,7 @@ class _MeshCanvas(QWidget):
         painter.end()
 
     def mousePressEvent(self, event) -> None:
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
         if event.button() == Qt.MouseButton.MiddleButton:
             self._pan_anchor = QPointF(event.position())
             self._selection_anchor = None
@@ -495,6 +507,9 @@ class ArtMeshInspector(QWidget):
         self.sidecar_canvas_size: tuple[int, int] = (1, 1)
         self.selected_index = -1
         self.selected_indices: set[int] = set()
+        self._dynamic_shared_ids = None
+        self.selection_history = SelectionHistory()
+        self._replaying_selection = False
         self._texture_pixmaps = {}
         self._selection_alpha_cache = {}
         self._atlas_geometry_cache = {}
@@ -835,6 +850,7 @@ class ArtMeshInspector(QWidget):
     def load_snapshot(self, snapshot: Mapping[str, Any], texture_paths,
                       *, selected_ids=None) -> bool:
         """Use an in-memory current pose without writing inspector metadata."""
+        primary = getattr(self.current_entry(), "drawable_id", None)
         previous = self.selected_drawable_ids() if selected_ids is None else list(selected_ids)
         self._loading = True
         try:
@@ -867,7 +883,13 @@ class ArtMeshInspector(QWidget):
             self._loading = False
         available = {entry.drawable_id for entry in self.entries}
         ids = [identifier for identifier in previous if identifier in available]
-        self.select_entries(ids)
+        self._replaying_selection = True
+        try:
+            self.select_entries(ids, primary_id=primary)
+        finally:
+            self._replaying_selection = False
+        if self._dynamic_shared_ids is not None:
+            self.set_shared_highlights(self._dynamic_shared_ids)
         self.metadataChanged.emit("")
         return True
 
@@ -1409,9 +1431,32 @@ class ArtMeshInspector(QWidget):
             self.entry_list.blockSignals(False)
             self._loading = False
         self._update_views()
+        if not self._replaying_selection:
+            self.selection_history.record(self._selection_state())
         self.selectionIdsChanged.emit(self.selected_drawable_ids())
         self.selectionChanged.emit(self.current_entry())
         return [self.entries[by_id[identifier]] for identifier in ids if identifier in by_id]
+
+    def _selection_state(self):
+        return (tuple(self.selected_drawable_ids()), getattr(self.current_entry(), "drawable_id", None))
+
+    def reset_selection_history(self):
+        self.selection_history.reset(self._selection_state())
+
+    def undo_selection(self):
+        self._restore_selection_history(self.selection_history.undo())
+
+    def redo_selection(self):
+        self._restore_selection_history(self.selection_history.redo())
+
+    def _restore_selection_history(self, state):
+        if state is None:
+            return
+        self._replaying_selection = True
+        try:
+            self.select_entries(state[0], primary_id=state[1])
+        finally:
+            self._replaying_selection = False
 
     def apply_selection(self, drawable_ids, mode="replace", primary_id=None):
         """Apply UV, list or preview gestures to the same final selection."""
@@ -1486,6 +1531,10 @@ class ArtMeshInspector(QWidget):
         self.select_entries(ids, primary_id=identifier or self._candidate_primary)
 
     def _shared_entry_indices(self, texture_index: int | None = None) -> set[int]:
+        if self._dynamic_shared_ids is not None:
+            return {index for index, entry in enumerate(self.entries)
+                    if entry.drawable_id in self._dynamic_shared_ids
+                    and (texture_index is None or entry.texture_index == texture_index)}
         result: set[int] = set()
         for index, entry in enumerate(self.entries):
             if texture_index is not None and entry.texture_index != texture_index:
@@ -1500,6 +1549,24 @@ class ArtMeshInspector(QWidget):
                     result.add(index)
                     break
         return result
+
+    def set_shared_highlights(self, identifiers):
+        """Highlight potential impact independently of the editable selection."""
+        self._dynamic_shared_ids = set(identifiers)
+        marker = QPixmap(14, 14)
+        marker.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(marker)
+        painter.setPen(QPen(QColor(255, 125, 54), 2, Qt.PenStyle.DashLine))
+        painter.drawRect(2, 2, 9, 9)
+        painter.end()
+        for index, entry in enumerate(self.entries):
+            item = self.entry_list.item(index)
+            if item:
+                affected = entry.drawable_id in self._dynamic_shared_ids
+                item.setIcon(QIcon(marker) if affected else QIcon())
+                item.setToolTip(item.text() + ("\n" + tr("editor.selection.legend",
+                    default="黄色实线：已选部件；橙色虚线：共享图集像素的未选部件。") if affected else ""))
+        self._update_views()
 
     def hit_pose(self, x: float, y: float) -> int | None:
         point = (float(x), float(y))

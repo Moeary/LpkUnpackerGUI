@@ -1,15 +1,62 @@
 import sys
 from pathlib import Path
 
+# Nuitka never sets ``sys.frozen``; compiled modules get ``__compiled__``.
+_COMPILED = globals().get("__compiled__")
+
+
+def is_packaged() -> bool:
+    return _COMPILED is not None or bool(getattr(sys, "frozen", False))
+
+
+# Read-only files shipped inside the build.  In a Nuitka onefile build this is
+# the temporary extraction directory, which is deleted when the app exits.
+BUNDLE_ROOT = Path(__file__).resolve().parent.parent
+
 
 def project_root() -> Path:
+    """Directory that holds the visible EXE (or the source checkout).
+
+    Writable state (``runtime/``) and user-placed tools live here so they
+    survive restarts.  For standalone builds it equals ``BUNDLE_ROOT``.
+    """
+    containing_dir = getattr(_COMPILED, "containing_dir", None)
+    if containing_dir:
+        return Path(containing_dir).resolve()
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent.parent
+    return BUNDLE_ROOT
+
+
+def self_executable() -> Path:
+    """Binary of the running process, for starting worker processes.
+
+    Nuitka reports ``sys.executable`` as a ``python.exe`` beside the program
+    that does not exist, so packaged builds ask Windows for the image path.
+    """
+    if is_packaged() and sys.platform == "win32":
+        import ctypes
+
+        buffer = ctypes.create_unicode_buffer(32768)
+        if ctypes.windll.kernel32.GetModuleFileNameW(None, buffer, len(buffer)):
+            return Path(buffer.value)
+    return Path(sys.executable)
+
+
+def app_executable() -> Path:
+    """Command that relaunches the app from outside this process tree.
+
+    Onefile builds run from a temporary extraction directory that disappears
+    on exit, so persistent configs (MCP clients) must name the outer EXE.
+    """
+    original = getattr(_COMPILED, "original_argv0", None)
+    if original:
+        return Path(original).resolve()
+    return self_executable()
 
 
 PROJECT_ROOT = project_root()
-ASSETS_DIR = PROJECT_ROOT / "assets"
+ASSETS_DIR = BUNDLE_ROOT / "assets"
 APP_ICON = ASSETS_DIR / "app" / "icon.ico"
 RUNTIME_DIR = PROJECT_ROOT / "runtime"
 RUNTIME_TEMP_DIR = RUNTIME_DIR / "temp"

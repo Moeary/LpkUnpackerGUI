@@ -13,11 +13,10 @@ import os
 import re
 import shutil
 import string
-import sys
 from pathlib import Path
 from typing import Iterable, Mapping
 
-from app.paths import PROJECT_ROOT
+from app.paths import BUNDLE_ROOT, PROJECT_ROOT
 
 # The pure download/install API lives in a separate module so discovery stays
 # lightweight.  Re-export it here for callers that already use toolchain.py.
@@ -132,11 +131,11 @@ def tool_roots(extra_roots: Iterable[str | os.PathLike[str]] = ()) -> list[Path]
             PROJECT_ROOT / "app" / "tools",
             PROJECT_ROOT / "tools",
             PROJECT_ROOT / "runtime" / "tools",
+            # Tools bundled inside a onefile build are extracted here.
+            BUNDLE_ROOT / "tools",
+            BUNDLE_ROOT / "app" / "tools",
         )
     )
-    if getattr(sys, "frozen", False):
-        executable_root = Path(sys.executable).resolve().parent
-        roots.extend((executable_root / "tools", executable_root / "app" / "tools"))
 
     for env_name in ("LPK_TOOLS_DIR", "LPK_RUNTIME_TOOLS_DIR"):
         path = _clean_path(os.environ.get(env_name))

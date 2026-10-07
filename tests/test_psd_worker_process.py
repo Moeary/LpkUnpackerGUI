@@ -123,7 +123,7 @@ class PsdWorkerProcessTests(unittest.TestCase):
         self.app.processEvents()
         self.assertTrue(self.page.mode_combo.isVisible())
         self.assertTrue(self.page.mesh_canvas_spin.isVisible())
-        self.assertEqual(self.page.mode_combo.count(), 3)
+        self.assertEqual(self.page.mode_combo.count(), 2)
         self.assertEqual(self.page.mesh_canvas_spin.value(), 2048)
         before = (copy.deepcopy(self.session.project.modified), copy.deepcopy(self.session._undo), self.hashes(self.model.parent))
         target = self.session.root / "psd-new"
@@ -204,7 +204,7 @@ class PsdWorkerProcessTests(unittest.TestCase):
         self.assertEqual(len(completed), 1)
         self.assertFalse(cancelled)
         self.assertNotEqual((output / "repeat_mesh_pose.psd").read_bytes(), b"previous PSD")
-        self.assertEqual((output / "keep.txt").read_text(), "unrelated")
+        self.assertEqual((output / "keep.txt").read_text(encoding="utf-8"), "unrelated")
         worker.cleanup_job()
 
     def test_standalone_publish_failure_restores_preexisting_entries(self):
@@ -229,8 +229,12 @@ class PsdWorkerProcessTests(unittest.TestCase):
         self.assertEqual({p.name for p in stage.iterdir()}, {"a.psd", "b.json"})
 
     def test_packaged_worker_uses_early_dispatch(self):
-        with patch.object(sys, "frozen", True, create=True):
-            self.assertEqual(worker_command(Path("task/request.pickle"))[:2], [sys.executable, "--psd-worker"])
+        # Nuitka's sys.executable names a nonexistent python.exe; the worker
+        # must relaunch the real process image instead.
+        exe = Path(r"C:\Apps\LpkUnpacker\LpkUnpackerGUI.exe")
+        with patch.object(sys, "frozen", True, create=True), \
+             patch("app.paths.self_executable", return_value=exe):
+            self.assertEqual(worker_command(Path("task/request.pickle"))[:2], [str(exe), "--psd-worker"])
 
     def test_worker_log_open_write_or_close_failure_still_drains_large_pipe(self):
         script = """

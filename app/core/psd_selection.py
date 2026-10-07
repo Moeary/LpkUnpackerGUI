@@ -132,10 +132,13 @@ def uv_region(cv2: Any, uvs: Any, indices: Any, size: tuple[int, int]) -> tuple[
 def selection_uv_constraints(
     cv2: Any, drawables: list[dict[str, Any]], selected_ids: Sequence[str],
     texture_sizes: list[tuple[int, int]],
+    *, cancelled=None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     selected = set(selected_ids)
     coverage: dict[int, np.ndarray] = {}
     for item in drawables:
+        if cancelled and cancelled():
+            raise InterruptedError("UV analysis cancelled")
         if item["id"] not in selected:
             continue
         texture_index = int(item.get("texture_index", -1))
@@ -148,6 +151,8 @@ def selection_uv_constraints(
     protected: list[dict[str, Any]] = []
     shared: list[dict[str, Any]] = []
     for item in drawables:
+        if cancelled and cancelled():
+            raise InterruptedError("UV analysis cancelled")
         texture_index = int(item.get("texture_index", -1))
         if item["id"] in selected or texture_index not in coverage:
             continue

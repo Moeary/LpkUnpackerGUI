@@ -291,7 +291,7 @@ class Live2DEditorSessionTests(unittest.TestCase):
             self.session.save_copy(self.model.parent / "unsafe")
 
     def test_existing_commands_and_original_binding_indices_survive(self):
-        data = json.loads(self.model.read_text())
+        data = json.loads(self.model.read_text(encoding="utf-8"))
         (self.model.parent / "motion.json").write_text(json.dumps({"Version": 3, "Meta": {"Duration": 2, "Fps": 30, "Loop": False},
                             "Curves": [{"Target": "Parameter", "Id": "ParamAngleY", "Segments": [0, 0, 0, 2, 1]}]}), encoding="utf-8")
         command = {"Name": "Menu", "Text": "original command",
@@ -389,7 +389,7 @@ class Live2DEditorSessionTests(unittest.TestCase):
         _motion_meta(motion)
         motion_path = self.model.parent / "motion.json"
         motion_path.write_text(json.dumps(motion, separators=(",", ":")), encoding="utf-8")
-        document = json.loads(self.model.read_text())
+        document = json.loads(self.model.read_text(encoding="utf-8"))
         document["FileReferences"]["Motions"] = {"Idle": [
             {"Name": "Menu", "Command": "start_mtn Idle#1"},
             {"File": "motion.json", "Name": "First", "PostCommand": "parameters lock drag 0"},
@@ -423,7 +423,7 @@ class Live2DEditorSessionTests(unittest.TestCase):
         self.assertEqual(native.get_keyframes("Idle[1]", "ParamAngleY", "value")["keyframes"][0]["value"], 0)
         invalid = json.loads(raw)
         invalid["Curves"][0]["Segments"] = [0, 0, 4, 2, 1]
-        (other.root / "motion.json").write_text(json.dumps(invalid))
+        (other.root / "motion.json").write_text(json.dumps(invalid), encoding="utf-8")
         with self.assertRaises(AnimationEditingError):
             create_animation_project(other.model_path)
 
@@ -515,7 +515,7 @@ class Live2DEditorSessionTests(unittest.TestCase):
         other.set_keyframes("Idle[1]", "ParamAngleY", [{"time": 0, "value": -20}])
         other.delete_motion("Idle[2]")
         saved = other.save_copy(self.root / "deleted-copy")
-        output = json.loads(Path(saved["model_path"]).read_text())
+        output = json.loads(Path(saved["model_path"]).read_text(encoding="utf-8"))
         entries = output["FileReferences"]["Motions"]["Idle"]
         self.assertEqual(entries[:2], [document["FileReferences"]["Motions"]["Idle"][0], document["FileReferences"]["Motions"]["Idle"][2]])
         self.assertEqual(entries[2]["Name"], "Shared")

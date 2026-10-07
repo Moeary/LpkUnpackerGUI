@@ -229,18 +229,18 @@ class Live2DAppearanceWorkflowTests(unittest.TestCase):
         self.assertEqual(panel.export_name_edit.currentData(), "default")
         self.assertEqual(panel.mode_combo.currentData(), "mesh")
         self.assertEqual(panel.mesh_canvas_spin.value(), 2048)
-        panel.mode_combo.setCurrentIndex(panel.mode_combo.findData("atlas-artmesh"))
+        panel.mode_combo.setCurrentIndex(panel.mode_combo.findData("atlas-components"))
         panel.mesh_canvas_spin.setValue(1024)
         panel.mesh_canvas_spin.editingFinished.emit()
         panel.texture_name_edit.setText("Remembered atlas")
         self.page.appearance_workspace.show_psd_task("repack")
         panel.save_current_project()
         saved = load_project(panel.current_project.project_file)
-        self.assertEqual(saved.data["ui_state"]["export_mode"], "atlas-artmesh")
+        self.assertEqual(saved.data["ui_state"]["export_mode"], "atlas-components")
         self.assertEqual(saved.data["ui_state"]["workflow"], "repack")
         self.assertEqual(saved.data["ui_state"]["texture_name"], "Remembered atlas")
         panel.bind_project(saved)
-        self.assertEqual(panel.mode_combo.currentData(), "atlas-artmesh")
+        self.assertEqual(panel.mode_combo.currentData(), "atlas-components")
         self.assertEqual(panel.texture_name_edit.text(), "Remembered atlas")
         self.assertEqual(panel.settings_manager.get("psd.resource_limits.mesh_max_dimension"), 1024)
 
@@ -260,7 +260,11 @@ class Live2DAppearanceWorkflowTests(unittest.TestCase):
             for path in (first, first.parent, first, first.parent):
                 page._queue_texture_reload(str(path))
             self.assertEqual(page._pending_textures, {0})
-            QTest.qWait(420)
+            # The 350 ms debounce can fire late on a loaded machine or CI runner.
+            deadline = time.monotonic() + 5
+            while not accept.call_args_list and time.monotonic() < deadline:
+                QTest.qWait(20)
+            QTest.qWait(100)
             self.assertEqual([call.args[0] for call in accept.call_args_list], [0])
             self.assertEqual(page.preview.reloads, before + 1)
             self.assertIn(str(first), page.texture_watcher.files())

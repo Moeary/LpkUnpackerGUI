@@ -1,0 +1,3 @@
+# Patches are applied to LF upstream sources; never convert them to CRLF on Windows checkouts.
+*.patch text eol=lf
+*.diff text eol=lf

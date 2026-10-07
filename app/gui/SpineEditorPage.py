@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import QPoint, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QDragEnterEvent, QDropEvent, QKeySequence, QPixmap, QShortcut
+from PySide6.QtGui import QDragEnterEvent, QDropEvent, QPixmap
 from PySide6.QtWidgets import (
     QDialog, QFileDialog, QFormLayout, QGridLayout, QHBoxLayout, QListWidgetItem,
     QFrame, QSplitter, QStackedWidget, QTreeWidgetItem, QVBoxLayout, QWidget, QSizePolicy,
@@ -23,6 +23,8 @@ from qfluentwidgets import (
 from app.core.animation_editing import AnimationEditingError
 from app.core.editor_session import BONE_FIELDS, SpineEditorSession
 from app.gui.SpinePreviewWidget import SpinePreviewWidget
+from app.gui.editor_shortcuts import EditorShortcutRouter
+from app.gui.editor_recovery import EditorRecoveryController
 from app.gui.editor_timeline import AnimationTimelineEditor
 from app.gui.editor_actions import ActionComboBox, ActionDeleteDialog, ActionNameDialog, close_editor_popup
 from app.gui.editor_dialogs import EditorMessageBox as QMessageBox
@@ -531,12 +533,9 @@ class SpineEditorPage(QWidget):
         self.atlas_inspector.replaceRequested.connect(self._replace_region)
         self.atlas_inspector.exportRequested.connect(self._export_region)
         self.preview.previewFailed.connect(self._preview_failed)
-        self._shortcuts = []
-        for key, callback in ((QKeySequence.StandardKey.Undo, self.undo), (QKeySequence.StandardKey.Redo, self.redo), (QKeySequence.StandardKey.Save, self.export_copy)):
-            shortcut = QShortcut(QKeySequence(key), self)
-            shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-            shortcut.activated.connect(callback)
-            self._shortcuts.append(shortcut)
+        self.recovery = EditorRecoveryController(self, "spine")
+        self.layout().insertWidget(1, self.recovery.bar)
+        self.shortcuts = EditorShortcutRouter(self, "spine")
         get_i18n().languageChanged.connect(self.retranslate_ui)
         self.retranslate_ui()
         self._update_actions()
@@ -1078,6 +1077,8 @@ class SpineEditorPage(QWidget):
         self.status_label.setText(_text("spine_editor.error", error=str(error)))
 
     def _update_actions(self):
+        if hasattr(self, "recovery"):
+            self.recovery.refresh()
         opened = self.session is not None
         busy = self.loading
         self.save_button.setEnabled(opened and not busy)
@@ -1105,6 +1106,7 @@ class SpineEditorPage(QWidget):
         except Exception as exc:
             self._report_error(exc)
             return False
+        self.recovery.note_saved(result["model_path"])
         self.status_label.setText(_text("spine_editor.saved", path=result["model_path"]))
         self._update_actions()
         return True
@@ -1118,6 +1120,8 @@ class SpineEditorPage(QWidget):
                                           button_texts={QMessageBox.StandardButton.Save: _text("spine_editor.save")})
             if answer == QMessageBox.StandardButton.Cancel:
                 return False
+            if answer == QMessageBox.StandardButton.Discard:
+                self.recovery.note_discard()
             if answer == QMessageBox.StandardButton.Save and not self.export_copy():
                 return False
         if self._open_worker:
@@ -1143,6 +1147,7 @@ class SpineEditorPage(QWidget):
             if isinstance(worker, _OpenWorker) and worker.session is not None:
                 worker.session.close()
                 worker.session = None
+        self.recovery.shutdown()
         self.preview.shutdown()
         if self.session:
             self.session.close()

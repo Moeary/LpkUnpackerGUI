@@ -6,6 +6,9 @@ on:
       - 'v*'  # Trigger when pushing tags like v1.0.0
   workflow_dispatch:  # Allow manual trigger
 
+permissions:
+  contents: read
+
 jobs:
   build_windows:
     name: Build Windows
@@ -45,7 +48,8 @@ jobs:
     - name: Set up pixi
       uses: prefix-dev/setup-pixi@v0.9.3
       with:
-        pixi-version: v0.61.0
+        # Keep compatible with pixi.lock format 7 and the local build environment.
+        pixi-version: v0.76.2
         cache: true
 
     - name: Set up MSVC native compiler
@@ -64,6 +68,27 @@ jobs:
           throw "The MSVC C++ compiler was not activated by msvc-dev-cmd."
         }
 
+    - name: Set up pinned Live2D MinGW toolchain
+      shell: pwsh
+      run: |
+        $url = "https://github.com/skeeto/w64devkit/releases/download/v1.23.0/w64devkit-1.23.0.zip"
+        $expectedHash = "5c7dce6762be3e0dba648a9317790444c0e2f1ef3e677315c115727d7a549539"
+        $archive = Join-Path $env:RUNNER_TEMP "w64devkit-1.23.0.zip"
+        $extractRoot = Join-Path $env:RUNNER_TEMP "live2d-toolchain"
+        Invoke-WebRequest -Uri $url -OutFile $archive
+        $actualHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actualHash -ne $expectedHash) {
+          throw "w64devkit checksum mismatch: $actualHash"
+        }
+        Expand-Archive -LiteralPath $archive -DestinationPath $extractRoot -Force
+        $toolchainBin = Join-Path $extractRoot "w64devkit/bin"
+        foreach ($tool in @("gcc", "g++", "gendef", "dlltool", "mingw32-make")) {
+          if (-not (Test-Path -LiteralPath (Join-Path $toolchainBin "$tool.exe") -PathType Leaf)) {
+            throw "Live2D build tool is missing: $tool"
+          }
+        }
+        $toolchainBin >> $env:GITHUB_PATH
+
     - name: Cache pinned Spine source archives
       uses: actions/cache@v4
       with:
@@ -73,6 +98,15 @@ jobs:
         key: spine-native-${{ hashFiles('app/core/toolchain_manifest.py', 'app/native/spine_bridge/CMakeLists.txt') }}
         restore-keys: |
           spine-native-
+
+    - name: Cache pinned Live2D source archives
+      uses: actions/cache@v4
+      with:
+        # Archives are SHA256-verified by scripts/build_live2d_native.py on every use.
+        path: |
+          runtime/tools/live2d_native/source/*.zip
+          runtime/tools/live2d_native/source/*.tar.gz
+        key: live2d-native-source-${{ hashFiles('third_party/live2d_native/SOURCE_METADATA.json') }}
 
     - name: Cache Nuitka downloads
       uses: actions/cache@v4
@@ -88,14 +122,24 @@ jobs:
       
     - name: Verify build output
       id: verify
+      shell: pwsh
       run: |
-        $exe = Get-ChildItem -Path "build" -Recurse -Filter "LpkUnpackerGUI.exe" | Select-Object -First 1
-        if (-Not $exe) {
-          Write-Error "Build failed: LpkUnpackerGUI.exe not found under build/"
-          exit 1
+        # Onefile EXE at build/, plus the payload it packs kept in build/main.dist.
+        $exe = Join-Path $PWD "build/LpkUnpackerGUI.exe"
+        $dist = Join-Path $PWD "build/main.dist"
+        if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+          throw "Build failed: onefile build/LpkUnpackerGUI.exe not found."
         }
-        echo "DIST_DIR=$($exe.Directory.FullName)" >> $env:GITHUB_OUTPUT
-        Write-Host "Build successful: $($exe.FullName)"
+        # Nuitka's Windows onefile payload holds the program as main.dll.
+        if (-not (Test-Path -LiteralPath $dist -PathType Container)) {
+          throw "Build failed: onefile payload build/main.dist not found."
+        }
+        if (-not (Test-Path -LiteralPath (Join-Path $dist "tools/AssetStudioCLI/AssetStudioModCLI.exe") -PathType Leaf)) {
+          throw "AssetStudioModCLI.exe is missing from the onefile payload."
+        }
+        echo "EXE_PATH=$exe" >> $env:GITHUB_OUTPUT
+        echo "DIST_DIR=$dist" >> $env:GITHUB_OUTPUT
+        Write-Host ("Build successful: {0} ({1:N1} MiB)" -f $exe, ((Get-Item $exe).Length / 1MB))
 
     - name: Verify bundled native artifacts
       shell: pwsh
@@ -116,29 +160,74 @@ jobs:
           throw "Release bundle must contain exactly the three required native DLLs and three licenses."
         }
     
+    - name: Smoke test onefile EXE
+      shell: pwsh
+      env:
+        QT_QPA_PLATFORM: offscreen
+      run: |
+        # Run a copy from an empty folder: it must stay up (no import crash)
+        # and keep runtime/ beside the EXE, not in its extraction directory.
+        $root = Join-Path $env:RUNNER_TEMP "smoke"
+        New-Item -ItemType Directory -Force -Path $root | Out-Null
+        $exe = Join-Path $root "LpkUnpackerGUI.exe"
+        Copy-Item -LiteralPath "${{ steps.verify.outputs.EXE_PATH }}" -Destination $exe
+        $process = Start-Process -FilePath $exe -PassThru -NoNewWindow `
+          -RedirectStandardOutput (Join-Path $root "stdout.txt") -RedirectStandardError (Join-Path $root "stderr.txt")
+        $exited = $process.WaitForExit(60000)
+        $log = Get-ChildItem -Path (Join-Path $root "runtime/log") -Filter *.log -ErrorAction SilentlyContinue | Select-Object -First 1
+        Get-Content (Join-Path $root "stdout.txt"), (Join-Path $root "stderr.txt") -ErrorAction SilentlyContinue | Select-Object -Last 40
+        if ($exited) {
+          throw "LpkUnpackerGUI.exe exited during startup with code $($process.ExitCode)."
+        }
+        Stop-Process -Id $process.Id -Force
+        if (-not $log) {
+          throw "runtime/log was not created beside the EXE."
+        }
+        if (Select-String -LiteralPath $log.FullName -Pattern "Error initializing application|Traceback" -Quiet) {
+          Get-Content -LiteralPath $log.FullName | Select-Object -Last 40
+          throw "Startup errors were logged."
+        }
+        Write-Host "Onefile EXE started and stayed up for 60 s; runtime/ is beside the EXE."
+
     - name: Package build output
       id: package
+      shell: pwsh
       run: |
         if ("${{ github.ref }}" -match '^refs/tags/(.+)$') {
           $version = $matches[1]
         } else {
           $version = "${{ github.sha }}".Substring(0, 7)
         }
-        $zipName = "LpkUnpacker-$version-windows-x64.zip"
-        Compress-Archive -Path "${{ steps.verify.outputs.DIST_DIR }}/*" -DestinationPath $zipName -CompressionLevel Optimal
-        echo "ZIP_NAME=$zipName" >> $env:GITHUB_OUTPUT
+        $exeName = "LpkUnpacker-$version-windows-x64.exe"
+        Copy-Item -LiteralPath "${{ steps.verify.outputs.EXE_PATH }}" -Destination $exeName
+        echo "EXE_NAME=$exeName" >> $env:GITHUB_OUTPUT
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: windows-x64-binary
-        path: ${{ steps.package.outputs.ZIP_NAME }}
+        path: ${{ steps.package.outputs.EXE_NAME }}
+
+    - name: Upload build logs on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-logs
+        path: |
+          build/
+          runtime/build/
+          nuitka-crash-report.xml
+          *.log
+        if-no-files-found: ignore
+        retention-days: 7
 
   release:
     name: Create Release
     needs: [build_windows]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
     - name: Download Windows artifact
       uses: actions/download-artifact@v4
@@ -149,18 +238,8 @@ jobs:
       uses: softprops/action-gh-release@v2
       with:
         files: |
-          LpkUnpacker-*-windows-x64.zip
+          LpkUnpacker-*-windows-x64.exe
         generate_release_notes: true
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    
-    - name: Upload build logs on failure
-      if: failure()
-      uses: actions/upload-artifact@v4
-      with:
-        name: build-logs
-        path: |
-          build/
-          *.log
-        retention-days: 7
 

@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.build_nuitka import ROOT, build_nuitka_args, run_msvc_build
+from scripts.build_nuitka import ROOT, build_nuitka_args, remove_intermediate_build_dirs, run_msvc_build
 
 
 class BuildNuitkaTests(unittest.TestCase):
@@ -22,6 +22,37 @@ class BuildNuitkaTests(unittest.TestCase):
         args = build_nuitka_args("msvc")
 
         self.assertIn("--assume-yes-for-downloads", args)
+
+    def test_release_is_onefile_and_keeps_dist_for_verification(self):
+        args = build_nuitka_args("msvc")
+
+        self.assertIn("--onefile", args)
+        self.assertNotIn("--standalone", args)
+        self.assertNotIn("--remove-output", args)
+
+    def test_dynamically_imported_live2d_runtime_is_bundled(self):
+        args = build_nuitka_args("msvc")
+
+        self.assertIn("--include-package=live2d.v3", args)
+        self.assertIn("--include-package-data=live2d", args)
+
+    def test_assetstudio_exe_and_dlls_are_bundled_raw(self):
+        # --include-data-dir silently skips .exe/.dll files.
+        args = build_nuitka_args("msvc")
+
+        self.assertIn("--include-raw-dir=./app/tools/AssetStudioCLI=tools/AssetStudioCLI", args)
+        self.assertFalse(any(arg.startswith("--include-data-dir=./app/tools/AssetStudioCLI") for arg in args))
+
+    def test_intermediate_cleanup_keeps_onefile_payload(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            build = Path(temporary)
+            for name in ("main.build", "main.onefile-build", "main.dist"):
+                (build / name).mkdir()
+                (build / name / "file").write_text("x", encoding="utf-8")
+
+            remove_intermediate_build_dirs(build)
+
+            self.assertEqual(sorted(path.name for path in build.iterdir()), ["main.dist"])
 
     @staticmethod
     def _write_required_native_inputs(root: Path, *, include_notices: bool = True) -> None:

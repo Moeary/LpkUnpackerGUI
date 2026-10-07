@@ -61,6 +61,8 @@ class SettingsManager:
                 "temp_dir": str(RUNTIME_TEMP_DIR),
                 "output_root": str(RUNTIME_OUTPUT_DIR),
             },
+            "editor": {"recovery": {"enabled": True, "interval": 60, "keep": 3},
+                       "shortcuts": {"live2d": {}, "spine": {}}},
             "output_paths": output_paths,
             "last_lpk_path": "",
             "last_config_path": "",
@@ -251,6 +253,16 @@ class SettingsManager:
             self._set_nested_value(latest, key, value)
             self.settings = latest
             self.save_settings()
+
+    def set_editor_preference(self, key: str, value: Any) -> bool:
+        """Persist explicit editor preferences independently of remembered paths."""
+        with _SETTINGS_WRITE_LOCK:
+            latest = self._load_latest_settings_for_update()
+            if latest is None:
+                return False
+            self._set_nested_value(latest, "editor." + key, value)
+            self.settings = latest
+            return self.save_settings()
 
     @staticmethod
     def _get_nested_value(settings: Dict[str, Any], key: str, default: Any = None) -> Any:

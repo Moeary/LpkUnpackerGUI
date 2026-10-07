@@ -333,7 +333,7 @@ class DetachedExportTests(_AppearanceFixture, unittest.TestCase):
         self.assertEqual(modified_item["Command"], "keep_displayed_command")
         self.assertEqual(modified_item["FadeInTime"], .7)
         self.assertEqual(len(result["FileReferences"]["Motions"]["Idle"]), 2)
-        self.assertEqual(json.loads((new.parent / EDITOR_MANIFEST).read_text())["pose_parameters"], {"ParamAngleY": 14})
+        self.assertEqual(json.loads((new.parent / EDITOR_MANIFEST).read_text(encoding="utf-8"))["pose_parameters"], {"ParamAngleY": 14})
         self.assertEqual(before_hashes, hashes(model.parent))
 
     def test_worker_core_is_fresh_and_not_live_session_core(self):
@@ -346,13 +346,16 @@ class DetachedExportTests(_AppearanceFixture, unittest.TestCase):
         self.session.set_parameter("ParamAngleY", 8)
         request = self.session.capture_export_snapshot()
         self.addCleanup(request.close)
+        # Patch the class, not just load_moc: constructing CubismCore needs the
+        # optional Core DLL, which clean CI checkouts do not have.
         with patch.object(self.session, "snapshot_mesh", side_effect=AssertionError("worker touched live Core")), \
-             patch("app.core.cubism_core.CubismCore.load_moc", return_value=WorkerModel()):
+             patch("app.core.cubism_core.CubismCore") as worker_core:
+            worker_core.return_value.load_moc.return_value = WorkerModel()
             with ThreadPoolExecutor(max_workers=1) as pool:
                 output = pool.submit(request.write, self.root / "worker_core").result(timeout=30)
         self.assertNotEqual(called[0][0], main_thread)
         self.assertEqual(called[0][1], {"ParamAngleY": 8})
-        self.assertEqual(json.loads((output.parent / "model.drawables.json").read_text())["parameters"], {"ParamAngleY": 8})
+        self.assertEqual(json.loads((output.parent / "model.drawables.json").read_text(encoding="utf-8"))["parameters"], {"ParamAngleY": 8})
 
     def test_snapshot_output_refuses_source_existing_and_request_release(self):
         request = self.session.capture_export_snapshot(self.root / "destination")

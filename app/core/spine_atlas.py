@@ -562,10 +562,10 @@ def writeback_spine_atlas(
         # not mathematically reversible for every possible channel value, and
         # for transparent pixels that may intentionally carry hidden RGB.
         packed_reference = packed_source
-        raw_pixels = list(packed_original.getdata())
-        new_pixels = list(packed_straight.getdata())
-        reference_pixels = list(packed_reference.getdata())
-        packed_pixels = list(packed.getdata())
+        raw_pixels = list(packed_original.get_flattened_data())
+        new_pixels = list(packed_straight.get_flattened_data())
+        reference_pixels = list(packed_reference.get_flattened_data())
+        packed_pixels = list(packed.get_flattened_data())
         for pixel_index, (new_pixel, reference_pixel) in enumerate(zip(new_pixels, reference_pixels)):
             if new_pixel == reference_pixel:
                 packed_pixels[pixel_index] = raw_pixels[pixel_index]
@@ -1338,8 +1338,8 @@ def _apply_edit(target: Image.Image, edit: AtlasEditLayer, region: AtlasRegion) 
     mask = image.getchannel("A")
     if edit.opacity != 1.0:
         mask = _scale_alpha(Image.merge("RGBA", (mask, mask, mask, mask)), edit.opacity).getchannel("A")
-    pixels = list(target.getdata())
-    masks = list(mask.getdata())
+    pixels = list(target.get_flattened_data())
+    masks = list(mask.get_flattened_data())
     width = target.width
     for yy in range(image.height):
         for xx in range(image.width):
@@ -1437,7 +1437,7 @@ def _scale_alpha(image: Image.Image, opacity: float) -> Image.Image:
 
 
 def _unpremultiply(image: Image.Image) -> Image.Image:
-    pixels = list(image.convert("RGBA").getdata())
+    pixels = list(image.convert("RGBA").get_flattened_data())
     result = []
     for red, green, blue, alpha in pixels:
         if alpha == 0:
@@ -1457,7 +1457,7 @@ def _unpremultiply(image: Image.Image) -> Image.Image:
 
 
 def _premultiply(image: Image.Image) -> Image.Image:
-    pixels = list(image.convert("RGBA").getdata())
+    pixels = list(image.convert("RGBA").get_flattened_data())
     result = []
     for red, green, blue, alpha in pixels:
         result.append(

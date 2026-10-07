@@ -1,0 +1,42 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+      - dev
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unittest:
+    name: Unit tests (Windows)
+    runs-on: windows-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up pixi
+      uses: prefix-dev/setup-pixi@v0.9.3
+      with:
+        # Keep in sync with build-release.yml (pixi.lock format 7).
+        pixi-version: v0.76.2
+        cache: true
+
+    - name: Check sources
+      run: pixi run check
+
+    - name: Run unit tests
+      # Native runtimes are not built here; tests that need them fall back or skip.
+      # A few failed tests are retried once; ones that pass on retry are reported as flaky.
+      run: pixi run test
