@@ -130,7 +130,8 @@ jobs:
         if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
           throw "Build failed: onefile build/LpkUnpackerGUI.exe not found."
         }
-        if (-not (Test-Path -LiteralPath (Join-Path $dist "LpkUnpackerGUI.exe") -PathType Leaf)) {
+        # Nuitka's Windows onefile payload holds the program as main.dll.
+        if (-not (Test-Path -LiteralPath $dist -PathType Container)) {
           throw "Build failed: onefile payload build/main.dist not found."
         }
         if (-not (Test-Path -LiteralPath (Join-Path $dist "tools/AssetStudioCLI/AssetStudioModCLI.exe") -PathType Leaf)) {
@@ -159,6 +160,35 @@ jobs:
           throw "Release bundle must contain exactly the three required native DLLs and three licenses."
         }
     
+    - name: Smoke test onefile EXE
+      shell: pwsh
+      env:
+        QT_QPA_PLATFORM: offscreen
+      run: |
+        # Run a copy from an empty folder: it must stay up (no import crash)
+        # and keep runtime/ beside the EXE, not in its extraction directory.
+        $root = Join-Path $env:RUNNER_TEMP "smoke"
+        New-Item -ItemType Directory -Force -Path $root | Out-Null
+        $exe = Join-Path $root "LpkUnpackerGUI.exe"
+        Copy-Item -LiteralPath "${{ steps.verify.outputs.EXE_PATH }}" -Destination $exe
+        $process = Start-Process -FilePath $exe -PassThru -NoNewWindow `
+          -RedirectStandardOutput (Join-Path $root "stdout.txt") -RedirectStandardError (Join-Path $root "stderr.txt")
+        $exited = $process.WaitForExit(60000)
+        $log = Get-ChildItem -Path (Join-Path $root "runtime/log") -Filter *.log -ErrorAction SilentlyContinue | Select-Object -First 1
+        Get-Content (Join-Path $root "stdout.txt"), (Join-Path $root "stderr.txt") -ErrorAction SilentlyContinue | Select-Object -Last 40
+        if ($exited) {
+          throw "LpkUnpackerGUI.exe exited during startup with code $($process.ExitCode)."
+        }
+        Stop-Process -Id $process.Id -Force
+        if (-not $log) {
+          throw "runtime/log was not created beside the EXE."
+        }
+        if (Select-String -LiteralPath $log.FullName -Pattern "Error initializing application|Traceback" -Quiet) {
+          Get-Content -LiteralPath $log.FullName | Select-Object -Last 40
+          throw "Startup errors were logged."
+        }
+        Write-Host "Onefile EXE started and stayed up for 60 s; runtime/ is beside the EXE."
+
     - name: Package build output
       id: package
       shell: pwsh

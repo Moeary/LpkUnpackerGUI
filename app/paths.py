@@ -28,16 +28,31 @@ def project_root() -> Path:
     return BUNDLE_ROOT
 
 
+def self_executable() -> Path:
+    """Binary of the running process, for starting worker processes.
+
+    Nuitka reports ``sys.executable`` as a ``python.exe`` beside the program
+    that does not exist, so packaged builds ask Windows for the image path.
+    """
+    if is_packaged() and sys.platform == "win32":
+        import ctypes
+
+        buffer = ctypes.create_unicode_buffer(32768)
+        if ctypes.windll.kernel32.GetModuleFileNameW(None, buffer, len(buffer)):
+            return Path(buffer.value)
+    return Path(sys.executable)
+
+
 def app_executable() -> Path:
     """Command that relaunches the app from outside this process tree.
 
-    In onefile builds ``sys.executable`` is the extracted inner binary, which
-    disappears on exit, so persistent configs must point at the outer EXE.
+    Onefile builds run from a temporary extraction directory that disappears
+    on exit, so persistent configs (MCP clients) must name the outer EXE.
     """
     original = getattr(_COMPILED, "original_argv0", None)
     if original:
         return Path(original).resolve()
-    return Path(sys.executable)
+    return self_executable()
 
 
 PROJECT_ROOT = project_root()

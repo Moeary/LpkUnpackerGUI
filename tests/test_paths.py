@@ -29,6 +29,17 @@ class PackagedPathTests(unittest.TestCase):
             self.assertEqual(paths.project_root(), outer.resolve())
             self.assertEqual(paths.app_executable(), (outer / "LpkUnpackerGUI.exe").resolve())
 
+    @unittest.skipUnless(sys.platform == "win32", "Windows process image lookup")
+    def test_packaged_self_executable_is_the_real_process_image(self):
+        # Nuitka sets sys.executable to a python.exe that does not exist.
+        with patch.object(paths, "_COMPILED", SimpleNamespace(containing_dir=None, original_argv0=None)), \
+             patch.object(sys, "executable", r"C:\missing\python.exe"):
+            image = paths.self_executable()
+            self.assertTrue(image.is_file())
+            self.assertNotEqual(image, Path(r"C:\missing\python.exe"))
+            # Without original_argv0 (standalone), MCP configs use the image too.
+            self.assertEqual(paths.app_executable(), image)
+
     def test_bundled_assets_are_read_from_the_bundle(self):
         self.assertEqual(paths.ASSETS_DIR, paths.BUNDLE_ROOT / "assets")
         self.assertTrue((paths.ASSETS_DIR / "app" / "icon.ico").is_file())

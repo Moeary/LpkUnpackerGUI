@@ -113,6 +113,11 @@ def build_nuitka_args(compiler: str, *, require_native: bool = False) -> list[st
         "--include-package=psd_tools",
         "--include-module=app.core.psd_worker",
         "--include-distribution-metadata=live2d-py",
+        # live2d_preview_native imports live2d.v3 via importlib after picking
+        # the overlay, so Nuitka cannot see it; without this the EXE fails at
+        # startup with "No module named 'live2d.v3'".
+        "--include-package=live2d.v3",
+        "--include-package-data=live2d",
         "--include-package=mcp",
         "--include-package=uvicorn",
         "--windows-icon-from-ico=assets/app/icon.ico",

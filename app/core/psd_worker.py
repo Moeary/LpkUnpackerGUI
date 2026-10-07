@@ -55,8 +55,10 @@ def _archive_failure(job_dir: Path, code: int | None) -> Path | None:
 
 
 def worker_command(job_file: Path) -> list[str]:
-    if getattr(sys, "frozen", False) or "__compiled__" in globals():
-        return [sys.executable, "--psd-worker", "--job-file", str(job_file)]
+    from app.paths import is_packaged, self_executable
+
+    if is_packaged():
+        return [str(self_executable()), "--psd-worker", "--job-file", str(job_file)]
     return [sys.executable, "-u", "-m", "app.main", "--psd-worker", "--job-file", str(job_file)]
 
 

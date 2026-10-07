@@ -30,6 +30,12 @@ class BuildNuitkaTests(unittest.TestCase):
         self.assertNotIn("--standalone", args)
         self.assertNotIn("--remove-output", args)
 
+    def test_dynamically_imported_live2d_runtime_is_bundled(self):
+        args = build_nuitka_args("msvc")
+
+        self.assertIn("--include-package=live2d.v3", args)
+        self.assertIn("--include-package-data=live2d", args)
+
     def test_assetstudio_exe_and_dlls_are_bundled_raw(self):
         # --include-data-dir silently skips .exe/.dll files.
         args = build_nuitka_args("msvc")
