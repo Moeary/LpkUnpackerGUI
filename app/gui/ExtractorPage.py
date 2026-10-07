@@ -6,7 +6,6 @@ import tempfile
 from PySide6.QtCore import Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
-    QApplication,
     QFileDialog,
     QAbstractItemView,
     QFrame,
@@ -30,6 +29,7 @@ from qfluentwidgets import (
     PrimaryPushButton,
     ProgressBar,
     PushButton,
+    StrongBodyLabel,
     SubtitleLabel,
     TableWidget,
     TextEdit,
@@ -42,6 +42,7 @@ from app.core.spine_converter import SpineConversionOptions
 from app.core.extract import ExtractSourceType, ExtractTaskPlan, analyze_sources, scan_package_folder
 from app.core.extractor_thread import ExtractorThread
 from app.i18n import get_i18n, tr
+from app.gui.typography import CardTitleLabel
 
 
 UNITY_SOURCE_EXTENSIONS = {
@@ -216,9 +217,12 @@ class ExtractorPage(QFrame):
         input_layout.setContentsMargins(14, 14, 14, 14)
         input_layout.setSpacing(10)
 
+        # Field captions sit above their row so the path field keeps the
+        # card width; side-by-side captions squeezed it to a few characters.
+        self.file_label = StrongBodyLabel("", self)
+        input_layout.addWidget(self.file_label)
         self.file_layout = QHBoxLayout()
         self.file_layout.setAlignment(Qt.AlignVCenter)
-        self.file_label = SubtitleLabel("", self)
         self.file_edit = DropPathLineEdit(self)
         self.file_edit.setReadOnly(True)
         self.file_edit.pathsDropped.connect(self.analyze_input_paths)
@@ -230,22 +234,21 @@ class ExtractorPage(QFrame):
         self.folder_button.setIcon(FluentIcon.FOLDER_ADD)
         self.folder_button.clicked.connect(self.browse_folder)
 
-        self.file_layout.addWidget(self.file_label)
         self.file_layout.addWidget(self.file_edit, 1)
         self.file_layout.addWidget(self.file_button)
         self.file_layout.addWidget(self.folder_button)
         input_layout.addLayout(self.file_layout)
 
+        self.output_label = StrongBodyLabel("", self)
+        input_layout.addWidget(self.output_label)
         self.output_layout = QHBoxLayout()
         self.output_layout.setAlignment(Qt.AlignVCenter)
-        self.output_label = SubtitleLabel("", self)
         self.output_edit = LineEdit(self)
         self.output_edit.setText(self.default_output_dir)
         self.output_edit.setCursorPosition(0)
         self.output_button = PushButton("", self)
         self.output_button.setIcon(FluentIcon.FOLDER)
         self.output_button.clicked.connect(self.browse_output)
-        self.output_layout.addWidget(self.output_label)
         self.output_layout.addWidget(self.output_edit, 1)
         self.output_layout.addWidget(self.output_button)
         input_layout.addLayout(self.output_layout)
@@ -280,7 +283,7 @@ class ExtractorPage(QFrame):
         self.progress_bar.setFixedHeight(self.PROGRESS_HEIGHT)
         action_layout.addWidget(self.progress_bar)
 
-        self.summary_label = SubtitleLabel("", self)
+        self.summary_label = CardTitleLabel("", self)
         self.summary_label.setVisible(False)
         action_layout.addWidget(self.summary_label)
 
@@ -314,7 +317,7 @@ class ExtractorPage(QFrame):
         self.log_card_layout.setSpacing(10)
         self.log_header_layout = QHBoxLayout()
         self.log_header_layout.setSpacing(10)
-        self.log_label = SubtitleLabel("", self.log_card)
+        self.log_label = CardTitleLabel("", self.log_card)
         self.clear_log_button = PushButton("", self)
         self.clear_log_button.setIcon(FluentIcon.REMOVE)
         self.log_header_layout.addWidget(self.log_label, 1)
@@ -340,7 +343,7 @@ class ExtractorPage(QFrame):
 
         self.task_header_layout = QHBoxLayout()
         self.task_header_layout.setSpacing(10)
-        self.task_title_label = SubtitleLabel("", self.right_panel)
+        self.task_title_label = CardTitleLabel("", self.right_panel)
         self.task_header_layout.addWidget(self.task_title_label, 1)
 
         self.deep_analyze_button = PushButton("", self.right_panel)
@@ -409,9 +412,8 @@ class ExtractorPage(QFrame):
         for widget in input_controls:
             widget.setFixedHeight(self.CONTROL_HEIGHT)
 
-        self.file_button.setMinimumWidth(112)
-        self.folder_button.setMinimumWidth(126)
-        self.output_button.setMinimumWidth(112)
+        self.file_edit.setMinimumWidth(140)
+        self.output_edit.setMinimumWidth(140)
 
         for button in (
             self.extract_button,
@@ -422,8 +424,11 @@ class ExtractorPage(QFrame):
         ):
             button.setFixedHeight(self.ACTION_HEIGHT)
 
+        # An explicit minimum replaces the button's own text-based minimum,
+        # so never set one narrower than the current label needs.
         for button in self.findChildren(PushButton):
-            button.setMinimumWidth(96)
+            button.setMinimumWidth(0)
+            button.setMinimumWidth(max(96, button.sizeHint().width()))
 
         self.progress_bar.setFixedHeight(self.PROGRESS_HEIGHT)
 
@@ -466,6 +471,8 @@ class ExtractorPage(QFrame):
                 tr("extractor.task_output"),
             ]
         )
+        # Button widths follow their translated labels.
+        self.apply_compact_metrics()
 
     def on_images_only_changed(self, state):
         self.config_manager.set_extract_images_only(state == Qt.Checked)
@@ -998,12 +1005,6 @@ class ExtractorPage(QFrame):
     def updateUIScale(self, window_width, window_height):
         scale_factor = max(1.0, window_width / 1000.0)
         self.apply_compact_metrics()
-
-        font = QApplication.instance().font()
-        for label in self.findChildren(SubtitleLabel):
-            label_font = label.font()
-            label_font.setPointSize(font.pointSize() + 2)
-            label.setFont(label_font)
 
         self.log_text.setMinimumHeight(int(200 * scale_factor))
         self.progress_bar.setFixedHeight(self.PROGRESS_HEIGHT)

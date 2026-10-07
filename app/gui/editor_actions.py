@@ -75,7 +75,7 @@ class ActionComboBox(EditableComboBox):
             return
         previous = self._selected_index
         self._selected_index = self._currentIndex = index
-        self.setText(self.items[index].text)
+        self._show_selected_text()
         if previous != index:
             self.currentIndexChanged.emit(index)
 
@@ -117,12 +117,29 @@ class ActionComboBox(EditableComboBox):
 
     def focusOutEvent(self, event):  # noqa: N802
         if self.currentIndex() >= 0 and not self.dropMenu:
-            self.setText(self.items[self.currentIndex()].text)
+            self._show_selected_text()
         super().focusOutEvent(event)
+
+    def _show_selected_text(self):
+        """Show the selected action from its first character.
+
+        setText leaves the cursor at the end, so a name wider than the field
+        scrolled its start out of view; the tooltip keeps the full name.
+        """
+
+        self.setText(self.items[self._selected_index].text)
+        self.setCursorPosition(0)
+        self._update_tooltip()
+
+    def _update_tooltip(self):
+        hint = action_text("editor.actions.search")
+        if 0 <= self._selected_index < self.count():
+            hint = self.items[self._selected_index].text + "\n" + hint
+        self.setToolTip(hint)
 
     def retranslate_ui(self):
         self.setPlaceholderText(action_text("editor.actions.search"))
-        self.setToolTip(action_text("editor.actions.search"))
+        self._update_tooltip()
         self.setAccessibleName(action_text("editor.actions.search"))
 
 

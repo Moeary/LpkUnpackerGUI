@@ -78,11 +78,11 @@ class ComparisonCanvas(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#353940"))
+        painter.fillRect(self.rect(), QColor("#353535"))
         for y in range(0, self.height(), 18):
             for x in range(0, self.width(), 18):
                 if (x // 18 + y // 18) % 2 == 0:
-                    painter.fillRect(x, y, 18, 18, QColor("#424750"))
+                    painter.fillRect(x, y, 18, 18, QColor("#424242"))
         if self.view is None:
             return
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, self.zoom <= 1)

@@ -37,8 +37,11 @@ from app.gui.editor_recovery import EditorRecoveryController
 from app.gui.editor_timeline import AnimationTimelineEditor
 from app.gui.editor_actions import ActionComboBox, ActionDeleteDialog, ActionNameDialog, action_text, close_editor_popup
 from app.gui.editor_dialogs import EditorMessageBox as QMessageBox, EditorTextDialog, ThemedEditorDialog as MessageBoxBase
-from app.gui.editor_workspace import EditorComboBox, EditorViewportLayout, EditorWorkspace, FluentEditorTabs
+from app.gui.editor_workspace import (
+    PANEL_CORNER_RESERVE, EditorComboBox, EditorViewportLayout, EditorWorkspace, FluentEditorTabs,
+)
 from app.i18n import get_i18n, tr
+from app.gui.theme import transparent_scroll_area
 
 
 LIVE2D_EDITOR_TEXT = {
@@ -185,6 +188,8 @@ class Live2DEditorPage(QFrame):
         self._atlas_preview_paths = None
         self._atlas_preview_label = ""
         self._binding_projects = False
+        # (session, psd dir) of a PSD base the Appearance tab is preparing by itself.
+        self._auto_psd_base = None
         self.last_open_error = ""
         self._refreshing = False
         self._active = False
@@ -273,7 +278,8 @@ class Live2DEditorPage(QFrame):
         self.selection_toolbar = QWidget(self.stage)
         self.selection_toolbar.setFixedHeight(32)
         selection_layout = QHBoxLayout(self.selection_toolbar)
-        selection_layout.setContentsMargins(6, 0, 6, 0)
+        # Keep clear of the panel's hide button in the top-right corner.
+        selection_layout.setContentsMargins(6, 0, PANEL_CORNER_RESERVE, 0)
         selection_layout.setSpacing(4)
         self.point_select_button = TransparentToggleToolButton(FluentIcon.EDIT, self.selection_toolbar)
         self.rect_select_button = TransparentToggleToolButton(FluentIcon.FULL_SCREEN, self.selection_toolbar)
@@ -295,7 +301,7 @@ class Live2DEditorPage(QFrame):
         self.preview_toolbar = QWidget(self.stage)
         self.preview_toolbar.setFixedHeight(32)
         preview_toolbar_layout = QHBoxLayout(self.preview_toolbar)
-        preview_toolbar_layout.setContentsMargins(6, 0, 6, 0)
+        preview_toolbar_layout.setContentsMargins(6, 0, PANEL_CORNER_RESERVE, 0)
         self.preview_context_label = CaptionLabel(self.preview_toolbar)
         self.preview_context_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.return_model_button = PushButton(self.preview_toolbar)
@@ -687,7 +693,7 @@ class Live2DEditorPage(QFrame):
         self.texture_scroll.setFrameShape(QFrame.NoFrame)
         self.texture_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.texture_scroll.setWidget(content)
-        self.texture_scroll.enableTransparentBackground()
+        transparent_scroll_area(self.texture_scroll)
         self.texture_tab.watch_drop_surface(self.texture_scroll.viewport())
         self.texture_tab.watch_drop_surface(self.texture_image)
         layout.addWidget(self.texture_scroll)
@@ -913,10 +919,23 @@ class Live2DEditorPage(QFrame):
 
     def _psd_project_changed(self, project):
         if self.session and not self._binding_projects:
-            self.session.bind_psd_project(project)
-            if self.psd_panel._project_dirty:
-                self.session.mark_project_changed()
+            pending = self._auto_psd_base
+            automatic = (pending is not None and pending[0] is self.session and project is not None
+                         and Path(project.project_dir).resolve() == pending[1])
+            if automatic:
+                # Opening the Appearance tab prepares this base by itself;
+                # it is not an edit, so it must not ask the user to save.
+                self._auto_psd_base = None
+                with self.session.preserve_clean_state():
+                    self._bind_psd_project_change(project)
+            else:
+                self._bind_psd_project_change(project)
             self._update_actions()
+
+    def _bind_psd_project_change(self, project):
+        self.session.bind_psd_project(project)
+        if self.psd_panel._project_dirty:
+            self.session.mark_project_changed()
 
     def _mod_project_changed(self, project):
         if self.session and not self._binding_projects:
@@ -2868,8 +2887,10 @@ class Live2DEditorPage(QFrame):
         if not callable(begin):
             return False
         request = self._psd_export_snapshot_request()
+        target = self.session.root / "psd"
         try:
-            if begin(request, self.session.root / "psd", project_name="psd"):
+            if begin(request, target, project_name="psd"):
+                self._auto_psd_base = (self.session, target.resolve())
                 return True
         except Exception as exc:
             self._error(exc)

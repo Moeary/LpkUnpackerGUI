@@ -36,7 +36,7 @@ def _style_dialog_button(button):
     setCustomStyleSheet(
         button,
         "QPushButton:disabled { color: #596575; background-color: #e3e9f0; border: 1px solid #c7d0dc; }",
-        "QPushButton:disabled { color: #a4afbf; background-color: #303641; border: 1px solid #596575; }",
+        "QPushButton:disabled { color: #a0a0a0; background-color: #3b3b3b; border: 1px solid #5a5a5a; }",
     )
 
 

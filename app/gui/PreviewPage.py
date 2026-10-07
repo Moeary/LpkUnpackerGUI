@@ -72,7 +72,9 @@ from app.gui.Live2DPreviewWindow import Live2DPreviewWindow
 from app.gui.SpinePreviewWidget import SpinePreviewWidget
 from app.gui.editor_workspace import EditorTabs, EditorViewportLayout, EditorComboBox
 from app.i18n import get_i18n, tr
+from app.gui.theme import transparent_scroll_area
 from app.paths import is_packaged, self_executable
+from app.gui.typography import CardTitleLabel
 
 
 PREVIEW_LAYOUT_TEXT = {
@@ -242,7 +244,7 @@ class DragDropArea(QFrame):
                 background: palette(alternate-base);
             }
             DragDropArea:hover {
-                border-color: #00A6B3;
+                border-color: palette(highlight);
                 background: palette(base);
             }
         """)
@@ -338,12 +340,12 @@ class DragDropArea(QFrame):
     def _set_drag_active_style(self):
         self.setStyleSheet("""
             DragDropArea {
-                border: 2px solid #00A6B3;
+                border: 2px solid palette(highlight);
                 border-radius: 8px;
                 background: palette(base);
             }
             DragDropArea:hover {
-                border-color: #00A6B3;
+                border-color: palette(highlight);
                 background: palette(base);
             }
         """)
@@ -357,7 +359,7 @@ class DragDropArea(QFrame):
                 background: palette(alternate-base);
             }
             DragDropArea:hover {
-                border-color: #00A6B3;
+                border-color: palette(highlight);
                 background: palette(base);
             }
         """)
@@ -967,6 +969,7 @@ class Live2DSettingsPanel(QFrame):
         scroll_layout.addStretch()
 
         scroll.setWidget(scroll_widget)
+        transparent_scroll_area(scroll)
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.enableTransparentBackground()
@@ -981,7 +984,7 @@ class Live2DSettingsPanel(QFrame):
         layout.setSpacing(10)
 
         # 组标题
-        self.window_group_title = SubtitleLabel("", group)
+        self.window_group_title = CardTitleLabel("", group)
         layout.addWidget(self.window_group_title)
 
         # 窗口大小设置
@@ -1063,7 +1066,7 @@ class Live2DSettingsPanel(QFrame):
         layout.setSpacing(10)
 
         # 组标题
-        self.model_group_title = SubtitleLabel("", group)
+        self.model_group_title = CardTitleLabel("", group)
         layout.addWidget(self.model_group_title)
 
         # 模型旋转
@@ -1211,7 +1214,7 @@ class Live2DSettingsPanel(QFrame):
         layout.setSpacing(8)
 
         # 组标题
-        self.interaction_group_title = SubtitleLabel("", group)
+        self.interaction_group_title = CardTitleLabel("", group)
         layout.addWidget(self.interaction_group_title)
 
         # 交互选项
@@ -1239,7 +1242,7 @@ class Live2DSettingsPanel(QFrame):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
 
-        self.advanced_group_title = SubtitleLabel("", group)
+        self.advanced_group_title = CardTitleLabel("", group)
         layout.addWidget(self.advanced_group_title)
 
         self.advanced_enable_check = CheckBox("", group)
@@ -1694,6 +1697,7 @@ class SpineAnimationControls(CardWidget):
         inner_layout.addStretch(1)
 
         scroll.setWidget(inner)
+        transparent_scroll_area(scroll)
         layout.addWidget(scroll, 1)
         self._time_max = 0.0
         self._ready = False
@@ -1837,6 +1841,8 @@ class PreviewPage(QFrame):
         self.preview_dock_area = None
         self.preview_dock_layout = None
         self.preview_placeholder = None
+        # True while the stage shows its default "nothing loaded" message.
+        self._stage_idle = True
         self.spine_preview = None
         self.spine_controls = None
         self.motion_group_title = None
@@ -2099,7 +2105,7 @@ class PreviewPage(QFrame):
         right_layout.setContentsMargins(12, 10, 0, 0)
         right_layout.setSpacing(10)
 
-        self.preview_stage_title = SubtitleLabel("", self)
+        self.preview_stage_title = CardTitleLabel("", self)
         right_layout.addWidget(self.preview_stage_title)
 
         self.preview_stage = QFrame(self)
@@ -2163,6 +2169,8 @@ class PreviewPage(QFrame):
         self.preview_placeholder.setAlignment(Qt.AlignCenter)
         self.preview_placeholder.setWordWrap(True)
         self.preview_placeholder.setStyleSheet("color: palette(placeholder-text);")
+        # Its visibility tells whether the stage holds anything to close.
+        self.preview_placeholder.installEventFilter(self)
         self.preview_dock_layout.addWidget(self.preview_placeholder, 1)
 
         self.image_preview_panel = ImagePreviewPanel(self.preview_dock_area)
@@ -2198,7 +2206,13 @@ class PreviewPage(QFrame):
         self.empty_details = BodyLabel(action_widget)
         self.empty_details.setWordWrap(True)
         self.empty_details.setAlignment(Qt.AlignCenter)
-        self.resource_details_stack.addWidget(self.empty_details)
+        # Show the empty state on a card like the source panel, instead of a
+        # sentence floating on the page background.
+        self.empty_details_card = CardWidget(action_widget)
+        empty_layout = QVBoxLayout(self.empty_details_card)
+        empty_layout.setContentsMargins(16, 16, 16, 16)
+        empty_layout.addWidget(self.empty_details)
+        self.resource_details_stack.addWidget(self.empty_details_card)
         self.resource_details_stack.addWidget(self.image_item_list)
         self.live2d_details = EditorTabs(action_widget)
         self.spine_details = EditorTabs(action_widget)
@@ -2214,7 +2228,7 @@ class PreviewPage(QFrame):
         motion_layout = QVBoxLayout(self.motion_group)
         motion_layout.setContentsMargins(12, 12, 12, 12)
         motion_layout.setSpacing(8)
-        self.motion_group_title = SubtitleLabel("", self.motion_group)
+        self.motion_group_title = CardTitleLabel("", self.motion_group)
         motion_layout.addWidget(self.motion_group_title)
         self.motion_combo = EditableComboBox(self.motion_group)
         self.motion_combo.setClearButtonEnabled(True)
@@ -2275,7 +2289,7 @@ class PreviewPage(QFrame):
         pose_layout = QVBoxLayout(self.pose_controls_card)
         pose_layout.setContentsMargins(12, 12, 12, 12)
         pose_layout.setSpacing(8)
-        self.pose_controls_title = SubtitleLabel("", self.pose_controls_card)
+        self.pose_controls_title = CardTitleLabel("", self.pose_controls_card)
         pose_layout.addWidget(self.pose_controls_title)
         self.freeze_motion_check = CheckBox("", self.pose_controls_card)
         self.freeze_motion_check.toggled.connect(self._on_pose_freeze_toggled)
@@ -2455,7 +2469,7 @@ class PreviewPage(QFrame):
         if mode != self._resource_mode and mode != "live2d":
             self._clear_live2d_controls()
         self._resource_mode = mode
-        pages = {"empty": self.empty_details, "image": self.image_item_list,
+        pages = {"empty": self.empty_details_card, "image": self.image_item_list,
                  "live2d": self.live2d_details, "spine": self.spine_details}
         self.resource_details_stack.setCurrentWidget(pages[mode])
         for widget in (self.motion_group, self.pose_controls_card, self.advanced_panel):
@@ -3183,7 +3197,26 @@ class PreviewPage(QFrame):
         self._last_preview_dock_rect = None
         self._set_motion_debug_visible(False)
 
+    def eventFilter(self, obj, event):  # noqa: N802
+        if obj is self.preview_placeholder and event.type() in (QEvent.Type.Show, QEvent.Type.Hide):
+            self._sync_close_buttons()
+        return super().eventFilter(obj, event)
+
+    def _sync_close_buttons(self):
+        """Close is useless on the idle stage; keep it for content, loading and errors.
+
+        A loading or error message also counts: closing cancels the import
+        or clears the message.
+        """
+
+        placeholder = self.preview_placeholder
+        idle = bool(self._stage_idle and placeholder is not None and placeholder.isVisibleTo(self))
+        for button in (self.close_all_btn, self.preview_stage_close_btn):
+            if button is not None:
+                button.setEnabled(not idle)
+
     def _show_stage_placeholder(self, text: str | None = None, *, keep_editor_source=False):
+        self._stage_idle = text is None and not keep_editor_source
         if not keep_editor_source:
             self._set_editor_source()
         self._set_resource_mode("live2d" if keep_editor_source else "empty")
@@ -3196,6 +3229,7 @@ class PreviewPage(QFrame):
         if self.preview_placeholder:
             self.preview_placeholder.setText(text or tr("preview.stage_empty"))
             self.preview_placeholder.setVisible(True)
+        self._sync_close_buttons()
 
     def _show_image_stage(self):
         self._set_editor_source()

@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from PySide6.QtCore import QEvent, QItemSelectionModel, QPointF, QRectF, QSignalBlocker, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPen, QPixmap, QPolygonF, QTransform
+from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPalette, QPen, QPixmap, QPolygonF, QTransform
 from PySide6.QtWidgets import (
     QDialog,
     QAbstractItemView,
@@ -41,6 +41,7 @@ from qfluentwidgets import (
 )
 
 from app.i18n import get_i18n, tr
+from app.gui.theme import transparent_scroll_area
 from app.gui.editor_workspace import FluentEditorTabs, EditorViewportLayout
 from app.gui.editor_dialogs import ThemedEditorDialog
 from app.gui.live2d_selection import SelectionScene, barycentric, combine_selection, intersect_convex
@@ -278,7 +279,7 @@ class _MeshCanvas(QWidget):
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.fillRect(self.rect(), self.palette().window())
+        painter.fillRect(self.rect(), self.palette().base())
         scale, offset_x, offset_y = self._transform()
         width, height = self.source_size
         target = QRectF(offset_x, offset_y, width * scale, height * scale)
@@ -302,8 +303,10 @@ class _MeshCanvas(QWidget):
             else:
                 painter.drawPixmap(target, self.pixmap, QRectF(self.pixmap.rect()))
         elif self.mode == "atlas":
-            painter.setPen(QPen(QColor("#697483"), 1))
-            painter.drawText(target, Qt.AlignmentFlag.AlignCenter, tr("psd.inspector.texture_missing"))
+            painter.setPen(QPen(self.palette().color(QPalette.ColorRole.PlaceholderText), 1))
+            # With nothing loaded there is no texture to miss; say so plainly.
+            key = "psd.inspector.texture_missing" if self.entries else "psd.inspector.no_entries"
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, tr(key))
         else:
             painter.setPen(QPen(QColor("#697483"), 1))
             painter.drawRect(target)
@@ -643,6 +646,7 @@ class ArtMeshInspector(QWidget):
 
             self.list_panel = QWidget(self.splitter)
             self.list_panel.setMinimumWidth(76)
+            self.list_panel.setBackgroundRole(QPalette.ColorRole.Base)
             self.list_panel.setAutoFillBackground(True)
             self.list_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
             list_layout = QVBoxLayout(self.list_panel)
@@ -675,7 +679,7 @@ class ArtMeshInspector(QWidget):
             self.entry_list.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
             self.entry_list.setTextElideMode(Qt.TextElideMode.ElideRight)
             self.entry_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-            surface_qss = "QListWidget { background: palette(window); border: none; }"
+            surface_qss = "QListWidget { background: palette(base); border: none; }"
             setCustomStyleSheet(self.entry_list, surface_qss, surface_qss)
             list_layout.addWidget(self.entry_list, 1)
 
@@ -688,7 +692,6 @@ class ArtMeshInspector(QWidget):
             self.editor_details_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             self.editor_details_scroll.setMinimumSize(0, 116)
             self.editor_details_scroll.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
-            self.editor_details_scroll.enableTransparentBackground()
             self.view_splitter.addWidget(self.editor_details_scroll)
             self.view_splitter.setChildrenCollapsible(False)
             self.view_splitter.setStretchFactor(0, 3)
@@ -700,14 +703,16 @@ class ArtMeshInspector(QWidget):
             self.splitter.setHandleWidth(6)
             self.splitter.setStretchFactor(0, 0)
             self.splitter.setStretchFactor(1, 1)
-            self.splitter.setSizes([132, 310])
+            # The list is the primary control; give its search field room.
+            self.splitter.setSizes([200, 300])
             self.view_splitter.setMinimumWidth(0)
             self.view_splitter.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
             self.atlas_frame.setMinimumSize(0, 120)
             self.atlas_frame.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
+            self.atlas_frame.setBackgroundRole(QPalette.ColorRole.Base)
             self.atlas_frame.setAutoFillBackground(True)
             self.atlas_canvas.setMinimumWidth(0)
-            self._uv_saved_sizes = [132, 310]
+            self._uv_saved_sizes = [200, 300]
             self.splitter.splitterMoved.connect(self._uv_splitter_moved)
             self.atlas_title_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
             self._atlas_layout.insertWidget(0, self.atlas_title_label)
@@ -726,6 +731,7 @@ class ArtMeshInspector(QWidget):
                 old.setParent(self)
             self._editor_details_widget = details_widget
             self.editor_details_scroll.setWidget(details_widget)
+            transparent_scroll_area(self.editor_details_scroll)
             details_widget.show()
 
     def uv_preview_visible(self) -> bool:
@@ -1272,13 +1278,13 @@ class ArtMeshInspector(QWidget):
         self.overview_scroll.setWidgetResizable(True)
         self.overview_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.overview_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.overview_scroll.enableTransparentBackground()
         self.overview_body = QWidget()
         self.overview_grid = QGridLayout(self.overview_body)
         self.overview_grid.setContentsMargins(0, 0, 0, 0)
         self.overview_grid.setSpacing(8)
         self.overview_grid.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.overview_scroll.setWidget(self.overview_body)
+        transparent_scroll_area(self.overview_scroll)
         self.overview_scroll.viewport().installEventFilter(self)
         self.atlas_tabs.addTab(self.overview_scroll, _text("artmesh.inspector.overview"))
         for position, texture_index in enumerate(indices):

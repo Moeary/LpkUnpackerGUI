@@ -11,7 +11,6 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
     QHBoxLayout,
-    QLabel,
     QPlainTextEdit,
     QSizePolicy,
     QVBoxLayout,
@@ -30,11 +29,14 @@ from qfluentwidgets import (
     PrimaryPushButton,
     ProgressBar,
     PushButton,
+    ScrollArea,
     SubtitleLabel,
 )
 
 from app.i18n import get_i18n, tr
+from app.gui.theme import transparent_scroll_area
 from app.core.settings_manager import SettingsManager
+from app.gui.typography import CardTitleLabel
 
 
 try:
@@ -63,6 +65,16 @@ def _result_value(result: Any, name: str, default: Any = "") -> Any:
     if isinstance(result, dict):
         return result.get(name, default)
     return getattr(result, name, default)
+
+
+def _wrappable_path(path: str) -> str:
+    """Let a word-wrapped label break a long path after its separators.
+
+    A path has no spaces, so QLabel otherwise keeps it on one line and clips
+    it at the card edge.  The zero-width space is invisible.
+    """
+
+    return path.replace("\\", "\\​").replace("/", "/​")
 
 
 class _SpineConverterDropFrame(QFrame):
@@ -191,7 +203,21 @@ class SpineConverterPage(_SpineConverterDropFrame):
         self._update_editor_project_availability()
 
     def _build_ui(self):
-        self.main_layout = QVBoxLayout(self)
+        # Scroll vertically instead of compressing controls below their
+        # minimum height (clipped button text) in a short window.
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        self.scroll_area = ScrollArea(self)
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.content_widget = QFrame(self.scroll_area)
+        self.content_widget.setObjectName("spineConverterContent")
+        self.scroll_area.setWidget(self.content_widget)
+        transparent_scroll_area(self.scroll_area)
+        outer_layout.addWidget(self.scroll_area)
+
+        self.main_layout = QVBoxLayout(self.content_widget)
         self.main_layout.setContentsMargins(20, 18, 20, 20)
         self.main_layout.setSpacing(14)
 
@@ -228,7 +254,7 @@ class SpineConverterPage(_SpineConverterDropFrame):
         # Stable handles for visual smoke tests and callers that want to
         # highlight the main controls/result surfaces.
         self.controls_card = self.input_card
-        self.source_card_title = SubtitleLabel(self.input_card)
+        self.source_card_title = CardTitleLabel(self.input_card)
         input_layout.addWidget(self.source_card_title)
 
         self.source_label = BodyLabel(self.input_card)
@@ -274,7 +300,7 @@ class SpineConverterPage(_SpineConverterDropFrame):
         self.options_card, options_layout = self._new_card(
             self, "spineConverterOptionsCard"
         )
-        self.options_card_title = SubtitleLabel(self.options_card)
+        self.options_card_title = CardTitleLabel(self.options_card)
         options_layout.addWidget(self.options_card_title)
 
         self.target_version_label = BodyLabel(self.options_card)
@@ -314,7 +340,7 @@ class SpineConverterPage(_SpineConverterDropFrame):
         self.action_card, action_layout = self._new_card(
             self, "spineConverterActionCard"
         )
-        self.action_card_title = SubtitleLabel(self.action_card)
+        self.action_card_title = CardTitleLabel(self.action_card)
         action_layout.addWidget(self.action_card_title)
 
         actions = QHBoxLayout()
@@ -339,7 +365,7 @@ class SpineConverterPage(_SpineConverterDropFrame):
         self.dependencies_card, dependencies_layout = self._new_card(
             self, "spineConverterDependenciesCard"
         )
-        self.dependencies_card_title = SubtitleLabel(self.dependencies_card)
+        self.dependencies_card_title = CardTitleLabel(self.dependencies_card)
         dependencies_layout.addWidget(self.dependencies_card_title)
         self.converter_status_label = CaptionLabel(self.dependencies_card)
         self.converter_status_label.setWordWrap(True)
@@ -360,7 +386,7 @@ class SpineConverterPage(_SpineConverterDropFrame):
         self.status_card, status_layout = self._new_card(
             self, "spineConverterStatusCard"
         )
-        self.status_card_title = SubtitleLabel(self.status_card)
+        self.status_card_title = CardTitleLabel(self.status_card)
         status_layout.addWidget(self.status_card_title)
         self.status_label = BodyLabel(self.status_card)
         self.status_label.setWordWrap(True)
@@ -369,14 +395,13 @@ class SpineConverterPage(_SpineConverterDropFrame):
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
         )
         status_layout.addWidget(self.status_label)
-        self.warning_label = QLabel(self.status_card)
+        # A caveat, not a link: plain caption text instead of link blue.
+        self.warning_label = CaptionLabel(self.status_card)
         self.warning_label.setWordWrap(True)
         self.warning_label.setMinimumWidth(0)
         self.warning_label.setSizePolicy(
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
         )
-        # palette(link) stays legible in both bundled light and dark themes.
-        self.warning_label.setStyleSheet("color: palette(link);")
         status_layout.addWidget(self.warning_label)
         self.right_column.addWidget(self.status_card)
 
@@ -384,7 +409,7 @@ class SpineConverterPage(_SpineConverterDropFrame):
             self, "spineConverterResultCard"
         )
         self.results_card = self.result_card
-        self.result_card_title = SubtitleLabel(self.result_card)
+        self.result_card_title = CardTitleLabel(self.result_card)
         result_layout.addWidget(self.result_card_title)
         self.result_text = QPlainTextEdit(self.result_card)
         self.result_text.setReadOnly(True)
@@ -422,7 +447,7 @@ class SpineConverterPage(_SpineConverterDropFrame):
         self.flow_card, flow_layout = self._new_card(
             self, "spineConverterFlowCard"
         )
-        self.flow_card_title = SubtitleLabel(self.flow_card)
+        self.flow_card_title = CardTitleLabel(self.flow_card)
         flow_layout.addWidget(self.flow_card_title)
         self.flow_source_label = self._new_flow_step(
             flow_layout, "1", self.flow_card
@@ -659,7 +684,7 @@ class SpineConverterPage(_SpineConverterDropFrame):
     def _render_converter_status(self):
         path = str(self._converter_info or "").strip()
         if path:
-            self.converter_status_label.setText(tr("spine_converter.converter_found", path=path))
+            self.converter_status_label.setText(tr("spine_converter.converter_found", path=_wrappable_path(path)))
         else:
             self.converter_status_label.setText(tr("spine_converter.converter_auto"))
 
@@ -672,7 +697,7 @@ class SpineConverterPage(_SpineConverterDropFrame):
             return
         path = str(self._editor_info or "").strip()
         if path:
-            self.editor_status_label.setText(tr("spine_converter.editor_found", path=path))
+            self.editor_status_label.setText(tr("spine_converter.editor_found", path=_wrappable_path(path)))
         else:
             self.editor_status_label.setText(tr("spine_converter.editor_auto"))
 

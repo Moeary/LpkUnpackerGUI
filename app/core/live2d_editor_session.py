@@ -16,6 +16,7 @@ import shutil
 import tempfile
 import time
 from collections import OrderedDict
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -542,6 +543,23 @@ class Live2DEditorSession:
     @property
     def dirty(self) -> bool:
         return self.parameter_preview_pending or self._signature() != self._saved_signature
+
+    @contextmanager
+    def preserve_clean_state(self):
+        """Keep a clean session clean across automatic housekeeping.
+
+        Used for work the user did not ask for (e.g. preparing the PSD base
+        when the Appearance tab first opens), which changes the signature but
+        loses nothing if it is never saved.  A session that already has
+        unsaved edits stays dirty.
+        """
+
+        clean = not self.dirty
+        try:
+            yield
+        finally:
+            if clean and not self.parameter_preview_pending:
+                self._saved_signature = self._signature()
 
     def named_selections(self) -> dict[str, list[str]]:
         return copy.deepcopy(self._named_selections)

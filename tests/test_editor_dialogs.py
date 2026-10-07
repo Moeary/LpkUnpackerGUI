@@ -77,7 +77,7 @@ class EditorDialogsTests(unittest.TestCase):
                 image = box.grab().toImage()
                 self.assertEqual(image.pixelColor(3, 3).name(), background.name())
                 control_image = box.button(box.Save).grab().toImage()
-                disabled_text = "#a4afbf" if theme == "dark" else "#596575"
+                disabled_text = "#a0a0a0" if theme == "dark" else "#596575"
                 self.assertTrue(any(control_image.pixelColor(x, y).name() == disabled_text
                                     for y in range(control_image.height()) for x in range(control_image.width())))
 

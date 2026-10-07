@@ -11,7 +11,7 @@ from PySide6.QtCore import QPoint, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QPixmap
 from PySide6.QtWidgets import (
     QDialog, QFileDialog, QFormLayout, QGridLayout, QHBoxLayout, QListWidgetItem,
-    QFrame, QSplitter, QStackedWidget, QTreeWidgetItem, QVBoxLayout, QWidget, QSizePolicy,
+    QFrame, QStackedWidget, QTreeWidgetItem, QVBoxLayout, QWidget, QSizePolicy,
 )
 from qfluentwidgets import (
     BodyLabel as QLabel, CaptionLabel, CheckBox as QCheckBox,
@@ -28,8 +28,11 @@ from app.gui.editor_recovery import EditorRecoveryController
 from app.gui.editor_timeline import AnimationTimelineEditor
 from app.gui.editor_actions import ActionComboBox, ActionDeleteDialog, ActionNameDialog, close_editor_popup
 from app.gui.editor_dialogs import EditorMessageBox as QMessageBox
-from app.gui.editor_workspace import EditorComboBox as QComboBox, EditorTabs, EditorViewportLayout, EditorWorkspace
+from app.gui.editor_workspace import (
+    EditorComboBox as QComboBox, EditorSplitter, EditorTabs, EditorViewportLayout, EditorWorkspace,
+)
 from app.i18n import get_i18n, tr
+from app.gui.theme import transparent_scroll_area
 
 
 SPINE_EDITOR_TEXT = {
@@ -53,6 +56,7 @@ SPINE_EDITOR_TEXT = {
     "spine_editor.setup": "设置姿态",
     "spine_editor.skin": "皮肤",
     "spine_editor.track": "轨道",
+    "spine_editor.track_placeholder": "选择骨骼轨道",
     "spine_editor.duration": "时长 (秒)",
     "spine_editor.new_animation": "新建动作",
     "spine_editor.clone_animation": "复制动作",
@@ -441,6 +445,7 @@ class SpineEditorPage(QWidget):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setWidget(self.inspector_stack)
+        transparent_scroll_area(scroll)
         scroll.setMinimumWidth(220)
         self.details_widget = QWidget(self)
         details_layout = EditorViewportLayout(self.details_widget)
@@ -451,8 +456,8 @@ class SpineEditorPage(QWidget):
         search_row.addWidget(self.search_edit, 1)
         search_row.addSpacing(28)
         details_layout.addLayout(search_row)
-        self.details_splitter = QSplitter(Qt.Orientation.Vertical, self)
-        self.details_splitter.setHandleWidth(7)
+        self.details_splitter = EditorSplitter(Qt.Orientation.Vertical, self)
+        self.details_splitter.setHandleWidth(10)
         self.details_splitter.setChildrenCollapsible(False)
         self.details_splitter.addWidget(self.tabs)
         self.details_splitter.addWidget(scroll)
@@ -1164,6 +1169,8 @@ class SpineEditorPage(QWidget):
                             (self.duration_spin, "duration"), (self.track_combo, "track"), (self.channel_combo, "track")):
             widget.setToolTip(_text(f"spine_editor.{key}"))
         self.search_edit.setPlaceholderText(_text("spine_editor.search"))
+        # Shown while no model/track list is loaded, like the Live2D track picker.
+        self.track_combo.setPlaceholderText(_text("spine_editor.track_placeholder"))
         self.animation_combo.retranslate_ui()
         self.animation_options_button.setToolTip(_text("spine_editor.animation") + " · " + _text("spine_editor.duration"))
         self.workspace.retranslate_ui()

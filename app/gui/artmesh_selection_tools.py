@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from threading import Event
 
-from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, QSignalBlocker, QSize, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, QRunnable, QThreadPool, QTimer, QSignalBlocker, QSize, Qt, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget, QSizePolicy
 from qfluentwidgets import CaptionLabel, CheckBox, ComboBox, FluentIcon, RoundMenu, TransparentToolButton
@@ -38,11 +38,14 @@ def selection_text(key, **values):
 
 
 class _CompactCheckBox(CheckBox):
+    # Wide enough for the label at large fonts; the summary beside it elides first.
+    MAX_WIDTH = 220
+
     def __init__(self, parent):
         super().__init__(parent)
         self._full_text = ""
         self.setMinimumWidth(90)
-        self.setMaximumWidth(150)
+        self.setMaximumWidth(self.MAX_WIDTH)
 
     def setText(self, text):
         self._full_text = text
@@ -55,8 +58,17 @@ class _CompactCheckBox(CheckBox):
         super().resizeEvent(event)
         self._fit_text()
 
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        # Fluent buttons set their font inside __init__, before _full_text exists.
+        if event.type() == QEvent.Type.FontChange and hasattr(self, "_full_text"):
+            self._fit_text()
+            self.updateGeometry()
+
     def sizeHint(self):
-        return QSize(min(150, max(90, self.fontMetrics().horizontalAdvance(self._full_text) + 38)),
+        # A few pixels of slack: fractional DPI rounding otherwise elides a
+        # label that fits exactly.
+        return QSize(min(self.MAX_WIDTH, max(90, self.fontMetrics().horizontalAdvance(self._full_text) + 44)),
                      super().sizeHint().height())
 
     def minimumSizeHint(self):
@@ -139,7 +151,7 @@ class ArtMeshSelectionTools(QWidget):
         self.save_button = CompactAppearanceButton(self)
         self.save_button.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.save_button.setMinimumWidth(70)
-        self.save_button.setMaximumWidth(110)
+        self.save_button.setMaximumWidth(160)
         self.more_button = TransparentToolButton(FluentIcon.MORE, self)
         self.more_button.setFixedSize(30, 30)
         self.undo_button = TransparentToolButton(FluentIcon.RETURN, self)
@@ -160,7 +172,7 @@ class ArtMeshSelectionTools(QWidget):
         self.include_button = CompactAppearanceButton(self)
         self.include_button.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.include_button.setMinimumWidth(70)
-        self.include_button.setMaximumWidth(110)
+        self.include_button.setMaximumWidth(160)
         row.addWidget(self.shared_check)
         row.addWidget(self.summary, 1)
         row.addWidget(self.include_button)

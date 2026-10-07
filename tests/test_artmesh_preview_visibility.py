@@ -243,7 +243,8 @@ class DrawableSelectionLayoutTests(unittest.TestCase):
             for theme in ("dark", "light"):
                 apply_application_theme(theme, inspector)
                 self.app.processEvents()
-                expected = inspector.palette().window().color()
+                # List and UV canvas sit on the panel surface (palette base).
+                expected = inspector.palette().base().color()
                 canvas = inspector.atlas_canvas
                 self.assertEqual(canvas.grab().toImage().pixelColor(1, 1), expected)
                 view = inspector.entry_list.viewport()

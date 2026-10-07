@@ -591,7 +591,8 @@ class ADPOpenGLCanvas(QOpenGLWindow):
         self.update()
 
     def _set_palette_background(self) -> None:
-        color = QGuiApplication.palette().color(QPalette.ColorRole.Window)
+        # Match the editor panel / Spine stage surface (palette base).
+        color = QGuiApplication.palette().color(QPalette.ColorRole.Base)
         self.__bg_color = (color.redF(), color.greenF(), color.blueF(), 1.0)
 
     def _on_palette_changed(self, *_args) -> None:

@@ -41,8 +41,8 @@ class ThemeTests(unittest.TestCase):
 
         apply_application_theme("dark", widget)
         self.app.processEvents()
-        self.assertEqual(widget.palette().color(widget.backgroundRole()).name(), "#272c34")
-        self.assertEqual(widget.grab().toImage().pixelColor(2, 2).name(), "#272c34")
+        self.assertEqual(widget.palette().color(widget.backgroundRole()).name(), "#323232")
+        self.assertEqual(widget.grab().toImage().pixelColor(2, 2).name(), "#323232")
 
         widget.close()
 

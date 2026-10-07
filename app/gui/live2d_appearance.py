@@ -5,7 +5,7 @@ from concurrent.futures import CancelledError
 from contextlib import nullcontext
 from threading import Event
 
-from PySide6.QtCore import QSize, Qt, QThread, QSignalBlocker, QTimer, Signal
+from PySide6.QtCore import QEvent, QSize, Qt, QThread, QSignalBlocker, QTimer, Signal
 from PySide6.QtWidgets import QHBoxLayout, QLayout, QSizePolicy, QWidget
 from qfluentwidgets import CaptionLabel, Pivot, ProgressBar, PushButton, TextEdit, TransparentToolButton, FluentIcon
 
@@ -86,12 +86,27 @@ class CompactAppearanceButton(PushButton):
     def minimumSizeHint(self):  # noqa: N802
         return QSize(48, super().minimumSizeHint().height())
 
+    def sizeHint(self):  # noqa: N802
+        # Measure the full label, not the elided one: otherwise a label elided
+        # while the pane was narrow keeps the button narrow for good.
+        width = self.fontMetrics().horizontalAdvance(self._full_text) + 30
+        if not self.icon().isNull():
+            width += self.iconSize().width() + 10
+        return QSize(width, super().sizeHint().height())
+
     def _fit_text(self):
         super().setText(self.fontMetrics().elidedText(self._full_text, Qt.ElideRight, max(32, self.width() - 26)))
 
     def resizeEvent(self, event):  # noqa: N802
         super().resizeEvent(event)
         self._fit_text()
+
+    def changeEvent(self, event):  # noqa: N802
+        super().changeEvent(event)
+        # Fluent buttons set their font inside __init__, before _full_text exists.
+        if event.type() == QEvent.Type.FontChange and hasattr(self, "_full_text"):
+            self._fit_text()
+            self.updateGeometry()
 
 
 class AppearanceStepPivot(Pivot):
@@ -134,6 +149,12 @@ class ElidedAppearanceLabel(CaptionLabel):
     def resizeEvent(self, event):  # noqa: N802
         super().resizeEvent(event)
         self._fit_text()
+
+    def changeEvent(self, event):  # noqa: N802
+        super().changeEvent(event)
+        # Fluent buttons set their font inside __init__, before _full_text exists.
+        if event.type() == QEvent.Type.FontChange and hasattr(self, "_full_text"):
+            self._fit_text()
 
 
 class AppearanceTaskWorkspace(QWidget):

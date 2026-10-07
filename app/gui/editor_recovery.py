@@ -11,7 +11,7 @@ import uuid
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Signal
 from PySide6.QtWidgets import QHBoxLayout, QSizePolicy, QWidget
-from qfluentwidgets import CaptionLabel, ComboBox, PushButton
+from qfluentwidgets import CaptionLabel, ComboBox, FluentIcon, TransparentPushButton
 
 from app.core.editor_recovery import RecoveryStore, capture_recovery
 from app.core.settings_manager import SettingsManager
@@ -70,7 +70,8 @@ class EditorRecoveryController(QObject):
         row.setContentsMargins(0, 0, 0, 0)
         self.label = ElidedAppearanceLabel(self.bar)
         self.label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-        self.button = PushButton(self.bar)
+        # A quiet text action: it belongs to the status line, not the toolbar.
+        self.button = TransparentPushButton(FluentIcon.HISTORY, "", self.bar)
         self.button.clicked.connect(self.choose_restore)
         row.addWidget(self.label, 1)
         row.addWidget(self.button)

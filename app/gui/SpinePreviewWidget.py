@@ -307,7 +307,7 @@ class SpinePreviewWidget(QFrame):
         self._settings: dict[str, Any] = {
             "opacity": 1.0, "model_rotation": 0.0, "model_scale": 1.0,
             "model_offset_x": 0.0, "model_offset_y": 0.0,
-            "transparent_bg": True, "bg_color": "#20242b", "antialias": True,
+            "transparent_bg": True, "bg_color": "#2b2b2b", "antialias": True,
         }
         self._last_tick = time.monotonic()
         self._textures_uploaded = False
@@ -495,14 +495,14 @@ class SpinePreviewWidget(QFrame):
                 return app.palette().color(QPalette.ColorRole.Base)
             return self.palette().color(QPalette.ColorRole.Base)
 
-        value = self._settings.get("bg_color", "#20242b")
+        value = self._settings.get("bg_color", "#2b2b2b")
         color = value if isinstance(value, QColor) else QColor(str(value))
         if color.isValid():
             return color
 
         if app is not None:
             return app.palette().color(QPalette.ColorRole.Base)
-        return QColor("#20242b")
+        return QColor("#2b2b2b")
 
     def _report_error(self, message: str) -> None:
         text = str(message or "Spine native preview failed.")

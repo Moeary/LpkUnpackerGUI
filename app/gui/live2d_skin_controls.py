@@ -10,6 +10,7 @@ from app.gui.editor_actions import ActionComboBox
 from app.gui.editor_dialogs import EditorTextDialog
 from app.gui.live2d_appearance import CompactAppearanceButton, appearance_text
 from app.i18n import tr
+from app.gui.theme import transparent_scroll_area
 
 
 SKIN_WORKSPACE_TEXT = {
@@ -222,7 +223,7 @@ class SkinCatalogControls(SkinDropFrame):
         self.scroll.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.scroll.setMinimumSize(0, 0)
         self.scroll.setWidget(content)
-        self.scroll.enableTransparentBackground()
+        transparent_scroll_area(self.scroll)
         root.addWidget(self.scroll)
         for surface in (self.scroll.viewport(), content, self.combo, self.import_model_button, self.import_textures_button):
             self.watch_drop_surface(surface)

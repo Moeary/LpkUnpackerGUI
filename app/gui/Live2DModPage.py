@@ -89,8 +89,10 @@ from app.core.live2dviewer_mod_project import (
 from app.core.settings_manager import SettingsManager
 from app.gui.editor_workspace import EditorViewportLayout, FluentEditorTabs
 from app.i18n import get_i18n, tr
+from app.gui.theme import transparent_scroll_area
 from app.gui.editor_dialogs import EditorMessageBox as QMessageBox, ThemedEditorDialog as MessageBoxBase
 from app.gui.ArtMeshInspector import ArtMeshPickDialog, ARTMESH_TEXT
+from app.gui.typography import CardTitleLabel
 
 
 MODEL_DRAG_MIME = "application/x-live2d-mod-model"
@@ -1066,7 +1068,7 @@ class Live2DModPage(QFrame):
         project_layout = QVBoxLayout(self.project_card)
         project_layout.setContentsMargins(14, 14, 14, 14)
         project_layout.setSpacing(8)
-        self.project_title = SubtitleLabel("", self.project_card)
+        self.project_title = CardTitleLabel("", self.project_card)
         self.project_combo = ProjectSearchComboBox(self.project_card)
         self.project_combo.currentIndexChanged.connect(self.on_project_combo_changed)
         self.project_combo.textChanged.connect(
@@ -1108,7 +1110,7 @@ class Live2DModPage(QFrame):
         artmesh_layout = QVBoxLayout(self.artmesh_card)
         artmesh_layout.setContentsMargins(14, 14, 14, 14)
         artmesh_layout.setSpacing(8)
-        self.artmesh_title = SubtitleLabel("", self.artmesh_card)
+        self.artmesh_title = CardTitleLabel("", self.artmesh_card)
         self.artmesh_combo = EditableComboBox(self.artmesh_card)
         self.artmesh_combo.setMaxVisibleItems(12)
         self.artmesh_combo.currentIndexChanged.connect(self.on_artmesh_combo_changed)
@@ -1124,7 +1126,7 @@ class Live2DModPage(QFrame):
         export_layout = QVBoxLayout(self.export_card)
         export_layout.setContentsMargins(14, 14, 14, 14)
         export_layout.setSpacing(8)
-        self.export_title = SubtitleLabel("", self.export_card)
+        self.export_title = CardTitleLabel("", self.export_card)
         self.export_hint = CaptionLabel("", self.export_card)
         self.export_hint.setWordWrap(True)
         self.export_button = PrimaryPushButton("", self.export_card)
@@ -1150,7 +1152,7 @@ class Live2DModPage(QFrame):
         import_layout = QVBoxLayout(self.import_card)
         import_layout.setContentsMargins(16, 14, 16, 14)
         import_layout.setSpacing(8)
-        self.import_title = SubtitleLabel("", self.import_card)
+        self.import_title = CardTitleLabel("", self.import_card)
         import_layout.addWidget(self.import_title)
         source_row = QHBoxLayout()
         self.source_edit = LineEdit(self.import_card)
@@ -1177,7 +1179,7 @@ class Live2DModPage(QFrame):
         right_layout.addWidget(separator)
 
         model_header = QHBoxLayout()
-        self.models_title = SubtitleLabel("", right)
+        self.models_title = CardTitleLabel("", right)
         self.models_count = CaptionLabel("", right)
         self.add_file_button = PushButton("", right)
         self.add_folder_button = PushButton("", right)
@@ -1203,14 +1205,13 @@ class Live2DModPage(QFrame):
         self.models_scroll.setWidgetResizable(True)
         self.models_scroll.setFrameShape(QFrame.NoFrame)
         self.models_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.models_scroll.enableTransparentBackground()
         self.models_container = ModelListContainer(self.models_scroll)
         self.models_container.reorderRequested.connect(self.move_model)
         self.models_layout = QVBoxLayout(self.models_container)
         self.models_layout.setContentsMargins(0, 0, 5, 0)
         self.models_layout.setSpacing(8)
         self.models_scroll.setWidget(self.models_container)
-        self.models_scroll.enableTransparentBackground()
+        transparent_scroll_area(self.models_scroll)
         right_layout.addWidget(self.models_scroll, 1)
 
         self.splitter.addWidget(left)
@@ -1247,7 +1248,7 @@ class Live2DModPage(QFrame):
         self.project_scroll.setFrameShape(QFrame.NoFrame)
         self.project_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.project_scroll.setWidget(left)
-        self.project_scroll.enableTransparentBackground()
+        transparent_scroll_area(self.project_scroll)
         self.workflow_tabs.addTab(self.project_scroll, "")
         right.setParent(self.workflow_tabs)
         right.layout().setContentsMargins(0, 0, 0, 0)
@@ -1313,7 +1314,7 @@ class Live2DModPage(QFrame):
         self.export_scroll.setFrameShape(QFrame.NoFrame)
         self.export_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.export_scroll.setWidget(self.export_page)
-        self.export_scroll.enableTransparentBackground()
+        transparent_scroll_area(self.export_scroll)
         self.workflow_tabs.addTab(self.export_scroll, "")
         root.addWidget(self.workflow_tabs, 1)
         self.workflow_status = CaptionLabel(self)

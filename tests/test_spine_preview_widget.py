@@ -112,7 +112,7 @@ class SpinePreviewWidgetTests(unittest.TestCase):
         try:
             self.app.setPalette(palette_for_theme("dark"))
             widget.set_view_settings({"transparent_bg": True, "bg_color": "#ff00ff"})
-            self.assertEqual(widget._background_color().name(), "#272c34")
+            self.assertEqual(widget._background_color().name(), "#323232")
 
             self.app.setPalette(palette_for_theme("light"))
             self.assertEqual(widget._background_color().name(), "#ffffff")
@@ -163,7 +163,7 @@ class SpinePreviewWidgetTests(unittest.TestCase):
             page._set_spine_mode(False)
             self.assertFalse(page._spine_mode)
             self.assertTrue(page.spine_controls.isHidden())
-            self.assertIs(page.resource_details_stack.currentWidget(), page.empty_details)
+            self.assertIs(page.resource_details_stack.currentWidget(), page.empty_details_card)
             page._show_image_stage()
             self.assertIs(page.resource_details_stack.currentWidget(), page.image_item_list)
             self.assertTrue(page.advanced_panel.isHidden())

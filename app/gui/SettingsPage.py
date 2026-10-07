@@ -70,6 +70,7 @@ from app.core.spine_preview import (
     list_installed_spine_runtimes,
 )
 from app.i18n import get_i18n, normalize_language_code, tr
+from app.gui.typography import CardTitleLabel
 
 
 class ToolchainInstallWorker(QThread):
@@ -303,17 +304,31 @@ class SettingsPage(QFrame):
             layout.addWidget(status)
 
     def _add_path_block(self, layout, label, description, editor, buttons, status=None):
-        """Add a path editor whose action buttons can wrap below the field."""
+        """Add a path editor with its (at most two) actions on the same row.
+
+        The field yields width to the buttons, which keep their text width, so
+        a short "Browse" no longer becomes a card-wide bar under the field.
+        """
 
         self._add_text_block(layout, label, description, status)
         self._configure_expanding(editor)
-        layout.addWidget(editor)
-        button_layout = QHBoxLayout()
-        button_layout.setSpacing(8)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        row.addWidget(editor, 1)
         for button in buttons:
-            self._configure_expanding(button)
-            button_layout.addWidget(button, 1)
-        layout.addLayout(button_layout)
+            button.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+            row.addWidget(button)
+        layout.addLayout(row)
+
+    @staticmethod
+    def _add_trailing_action(layout, button):
+        """Place a secondary action at its natural width, left-aligned."""
+
+        button.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        row = QHBoxLayout()
+        row.addWidget(button)
+        row.addStretch(1)
+        layout.addLayout(row)
 
     def _add_choice_block(self, layout, label, description, control):
         self._add_text_block(layout, label, description)
@@ -382,7 +397,7 @@ class SettingsPage(QFrame):
         self.general_card = general_card
         left_column.addWidget(general_card)
 
-        self.language_section_title = SubtitleLabel("", general_card)
+        self.language_section_title = CardTitleLabel("", general_card)
         self.language_section_title.setWordWrap(True)
         self.language_section_title.setMinimumWidth(0)
         self.language_section_title.setSizePolicy(
@@ -403,8 +418,10 @@ class SettingsPage(QFrame):
         self.language_note = CaptionLabel("", general_card)
         self.language_note.setWordWrap(True)
         general_layout.addWidget(self.language_note)
+        # A second section inside the same card needs a visible break.
+        general_layout.addSpacing(12)
 
-        self.theme_section_title = SubtitleLabel("", general_card)
+        self.theme_section_title = CardTitleLabel("", general_card)
         self.theme_section_title.setWordWrap(True)
         self.theme_section_title.setMinimumWidth(0)
         self.theme_section_title.setSizePolicy(
@@ -463,8 +480,7 @@ class SettingsPage(QFrame):
 
         self.font_reset_button = PushButton("", general_card)
         self.font_reset_button.clicked.connect(self.reset_font_preferences)
-        self._configure_expanding(self.font_reset_button)
-        general_layout.addWidget(self.font_reset_button)
+        self._add_trailing_action(general_layout, self.font_reset_button)
 
         # Output and archive settings ----------------------------------------
         runtime_card, runtime_layout = self._new_settings_card(
@@ -472,7 +488,7 @@ class SettingsPage(QFrame):
         )
         self.runtime_card = runtime_card
         left_column.addWidget(runtime_card)
-        self.runtime_section_title = SubtitleLabel("", runtime_card)
+        self.runtime_section_title = CardTitleLabel("", runtime_card)
         self.runtime_section_title.setWordWrap(True)
         self.runtime_section_title.setMinimumWidth(0)
         self.runtime_section_title.setSizePolicy(
@@ -591,7 +607,7 @@ class SettingsPage(QFrame):
         )
         self.download_card = download_card
         left_column.addWidget(download_card)
-        self.tool_download_section_title = SubtitleLabel("", download_card)
+        self.tool_download_section_title = CardTitleLabel("", download_card)
         self.tool_download_section_title.setWordWrap(True)
         self.tool_download_section_title.setMinimumWidth(0)
         self.tool_download_section_title.setSizePolicy(
@@ -679,7 +695,7 @@ class SettingsPage(QFrame):
         )
         self.spine_card = spine_card
         right_column.addWidget(spine_card)
-        self.spine_section_title = SubtitleLabel(
+        self.spine_section_title = CardTitleLabel(
             tr("settings.spine_section", "Spine"), spine_card
         )
         self.spine_section_title.setWordWrap(True)
@@ -890,7 +906,7 @@ class SettingsPage(QFrame):
         mcp_card, mcp_layout = self._new_settings_card(content, "settingsMcpCard")
         self.mcp_card = mcp_card
         right_column.addWidget(mcp_card)
-        self.mcp_title = SubtitleLabel("", mcp_card)
+        self.mcp_title = CardTitleLabel("", mcp_card)
         self.mcp_description = CaptionLabel("", mcp_card)
         self.mcp_description.setWordWrap(True)
         mcp_layout.addWidget(self.mcp_title)
@@ -932,7 +948,7 @@ class SettingsPage(QFrame):
         connection_card, connection_layout = self._new_settings_card(content, "settingsMcpConnectionCard")
         self.mcp_connection_card = connection_card
         right_column.addWidget(connection_card)
-        self.mcp_connection_title = SubtitleLabel("", connection_card)
+        self.mcp_connection_title = CardTitleLabel("", connection_card)
         self.mcp_status = CaptionLabel("", connection_card)
         self.mcp_status.setWordWrap(True)
         connection_layout.addWidget(self.mcp_connection_title)
@@ -974,7 +990,7 @@ class SettingsPage(QFrame):
         guide_card, guide_layout = self._new_settings_card(content, "settingsMcpGuideCard")
         self.mcp_guide_card = guide_card
         right_column.addWidget(guide_card)
-        self.mcp_guide_title = SubtitleLabel("", guide_card)
+        self.mcp_guide_title = CardTitleLabel("", guide_card)
         self.mcp_guide_hint = CaptionLabel("", guide_card)
         self.mcp_guide_hint.setWordWrap(True)
         guide_layout.addWidget(self.mcp_guide_title)

@@ -8,6 +8,7 @@ from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QScrollArea, QSizePol
 from qfluentwidgets import BodyLabel, FluentIcon, TransparentToolButton
 
 from app.i18n import tr
+from app.gui.theme import transparent_scroll_area
 
 
 class ImageZoomScrollArea(QScrollArea):
@@ -146,6 +147,7 @@ class ImagePreviewPanel(QFrame):
         list_scroll.setWidgetResizable(True)
         list_scroll.setFrameShape(QFrame.NoFrame)
         list_scroll.setWidget(self.list_widget)
+        transparent_scroll_area(list_scroll)
         side_layout.addWidget(self.list_title_label)
         side_layout.addWidget(self.limit_label)
         side_layout.addWidget(list_scroll, 1)
@@ -312,7 +314,7 @@ class ImagePreviewPanel(QFrame):
         text_layout.setSpacing(2)
         type_text = tr("preview.preview_item_model") if item.get("kind") == "model" else tr("preview.preview_item_image")
         type_label = BodyLabel(type_text, text_box)
-        type_label.setStyleSheet("color: #00A6B3; font-weight: 600;")
+        type_label.setStyleSheet("color: palette(highlight); font-weight: 600;")
         name_label = BodyLabel(str(item.get("label") or os.path.basename(str(item.get("path", "")))), text_box)
         name_label.setWordWrap(True)
         detail = str(item.get("detail") or "")
@@ -522,9 +524,9 @@ class ImagePreviewPanel(QFrame):
             if index == self._current_index:
                 item.setStyleSheet("""
                     QFrame#imagePreviewListItem {
-                        border: 1px solid #00A6B3;
+                        border: 1px solid palette(highlight);
                         border-radius: 8px;
-                        background: palette(highlight);
+                        background: palette(alternate-base);
                     }
                 """)
             else:

@@ -103,6 +103,8 @@ from app.gui.editor_workspace import EditorComboBox, EditorViewportLayout, Edito
 from app.gui.live2d_skin_controls import skin_text
 from app.gui.editor_dialogs import ThemedEditorDialog, get_editor_text
 from app.i18n import get_i18n, tr
+from app.gui.theme import transparent_scroll_area
+from app.gui.typography import CardTitleLabel
 
 
 MAX_WIDGET_SIZE = 16777215
@@ -115,6 +117,7 @@ PSD_WORKSPACE_TEXT = {
     "psd.workspace.bound": "PSD 子工程随当前 Live2D 工程一起保存。导出是独立快照，查看版本不会替换当前动作。",
     "psd.workspace.capture_pose": "保存当前预览参数为预设",
     "psd.workspace.capture_pose_short": "保存预设",
+    "psd.workspace.max_dimension_short": "最大边长：",
     "psd.workspace.paths": "工程与输出路径",
     "psd.workspace.help": "导出说明",
     "psd.workspace.import_project": "导入 PSD 工程副本",
@@ -617,13 +620,13 @@ class PsdReconstructionPage(QFrame):
         self.left_scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
-        self.left_scroll.enableTransparentBackground()
         self.left_scroll.setMinimumWidth(340)
         self.left_panel = QWidget()
         self.left_panel_layout = QVBoxLayout(self.left_panel)
         self.left_panel_layout.setContentsMargins(0, 0, 10, 0)
         self.left_panel_layout.setSpacing(10)
         self.left_scroll.setWidget(self.left_panel)
+        transparent_scroll_area(self.left_scroll)
         self.content_splitter.addWidget(self.left_scroll)
 
         self.right_column = QWidget(self.content_splitter)
@@ -638,13 +641,13 @@ class PsdReconstructionPage(QFrame):
         self.right_scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
-        self.right_scroll.enableTransparentBackground()
         self.right_scroll.setMinimumWidth(340)
         self.right_panel = QWidget()
         self.right_panel_layout = QVBoxLayout(self.right_panel)
         self.right_panel_layout.setContentsMargins(10, 0, 0, 0)
         self.right_panel_layout.setSpacing(10)
         self.right_scroll.setWidget(self.right_panel)
+        transparent_scroll_area(self.right_scroll)
         self.right_column_layout.addWidget(self.right_scroll, 1)
         self.right_footer = QWidget(self.right_column)
         self.right_footer_layout = QVBoxLayout(self.right_footer)
@@ -730,7 +733,7 @@ class PsdReconstructionPage(QFrame):
         self.project_layout = QVBoxLayout(self.project_frame)
         self.project_layout.setContentsMargins(12, 12, 12, 12)
         self.project_layout.setSpacing(8)
-        self.project_title_label = SubtitleLabel("", self.project_frame)
+        self.project_title_label = CardTitleLabel("", self.project_frame)
         self.project_layout.addWidget(self.project_title_label)
 
         self.project_name_edit = LineEdit(self.project_frame)
@@ -780,7 +783,7 @@ class PsdReconstructionPage(QFrame):
     def _build_workflow_controls(self, parent):
         self.workflow_layout = QVBoxLayout()
         self.workflow_layout.setSpacing(10)
-        self.workflow_label = SubtitleLabel("", parent)
+        self.workflow_label = CardTitleLabel("", parent)
         self.workflow_segment = QFrame(parent)
         self.workflow_segment.setObjectName("psdWorkflowSegment")
         self.workflow_segment_layout = QGridLayout(self.workflow_segment)
@@ -804,7 +807,7 @@ class PsdReconstructionPage(QFrame):
         self.export_card_layout = QVBoxLayout(self.export_card)
         self.export_card_layout.setContentsMargins(14, 14, 14, 14)
         self.export_card_layout.setSpacing(10)
-        self.export_card_title = SubtitleLabel("", self.export_card)
+        self.export_card_title = CardTitleLabel("", self.export_card)
         self.export_card_layout.addWidget(self.export_card_title)
 
         self.source_layout = QVBoxLayout()
@@ -865,7 +868,7 @@ class PsdReconstructionPage(QFrame):
         self.mode_container_layout.setContentsMargins(0, 0, 0, 0)
         self.mode_container_layout.setSpacing(6)
         self.mode_layout = QVBoxLayout()
-        self.mode_label = SubtitleLabel("", self.mode_frame)
+        self.mode_label = BodyLabel("", self.mode_frame)
         self.mode_combo = (EditorComboBox if self._compact else ComboBox)(self.mode_frame)
         self.mode_combo.addItem("", userData="mesh")
         self.mode_combo.addItem("", userData="atlas-components")
@@ -931,7 +934,7 @@ class PsdReconstructionPage(QFrame):
         self.repack_card_layout = QVBoxLayout(self.repack_card)
         self.repack_card_layout.setContentsMargins(14, 14, 14, 14)
         self.repack_card_layout.setSpacing(10)
-        self.repack_card_title = SubtitleLabel("", self.repack_card)
+        self.repack_card_title = CardTitleLabel("", self.repack_card)
         self.repack_card_title.setWordWrap(True)
         self.repack_card_layout.addWidget(self.repack_card_title)
 
@@ -1065,7 +1068,7 @@ class PsdReconstructionPage(QFrame):
         self.preview_control_layout = QVBoxLayout(self.preview_control_frame)
         self.preview_control_layout.setContentsMargins(12, 12, 12, 12)
         self.preview_control_layout.setSpacing(8)
-        self.preview_control_title_label = SubtitleLabel("", self.preview_control_frame)
+        self.preview_control_title_label = CardTitleLabel("", self.preview_control_frame)
         self.preview_control_layout.addWidget(self.preview_control_title_label)
 
         self.preview_source_layout = QVBoxLayout()
@@ -1111,7 +1114,7 @@ class PsdReconstructionPage(QFrame):
         self.motion_layout = QVBoxLayout(self.motion_frame)
         self.motion_layout.setContentsMargins(12, 12, 12, 12)
         self.motion_layout.setSpacing(8)
-        self.motion_title_label = SubtitleLabel("", self.motion_frame)
+        self.motion_title_label = CardTitleLabel("", self.motion_frame)
         self.motion_layout.addWidget(self.motion_title_label)
         self.motion_row_layout = QHBoxLayout()
         self.motion_label = BodyLabel("", self.motion_frame)
@@ -1143,7 +1146,7 @@ class PsdReconstructionPage(QFrame):
         self.preview_layout = QVBoxLayout(self.preview_frame)
         self.preview_layout.setContentsMargins(16, 16, 16, 16)
         self.preview_layout.setSpacing(10)
-        self.preview_title_label = SubtitleLabel("", self.preview_frame)
+        self.preview_title_label = CardTitleLabel("", self.preview_frame)
         self.preview_layout.addWidget(self.preview_title_label)
         self.preview_placeholder_label = BodyLabel("", self.preview_frame)
         self.preview_placeholder_label.setAlignment(Qt.AlignCenter)
@@ -1171,7 +1174,7 @@ class PsdReconstructionPage(QFrame):
         self.log_layout.setSpacing(8)
         self.log_header_layout = QHBoxLayout()
         self.log_header_layout.setContentsMargins(0, 0, 0, 0)
-        self.log_label = SubtitleLabel("", self.log_frame)
+        self.log_label = CardTitleLabel("", self.log_frame)
         self.log_header_layout.addWidget(self.log_label)
         self.log_header_layout.addStretch(1)
         # A plain Qt button avoids QFluent's per-widget palette override,
@@ -1222,12 +1225,12 @@ class PsdReconstructionPage(QFrame):
             scroll = ScrollArea(self.workflow_tabs)
             scroll.setWidgetResizable(True)
             scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-            scroll.enableTransparentBackground()
             content = QWidget(scroll)
             layout = EditorViewportLayout(content)
             layout.setContentsMargins(0, 0, 0, 0)
             layout.setSpacing(8)
             scroll.setWidget(content)
+            transparent_scroll_area(scroll)
             self.workflow_tabs.addWidget(scroll)
             self._compact_scrolls.append(scroll)
             self._compact_pages.append((content, layout))
@@ -1436,6 +1439,9 @@ class PsdReconstructionPage(QFrame):
         self.export_name_edit.setToolTip(self.export_preset_hint.text())
         self.mode_combo.setToolTip(self.mode_hint_label.text())
         self.mesh_canvas_frame.setToolTip(self.mesh_canvas_hint_label.text())
+        # The form column is narrow; the full caption wrapped and was clipped.
+        self.mesh_canvas_label.setText(_workspace_text("psd.workspace.max_dimension_short"))
+        self.mesh_canvas_label.setToolTip(tr("psd.mesh_canvas.max_dimension"))
         self.mesh_canvas_preset_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.mesh_canvas_spin.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.mesh_canvas_input_layout.setStretch(0, 1)
@@ -2612,8 +2618,8 @@ class PsdReconstructionPage(QFrame):
                 PushButton#psdWorkflowButton {
                     border: 0;
                     border-radius: 6px;
-                    background: #00A6B3;
-                    color: white;
+                    background: palette(highlight);
+                    color: palette(highlighted-text);
                     font-weight: 600;
                     padding: 0 14px;
                 }
@@ -2707,7 +2713,7 @@ class PsdReconstructionPage(QFrame):
                 background: palette(alternate-base);
             }
             QPushButton#psdLogToggleButton {
-                color: #00a6b3;
+                color: palette(highlight);
                 background: transparent;
                 border: 1px solid palette(mid);
                 border-radius: 5px;
@@ -2724,14 +2730,14 @@ class PsdReconstructionPage(QFrame):
         self.log_toggle_button.setStyleSheet(
             """
             QPushButton#psdLogToggleButton {
-                color: #00a6b3;
+                color: palette(highlight);
                 background: transparent;
-                border: 1px solid #00a6b3;
+                border: 1px solid palette(highlight);
                 border-radius: 5px;
                 padding: 0 8px;
             }
             QPushButton#psdLogToggleButton:hover {
-                background: rgba(0, 166, 179, 30);
+                background: palette(alternate-base);
             }
             """
         )
@@ -4374,11 +4380,6 @@ class PsdReconstructionPage(QFrame):
     def updateUIScale(self, window_width, window_height):
         self._configure_responsive_controls()
         self._arrange_button_rows()
-        font = QApplication.instance().font()
-        for label in self.findChildren(SubtitleLabel):
-            label_font = label.font()
-            label_font.setPointSize(font.pointSize() + 2)
-            label.setFont(label_font)
         if self._compact:
             self._compact_control_text()
             self._arrange_button_rows()

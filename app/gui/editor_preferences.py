@@ -15,7 +15,7 @@ class _KeyEditor(QKeySequenceEdit):
         self._sync_theme()
 
     def _sync_theme(self, *_args):
-        background, foreground, border = ("#25282d", "#f3f3f3", "#626973") if isDarkTheme() else ("#ffffff", "#202020", "#b8bec7")
+        background, foreground, border = ("#2b2b2b", "#f3f3f3", "#5a5a5a") if isDarkTheme() else ("#ffffff", "#202020", "#b8bec7")
         self.setStyleSheet(
             f'QKeySequenceEdit#editorKey {{ background: {background}; color: {foreground}; border: 1px solid {border}; border-radius: 5px; padding: 4px; }}'
             f'QKeySequenceEdit#editorKey QLineEdit {{ background: transparent; color: {foreground}; border: none; }}'

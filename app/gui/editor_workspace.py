@@ -16,6 +16,7 @@ from qfluentwidgets import (
 )
 
 from app.i18n import tr
+from app.gui.theme import transparent_scroll_area
 from app.core.settings_manager import SettingsManager
 
 
@@ -85,6 +86,7 @@ class EditorTabs(QWidget):
         self.tab_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.tab_scroll.setFixedHeight(39)
         self.tab_scroll.setWidget(self.pivot)
+        transparent_scroll_area(self.tab_scroll)
         self.tab_scroll.setWidgetResizable(False)
         self.tab_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.tab_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
@@ -216,10 +218,15 @@ class EditorSurface(CardWidget):
     def paintEvent(self, event):  # noqa: N802
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        dark = isDarkTheme()
-        painter.setPen(Qt.NoPen if dark else QPen(QColor(0, 0, 0, 38), 1))
-        painter.setBrush(self.palette().window() if dark else QColor(255, 255, 255))
+        # Same fill and hairline as the Fluent cards on the other pages, so
+        # switching pages does not change the surface colour.
+        painter.setPen(QPen(QColor(255, 255, 255, 16) if isDarkTheme() else QColor(0, 0, 0, 38), 1))
+        painter.setBrush(self.palette().base())
         painter.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 8, 8)
+
+
+# Width a panel's top row must leave free for the floating hide button.
+PANEL_CORNER_RESERVE = 28
 
 
 class EditorPanel(EditorSurface):
@@ -241,12 +248,13 @@ class EditorPanel(EditorSurface):
         self.hide_button.setFixedSize(24, 24)
         self.hide_button.clicked.connect(self.hideRequested)
         if isinstance(content, EditorTabs):
-            content.reserve_corner(28)
+            content.reserve_corner(PANEL_CORNER_RESERVE)
         if panel == "timeline":
             self.scroll = ScrollArea(self)
             self.scroll.setFrameShape(QFrame.Shape.NoFrame)
             self.scroll.setWidgetResizable(True)
             self.scroll.setWidget(content)
+            transparent_scroll_area(self.scroll)
             self.scroll.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
             self.scroll.setMinimumSize(0, 0)
             layout.addWidget(self.scroll, 1)
@@ -287,6 +295,13 @@ class _Grip(QSplitterHandle):
     def mouseDoubleClickEvent(self, event):  # noqa: N802
         self.resetRequested.emit()
         event.accept()
+
+
+class EditorSplitter(QSplitter):
+    """A splitter inside a panel, with the same dotted grip as the workspace."""
+
+    def createHandle(self):  # noqa: N802
+        return _Grip(self.orientation(), self)
 
 
 class _WorkspaceSplitter(QSplitter):
