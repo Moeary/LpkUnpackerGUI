@@ -17,8 +17,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from PySide6.QtCore import QEvent, QItemSelectionModel, QPointF, QRectF, QSignalBlocker, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPalette, QPen, QPixmap, QPolygonF, QTransform
+from PySide6.QtCore import QEvent, QItemSelectionModel, QPointF, QRectF, QSignalBlocker, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPainterPath, QPalette, QPen, QPixmap, QPolygonF, QTransform
 from PySide6.QtWidgets import (
     QDialog,
     QAbstractItemView,
@@ -194,6 +194,9 @@ class _MeshCanvas(QWidget):
     selectionRequested = Signal(float, float, str)
     regionRequested = Signal(dict, str)
 
+    # Largest cached base layer (texture + unselected meshes), in pixels.
+    _BASE_LAYER_PIXELS = 3072 * 3072
+
     def __init__(self, mode: str, parent: QWidget | None = None):
         super().__init__(parent)
         self.mode = mode
@@ -214,6 +217,14 @@ class _MeshCanvas(QWidget):
         self._selection_shift = False
         self._selection_moved = False
         self._triangle_cache = {}
+        self._path_cache = {}
+        self._base_cache = None
+        self._interacting = False
+        self._zooming = False
+        self._settle_timer = QTimer(self)
+        self._settle_timer.setSingleShot(True)
+        self._settle_timer.setInterval(120)
+        self._settle_timer.timeout.connect(self._interaction_settled)
         self.overview_mode = False
         self.setMinimumSize(100, 100)
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
@@ -235,6 +246,7 @@ class _MeshCanvas(QWidget):
         if (self.entries is not entries or self.source_size != tuple(map(int, source_size))
                 or self.texture_index != texture_index):
             self._triangle_cache.clear()
+            self._path_cache.clear()
         self.entries = entries
         if self.source_size != (max(1, int(source_size[0])), max(1, int(source_size[1]))):
             self.zoom_factor = 1.0
@@ -278,33 +290,120 @@ class _MeshCanvas(QWidget):
                                          else entry.atlas_triangles(self.source_size) if entry.texture_index == self.texture_index else [])
         return self._triangle_cache[key]
 
-    def paintEvent(self, _event) -> None:
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.fillRect(self.rect(), self.palette().base())
-        scale, offset_x, offset_y = self._transform()
+    def _outline_only(self) -> bool:
+        # Over a native pose frame only the mesh boundary is drawn.
+        return self.mode == "pose" and self.image_polygon is not None
+
+    def _entry_path(self, entry: ArtMeshEntry) -> QPainterPath | None:
+        """The entry's triangles (or pose outline) as one path in source pixels.
+
+        Built once per scene; painting maps it with the view transform, so a
+        pan or zoom costs one C++ draw call per visible entry instead of a
+        Python loop over every triangle.
+        """
+        key = (id(entry), self._outline_only())
+        if key not in self._path_cache:
+            triangles = self._entry_triangles(entry)
+            path = None
+            if triangles:
+                path = QPainterPath()
+                path.setFillRule(Qt.FillRule.WindingFill)
+                if key[1]:
+                    edges: dict = {}
+                    for triangle in triangles:
+                        for a, b in zip(triangle, triangle[1:] + triangle[:1]):
+                            edge = tuple(sorted((a, b)))
+                            edges[edge] = edges.get(edge, 0) + 1
+                    for (a, b), count in edges.items():
+                        if count == 1:
+                            path.moveTo(*a)
+                            path.lineTo(*b)
+                else:
+                    for triangle in triangles:
+                        path.addPolygon(QPolygonF([QPointF(*point) for point in triangle]))
+                        path.closeSubpath()
+            self._path_cache[key] = (path, path.boundingRect() if path is not None else QRectF())
+        return self._path_cache[key]
+
+    def _entry_style(self, index: int) -> tuple[QPen, QColor | None]:
+        selected = index in self.selected_indices
+        shared = index in self.shared_indices
+        if selected:
+            color, width_px = QColor(255, 218, 70, 210), 3
+        elif shared:
+            color, width_px = QColor(255, 125, 54, 190), 2
+        else:
+            hue = (index * 47) % 360
+            color = QColor(140, 150, 160, 55) if self.shared_indices else QColor.fromHsv(hue, 180, 235, 170)
+            width_px = 1
+        pen = QPen(color, width_px)
+        pen.setCosmetic(True)  # pixel width at every zoom level
+        if shared and not selected:
+            pen.setStyle(Qt.PenStyle.DashLine)
+        tint = None
+        if self.mode == "atlas" and self.shared_indices and (selected or shared) and not self._outline_only():
+            tint = QColor(color)
+            tint.setAlpha(40)
+        return pen, tint
+
+    def _draw_entries(self, painter: QPainter, indices, visible: QRectF | None) -> None:
+        for index in indices:
+            path, bounds = self._entry_path(self.entries[index])
+            if path is None or (visible is not None and not bounds.intersects(visible)):
+                continue
+            pen, tint = self._entry_style(index)
+            painter.setPen(pen)
+            painter.setBrush(tint if tint is not None else Qt.BrushStyle.NoBrush)
+            painter.drawPath(path)
+
+    def _base_layer(self, scale: float) -> QPixmap | None:
+        """Texture plus unselected meshes rendered once per zoom level.
+
+        Panning only moves this image; selected/shared meshes are drawn live
+        on top.  Very deep zooms would need a huge image, so they draw the
+        visible part directly instead.
+        """
         width, height = self.source_size
-        target = QRectF(offset_x, offset_y, width * scale, height * scale)
+        size = (max(1, round(width * scale)), max(1, round(height * scale)))
+        if size[0] * size[1] > self._BASE_LAYER_PIXELS or self.image_polygon is not None:
+            return None
+        key = (size, self._base_content_key())
+        if self._base_cache is not None and self._base_cache[0] == key:
+            return self._base_cache[1]
+        image = QPixmap(*size)
+        image.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        sx, sy = size[0] / width, size[1] / height
         if not self.pixmap.isNull():
-            if self.image_polygon is not None:
-                # A native frame includes the preview's letterbox, pan and zoom.
-                # Its four viewport corners have already been mapped through
-                # the SDK MVP into the same canvas coordinates as the meshes.
-                p0, p1, _p2, p3 = [self.source_to_view(point) for point in self.image_polygon]
-                image_width, image_height = self.pixmap.width(), self.pixmap.height()
-                mapping = QTransform((p1.x() - p0.x()) / image_width,
-                                     (p1.y() - p0.y()) / image_width,
-                                     (p3.x() - p0.x()) / image_height,
-                                     (p3.y() - p0.y()) / image_height,
-                                     p0.x(), p0.y())
-                painter.save()
-                painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-                painter.setTransform(mapping)
-                painter.drawPixmap(0, 0, self.pixmap)
-                painter.restore()
-            else:
-                painter.drawPixmap(target, self.pixmap, QRectF(self.pixmap.rect()))
-        elif self.mode == "atlas":
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, scale < 1)
+            painter.drawPixmap(QRectF(0, 0, *size), self.pixmap, QRectF(self.pixmap.rect()))
+        painter.setTransform(QTransform(sx, 0, 0, sy, 0, 0))
+        self._draw_entries(painter, self._unselected_indices(), None)
+        painter.end()
+        self._base_cache = (key, image)
+        return image
+
+    def _base_content_key(self):
+        return (self.texture_index, id(self.entries), self.pixmap.cacheKey(), frozenset(self.selected_indices),
+                frozenset(self.shared_indices), self.palette().color(QPalette.ColorRole.Base).rgba())
+
+    def _stretched_base(self) -> QPixmap | None:
+        """While a zoom gesture runs, reuse the last base layer, scaled."""
+        cache = self._base_cache
+        if (self._zooming and cache is not None and self.image_polygon is None
+                and cache[0][1] == self._base_content_key()):
+            return cache[1]
+        return None
+
+    def _unselected_indices(self):
+        if self._outline_only():
+            return []  # the model itself is the guide; edges of all meshes would hide it
+        return [index for index in range(len(self.entries))
+                if index not in self.selected_indices and index not in self.shared_indices]
+
+    def _paint_placeholder(self, painter: QPainter, target: QRectF) -> None:
+        if self.mode == "atlas":
             painter.setPen(QPen(self.palette().color(QPalette.ColorRole.PlaceholderText), 1))
             # With nothing loaded there is no texture to miss; say so plainly.
             key = "psd.inspector.texture_missing" if self.entries else "psd.inspector.no_entries"
@@ -315,55 +414,89 @@ class _MeshCanvas(QWidget):
             painter.setPen(QPen(QColor("#9aa6b5"), 1))
             painter.drawText(target, Qt.AlignmentFlag.AlignCenter, tr("psd.inspector.static_hint"))
 
-        ordered = sorted(enumerate(self.entries), key=lambda pair:
-                         (pair[0] in self.selected_indices, pair[0] in self.shared_indices))
-        for index, entry in ordered:
-            selected = index in self.selected_indices
-            shared = index in self.shared_indices
-            if self.mode == "pose" and self.image_polygon is not None and not selected and not shared:
-                # The model itself is the selection guide. Drawing every mesh
-                # edge on a thousand-drawable model obscures the visible parts.
-                continue
-            triangles = self._entry_triangles(entry)
-            if not triangles:
-                continue
-            if selected:
-                color = QColor(255, 218, 70, 210)
-                width_px = 3
-            elif shared:
-                color = QColor(255, 125, 54, 190)
-                width_px = 2
-            else:
-                hue = (index * 47) % 360
-                color = (QColor(140, 150, 160, 55) if self.shared_indices else
-                         QColor.fromHsv(hue, 180, 235, 170))
-                width_px = 1
-            pen = QPen(color, width_px)
-            if shared and not selected:
-                pen.setStyle(Qt.PenStyle.DashLine)
-            painter.setPen(pen)
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            if self.mode == "atlas" and self.shared_indices and (selected or shared):
-                tint = QColor(color)
-                tint.setAlpha(40)
-                painter.setBrush(tint)
-            if self.mode == "pose" and self.image_polygon is not None:
-                edges = {}
-                for triangle in triangles:
-                    for a, b in zip(triangle, triangle[1:] + triangle[:1]):
-                        edge = tuple(sorted((a, b)))
-                        edges[edge] = edges.get(edge, 0) + 1
-                for (a, b), count in edges.items():
-                    if count == 1:
-                        painter.drawLine(self.source_to_view(a), self.source_to_view(b))
-                continue
-            for triangle in triangles:
-                polygon = QPolygonF([self.source_to_view(point) for point in triangle])
-                painter.drawPolygon(polygon)
+    def _paint_texture(self, painter: QPainter, scale: float, offset_x: float, offset_y: float,
+                       visible: QRectF) -> None:
+        if self.image_polygon is not None:
+            # A native frame includes the preview's letterbox, pan and zoom.
+            # Its four viewport corners have already been mapped through
+            # the SDK MVP into the same canvas coordinates as the meshes.
+            p0, p1, _p2, p3 = [self.source_to_view(point) for point in self.image_polygon]
+            image_width, image_height = self.pixmap.width(), self.pixmap.height()
+            mapping = QTransform((p1.x() - p0.x()) / image_width,
+                                 (p1.y() - p0.y()) / image_width,
+                                 (p3.x() - p0.x()) / image_height,
+                                 (p3.y() - p0.y()) / image_height,
+                                 p0.x(), p0.y())
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            painter.setTransform(mapping)
+            painter.drawPixmap(0, 0, self.pixmap)
+            painter.restore()
+            return
+        # Deep zoom: scale only the visible part of a large atlas.
+        width, height = self.source_size
+        to_pixmap = (self.pixmap.width() / width, self.pixmap.height() / height)
+        source = visible.intersected(QRectF(0, 0, width, height))
+        if source.isEmpty():
+            return
+        target = QRectF(offset_x + source.x() * scale, offset_y + source.y() * scale,
+                        source.width() * scale, source.height() * scale)
+        painter.drawPixmap(target, self.pixmap, QRectF(source.x() * to_pixmap[0], source.y() * to_pixmap[1],
+                                                       source.width() * to_pixmap[0], source.height() * to_pixmap[1]))
+
+    def _paint_selection_rectangle(self, painter: QPainter) -> None:
         if self._selection_anchor is not None and self.selection_mode == "rectangle" and self._selection_moved:
             painter.setPen(QPen(QColor(0, 190, 220), 1.5, Qt.PenStyle.DashLine))
             painter.setBrush(QColor(0, 190, 220, 30))
             painter.drawRect(QRectF(self._selection_anchor, self._selection_position).normalized())
+
+    def _interaction_started(self, zooming: bool = False) -> None:
+        """Pan/zoom in progress: draw fast now, a smooth frame once it stops.
+
+        A zoom gesture stretches the cached base layer instead of rebuilding
+        it at every wheel step; the crisp layer is rebuilt once it settles.
+        """
+        self._interacting = True
+        self._zooming = self._zooming or zooming
+        self._settle_timer.start()
+
+    def _interaction_settled(self) -> None:
+        self._interacting = self._zooming = False
+        self.update()
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, not self._interacting)
+        painter.fillRect(self.rect(), self.palette().base())
+        scale, offset_x, offset_y = self._transform()
+        width, height = self.source_size
+        target = QRectF(offset_x, offset_y, width * scale, height * scale)
+        view = QTransform(scale, 0, 0, scale, offset_x, offset_y)
+        visible = QRectF(-offset_x / scale, -offset_y / scale, self.width() / scale, self.height() / scale)
+        if self.pixmap.isNull():
+            self._paint_placeholder(painter, target)
+        stretched = self._stretched_base()
+        base = None if stretched is not None else self._base_layer(scale)
+        if stretched is not None:
+            painter.drawPixmap(target, stretched, QRectF(stretched.rect()))
+        elif base is not None:
+            painter.drawPixmap(QPointF(offset_x, offset_y), base)
+        else:
+            if not self.pixmap.isNull():
+                self._paint_texture(painter, scale, offset_x, offset_y, visible)
+            painter.save()
+            painter.setTransform(view)
+            self._draw_entries(painter, self._unselected_indices(), visible)
+            painter.restore()
+        # Shared, then selected, meshes stay on top and are few: draw live.
+        live = sorted((index for index in range(len(self.entries))
+                       if index in self.selected_indices or index in self.shared_indices),
+                      key=lambda index: (index in self.selected_indices, index in self.shared_indices))
+        painter.save()
+        painter.setTransform(view)
+        self._draw_entries(painter, live, visible)
+        painter.restore()
+        self._paint_selection_rectangle(painter)
         painter.end()
 
     def mousePressEvent(self, event) -> None:
@@ -386,6 +519,7 @@ class _MeshCanvas(QWidget):
         if self._pan_anchor is not None:
             self.pan_offset += event.position() - self._pan_anchor
             self._pan_anchor = QPointF(event.position())
+            self._interaction_started()
             self.update()
             event.accept()
             return
@@ -442,6 +576,7 @@ class _MeshCanvas(QWidget):
         source = self.view_to_source(anchor)
         self.zoom_factor = min(12., max(1., self.zoom_factor * factor))
         self.pan_offset += anchor - self.source_to_view(source)
+        self._interaction_started(zooming=True)
         self.update()
 
     def handle_view_zoom(self, action: str) -> None:

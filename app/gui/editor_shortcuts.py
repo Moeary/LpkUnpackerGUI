@@ -33,6 +33,7 @@ SPECS = {
         ("point", "ArtMesh 点选", "V"), ("box", "ArtMesh 框选", "B"),
         ("clear", "清空选区", "Esc"), ("named", "保存命名选区", "Ctrl+Alt+S"),
         ("uv", "共享 UV 高亮", "U"), ("psd", "导出选区 PSD", "Ctrl+Shift+E"),
+        ("hide", "隐藏 / 显示选中的 ArtMesh", "H"),
         ("selection_undo", "撤销选区（任意编辑区域）", "Ctrl+Alt+Z"),
         ("selection_redo", "重做选区（任意编辑区域）", "Ctrl+Alt+Shift+Z"),
     ],
@@ -164,7 +165,8 @@ class EditorShortcutRouter(QObject):
             return
         if action in ("undo", "redo"):
             if self.selection_context(target):
-                getattr(page.artmesh_inspector, action + "_selection")()
+                # Selection gestures and ArtMesh hiding undo in the order made.
+                page.artmesh_context_history(redo=action == "redo")
             else:
                 getattr(page, action)()
             return
@@ -188,6 +190,8 @@ class EditorShortcutRouter(QObject):
                 page.selection_tools.shared_check.click()
             elif action == "psd":
                 page.export_selection_button.click()
+            elif action == "hide":
+                page.toggle_selected_visibility()
             elif action in ("selection_undo", "selection_redo"):
                 getattr(page.artmesh_inspector, action.split("_")[1] + "_selection")()
         else:

@@ -4,6 +4,9 @@
 class SelectionHistory:
     def __init__(self, limit=100):
         self.limit = limit
+        # Counts new gestures (not undo/redo), so callers can interleave this
+        # history with other undo stacks in the order the user acted.
+        self.records = 0
         self.reset()
 
     def reset(self, state=((), None)):
@@ -18,6 +21,7 @@ class SelectionHistory:
         self.past = self.past[-self.limit:]
         self.current = state
         self.future.clear()
+        self.records += 1
 
     def undo(self):
         if not self.past:

@@ -133,6 +133,8 @@ LIVE2D_EDITOR_TEXT = {
     "editor.live2d.rehide_hidden_hint": "把刚才显示出来的 ArtMesh 重新隐藏",
     "editor.live2d.isolate_selection": "仅看选中",
     "editor.live2d.isolate_selection_hint": "预览中只显示选中的 ArtMesh，用于导出前确认选区覆盖的区域；只影响预览，不改变模型与导出",
+    "editor.live2d.hidden_selected": "已隐藏 {count} 个选中的 ArtMesh（Ctrl+Z 撤销）",
+    "editor.live2d.shown_selected": "已显示 {count} 个选中的 ArtMesh",
 }
 
 
@@ -603,6 +605,11 @@ class Live2DEditorPage(QFrame):
             button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
             visibility_layout.addWidget(button, 1)
         self._revealed_hidden_ids: list[str] = []
+        # Order of selection gestures and visibility edits in the ArtMesh
+        # context, so Ctrl+Z there undoes whichever came last.
+        self._artmesh_undo_tokens: list[tuple] = []
+        self._artmesh_redo_tokens: list[tuple] = []
+        self._seen_selection_records = 0
         layout.addWidget(self.visibility_tools)
         self.artmesh_details_widget = QWidget(inspector)
         details_layout = EditorViewportLayout(self.artmesh_details_widget)
@@ -847,6 +854,8 @@ class Live2DEditorPage(QFrame):
                 raise RuntimeError(_text("editor.live2d.return_failed"))
             self.session = candidate
             self._revealed_hidden_ids = []
+            self._artmesh_undo_tokens.clear()
+            self._artmesh_redo_tokens.clear()
             self.clear_artmesh_selection(reset_history=True)
             if self.preview is None:
                 from app.gui.Live2DPreviewWindow import Live2DPreviewWindow
@@ -2035,6 +2044,7 @@ class Live2DEditorPage(QFrame):
         # Rectangle handlers restore their own region only after final IDs sync.
         self._selection_region = None
         self._selection_region_key = None
+        self._note_selection_gesture()
         self._update_selection_actions()
         if self.isolate_selection_button.isChecked() and self.session and self.preview:
             self._apply_preview_pose()  # the isolated preview follows the selection
@@ -2347,6 +2357,7 @@ class Live2DEditorPage(QFrame):
                     return False
                 self.session.set_drawable_visibility(identifiers, True)
                 self._revealed_hidden_ids = identifiers
+            self._note_visibility_edit()
             self._apply_preview_pose()
             self._schedule_mesh_refresh()
             self._update_drawable_controls()
@@ -2355,6 +2366,69 @@ class Live2DEditorPage(QFrame):
         except Exception as exc:
             self._error(exc)
             return False
+
+    def toggle_selected_visibility(self) -> bool:
+        """H: hide the selected ArtMeshes, or show them when all are hidden.
+
+        A quick look at the model without these parts; Ctrl+Z / Ctrl+Shift+Z
+        in the ArtMesh context undo and redo it like a selection gesture.
+        """
+        identifiers = list(self._selected_drawable_ids)
+        if (not self.session or self._preview_session or not identifiers or self._projects_busy()
+                or self.tabs.currentWidget() is not self.artmesh_tab):
+            return False
+        try:
+            self._flush_parameter_edit()
+            hide = any(self.session.drawable_visibility_overrides.get(identifier, True) for identifier in identifiers)
+            self.session.set_drawable_visibility(identifiers, not hide)
+            self._note_visibility_edit()
+            self._apply_preview_pose()
+            self._schedule_mesh_refresh()
+            self._update_drawable_controls()
+            self._update_actions()
+            self._status(_text("editor.live2d.hidden_selected" if hide else "editor.live2d.shown_selected",
+                               count=len(identifiers)))
+            return True
+        except Exception as exc:
+            self._error(exc)
+            return False
+
+    def _note_visibility_edit(self):
+        if self.session and self.session._undo:
+            self._artmesh_undo_tokens.append(("visibility", self.session._undo[-1]))
+            del self._artmesh_undo_tokens[:-200]
+            self._artmesh_redo_tokens.clear()
+
+    def _note_selection_gesture(self):
+        inspector = self.artmesh_inspector
+        records = inspector.selection_history.records
+        if inspector._replaying_selection or records == self._seen_selection_records:
+            return
+        self._seen_selection_records = records
+        self._artmesh_undo_tokens.append(("selection", None))
+        del self._artmesh_undo_tokens[:-200]
+        self._artmesh_redo_tokens.clear()
+
+    def artmesh_context_history(self, *, redo: bool = False):
+        """Undo/redo in the ArtMesh context: the latest of selection gesture
+        or visibility edit.  A visibility step is only replayed while it is
+        still the session's own next undo/redo state; otherwise selection
+        history is used, as before."""
+        tokens, opposite = ((self._artmesh_redo_tokens, self._artmesh_undo_tokens) if redo
+                            else (self._artmesh_undo_tokens, self._artmesh_redo_tokens))
+        token = tokens.pop() if tokens else None
+        if token is not None and token[0] == "visibility":
+            stack = (self.session._redo if redo else self.session._undo) if self.session else []
+            if stack and stack[-1] is token[1]:
+                self.redo() if redo else self.undo()
+                after = self.session._undo if redo else self.session._redo
+                if after:
+                    opposite.append(("visibility", after[-1]))
+                return
+        elif token is not None:
+            opposite.append(("selection", None))
+        inspector = self.artmesh_inspector
+        inspector.redo_selection() if redo else inspector.undo_selection()
 
     def _update_visibility_tools(self):
         hidden = self._hidden_drawable_ids()
@@ -2382,6 +2456,7 @@ class Live2DEditorPage(QFrame):
         try:
             self._flush_parameter_edit()
             self.session.set_drawable_visibility(self._selected_drawable_ids, state != Qt.Unchecked.value)
+            self._note_visibility_edit()
             self._apply_preview_pose()
             self._schedule_mesh_refresh()
             self._update_drawable_controls()

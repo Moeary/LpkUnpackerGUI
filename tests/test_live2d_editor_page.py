@@ -568,6 +568,35 @@ class Live2DEditorPageTests(unittest.TestCase):
         page.isolate_selection_button.setChecked(False)
         self.assertEqual(page.preview.drawables, session.drawable_opacity_multipliers())
 
+    def test_h_hides_selection_and_ctrl_z_undoes_hiding_and_selection_in_order(self):
+        self._add_atlas_meshes()
+        self.open()
+        page, session = self.page, self.page.session
+        page.tabs.setCurrentWidget(page.artmesh_tab)
+        inspector = page.artmesh_inspector
+        context = inspector.entry_list  # a widget inside the ArtMesh tab
+        inspector.select_entries(["ArtMeshFace", "ArtMeshEar"])
+        page.shortcuts.dispatch("hide", context)
+        self.assertEqual(session.drawable_visibility_overrides, {"ArtMeshFace": False, "ArtMeshEar": False})
+        self.assertEqual(page.preview.drawables["ArtMeshFace"], 0.0)
+        inspector.select_entries(["ArtMeshHair"])
+
+        page.shortcuts.dispatch("undo", context)  # the later selection gesture first
+        self.assertEqual(set(page._selected_drawable_ids), {"ArtMeshFace", "ArtMeshEar"})
+        self.assertEqual(session.drawable_visibility_overrides, {"ArtMeshFace": False, "ArtMeshEar": False})
+        page.shortcuts.dispatch("undo", context)  # then the hiding
+        self.assertEqual(session.drawable_visibility_overrides, {})
+        page.shortcuts.dispatch("redo", context)
+        self.assertEqual(session.drawable_visibility_overrides, {"ArtMeshFace": False, "ArtMeshEar": False})
+        page.shortcuts.dispatch("redo", context)
+        self.assertEqual(page._selected_drawable_ids, ["ArtMeshHair"])
+
+        inspector.select_entries(["ArtMeshFace", "ArtMeshEar"])
+        page.shortcuts.dispatch("hide", context)  # all hidden: H shows them again
+        self.assertEqual(session.drawable_visibility_overrides, {})
+        page.tabs.setCurrentWidget(page.parameter_tab)
+        self.assertFalse(page.toggle_selected_visibility())  # only while the ArtMesh tab is active
+
     def test_hidden_selected_drawables_restore_only_export_snapshot_without_mutating_preview(self):
         from app.gui.editor_dialogs import EditorMessageBox
         self._add_atlas_meshes()
