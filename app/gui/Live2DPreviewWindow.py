@@ -976,7 +976,8 @@ class Live2DPreviewWindow(QWidget):
         self._editor_mode = bool(enabled)
         if self.live2d_canvas:
             self.live2d_canvas.setEditorInteraction(enabled)
-            self.live2d_canvas.setViewInteraction(enabled)
+            # Ctrl+wheel zoom / middle-drag pan stay on in plain previews too.
+            self.live2d_canvas.setViewInteraction(True)
 
     def set_rendering_active(self, active: bool):
         if self.live2d_canvas:

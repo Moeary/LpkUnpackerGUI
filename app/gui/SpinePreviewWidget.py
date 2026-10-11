@@ -34,6 +34,7 @@ except (ImportError, OSError):  # keep non-GUI imports and diagnostics usable
     OPENGL_AVAILABLE = False
 
 from app.core.spine_native import SpineNativeError, SpineNativeModel, find_native_library
+from app.gui.view_zoom import ZOOM_STEP as ZOOM_KEY_STEP, zoom_key_action
 
 
 def _gl_id(value: Any) -> int:
@@ -213,6 +214,10 @@ if OPENGL_AVAILABLE:
             if not self._owner._canvas_release(event):
                 super().mouseReleaseEvent(event)
 
+        def keyPressEvent(self, event):  # noqa: N802
+            if not self._owner._canvas_key(event):
+                super().keyPressEvent(event)
+
         def resizeGL(self, width: int, height: int):  # noqa: N802
             # ``paintGL`` owns the viewport.  Qt can deliver a late resize
             # callback while a QOpenGLWindow is being closed, when no context
@@ -314,9 +319,10 @@ class SpinePreviewWidget(QFrame):
     # Emitted with a PickResult (or None) when a click selects a part.
     regionPicked = Signal(object)
 
-    ZOOM_STEP = 1.25
-    MIN_ZOOM = 0.1
-    MAX_ZOOM = 20.0
+    # Same 25%-800% range as Live2D and the preview page's scale slider.
+    ZOOM_STEP = ZOOM_KEY_STEP
+    MIN_ZOOM = 0.25
+    MAX_ZOOM = 8.0
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -338,8 +344,9 @@ class SpinePreviewWidget(QFrame):
         }
         self._last_tick = time.monotonic()
         self._textures_uploaded = False
-        # Editor-only interaction: Ctrl+wheel zoom, middle-drag pan, click pick.
-        self._view_interaction = False
+        # Ctrl+wheel / Ctrl+= Ctrl+- Ctrl+0 zoom and middle-drag pan everywhere;
+        # click picking is editor-only (set_pick_enabled).
+        self._view_interaction = True
         self._pick_enabled = False
         self._press_pos = None
         self._pan_last = None
@@ -503,9 +510,14 @@ class SpinePreviewWidget(QFrame):
         })
         self._refresh_canvas()
 
+    def view_settings(self) -> dict:
+        """Current view transform, in the units set_view_settings() takes."""
+        return {key: float(self._settings.get(key, default)) for key, default in (
+            ("model_scale", 1.0), ("model_rotation", 0.0), ("model_offset_x", 0.0), ("model_offset_y", 0.0))}
+
     # View interaction ---------------------------------------------------
     def set_view_interaction(self, enabled: bool) -> None:
-        """Allow Ctrl+wheel zoom and middle-button pan on the canvas."""
+        """Allow Ctrl+wheel / keyboard zoom and middle-button pan (default on)."""
         self._view_interaction = bool(enabled)
 
     def set_pick_enabled(self, enabled: bool) -> None:
@@ -639,6 +651,21 @@ class SpinePreviewWidget(QFrame):
             self.zoom_by(self.ZOOM_STEP ** steps, (position.x(), position.y()))
         event.accept()
         return True
+
+    def _canvas_key(self, event) -> bool:
+        action = zoom_key_action(event) if self._view_interaction and self._model is not None else None
+        if action is None:
+            return False
+        if action == "reset":
+            self.reset_view()
+        else:
+            self.zoom_by(self.ZOOM_STEP if action == "in" else 1 / self.ZOOM_STEP)
+        event.accept()
+        return True
+
+    def keyPressEvent(self, event):  # noqa: N802
+        if not self._canvas_key(event):
+            super().keyPressEvent(event)
 
     def _canvas_press(self, event) -> bool:
         if self._model is None:

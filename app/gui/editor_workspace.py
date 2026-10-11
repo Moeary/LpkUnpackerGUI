@@ -33,7 +33,7 @@ WORKSPACE_TEXT = {
     "editor.workspace.zoom_in": "放大",
     "editor.workspace.zoom_out": "缩小",
     "editor.workspace.zoom_reset": "重置视图",
-    "editor.workspace.zoom_hint": "Ctrl+滚轮在光标处缩放；按住鼠标中键拖动平移",
+    "editor.workspace.zoom_hint": "Ctrl+滚轮或 Ctrl+= / Ctrl+- 缩放，Ctrl+0 复位；按住鼠标中键拖动平移",
 }
 
 

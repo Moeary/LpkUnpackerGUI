@@ -9,6 +9,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import numpy as np
+from PySide6.QtCore import QEvent, QPointF, Qt
+from PySide6.QtGui import QKeyEvent, QMouseEvent
 from PySide6.QtWidgets import QApplication
 
 from app.gui.Live2DCanvas import Live2DCanvas
@@ -262,6 +264,39 @@ class ContentFitCanvasTests(unittest.TestCase):
         self.assertAlmostEqual(state["offset_y"], start["offset_y"])
         canvas.resetView()  # nothing left to undo
         self.assertAlmostEqual(canvas.viewScale(), start["scale"])
+
+    def _mouse(self, kind, x, y, button, modifiers=Qt.KeyboardModifier.NoModifier):
+        buttons = Qt.MouseButton.NoButton if kind == QEvent.Type.MouseButtonRelease else button
+        return QMouseEvent(kind, QPointF(x, y), QPointF(x, y), button, buttons, modifiers)
+
+    def test_plain_preview_pans_with_middle_drag_and_zooms_with_keys(self):
+        canvas = self.canvas
+        self.assertTrue(canvas._view_interaction)  # on without editor mode
+        middle = Qt.MouseButton.MiddleButton
+        grabbed = canvas.windowPointToModel(200, 150)
+        canvas.mousePressEvent(self._mouse(QEvent.Type.MouseButtonPress, 200, 150, middle))
+        canvas.mouseMoveEvent(self._mouse(QEvent.Type.MouseMove, 230, 130, middle))
+        canvas.mouseReleaseEvent(self._mouse(QEvent.Type.MouseButtonRelease, 230, 130, middle))
+        np.testing.assert_allclose(canvas.windowPointToModel(230, 130), grabbed, atol=1e-6)
+
+        canvas.setModelTransform(1.0, 0.0, 0.0)
+        ctrl = Qt.KeyboardModifier.ControlModifier
+        for key, modifiers in ((Qt.Key.Key_Equal, ctrl), (Qt.Key.Key_Plus, ctrl | Qt.KeyboardModifier.ShiftModifier)):
+            canvas.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, key, modifiers))
+        self.assertAlmostEqual(canvas.viewScale(), 1.25 ** 2)
+        canvas.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Minus, ctrl | Qt.KeyboardModifier.KeypadModifier))
+        self.assertAlmostEqual(canvas.viewScale(), 1.25)
+        canvas.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_0, ctrl))
+        self.assertAlmostEqual(canvas.viewScale(), 1.0)
+
+    def test_settings_transform_accepts_the_full_interactive_zoom_range(self):
+        self.canvas.setModelTransform(8.0, 3.0, -2.5)
+        state = self.canvas.getContentFitState()
+        self.assertAlmostEqual(state["scale"], self.canvas.VIEW_MAX_SCALE)
+        self.assertAlmostEqual(state["offset_x"], 3.0)
+        self.assertAlmostEqual(state["offset_y"], -2.5)
+        self.canvas.setModelTransform(20.0, 0.0, 0.0)
+        self.assertAlmostEqual(self.canvas.viewScale(), 8.0)
 
     def test_reset_after_zooming_a_fitted_view_restores_fit_mode(self):
         self.canvas.setContentFitEnabled(True)

@@ -13,7 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("LPK_DISABLE_NATIVE_PREVIEW", "1")
 
 try:
-    from PySide6.QtCore import QCoreApplication, QEvent, QTimer, Qt
+    from PySide6.QtCore import QCoreApplication, QEvent, QThread, QTimer, Qt
     from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
     from app.gui.SpineEditorPage import SpineEditorPage
@@ -339,15 +339,44 @@ class SpineEditorPageTests(unittest.TestCase):
         self.page.preview.regionPicked.emit(None)
         self.assertEqual(self.page._selection, ("slot", "front"))  # a miss keeps the selection
 
-    def test_psd_menu_exports_and_writes_back_through_history(self):
+    def test_ctrl_plus_minus_zero_shortcuts_zoom_the_preview_from_anywhere_in_the_page(self):
+        self.open()
+        self.page.tree.setFocus()
+        QTest.keyClick(self.page.tree, Qt.Key_Equal, Qt.ControlModifier)
+        self.assertAlmostEqual(self.page.preview.view_scale(), 1.25)
+        QTest.keyClick(self.page.tree, Qt.Key_Plus, Qt.ControlModifier | Qt.ShiftModifier)  # Ctrl++
+        self.assertAlmostEqual(self.page.preview.view_scale(), 1.25 ** 2)
+        QTest.keyClick(self.page.tree, Qt.Key_Minus, Qt.ControlModifier)
+        self.assertAlmostEqual(self.page.preview.view_scale(), 1.25)
+        QTest.keyClick(self.page.tree, Qt.Key_0, Qt.ControlModifier)
+        self.assertEqual(self.page.preview.view_scale(), 1.0)
+
+    def test_psd_tab_exports_and_writes_back_in_background_through_history(self):
         from PIL import Image
         from psd_tools import PSDImage
         from psd_tools.api.layers import PixelLayer
         self.open_with_parts()
-        self.assertTrue(self.page.psd_button.isEnabled())
+        self.assertIs(self.page.tabs.widget(3), self.page.psd_panel)
+        self.assertTrue(self.page.psd_panel.export_button.isEnabled())
         output = self.root / "psd"
-        self.assertTrue(self.page.export_atlas_psd(str(output)))
+        real_export = SpineEditorSession.export_atlas_psd
+        threads = []
+
+        def export_off_gui_thread(session, path):
+            threads.append(QThread.currentThread() is not self.app.thread())
+            return real_export(session, path)
+
+        with patch.object(SpineEditorSession, "export_atlas_psd", export_off_gui_thread):
+            self.assertTrue(self.page.export_atlas_psd(str(output)))
+            self.assertTrue(self.page.psd_busy)
+            self.assertFalse(self.page.psd_panel.export_button.isEnabled())
+            self.assertFalse(self.page.export_atlas_psd(str(output)))  # one PSD job at a time
+            self.wait(lambda: not self.page.psd_busy, timeout=30)
+        self.assertEqual(threads, [True])
+        self.assertTrue(self.page.psd_panel.export_button.isEnabled())
+        self.assertFalse(self.page.session.dirty)
         psd_path = output / "spine_atlas.psd"
+        self.assertIn(str(psd_path), self.page.psd_panel.result.text())
         psd = PSDImage.open(psd_path)
         face_id = next(self.page.atlas_list.item(i).data(Qt.UserRole)[1] for i in range(self.page.atlas_list.count())
                        if self.page.atlas_list.item(i).text() == "face")
@@ -358,6 +387,7 @@ class SpineEditorPageTests(unittest.TestCase):
                                         name="base", top=base.top, left=base.left))
         psd.save(psd_path)
         self.assertTrue(self.page.import_atlas_psd(str(psd_path)))
+        self.wait(lambda: not self.page.psd_busy, timeout=30)
         self.assertTrue(self.page.session.dirty)
         self.assertIn("face", self.page.status_label.text())
         self.assertTrue(self.page.undo_button.isEnabled())

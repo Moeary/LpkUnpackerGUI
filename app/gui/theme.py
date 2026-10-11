@@ -11,7 +11,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtGui import QGuiApplication
-from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtWidgets import QAbstractItemView, QApplication, QToolTip, QWidget
 from qfluentwidgets import Theme, ThemeColor, isDarkTheme, setTheme
 
 
@@ -223,6 +223,37 @@ def transparent_scroll_area(scroll) -> None:
         content.setAutoFillBackground(False)
 
 
+def fluent_scroll_bars(area, *, horizontal: bool = True) -> None:
+    """Replace a plain Qt scroll area's native scroll bars with Fluent ones.
+
+    Native QScrollBar ignores the Fluent theme: on Windows it stays a wide,
+    light bar in dark mode.  QFluentWidgets' overlay ScrollBar follows the
+    theme and mirrors the hidden native bar, so wheel handling, programmatic
+    setValue() and range changes keep working unchanged.
+    """
+
+    if getattr(area, "_lpk_fluent_scroll_bars", None):
+        return
+    from qfluentwidgets import ScrollBar
+
+    if isinstance(area, QAbstractItemView):
+        area.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        area.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+    bars = (ScrollBar(Qt.Orientation.Vertical, area), ScrollBar(Qt.Orientation.Horizontal, area))
+    bars[1].setForceHidden(not horizontal)
+    area._lpk_fluent_scroll_bars = bars
+
+
+def _tooltip_palette(theme: Theme) -> QPalette:
+    colors = _DARK_COLORS if theme is Theme.DARK else _LIGHT_COLORS
+    palette = QPalette()
+    for group in (QPalette.ColorGroup.Active, QPalette.ColorGroup.Inactive):
+        for role, key in ((QPalette.ColorRole.ToolTipBase, "base"), (QPalette.ColorRole.Window, "base"),
+                          (QPalette.ColorRole.ToolTipText, "text"), (QPalette.ColorRole.WindowText, "text")):
+            palette.setColor(group, role, QColor(colors[key]))
+    return palette
+
+
 def _repolish(widget: QWidget) -> None:
     """Re-evaluate palette(...) expressions in custom style sheets."""
 
@@ -254,6 +285,9 @@ def apply_application_theme(theme: str | Theme | None, root: QWidget | None = No
     # second step below refreshes custom style sheets that were already set
     # during page construction.
     app.setPalette(palette_for_theme(selected))
+    # Native tool tips keep their own palette; without this, buttons that use
+    # plain setToolTip() show a light tip with light text in dark mode.
+    QToolTip.setPalette(_tooltip_palette(selected))
     setTheme(selected)
     if root is not None:
         _repolish(root)
@@ -288,6 +322,7 @@ def _sync_system_theme_listener(root: QWidget, enabled: bool) -> None:
 __all__ = [
     "accent_color",
     "apply_application_theme",
+    "fluent_scroll_bars",
     "normalize_theme",
     "palette_for_theme",
     "theme_token",

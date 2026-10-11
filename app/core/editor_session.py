@@ -582,6 +582,22 @@ class SpineEditorSession:
         so later edits to other regions survive.  Returns the changed region
         names.
         """
+        updates, names = self.read_atlas_psd(psd_path)
+        self.apply_texture_edits(updates)
+        return names
+
+    def apply_texture_edits(self, updates: dict[str, bytes]) -> None:
+        """Replace edited page images as one undo step (no-op when empty)."""
+        if updates:
+            self._change(lambda: self._textures.update(updates))
+
+    def read_atlas_psd(self, psd_path: str | Path) -> tuple[dict[str, bytes], list[str]]:
+        """Compose an exported atlas PSD's edits without changing the session.
+
+        Returns (page image bytes by package path, changed region names).  It
+        only reads session state, so a worker may run it on a snapshot and
+        hand the result to apply_texture_edits() on the GUI thread.
+        """
         from app.core.spine_atlas import parse_atlas, writeback_spine_atlas
         psd_path = Path(psd_path).expanduser().resolve()
         metadata_path = psd_path.with_name("spine_atlas.json")
@@ -597,7 +613,7 @@ class SpineEditorSession:
             staged_atlas = self._materialize_atlases(stage)[relative]
             result = writeback_spine_atlas(metadata_path, psd_path, stage / "written", atlas_path=staged_atlas)
             if not result.changed_regions:
-                return []
+                return {}, []
             atlas = parse_atlas(staged_atlas)
             changed_pages = {atlas.region(region_id).page_index for region_id in result.changed_regions}
             source_atlas = atlases[relative]
@@ -606,8 +622,7 @@ class SpineEditorSession:
                 if page.index in changed_pages:
                     source = (source_atlas.parent / page.name).resolve()
                     updates[source.relative_to(self.project.source_root).as_posix()] = result.page_paths[page.index].read_bytes()
-            self._change(lambda: self._textures.update(updates))
-            return [atlas.region(region_id).name for region_id in result.changed_regions]
+            return updates, [atlas.region(region_id).name for region_id in result.changed_regions]
         finally:
             shutil.rmtree(stage, ignore_errors=True)
 

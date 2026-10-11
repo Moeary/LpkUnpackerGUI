@@ -34,7 +34,7 @@ from qfluentwidgets import (
 )
 
 from app.i18n import get_i18n, tr
-from app.gui.theme import transparent_scroll_area
+from app.gui.theme import fluent_scroll_bars, transparent_scroll_area
 from app.core.settings_manager import SettingsManager
 from app.gui.typography import CardTitleLabel
 
@@ -413,6 +413,7 @@ class SpineConverterPage(_SpineConverterDropFrame):
         result_layout.addWidget(self.result_card_title)
         self.result_text = QPlainTextEdit(self.result_card)
         self.result_text.setReadOnly(True)
+        fluent_scroll_bars(self.result_text)
         # Keep the empty log useful but compact; the full report remains
         # copyable and scrollable inside this bounded result surface.
         self.result_text.setMinimumHeight(104)

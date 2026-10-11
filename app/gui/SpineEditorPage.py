@@ -14,8 +14,8 @@ from PySide6.QtWidgets import (
     QFrame, QStackedWidget, QTreeWidgetItem, QVBoxLayout, QWidget, QSizePolicy,
 )
 from qfluentwidgets import (
-    Action, BodyLabel as QLabel, CaptionLabel, CheckBox as QCheckBox,
-    DoubleSpinBox as QDoubleSpinBox, FluentIcon, ListWidget as QListWidget,
+    BodyLabel as QLabel, CaptionLabel, CheckBox as QCheckBox,
+    DoubleSpinBox as QDoubleSpinBox, FluentIcon, IndeterminateProgressBar, ListWidget as QListWidget,
     PrimaryPushButton, PushButton as QPushButton, RoundMenu, ScrollArea as QScrollArea,
     SearchLineEdit, SubtitleLabel, TransparentToolButton, TreeWidget as QTreeWidget,
 )
@@ -101,7 +101,9 @@ SPINE_EDITOR_TEXT = {
     "spine_editor.psd_exported": "已导出 PSD：{path}（保留同目录的 spine_atlas.json 与 psd_baseline 以便回写）",
     "spine_editor.psd_imported": "已从 PSD 回写 {count} 个部件：{names}",
     "spine_editor.psd_unchanged": "PSD 中没有改动的部件，模型保持不变",
-    "spine_editor.pick_hint": "在预览中单击可选中该处的部件；Ctrl+滚轮缩放，按住中键拖动平移",
+    "spine_editor.psd_exporting": "正在后台导出 PSD，可继续编辑…",
+    "spine_editor.psd_importing": "正在后台读取 PSD 回写…",
+    "spine_editor.pick_hint": "在预览中单击可选中该处的部件；Ctrl+滚轮或 Ctrl+= / Ctrl+- 缩放，Ctrl+0 复位，按住中键拖动平移",
     "spine_editor.picked": "已选中部件：{name}",
     "spine_editor.pick_none": "单击处没有可见的部件",
 }
@@ -146,6 +148,15 @@ class _OpenWorker(QThread):
             self.failed.emit(str(exc))
 
 
+def _session_snapshot(session: SpineEditorSession) -> SpineEditorSession:
+    """A copy whose document and textures stay fixed while GUI edits go on."""
+    snapshot = copy.copy(session)
+    snapshot.project = copy.copy(session.project)
+    snapshot.project.document = copy.deepcopy(session.document)
+    snapshot._textures = dict(session._textures)
+    return snapshot
+
+
 class _PreviewWorker(QThread):
     completed = Signal(object)
     failed = Signal(str)
@@ -153,18 +164,74 @@ class _PreviewWorker(QThread):
     def __init__(self, session: SpineEditorSession, request: int, parent=None):
         super().__init__(parent)
         self.request = request
-        # Document snapshots are immutable to this worker while GUI edits
-        # continue. The one preview worker serializes writes to preview_root.
-        self.snapshot = copy.copy(session)
-        self.snapshot.project = copy.copy(session.project)
-        self.snapshot.project.document = copy.deepcopy(session.document)
-        self.snapshot._textures = dict(session._textures)
+        # The one preview worker serializes writes to preview_root.
+        self.snapshot = _session_snapshot(session)
 
     def run(self):
         try:
             self.completed.emit(self.snapshot.prepare_preview())
         except Exception as exc:
             self.failed.emit(str(exc))
+
+
+class _PsdWorker(QThread):
+    """Export or read back a whole-atlas PSD off the GUI thread.
+
+    PSD encoding/decoding of a large atlas takes seconds; on the GUI thread it
+    froze the editor.  The worker only reads a session snapshot; an import's
+    page images are applied by the page, on the GUI thread, as one undo step.
+    """
+
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, session: SpineEditorSession, operation: str, path: str, parent=None):
+        super().__init__(parent)
+        self.session, self.operation, self.path = session, operation, path
+        self.snapshot = _session_snapshot(session)
+
+    def run(self):
+        try:
+            if self.operation == "export":
+                self.completed.emit(self.snapshot.export_atlas_psd(self.path))
+            else:
+                self.completed.emit(self.snapshot.read_atlas_psd(self.path))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class _PsdPanel(QWidget):
+    """Right-panel PSD tab: whole-atlas export and write-back."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 8, 6, 8)
+        layout.setSpacing(8)
+        self.hint = CaptionLabel(self)
+        self.hint.setWordWrap(True)
+        self.export_button = PrimaryPushButton(FluentIcon.SAVE_AS, "", self)
+        self.import_button = QPushButton(FluentIcon.SYNC, "", self)
+        self.progress = IndeterminateProgressBar(self, start=False)
+        self.progress.hide()
+        self.result = CaptionLabel(self)
+        self.result.setWordWrap(True)
+        self.result.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        for widget in (self.hint, self.export_button, self.import_button, self.progress, self.result):
+            layout.addWidget(widget)
+        layout.addStretch(1)
+
+    def set_busy(self, busy: bool) -> None:
+        self.progress.setVisible(busy)
+        if busy:
+            self.progress.start()
+        else:
+            self.progress.stop()
+
+    def retranslate_ui(self):
+        self.hint.setText(_text("spine_editor.psd_hint"))
+        self.export_button.setText(_text("spine_editor.psd_export"))
+        self.import_button.setText(_text("spine_editor.psd_import"))
 
 
 class _BoneInspector(QWidget):
@@ -426,6 +493,13 @@ class SpineEditorPage(QWidget):
         self.tabs.addTab(self.tree, "")
         self.tabs.addTab(self.layers, "")
         self.tabs.addTab(self.atlas_list, "")
+        # Whole-atlas PSD round trip, a right-panel tab like the Live2D
+        # editor's PSD workbench: export every part, edit, write back.
+        self.psd_panel = _PsdPanel(self)
+        self.tabs.addTab(self.psd_panel, "")
+        self.psd_panel.export_button.clicked.connect(lambda _checked=False: self.export_atlas_psd())
+        self.psd_panel.import_button.clicked.connect(lambda _checked=False: self.import_atlas_psd())
+        self._psd_worker = None
         stage = QWidget(self)
         stage_layout = EditorViewportLayout(stage)
         stage_layout.setContentsMargins(0, 0, 0, 0)
@@ -433,16 +507,6 @@ class SpineEditorPage(QWidget):
         view_controls = QHBoxLayout()
         view_controls.addWidget(self.skin_label)
         view_controls.addWidget(self.skin_combo)
-        # Whole-atlas PSD round trip: export every part, edit, write back.
-        self.psd_button = QPushButton(FluentIcon.PHOTO, "", self)
-        self.psd_menu = RoundMenu(parent=self)
-        self.psd_export_action = Action(FluentIcon.SAVE_AS, "", self)
-        self.psd_import_action = Action(FluentIcon.SYNC, "", self)
-        self.psd_export_action.triggered.connect(lambda _checked=False: self.export_atlas_psd())
-        self.psd_import_action.triggered.connect(lambda _checked=False: self.import_atlas_psd())
-        self.psd_menu.addActions([self.psd_export_action, self.psd_import_action])
-        self.psd_button.clicked.connect(lambda: self.psd_menu.exec(self.psd_button.mapToGlobal(QPoint(0, self.psd_button.height()))))
-        view_controls.addWidget(self.psd_button)
         view_controls.addStretch(1)
         self.zoom_controls = ViewZoomControls(self)
         view_controls.addWidget(self.zoom_controls)
@@ -1059,36 +1123,78 @@ class SpineEditorPage(QWidget):
                 self._report_error(exc)
 
     # Whole-atlas PSD round trip ------------------------------------------
+    @property
+    def psd_busy(self) -> bool:
+        # Cleared on ``finished``, after the result has been delivered.
+        return self._psd_worker is not None
+
     def export_atlas_psd(self, output: str | None = None) -> bool:
-        if not self.session or self.loading:
+        """Start a background PSD export; True when the export started."""
+        if not self.session or self.loading or self.psd_busy:
             return False
         if output is None:
             output = QFileDialog.getExistingDirectory(self, _text("spine_editor.psd_export_dialog"),
                                                       str(self.session.original_source.parent))
         if not output:
             return False
-        try:
-            paths = self.session.export_atlas_psd(output)
-        except Exception as exc:
-            self._report_error(exc)
-            return False
-        self.status_label.setText(_text("spine_editor.psd_exported", path="; ".join(str(path) for path in paths)))
-        return True
+        return self._start_psd_worker("export", output)
 
     def import_atlas_psd(self, source: str | None = None) -> bool:
-        if not self.session or self.loading:
+        """Start reading an edited PSD back; True when the import started."""
+        if not self.session or self.loading or self.psd_busy:
             return False
         if source is None:
             source, _filter = QFileDialog.getOpenFileName(self, _text("spine_editor.psd_import_dialog"),
                                                           str(self.session.original_source.parent), "PSD (*.psd)")
         if not source:
             return False
-        names: list[str] = []
-        if not self._edit(lambda: names.extend(self.session.import_atlas_psd(source))):
-            return False
-        self.status_label.setText(_text("spine_editor.psd_imported", count=len(names), names=", ".join(names[:8])
-                                        + ("…" if len(names) > 8 else "")) if names else _text("spine_editor.psd_unchanged"))
+        return self._start_psd_worker("import", source)
+
+    def _start_psd_worker(self, operation: str, path: str) -> bool:
+        worker = _PsdWorker(self.session, operation, path, self)
+        worker.completed.connect(lambda result, worker=worker: self._psd_finished(worker, result))
+        worker.failed.connect(lambda error, worker=worker: self._psd_failed(worker, error))
+        worker.finished.connect(lambda worker=worker: self._psd_worker_done(worker))
+        self._psd_worker = worker
+        self._workers.append(worker)
+        self.psd_panel.set_busy(True)
+        self.psd_panel.result.clear()
+        self.status_label.setText(_text("spine_editor.psd_exporting" if operation == "export" else "spine_editor.psd_importing"))
+        self._update_actions()
+        worker.start()
         return True
+
+    def _psd_finished(self, worker: _PsdWorker, result):
+        if self._closing or worker.session is not self.session:
+            return  # the model was closed or replaced meanwhile
+        if worker.operation == "export":
+            message = _text("spine_editor.psd_exported", path="; ".join(str(path) for path in result))
+        else:
+            updates, names = result
+            if not names:
+                message = _text("spine_editor.psd_unchanged")
+            elif self._edit(lambda: self.session.apply_texture_edits(updates)):
+                message = _text("spine_editor.psd_imported", count=len(names),
+                                names=", ".join(names[:8]) + ("…" if len(names) > 8 else ""))
+            else:
+                return  # _edit() reported the error
+        self.status_label.setText(message)
+        self.psd_panel.result.setText(message)
+
+    def _psd_failed(self, worker: _PsdWorker, error: str):
+        if not self._closing and worker.session is self.session:
+            self._report_error(error)
+            self.psd_panel.result.setText(self.status_label.text())
+
+    def _psd_worker_done(self, worker: _PsdWorker):
+        if worker in self._workers:
+            self._workers.remove(worker)
+        if self._psd_worker is worker:
+            self._psd_worker = None
+        worker.deleteLater()
+        if not self._closing:
+            self.psd_panel.set_busy(False)
+            self._update_actions()
 
     # Click-to-pick in the preview ----------------------------------------
     def _preview_picked(self, result):
@@ -1215,7 +1321,9 @@ class SpineEditorPage(QWidget):
         self.duration_spin.setEnabled(opened and bool(self.animation_name) and not busy)
         self.animation_combo.setEnabled(opened and not busy)
         self.skin_combo.setEnabled(opened and not busy)
-        self.psd_button.setEnabled(opened and not busy)
+        psd_ready = opened and not busy and not self.psd_busy
+        self.psd_panel.export_button.setEnabled(psd_ready)
+        self.psd_panel.import_button.setEnabled(psd_ready)
         self.model_splitter.setEnabled(not busy)
         self.timeline.setEnabled(opened and not busy)
 
@@ -1290,10 +1398,7 @@ class SpineEditorPage(QWidget):
                             (self.duration_spin, "duration"), (self.track_combo, "track"), (self.channel_combo, "track")):
             widget.setToolTip(_text(f"spine_editor.{key}"))
         self.search_edit.setPlaceholderText(_text("spine_editor.search"))
-        self.psd_button.setText(_text("spine_editor.psd"))
-        self.psd_button.setToolTip(_text("spine_editor.psd_hint"))
-        self.psd_export_action.setText(_text("spine_editor.psd_export"))
-        self.psd_import_action.setText(_text("spine_editor.psd_import"))
+        self.psd_panel.retranslate_ui()
         self.zoom_controls.retranslate_ui()
         self.preview.setToolTip(_text("spine_editor.pick_hint"))
         # Shown while no model/track list is loaded, like the Live2D track picker.
@@ -1301,7 +1406,7 @@ class SpineEditorPage(QWidget):
         self.animation_combo.retranslate_ui()
         self.animation_options_button.setToolTip(_text("spine_editor.animation") + " · " + _text("spine_editor.duration"))
         self.workspace.retranslate_ui()
-        for index, key in enumerate(("skeleton", "layers", "atlas")):
+        for index, key in enumerate(("skeleton", "layers", "atlas", "psd")):
             self.tabs.setTabText(index, _text(f"spine_editor.{key}"))
         self.bone_inspector.retranslate_ui()
         self.slot_inspector.retranslate_ui()

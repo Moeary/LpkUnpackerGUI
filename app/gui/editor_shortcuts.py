@@ -1,7 +1,7 @@
 """Editable single-chord shortcuts scoped to the visible editor and its canvas."""
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QObject, Qt, Signal
+from PySide6.QtCore import QEvent, QKeyCombination, QObject, Qt, Signal
 from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QAbstractSpinBox, QKeySequenceEdit, QLineEdit, QPlainTextEdit,
@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
 
 from app.core.settings_manager import SettingsManager
 from app.i18n import tr
+from app.gui.view_zoom import ZOOM_STEP
 
 
 COMMON = [
@@ -22,6 +23,10 @@ COMMON = [
     ("delete_key", "删除选中的关键帧", "Delete"),
     ("new", "新建动作", "Ctrl+N"),
     ("clone", "复制当前动作", "Ctrl+D"),
+    ("zoom_in", "放大视图", "Ctrl+="),
+    ("zoom_in_alt", "放大视图（备用键位）", "Ctrl++"),
+    ("zoom_out", "缩小视图", "Ctrl+-"),
+    ("zoom_reset", "复位视图", "Ctrl+0"),
 ]
 SPECS = {
     "live2d": COMMON + [
@@ -110,7 +115,13 @@ class EditorShortcutRouter(QObject):
             return False
         if not self._belongs(target):
             return False
-        action = self.keys.get(event.keyCombination().toCombined())
+        combination = event.keyCombination()
+        # Integer masks: PySide6's ~ on a single Qt flag does not clear it.
+        ignored = Qt.KeyboardModifier.KeypadModifier.value
+        if combination.key() == Qt.Key.Key_Plus:
+            ignored |= Qt.KeyboardModifier.ShiftModifier.value  # Ctrl++ is typed as Ctrl+Shift+=
+        modifiers = Qt.KeyboardModifier(combination.keyboardModifiers().value & ~ignored)
+        action = self.keys.get(QKeyCombination(modifiers, combination.key()).toCombined())
         if action is None or (self._typing(target) and action != "save"):
             return False
         event.accept()
@@ -118,10 +129,35 @@ class EditorShortcutRouter(QObject):
             self.dispatch(action, target)
         return True
 
+    def _zoom(self, direction, target):
+        """Zoom the view under the keyboard focus: a focused UV/image view,
+        otherwise the editor's model preview (same keys as plain previews)."""
+        handler = getattr(target, "handle_view_zoom", None)
+        if callable(handler):
+            handler(direction)
+            return
+        page = self.page
+        if not page.session:
+            return
+        if self.kind == "live2d":
+            if direction == "reset":
+                page._reset_preview_view()
+            else:
+                page._zoom_preview(ZOOM_STEP if direction == "in" else 1 / ZOOM_STEP)
+        elif direction == "reset":
+            page.preview.reset_view()
+        else:
+            page.preview.zoom_by(ZOOM_STEP if direction == "in" else 1 / ZOOM_STEP)
+
     def dispatch(self, action, target=None):
         page = self.page
         if action == "redo_alt":
             action = "redo"
+        if action == "zoom_in_alt":
+            action = "zoom_in"
+        if action in ("zoom_in", "zoom_out", "zoom_reset"):
+            self._zoom(action.split("_")[1], target)
+            return
         if not page.session or (self.kind == "spine" and page.loading):
             return
         if self.kind == "live2d" and (page._projects_busy() or page._preview_workers):

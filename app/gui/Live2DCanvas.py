@@ -19,6 +19,7 @@ from live2d.utils.canvas import Canvas
 from app.core.model.motions import evaluate_motion_parameters, load_live2d_motions
 from app.gui.live2d_content_fit import alpha_content_bounds, content_fit_transform
 from app.gui.live2d_selection import ModelCoordinates, PreviewTransform, SelectionScene
+from app.gui.view_zoom import ZOOM_STEP, zoom_key_action
 
 live2d.init()
 
@@ -126,13 +127,15 @@ class ADPOpenGLCanvas(QOpenGLWindow):
     # Interactive zoom/pan changed the view; carries getContentFitState().
     viewTransformChanged = Signal(dict)
 
-    VIEW_ZOOM_STEP = 1.25
+    VIEW_ZOOM_STEP = ZOOM_STEP
     VIEW_MIN_SCALE = 0.25
     VIEW_MAX_SCALE = 8.0
 
     def __init__(self):
         super().__init__()
-        self._view_interaction = False
+        # Ctrl+wheel / Ctrl+= Ctrl+- Ctrl+0 zoom and middle-button pan, in
+        # every preview.
+        self._view_interaction = True
         self._view_pan_last = None
         # View before the first interactive zoom/pan; resetView() returns to it.
         self._view_home = None
@@ -548,14 +551,17 @@ class ADPOpenGLCanvas(QOpenGLWindow):
         """Apply responsive model scale and offsets at the final composition pass."""
         self._view_home = None  # explicit settings define a new starting view
         self.setContentFitEnabled(False)
-        self.__model_scale = max(0.25, min(4.0, float(scale)))
+        # Same range as interactive zoom, so the settings panel can hold
+        # (and re-apply) whatever Ctrl+wheel produced.
+        self.__model_scale = max(self.VIEW_MIN_SCALE, min(self.VIEW_MAX_SCALE, float(scale)))
+        limit = max(1.0, self.__model_scale)
         self.__model_offset = (
-            max(-1.0, min(1.0, float(offset_x))),
-            max(-1.0, min(1.0, -float(offset_y))),
+            max(-limit, min(limit, float(offset_x))),
+            max(-limit, min(limit, -float(offset_y))),
         )
         self.update()
 
-    # Interactive view (editor): Ctrl+wheel zoom, middle-button pan ---------
+    # Interactive view: Ctrl+wheel / keyboard zoom, middle-button pan ---------
     def setViewInteraction(self, enabled: bool):
         self._view_interaction = bool(enabled)
         self._view_pan_last = None
@@ -1028,6 +1034,14 @@ class Live2DCanvas(ADPOpenGLCanvas):
         return super().mouseReleaseEvent(event)
 
     def keyPressEvent(self, event):
+        action = zoom_key_action(event) if self._view_interaction else None
+        if action is not None:
+            if action == "reset":
+                self.resetView()
+            else:
+                self.zoomBy(self.VIEW_ZOOM_STEP if action == "in" else 1 / self.VIEW_ZOOM_STEP)
+            event.accept()
+            return
         if (not getattr(self, "external_selection_shortcuts", False)
                 and event.key() == Qt.Key.Key_Escape and self._selection_mode != "none"):
             self._selection_drag = None

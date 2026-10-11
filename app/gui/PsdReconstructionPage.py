@@ -103,7 +103,7 @@ from app.gui.editor_workspace import EditorComboBox, EditorViewportLayout, Edito
 from app.gui.live2d_skin_controls import skin_text
 from app.gui.editor_dialogs import ThemedEditorDialog, get_editor_text
 from app.i18n import get_i18n, tr
-from app.gui.theme import transparent_scroll_area
+from app.gui.theme import fluent_scroll_bars, transparent_scroll_area
 from app.gui.typography import CardTitleLabel
 
 
@@ -308,6 +308,7 @@ class PsdMultiRepackDialog(ThemedEditorDialog):
         layout.addLayout(source_row)
         self.psd_list = QListWidget(self)
         self.psd_list.setMinimumHeight(150)
+        fluent_scroll_bars(self.psd_list)
         layout.addWidget(self.psd_list)
 
         controls = QHBoxLayout()

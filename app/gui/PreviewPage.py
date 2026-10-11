@@ -1096,7 +1096,8 @@ class Live2DSettingsPanel(QFrame):
         self.scale_text_label = BodyLabel("", group)
         scale_layout.addWidget(self.scale_text_label)
         self.scale_slider = Slider(Qt.Horizontal, group)
-        self.scale_slider.setRange(25, 400)
+        # Matches the 25%-800% range of Ctrl+wheel zoom on the canvas.
+        self.scale_slider.setRange(25, 800)
         self.scale_slider.setValue(100)
         self.scale_value_label = BodyLabel("100%", group)
         self.scale_value_label.setMinimumWidth(48)
@@ -1128,14 +1129,14 @@ class Live2DSettingsPanel(QFrame):
         offset_layout.addWidget(self.offset_text_label, 0, 0, 1, 4)
         self.position_x_label = BodyLabel("X", group)
         self.position_x_spinbox = SpinBox(group)
-        self.position_x_spinbox.setRange(-100, 100)
+        self.position_x_spinbox.setRange(-800, 800)
         self.position_x_spinbox.setValue(0)
         self.position_x_spinbox.setSuffix(" %")
         self.position_x_spinbox.setFixedWidth(105)
         self.position_x_spinbox.valueChanged.connect(lambda _: self._emit_settings())
         self.position_y_label = BodyLabel("Y", group)
         self.position_y_spinbox = SpinBox(group)
-        self.position_y_spinbox.setRange(-100, 100)
+        self.position_y_spinbox.setRange(-800, 800)
         self.position_y_spinbox.setValue(0)
         self.position_y_spinbox.setSuffix(" %")
         self.position_y_spinbox.setFixedWidth(105)
@@ -2186,6 +2187,7 @@ class PreviewPage(QFrame):
         self.spine_preview.previewReady.connect(self._on_spine_preview_ready)
         self.spine_preview.previewFailed.connect(self._on_spine_preview_error)
         self.spine_preview.stateChanged.connect(self._on_spine_preview_state)
+        self.spine_preview.viewScaleChanged.connect(self._on_spine_view_changed)
         self.preview_dock_layout.addWidget(self.spine_preview, 1)
         self._ensure_embedded_live2d()
         self.preview_stage_layout.addWidget(self.preview_dock_area, 1)
@@ -4948,6 +4950,17 @@ class PreviewPage(QFrame):
             duration=3000,
             parent=self
         )
+
+    def _on_spine_view_changed(self, _scale: float = 1.0):
+        """Mirror Ctrl+wheel / keyboard zoom and middle-drag pan into the view sliders, so the
+        next settings change does not snap the view back."""
+        if not (self._spine_mode and self.spine_preview and self.settings_panel):
+            return
+        view = self.spine_preview.view_settings()
+        self.settings_panel.sync_view_transform({
+            "scale": view["model_scale"], "rotation": view["model_rotation"],
+            "offset_x": view["model_offset_x"], "offset_y": view["model_offset_y"],
+        })
 
     def on_settings_changed(self, settings: dict):
         """Apply display settings directly to the embedded OpenGL widget."""

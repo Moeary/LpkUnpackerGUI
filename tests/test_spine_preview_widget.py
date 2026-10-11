@@ -532,6 +532,44 @@ class SpinePreviewWidgetTests(unittest.TestCase):
         self.assertEqual(widget.view_to_skeleton(200, 150), (0.0, 100.0))  # centre of the bounds
         widget.deleteLater()
 
+    def test_any_preview_pans_with_middle_drag_and_zooms_with_ctrl_keys(self):
+        from PySide6.QtCore import QPointF, Qt
+        from PySide6.QtGui import QKeyEvent, QMouseEvent
+
+        def mouse(kind, x, y, button=Qt.MouseButton.MiddleButton, modifiers=Qt.KeyboardModifier.NoModifier):
+            buttons = Qt.MouseButton.NoButton if kind == QEvent.Type.MouseButtonRelease else button
+            return QMouseEvent(kind, QPointF(x, y), QPointF(x, y), button, buttons, modifiers)
+
+        widget = SpinePreviewWidget()
+        widget.resize(400, 300)
+        widget._base_bounds = (-100.0, -50.0, 200.0, 300.0)
+        widget._model = object()  # input only needs a loaded model
+        self.assertTrue(widget._view_interaction)  # on by default, not only in the editor
+        point = widget.view_to_skeleton(200, 150)
+        self.assertTrue(widget._canvas_press(mouse(QEvent.Type.MouseButtonPress, 200, 150)))
+        self.assertTrue(widget._canvas_move(mouse(QEvent.Type.MouseMove, 220, 140)))
+        self.assertTrue(widget._canvas_release(mouse(QEvent.Type.MouseButtonRelease, 220, 140)))
+        moved = widget.view_to_skeleton(220, 140)
+        self.assertAlmostEqual(point[0], moved[0], places=4)
+        self.assertAlmostEqual(point[1], moved[1], places=4)
+        # Ctrl+left is not a pan: without picking it is left to Qt.
+        self.assertFalse(widget._canvas_press(mouse(QEvent.Type.MouseButtonPress, 10, 10, Qt.MouseButton.LeftButton,
+                                                    Qt.KeyboardModifier.ControlModifier)))
+
+        ctrl = Qt.KeyboardModifier.ControlModifier
+        self.assertTrue(widget._canvas_key(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Equal, ctrl)))
+        self.assertAlmostEqual(widget.view_scale(), 1.25)
+        self.assertTrue(widget._canvas_key(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Minus, ctrl)))
+        self.assertAlmostEqual(widget.view_scale(), 1.0)
+        self.assertFalse(widget._canvas_key(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Minus, Qt.KeyboardModifier.NoModifier)))
+        widget.zoom_by(100)
+        self.assertEqual(widget.view_scale(), 8.0)  # same ceiling as the 800% scale slider
+        self.assertTrue(widget._canvas_key(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_0, ctrl)))
+        self.assertEqual(widget.view_settings()["model_scale"], 1.0)
+        self.assertEqual(widget.view_settings()["model_offset_x"], 0.0)
+        widget._model = None
+        widget.deleteLater()
+
 
 if __name__ == "__main__":
     unittest.main()

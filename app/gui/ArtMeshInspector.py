@@ -44,6 +44,7 @@ from app.i18n import get_i18n, tr
 from app.gui.theme import transparent_scroll_area
 from app.gui.editor_workspace import FluentEditorTabs, EditorViewportLayout
 from app.gui.editor_dialogs import ThemedEditorDialog
+from app.gui.view_zoom import ZOOM_STEP, zoom_key_action
 from app.gui.live2d_selection import SelectionScene, barycentric, combine_selection, intersect_convex
 
 
@@ -55,7 +56,7 @@ ARTMESH_TEXT = {
     "artmesh.inspector.selected_count": "已选 {count} 个 ArtMesh",
     "artmesh.inspector.pick_trigger": "选择换装触发部件",
     "artmesh.inspector.no_trigger": "请先预览此工程的主模型，再选择未绑定事件的部件。",
-    "artmesh.inspector.zoom_hint": "滚轮缩放，中键拖动，双击复位；总览中使用 Ctrl+滚轮缩放。",
+    "artmesh.inspector.zoom_hint": "滚轮或 Ctrl+= / Ctrl+- 缩放，中键拖动，双击或 Ctrl+0 复位；总览中使用 Ctrl+滚轮缩放。",
     "artmesh.inspector.selection_hint": "单击选择；Ctrl/Shift+单击增减；拖动框选；Ctrl/Shift+框选合并。",
     "artmesh.inspector.uv_toggle": "显示/收起 UV 与局部预览",
 }
@@ -433,12 +434,29 @@ class _MeshCanvas(QWidget):
         if self.overview_mode and not event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             event.ignore()
             return
-        anchor = event.position()
+        self._zoom_at(1.25 ** (event.angleDelta().y() / 120.), event.position())
+        event.accept()
+
+    def _zoom_at(self, factor: float, anchor: QPointF) -> None:
         source = self.view_to_source(anchor)
-        self.zoom_factor = min(12., max(1., self.zoom_factor * 1.25 ** (event.angleDelta().y() / 120.)))
+        self.zoom_factor = min(12., max(1., self.zoom_factor * factor))
         self.pan_offset += anchor - self.source_to_view(source)
         self.update()
-        event.accept()
+
+    def handle_view_zoom(self, action: str) -> None:
+        """Ctrl+= / Ctrl+- / Ctrl+0 (see app.gui.view_zoom)."""
+        if action == "reset":
+            self.reset_view()
+        else:
+            self._zoom_at(ZOOM_STEP if action == "in" else 1 / ZOOM_STEP, QPointF(self.rect().center()))
+
+    def keyPressEvent(self, event):
+        action = zoom_key_action(event)
+        if action is not None:
+            self.handle_view_zoom(action)
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def mouseDoubleClickEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:

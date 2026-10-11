@@ -2,22 +2,42 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import QEvent, QPoint, Qt, Signal
+from PySide6.QtCore import QPoint, Qt, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
 from qfluentwidgets import BodyLabel, FluentIcon, TransparentToolButton
 
 from app.i18n import tr
-from app.gui.theme import transparent_scroll_area
+from app.gui.theme import fluent_scroll_bars, transparent_scroll_area
+from app.gui.view_zoom import ZOOM_STEP, zoom_key_action
 
 
 class ImageZoomScrollArea(QScrollArea):
+    """Image viewport: the wheel (with or without Ctrl) or Ctrl+= / Ctrl+-
+    zooms, Ctrl+0 fits, and a middle-button drag pans."""
+
     zoomRequested = Signal(float, QPoint)
+    fitRequested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.horizontalScrollBar().installEventFilter(self)
-        self.verticalScrollBar().installEventFilter(self)
+        self._pan_last = None
+        fluent_scroll_bars(self)
+
+    def handle_view_zoom(self, action: str) -> None:
+        if action == "reset":
+            self.fitRequested.emit()
+        else:
+            self.zoomRequested.emit(ZOOM_STEP if action == "in" else 1 / ZOOM_STEP,
+                                    self.viewport().rect().center())
+
+    def keyPressEvent(self, event):
+        action = zoom_key_action(event)
+        if action is not None:
+            self.handle_view_zoom(action)
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def wheelEvent(self, event):
         angle_delta = event.angleDelta().y()
@@ -28,14 +48,33 @@ class ImageZoomScrollArea(QScrollArea):
             self.zoomRequested.emit(1.25 ** steps, event.position().toPoint())
         event.accept()
 
-    def eventFilter(self, watched, event):
-        if (
-            event.type() == QEvent.Type.Wheel
-            and watched in (self.horizontalScrollBar(), self.verticalScrollBar())
-        ):
+    def mousePressEvent(self, event):
+        self.setFocus(Qt.FocusReason.MouseFocusReason)  # for Ctrl+= / Ctrl+- / Ctrl+0
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._pan_last = event.position().toPoint()
+            self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
             event.accept()
-            return True
-        return super().eventFilter(watched, event)
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._pan_last is not None:
+            position = event.position().toPoint()
+            delta = position - self._pan_last
+            self._pan_last = position
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._pan_last is not None and event.button() == Qt.MouseButton.MiddleButton:
+            self._pan_last = None
+            self.viewport().unsetCursor()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 
 class ImagePreviewPanel(QFrame):
@@ -89,6 +128,7 @@ class ImagePreviewPanel(QFrame):
         self.image_scroll.setAlignment(Qt.AlignCenter)
         self.image_scroll.setFrameShape(QFrame.NoFrame)
         self.image_scroll.zoomRequested.connect(self.zoom_at_position)
+        self.image_scroll.fitRequested.connect(self.fit_to_window)
         self.image_scroll.setStyleSheet("""
             QScrollArea {
                 border: 1px solid palette(mid);
@@ -148,6 +188,8 @@ class ImagePreviewPanel(QFrame):
         list_scroll.setFrameShape(QFrame.NoFrame)
         list_scroll.setWidget(self.list_widget)
         transparent_scroll_area(list_scroll)
+        # The item list only scrolls vertically; long names wrap instead.
+        fluent_scroll_bars(list_scroll, horizontal=False)
         side_layout.addWidget(self.list_title_label)
         side_layout.addWidget(self.limit_label)
         side_layout.addWidget(list_scroll, 1)

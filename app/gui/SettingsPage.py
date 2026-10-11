@@ -70,6 +70,7 @@ from app.core.spine_preview import (
     list_installed_spine_runtimes,
 )
 from app.i18n import get_i18n, normalize_language_code, tr
+from app.gui.theme import fluent_scroll_bars
 from app.gui.typography import CardTitleLabel
 
 
@@ -1518,6 +1519,7 @@ class SettingsPage(QFrame):
         )
         layout.addWidget(filter_edit)
         entries = QListWidget(dialog)
+        fluent_scroll_bars(entries)
         layout.addWidget(entries, 1)
         note = CaptionLabel(
             tr(
