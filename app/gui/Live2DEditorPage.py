@@ -17,7 +17,7 @@ from qfluentwidgets import (
     BodyLabel, CaptionLabel, CardWidget, CheckBox, ComboBox, DoubleSpinBox,
     FluentIcon, LineEdit, PrimaryPushButton,
     PushButton, RoundMenu, ScrollArea, Slider, SubtitleLabel, TableWidget,
-    TransparentToolButton,
+    TogglePushButton, TransparentToolButton,
     TransparentToggleToolButton,
 )
 
@@ -127,6 +127,12 @@ LIVE2D_EDITOR_TEXT = {
     "editor.live2d.drawable_hint": "仅调整当前所选 ArtMesh 的预览可见性和透明度；恢复可见时保留所设透明度。",
     "editor.live2d.parent_part_settings": "所属 Part 设置",
     "editor.live2d.pick_hidden_drawables_export": "以下所选 ArtMesh 在预览中被隐藏或透明度为零：{ids}。仅在导出副本中恢复可见；当前预览和编辑记录保持不变。继续？",
+    "editor.live2d.reveal_hidden": "显示已隐藏 ({count})",
+    "editor.live2d.reveal_hidden_hint": "临时显示所有已隐藏的 ArtMesh（列表中带闭眼图标），再点一次把同一批重新隐藏；两步都可撤销",
+    "editor.live2d.rehide_hidden": "重新隐藏 ({count})",
+    "editor.live2d.rehide_hidden_hint": "把刚才显示出来的 ArtMesh 重新隐藏",
+    "editor.live2d.isolate_selection": "仅看选中",
+    "editor.live2d.isolate_selection_hint": "预览中只显示选中的 ArtMesh，用于导出前确认选区覆盖的区域；只影响预览，不改变模型与导出",
 }
 
 
@@ -582,6 +588,22 @@ class Live2DEditorPage(QFrame):
         self.drawable_controls.installEventFilter(self)
         self._arrange_drawable_controls()
         layout.addWidget(self.drawable_controls)
+        # Check what a selection export covers before exporting: reveal every
+        # hidden ArtMesh (and hide the same set again), or preview only the
+        # selection.  Hidden ArtMeshes carry an eye-off icon in the list.
+        self.visibility_tools = QWidget(self.artmesh_tab)
+        visibility_layout = QHBoxLayout(self.visibility_tools)
+        visibility_layout.setContentsMargins(2, 0, 2, 0)
+        visibility_layout.setSpacing(5)
+        self.reveal_hidden_button = PushButton(FluentIcon.VIEW, "", self.visibility_tools)
+        self.reveal_hidden_button.clicked.connect(self.toggle_hidden_reveal)
+        self.isolate_selection_button = TogglePushButton(FluentIcon.FILTER, "", self.visibility_tools)
+        self.isolate_selection_button.toggled.connect(self.set_selection_isolated)
+        for button in (self.reveal_hidden_button, self.isolate_selection_button):
+            button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+            visibility_layout.addWidget(button, 1)
+        self._revealed_hidden_ids: list[str] = []
+        layout.addWidget(self.visibility_tools)
         self.artmesh_details_widget = QWidget(inspector)
         details_layout = EditorViewportLayout(self.artmesh_details_widget)
         details_layout.setContentsMargins(0, 4, 0, 0)
@@ -824,6 +846,7 @@ class Live2DEditorPage(QFrame):
             if not self.return_to_current_model(reload=False, announce=False):
                 raise RuntimeError(_text("editor.live2d.return_failed"))
             self.session = candidate
+            self._revealed_hidden_ids = []
             self.clear_artmesh_selection(reset_history=True)
             if self.preview is None:
                 from app.gui.Live2DPreviewWindow import Live2DPreviewWindow
@@ -1529,7 +1552,8 @@ class Live2DEditorPage(QFrame):
             self.preview.set_part_opacity_overrides({key: value for key, value in render_session.part_overrides.items() if key in defaults}, defaults)
             drawables = getattr(self.preview, "set_drawable_opacity_overrides", None)
             if callable(drawables):
-                drawables(render_session.drawable_opacity_multipliers())
+                drawables(self._preview_drawable_multipliers(render_session))
+            self._update_visibility_tools()
             self._sync_parameter_values(values)
         elif self._selected_parameter in values:
             self._sync_parameter_values({self._selected_parameter: values[self._selected_parameter]})
@@ -2012,6 +2036,8 @@ class Live2DEditorPage(QFrame):
         self._selection_region = None
         self._selection_region_key = None
         self._update_selection_actions()
+        if self.isolate_selection_button.isChecked() and self.session and self.preview:
+            self._apply_preview_pose()  # the isolated preview follows the selection
 
     def _sync_selection_highlights(self, related=None):
         canvas = self.preview.live2d_canvas if self.preview else None
@@ -2266,6 +2292,89 @@ class Live2DEditorPage(QFrame):
             self.drawable_visible.setCheckState(Qt.PartiallyChecked if len(visibility) > 1
                                                else Qt.Checked if True in visibility else Qt.Unchecked)
             self.drawable_opacity.setValue(next(iter(opacities)) if len(opacities) == 1 else -.01)
+
+    # Hidden ArtMeshes and selection isolation ------------------------------
+    def _hidden_drawable_ids(self) -> list[str]:
+        if not self.session:
+            return []
+        return [identifier for identifier, visible in self.session.drawable_visibility_overrides.items()
+                if visible is False]
+
+    def _preview_drawable_multipliers(self, render_session) -> dict[str, float]:
+        """Session opacity multipliers, or only the selection while isolated.
+
+        Isolation is preview-only: it neither changes the session nor what an
+        export writes, and it shows selected ArtMeshes even when hidden, as
+        the export copy does.
+        """
+        multipliers = render_session.drawable_opacity_multipliers()
+        if not (self._selection_isolated() and render_session is self.session):
+            return multipliers
+        selected = set(self._selected_drawable_ids)
+        return {str(item["id"]): (1.0 if str(item["id"]) in selected else 0.0)
+                for item in (render_session.mesh_data or {}).get("drawables", [])}
+
+    def _selection_isolated(self) -> bool:
+        return bool(self.isolate_selection_button.isChecked() and self._selected_drawable_ids)
+
+    def set_selection_isolated(self, isolated: bool):
+        """Preview only the selected ArtMeshes (what a selection export covers)."""
+        if self.isolate_selection_button.isChecked() != bool(isolated):
+            with QSignalBlocker(self.isolate_selection_button):
+                self.isolate_selection_button.setChecked(bool(isolated))
+        if self.session and self.preview:
+            self._apply_preview_pose()
+
+    def toggle_hidden_reveal(self) -> bool:
+        """Show every hidden ArtMesh; the next click hides the same set again.
+
+        Both directions are ordinary undoable visibility edits, so they also
+        work with the undo history and the recovery snapshot.
+        """
+        if not self.session or self._preview_session or self._projects_busy():
+            return False
+        try:
+            self._flush_parameter_edit()
+            known = {str(item["id"]) for item in (self.session.mesh_data or {}).get("drawables", [])}
+            if self._revealed_hidden_ids:
+                identifiers = [identifier for identifier in self._revealed_hidden_ids if identifier in known]
+                self._revealed_hidden_ids = []
+                if identifiers:
+                    self.session.set_drawable_visibility(identifiers, False)
+            else:
+                identifiers = [identifier for identifier in self._hidden_drawable_ids() if identifier in known]
+                if not identifiers:
+                    return False
+                self.session.set_drawable_visibility(identifiers, True)
+                self._revealed_hidden_ids = identifiers
+            self._apply_preview_pose()
+            self._schedule_mesh_refresh()
+            self._update_drawable_controls()
+            self._update_actions()
+            return True
+        except Exception as exc:
+            self._error(exc)
+            return False
+
+    def _update_visibility_tools(self):
+        hidden = self._hidden_drawable_ids()
+        if self._revealed_hidden_ids and set(self._revealed_hidden_ids) <= set(hidden):
+            self._revealed_hidden_ids = []  # undo already hid the revealed set again
+        self.artmesh_inspector.set_user_hidden(hidden)
+        editable = bool(self.session and not self._preview_session and not self._projects_busy())
+        if self._revealed_hidden_ids:
+            self.reveal_hidden_button.setIcon(FluentIcon.HIDE)
+            self.reveal_hidden_button.setText(_text("editor.live2d.rehide_hidden",
+                                                    count=len(self._revealed_hidden_ids)))
+            self.reveal_hidden_button.setToolTip(_text("editor.live2d.rehide_hidden_hint"))
+        else:
+            self.reveal_hidden_button.setIcon(FluentIcon.VIEW)
+            self.reveal_hidden_button.setText(_text("editor.live2d.reveal_hidden", count=len(hidden)))
+            self.reveal_hidden_button.setToolTip(_text("editor.live2d.reveal_hidden_hint"))
+        self.reveal_hidden_button.setEnabled(editable and bool(self._revealed_hidden_ids or hidden))
+        self.isolate_selection_button.setText(_text("editor.live2d.isolate_selection"))
+        self.isolate_selection_button.setToolTip(_text("editor.live2d.isolate_selection_hint"))
+        self.isolate_selection_button.setEnabled(bool(self.session and not self._preview_session))
 
     def _drawable_visibility_changed(self, state):
         if not self.session or self._preview_session or not self._selected_drawable_ids or self._projects_busy():
@@ -2949,6 +3058,7 @@ class Live2DEditorPage(QFrame):
     def _update_actions(self):
         if hasattr(self, "recovery"):
             self.recovery.refresh()
+        self._update_visibility_tools()
         session = self.session
         self.save_button.setEnabled(bool(session))
         self.undo_button.setEnabled(bool(session and session.can_undo))

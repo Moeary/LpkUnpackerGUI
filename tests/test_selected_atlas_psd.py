@@ -81,6 +81,76 @@ class SelectedAtlasTests(unittest.TestCase):
             repack_atlas_png_from_psd(edited, self.root / "conflict", metadata_path=both.metadata_path)
         self.assertFalse(list((self.root / "conflict").glob("*.png")))
 
+    def edit_merged(self, result, changes, *, hide=False):
+        """Edit the single merged layer in place, as an artist would."""
+        from psd_tools import PSDImage
+        from psd_tools.api.layers import PixelLayer
+        from psd_tools.constants import Tag
+        metadata = self.fixture.metadata(result)
+        psd = PSDImage.open(result.psd_path)
+        by_name = {info["merged_layer"]["name"]: info for info in metadata["layers"]}
+        for name, info in by_name.items():
+            merged = info["merged_layer"]
+            original = next(layer for layer in psd.descendants()
+                            if not layer.is_group() and layer.name == name)
+            pixels = np.asarray(original.topil().convert("RGBA")).copy()
+            for piece in metadata["layers"]:
+                if piece["merged_layer"]["name"] == name and piece["drawable_id"] in changes:
+                    y, x = piece["top"] - merged["top"], piece["left"] - merged["left"]
+                    changes[piece["drawable_id"]](pixels[y:y + piece["bbox"][3], x:x + piece["bbox"][2]])
+            replacement = PixelLayer.frompil(Image.fromarray(pixels), original.parent, name=name,
+                                             left=original.left, top=original.top)
+            replacement.tagged_blocks.set_data(Tag.LAYER_ID, int(original.layer_id))
+            original.parent.remove(original)
+            if hide:  # hide the edit unit (the visible top-level group)
+                replacement.parent.parent.visible = False
+        edited = self.root / "merged-edit.psd"
+        psd.save(edited)
+        return edited
+
+    def test_single_layer_merges_pieces_and_writes_back_like_per_artmesh_layers(self):
+        from psd_tools import PSDImage
+        result = reconstruct_live2d_psd(self.model, self.root / "single", mode="atlas-components",
+                                        selected_drawable_ids=["EarLeft", "HairTop"], mesh_data=self.mesh,
+                                        atlas_single_layer=True)
+        metadata = self.fixture.metadata(result)
+        self.assertEqual(metadata["selection"]["layer_mode"], "single")
+        self.assertEqual({info["drawable_id"] for info in metadata["layers"]}, {"EarLeft", "HairTop"})
+        self.assertEqual({info["merged_layer"]["name"] for info in metadata["layers"]}, {"selected_atlas"})
+        pixel_layers = [layer.name for layer in PSDImage.open(result.psd_path).descendants() if not layer.is_group()]
+        self.assertEqual(pixel_layers, ["selected_atlas"])
+        noop = repack_atlas_png_from_psd(result.psd_path, self.root / "single-noop")
+        for index, texture in enumerate(self.textures):
+            self.assertEqual(noop.texture_outputs[index].read_bytes(), texture.read_bytes())
+
+        edited = self.edit_merged(result, {
+            "EarLeft": lambda pixels: pixels.__setitem__((3, 3, slice(0, 3)), (240, 20, 20)),
+            "HairTop": lambda pixels: pixels.__setitem__((2, 2, 3), 0),  # erase one texel
+        })
+        output = repack_atlas_png_from_psd(edited, self.root / "single-edited", metadata_path=result.metadata_path)
+        self.assertEqual({item["layer"] for item in output.region_masks}, {"EarLeft", "HairTop"})
+        for index, texture in enumerate(self.textures):
+            with Image.open(texture) as source, Image.open(output.texture_outputs[index]) as target:
+                before, after = np.asarray(source), np.asarray(target)
+                self.assertEqual(int(np.any(before != after, axis=2).sum()), 1)
+                if index == 0:
+                    self.assertEqual(int(after[22, 22, 3]), 0)
+                else:
+                    self.assertEqual(after[5, 5, :3].tolist(), [240, 20, 20])
+
+    def test_single_layer_original_layout_uses_one_layer_per_texture_and_hidden_layer_is_ignored(self):
+        result = reconstruct_live2d_psd(self.model, self.root / "single-original", mode="atlas-components",
+                                        selected_drawable_ids=["EarLeft", "HairTop"], mesh_data=self.mesh,
+                                        atlas_layout="original", atlas_single_layer=True)
+        layers = self.fixture.metadata(result)["layers"]
+        self.assertEqual(len({info["merged_layer"]["name"] for info in layers}), 2)  # pieces on two textures
+        self.assertTrue(all([info["left"], info["top"]] == info["atlas_origin"] for info in layers))
+        edited = self.edit_merged(result, {"EarLeft": lambda pixels: pixels.__setitem__((3, 3, 3), 0)}, hide=True)
+        output = repack_atlas_png_from_psd(edited, self.root / "hidden", metadata_path=result.metadata_path)
+        for index, texture in enumerate(self.textures):
+            self.assertEqual(output.texture_outputs[index].read_bytes(), texture.read_bytes())
+        self.assertTrue(any("hidden" in warning for warning in output.warnings))
+
     def test_resized_canvas_rejected(self):
         result = self.export()
         edited = self.fixture.edit_layers(self.root, result, {}, canvas_size=(128, 128))

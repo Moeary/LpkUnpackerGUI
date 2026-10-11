@@ -11,6 +11,8 @@ from typing import Any, Callable, Iterable, Mapping, Optional
 import numpy as np
 from PIL import Image
 
+from app.core.psd_atlas_selection import merged_piece
+
 
 ProgressCallback = Callable[[int, str], None]
 METADATA_FORMAT = "LpkUnpacker.Live2DAtlasPSD"
@@ -405,6 +407,7 @@ def reconstruct_live2d_psd(
     selection_region: Any = None,
     mesh_data: Mapping[str, Any] | None = None,
     atlas_layout: str = "packed",
+    atlas_single_layer: bool = False,
 ) -> ReconstructionResult:
     mode = str(mode or "mesh").strip().lower()
     if mode not in {"mesh", "atlas-components", "atlas-artmesh"}:
@@ -493,7 +496,7 @@ def reconstruct_live2d_psd(
         try:
             layers, size, layer_metadata, selection = build_selected_atlas(
                 cv2, source_info.mesh_data, selected_drawable_ids, textures,
-                packed=atlas_layout == "packed", limits=limits,
+                packed=atlas_layout == "packed", limits=limits, single_layer=bool(atlas_single_layer),
             )
         except PsdSelectionError as exc:
             raise PsdReconstructionError(str(exc)) from exc
@@ -1060,6 +1063,7 @@ def _repack_selected_mesh_psd_layers(
     change_regions: list[dict[str, Any]] = []
     region_masks: list[dict[str, Any]] = []
     affected_shared_ids: set[str] = set()
+    merged_images: dict[str, Any] = {}
 
     def reject(message: str, affected: list[str]) -> None:
         _write_json(output_path / "repack_report.json", {
@@ -1076,15 +1080,25 @@ def _repack_selected_mesh_psd_layers(
         if layer is None or not _layer_effectively_visible(layer):
             warnings.append(f"Selected ArtMesh is missing or hidden in PSD; its atlas pixels are unchanged: {identifier}")
             continue
-        image = layer.composite(force=True)
+        merged = info.get("merged_layer")
+        merged_key = str(merged.get("name")) if merged else ""
+        if merged_key in merged_images:
+            image = merged_images[merged_key]  # one composite per single-layer PSD layer
+        else:
+            image = layer.composite(force=True)
+            if merged:
+                merged_images[merged_key] = image
         if image is None:
             continue
-        edited = np.asarray(image.convert("RGBA"), dtype=np.uint8)
         left, top = int(info["left"]), int(info["top"])
         expected_size = (int(info["bbox"][2]), int(info["bbox"][3]))
-        if (int(layer.left), int(layer.top)) != (left, top) or image.size != expected_size:
-            reject("Selected pose PSD layer was moved or resized: " + identifier
+        layer_origin, layer_size = ((left, top), expected_size) if not merged else (
+            (int(merged["left"]), int(merged["top"])), (int(merged["width"]), int(merged["height"])))
+        if (int(layer.left), int(layer.top)) != layer_origin or image.size != layer_size:
+            reject("Selected pose PSD layer was moved or resized: " + str(merged_key or identifier)
                    + ". Keep the original layer positions and dimensions; edit pixels inside its Paint group.", [])
+        image = merged_piece(image, info)
+        edited = np.asarray(image.convert("RGBA"), dtype=np.uint8)
         baseline = _load_layer_baseline(
             metadata_file, info, image, left, top, edited.shape[:2], baseline_origin=(left, top),
         )
@@ -1623,6 +1637,7 @@ def _refresh_pixel_references_from_psd(
             continue
         image = layer.composite(force=True)
         if image is not None:
+            image = merged_piece(image, layer_info)
             layer_info["pixel_reference"] = _build_pixel_reference(image)
         layer_info["layer_id"] = int(getattr(layer, "layer_id", 0) or 0)
         layer_info["binding_path"] = _layer_binding_path(layer)
@@ -1991,6 +2006,7 @@ def _write_layer_baselines(
         image = baseline_layer.composite(force=True)
         if image is None:
             continue
+        image = merged_piece(image, layer_info)
         # Index-based filenames avoid collisions when users intentionally use
         # duplicate drawable IDs.  The layer_id/path remains the binding key.
         output = baseline_dir / f"layer_{index:04d}.png"

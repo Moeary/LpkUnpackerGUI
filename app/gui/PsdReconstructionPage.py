@@ -184,6 +184,7 @@ class PsdReconstructionThread(QThread):
         allow_shared_uv: bool = False,
         pose_stage_request: dict | None = None,
         atlas_layout: str = "packed",
+        atlas_single_layer: bool = False,
     ):
         super().__init__()
         self.source_path = source_path
@@ -200,6 +201,7 @@ class PsdReconstructionThread(QThread):
         self.mesh_data = copy.deepcopy(mesh_data)
         self.allow_shared_uv = bool(allow_shared_uv)
         self.atlas_layout = atlas_layout
+        self.atlas_single_layer = bool(atlas_single_layer)
         # This is a plain-data request captured by the GUI before the thread
         # starts.  The worker never calls a provider, QWidget, or editor
         # session.  On success ``pose_stage`` is committed by the page after
@@ -239,7 +241,7 @@ class PsdReconstructionThread(QThread):
             job = {name: getattr(self, name) for name in (
                 "source_path", "output_dir", "mode", "metadata_path", "parameter_values", "pose_name",
                 "output_name", "resource_limits", "multi_psd_paths", "selected_drawable_ids",
-                "selection_region", "mesh_data", "allow_shared_uv", "atlas_layout")}
+                "selection_region", "mesh_data", "allow_shared_uv", "atlas_layout", "atlas_single_layer")}
             if self.pose_stage_request:
                 parent = Path(self.pose_stage_request["project_dir"]) / ".psd-staging"
                 parent.mkdir(parents=True, exist_ok=True)
@@ -2096,7 +2098,8 @@ class PsdReconstructionPage(QFrame):
             self.unifiedPreviewRequested.emit(*ready)
 
     def export_selected_artmeshes(self, drawable_ids, pose, region=None, *, mesh_data=None,
-                                 mode=None, atlas_layout="packed", output_name=None) -> bool:
+                                 mode=None, atlas_layout="packed", output_name=None,
+                                 atlas_single_layer=False) -> bool:
         """Export a frozen selection and pose through one private worker stage."""
         if self.is_busy():
             self.append_log(_workspace_text("psd.selection.busy"))
@@ -2149,7 +2152,8 @@ class PsdReconstructionPage(QFrame):
                 parameter_values=parameters, pose_name=name, output_name=scheme_id,
                 resource_limits=self.settings_manager.get("psd.resource_limits", {}),
                 selected_drawable_ids=ids, selection_region=region, mesh_data=exact_mesh,
-                pose_stage_request=stage_request, atlas_layout=atlas_layout))
+                pose_stage_request=stage_request, atlas_layout=atlas_layout,
+                atlas_single_layer=bool(atlas_single_layer) and mode == "atlas-components"))
             return True
         except Exception as exc:
             self.on_reconstruction_error(str(exc))

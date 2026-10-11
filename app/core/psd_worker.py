@@ -306,7 +306,8 @@ def _execute(job: dict, job_dir: Path) -> dict:
                                        pose_name=job.get("pose_name"), output_name=job.get("output_name"),
                                        selected_drawable_ids=job.get("selected_drawable_ids"),
                                        selection_region=job.get("selection_region"), mesh_data=job.get("mesh_data"),
-                                       atlas_layout=job.get("atlas_layout", "packed"), **common)
+                                       atlas_layout=job.get("atlas_layout", "packed"),
+                                       atlas_single_layer=bool(job.get("atlas_single_layer", False)), **common)
     encoded = _encode_result(result)
     if stage:
         finalize_pose_export_stage(stage, result)

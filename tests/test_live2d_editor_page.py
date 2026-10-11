@@ -524,6 +524,50 @@ class Live2DEditorPageTests(unittest.TestCase):
         page.redo()
         self.assertEqual(session.drawable_visibility_overrides, {})
 
+    def test_hidden_artmeshes_are_marked_revealed_rehidden_and_selection_can_be_isolated(self):
+        self._add_atlas_meshes()
+        self.open()
+        page, session = self.page, self.page.session
+        page.tabs.setCurrentWidget(page.artmesh_tab)
+        inspector = page.artmesh_inspector
+        self.assertFalse(page.reveal_hidden_button.isEnabled())  # nothing hidden yet
+        session.set_drawable_visibility(["ArtMeshFace", "ArtMeshHair"], False)
+        page._apply_preview_pose()
+
+        def marked():
+            return {entry.drawable_id for row, entry in enumerate(inspector.entries)
+                    if not inspector.entry_list.item(row).icon().isNull()}
+        self.assertEqual(marked(), {"ArtMeshFace", "ArtMeshHair"})
+        self.assertTrue(page.reveal_hidden_button.isEnabled())
+        self.assertIn("2", page.reveal_hidden_button.text())
+
+        undo = len(session._undo)
+        self.assertTrue(page.toggle_hidden_reveal())  # show all hidden
+        self.assertEqual(session.drawable_visibility_overrides, {})
+        self.assertEqual(marked(), set())
+        self.assertEqual(page._revealed_hidden_ids, ["ArtMeshFace", "ArtMeshHair"])
+        self.assertTrue(page.toggle_hidden_reveal())  # hide the same set again
+        self.assertEqual(session.drawable_visibility_overrides, {"ArtMeshFace": False, "ArtMeshHair": False})
+        self.assertEqual(len(session._undo), undo + 2)
+        self.assertTrue(page.toggle_hidden_reveal())
+        page.undo()  # undoing the reveal forgets it: the button offers "show" again
+        self.assertEqual(page._revealed_hidden_ids, [])
+        self.assertEqual(marked(), {"ArtMeshFace", "ArtMeshHair"})
+
+        inspector.select_entries(["ArtMeshFace", "ArtMeshEar"])
+        signature = session._signature()
+        page.isolate_selection_button.setChecked(True)
+        drawables = page.preview.drawables
+        self.assertEqual(drawables["ArtMeshFace"], 1.0)  # selected shows even though hidden
+        self.assertEqual(drawables["ArtMeshEar"], 1.0)
+        self.assertEqual(drawables["ArtMeshHair"], 0.0)
+        self.assertEqual(session._signature(), signature)  # preview only
+        inspector.select_entries(["ArtMeshHair"])
+        self.assertEqual(page.preview.drawables["ArtMeshHair"], 1.0)  # follows the selection
+        self.assertEqual(page.preview.drawables["ArtMeshFace"], 0.0)
+        page.isolate_selection_button.setChecked(False)
+        self.assertEqual(page.preview.drawables, session.drawable_opacity_multipliers())
+
     def test_hidden_selected_drawables_restore_only_export_snapshot_without_mutating_preview(self):
         from app.gui.editor_dialogs import EditorMessageBox
         self._add_atlas_meshes()

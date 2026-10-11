@@ -59,6 +59,7 @@ ARTMESH_TEXT = {
     "artmesh.inspector.zoom_hint": "滚轮或 Ctrl+= / Ctrl+- 缩放，中键拖动，双击或 Ctrl+0 复位；总览中使用 Ctrl+滚轮缩放。",
     "artmesh.inspector.selection_hint": "单击选择；Ctrl/Shift+单击增减；拖动框选；Ctrl/Shift+框选合并。",
     "artmesh.inspector.uv_toggle": "显示/收起 UV 与局部预览",
+    "artmesh.inspector.user_hidden": "已在预览中隐藏",
 }
 
 
@@ -529,6 +530,8 @@ class ArtMeshInspector(QWidget):
         self.selected_index = -1
         self.selected_indices: set[int] = set()
         self._dynamic_shared_ids = None
+        self._user_hidden_ids: set[str] = set()
+        self._marker_icons: dict = {}
         self.selection_history = SelectionHistory()
         self._replaying_selection = False
         self._texture_pixmaps = {}
@@ -1233,6 +1236,7 @@ class ArtMeshInspector(QWidget):
             item.setData(Qt.ItemDataRole.UserRole, index)
             self.entry_list.addItem(item)
         self.entry_list.blockSignals(False)
+        self._refresh_entry_markers()
         self._filter_entries()
 
     def _filter_entries(self, *_args):
@@ -1577,20 +1581,46 @@ class ArtMeshInspector(QWidget):
     def set_shared_highlights(self, identifiers):
         """Highlight potential impact independently of the editable selection."""
         self._dynamic_shared_ids = set(identifiers)
-        marker = QPixmap(14, 14)
-        marker.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(marker)
-        painter.setPen(QPen(QColor(255, 125, 54), 2, Qt.PenStyle.DashLine))
-        painter.drawRect(2, 2, 9, 9)
-        painter.end()
+        self._refresh_entry_markers()
+        self._update_views()
+
+    def set_user_hidden(self, identifiers):
+        """Mark ArtMeshes the user hid in the editor preview (eye-off icon)."""
+        hidden = set(map(str, identifiers))
+        if hidden != self._user_hidden_ids:
+            self._user_hidden_ids = hidden
+            self._refresh_entry_markers()
+
+    def _entry_marker(self, shared: bool, hidden: bool) -> QIcon:
+        key = (shared, hidden)
+        if key not in self._marker_icons:
+            if not (shared or hidden):
+                self._marker_icons[key] = QIcon()
+            else:
+                marker = QPixmap(14, 14)
+                marker.fill(Qt.GlobalColor.transparent)
+                painter = QPainter(marker)
+                if hidden:
+                    FluentIcon.HIDE.icon().paint(painter, 1, 1, 12, 12)
+                if shared:
+                    painter.setPen(QPen(QColor(255, 125, 54), 2, Qt.PenStyle.DashLine))
+                    painter.drawRect(2, 2, 9, 9) if not hidden else painter.drawRect(0, 0, 13, 13)
+                painter.end()
+                self._marker_icons[key] = QIcon(marker)
+        return self._marker_icons[key]
+
+    def _refresh_entry_markers(self):
+        self._marker_icons = {}  # theme may have changed the eye icon colour
+        legend = tr("editor.selection.legend", default="黄色实线：已选部件；橙色虚线：共享图集像素的未选部件。")
+        hidden_text = _text("artmesh.inspector.user_hidden")
         for index, entry in enumerate(self.entries):
             item = self.entry_list.item(index)
             if item:
-                affected = entry.drawable_id in self._dynamic_shared_ids
-                item.setIcon(QIcon(marker) if affected else QIcon())
-                item.setToolTip(item.text() + ("\n" + tr("editor.selection.legend",
-                    default="黄色实线：已选部件；橙色虚线：共享图集像素的未选部件。") if affected else ""))
-        self._update_views()
+                shared = bool(self._dynamic_shared_ids) and entry.drawable_id in self._dynamic_shared_ids
+                hidden = entry.drawable_id in self._user_hidden_ids
+                item.setIcon(self._entry_marker(shared, hidden))
+                item.setToolTip(item.text() + ("\n" + hidden_text if hidden else "")
+                                + ("\n" + legend if shared else ""))
 
     def hit_pose(self, x: float, y: float) -> int | None:
         point = (float(x), float(y))
