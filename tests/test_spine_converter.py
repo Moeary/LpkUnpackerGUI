@@ -222,13 +222,49 @@ class SpineConverterTests(unittest.TestCase):
         with self.assertRaises(SpineSourceAmbiguousError):
             convert_spine(skeleton, self.root / "out", converter_path=self.converter)
 
-    def test_rotation_other_than_zero_or_ninety_is_explicitly_unsupported(self) -> None:
+    def test_180_and_270_degree_regions_move_to_an_extra_page_without_touching_overlaps(self) -> None:
+        from app.core.spine_atlas import _rotate_from_page, parse_atlas
+
         skeleton = self.root / "skeleton.skel"
-        skeleton.write_bytes(b"fixture 4.0.37\0")
-        self._atlas(self.root, rotate=180)
-        with patch("app.core.spine_converter._run_native_converter", side_effect=self._fake_converter()):
-            with self.assertRaises(SpineUnsupportedError):
-                convert_spine(skeleton, self.root / "out", target_version="3.8.99", converter_path=self.converter)
+        skeleton.write_bytes(b"fixture 3.8.99\0")
+        page = Image.new("RGBA", (16, 16), (0, 0, 0, 0))
+        for x in range(16):
+            for y in range(16):
+                page.putpixel((x, y), (x * 15, y * 15, 77, 255))
+        page.save(self.root / "page.png")
+        # Like real 3.8.99 exports: "rotate: <degrees>" and a neighbour whose
+        # rectangle overlaps the turned one (transparent-margin packing).
+        (self.root / "main.atlas").write_text("\n".join([
+            "page.png", "size: 16,16", "format: RGBA8888", "filter: Linear,Linear", "repeat: none",
+            "hand", "  rotate: 270", "  xy: 2, 1", "  size: 3, 5", "  orig: 3, 6", "  offset: 0, 0", "  index: -1",
+            "water", "  rotate: 180", "  xy: 9, 9", "  size: 4, 3", "  orig: 4, 3", "  offset: 0, 0", "  index: -1",
+            "near", "  rotate: false", "  xy: 4, 2", "  size: 4, 4", "  orig: 4, 4", "  offset: 0, 0", "  index: -1",
+            "",
+        ]), encoding="utf-8")
+
+        def regions(atlas_path):
+            atlas = parse_atlas(atlas_path)
+            images = {item.index: Image.open(atlas_path.parent / item.name).convert("RGBA") for item in atlas.pages}
+            result = {}
+            for region in atlas.regions:
+                width, height = region.physical_size
+                block = images[region.page_index].crop((region.x, region.y, region.x + width, region.y + height))
+                result[region.name] = (region.rotation, region.page_index, _rotate_from_page(block, region.rotation).tobytes())
+            return result
+
+        before = regions(self.root / "main.atlas")
+        with patch("app.core.spine_converter._run_native_converter", side_effect=self._fake_converter("3.8.75")):
+            result = convert_spine(skeleton, self.root / "out", target_version="3.8.75", converter_path=self.converter)
+        after = regions(result.output_dir / "main.atlas")
+        self.assertEqual({name: item[2] for name, item in after.items()}, {name: item[2] for name, item in before.items()})
+        self.assertEqual((after["hand"][0], after["water"][0], after["near"][0]), (90, 0, 0))
+        self.assertEqual((after["hand"][1], after["water"][1], after["near"][1]), (1, 1, 0))
+        # The original page is copied as-is, overlapping neighbour included.
+        self.assertEqual(Image.open(result.output_dir / "page.png").tobytes(), page.tobytes())
+        self.assertTrue((result.output_dir / "page_3x_turned.png").is_file())
+        atlas_text = (result.output_dir / "main.atlas").read_text(encoding="utf-8")
+        self.assertNotIn("270", atlas_text)
+        self.assertTrue(any("180/270" in warning for warning in result.warnings))
 
     def test_converter_failure_writes_failure_report(self) -> None:
         skeleton = self.root / "skeleton.skel"

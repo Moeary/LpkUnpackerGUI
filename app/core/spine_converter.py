@@ -28,7 +28,7 @@ import os
 import re
 import shutil
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -785,26 +785,38 @@ def _copy_atlas_assets(
         atlas_destination.parent.mkdir(parents=True, exist_ok=True)
         page_reports: list[dict[str, Any]] = []
         page_outputs: dict[int, Path] = {}
-        for page in atlas.pages:
-            source_page = _resolve_atlas_page(atlas_path.parent, page.name, resolved.source_root)
-            page_destination = _asset_destination(source_page, resolved.source_root, destination)
-            _copy_page(
-                source_page,
-                page_destination,
-                page,
-                downgrade=target_major == 3,
-                state=state,
-                warnings=warnings,
-            )
-            page_outputs[page.index] = page_destination
-            page_reports.append(
-                {
-                    "source": str(source_page),
-                    "output": str(page_destination),
-                    "pma": bool(page.pma),
-                    "scale": page.scale,
-                }
-            )
+        with tempfile.TemporaryDirectory(prefix="spine-atlas-turned-") as scratch:
+            # 3.x atlases only know rotate true/false; move 180/270-degree
+            # regions to extra pages (see _relocate_half_turn_regions).
+            extra_sources: dict[int, tuple[Path, int]] = {}
+            if target_major == 3:
+                atlas, extra_sources = _relocate_half_turn_regions(
+                    atlas, atlas_path, resolved.source_root, Path(scratch), warnings
+                )
+            for page in atlas.pages:
+                if page.index in extra_sources:
+                    source_page, base_index = extra_sources[page.index]
+                    page_destination = page_outputs[base_index].with_name(Path(page.name).name)
+                else:
+                    source_page = _resolve_atlas_page(atlas_path.parent, page.name, resolved.source_root)
+                    page_destination = _asset_destination(source_page, resolved.source_root, destination)
+                _copy_page(
+                    source_page,
+                    page_destination,
+                    page,
+                    downgrade=target_major == 3,
+                    state=state,
+                    warnings=warnings,
+                )
+                page_outputs[page.index] = page_destination
+                page_reports.append(
+                    {
+                        "source": str(source_page),
+                        "output": str(page_destination),
+                        "pma": bool(page.pma),
+                        "scale": page.scale,
+                    }
+                )
         if target_major == 3:
             _write_downgraded_atlas(atlas, atlas_destination, page_outputs, warnings)
             warnings.append(
@@ -830,6 +842,89 @@ def _copy_atlas_assets(
         texture_destination = _asset_destination(texture_path, resolved.source_root, destination)
         _copy_file_once(texture_path, texture_destination)
     return reports
+
+
+_TURNED_PAGE_PADDING = 4
+
+
+def _relocate_half_turn_regions(
+    atlas: SpineAtlas,
+    atlas_path: Path,
+    source_root: Path,
+    scratch: Path,
+    warnings: list[str],
+) -> tuple[SpineAtlas, dict[int, tuple[Path, int]]]:
+    """Copy 180/270-degree regions to extra pages as 0/90-degree regions.
+
+    Spine 3.8.99 atlases may say ``rotate: 180``/``rotate: 270``, while 3.x
+    runtimes such as 3.8.75 only read ``rotate: true``/``false``.  Turning a
+    packed block by 180 degrees maps 270 to 90 and 180 to 0 losslessly, but
+    packers may overlap transparent margins of neighbouring rectangles, so the
+    turned block cannot go back in place.  Each affected page gets one extra
+    page holding its turned blocks; the original page is left untouched.
+
+    Returns the rewritten atlas and {extra page index: (scratch image, page
+    index it was taken from)}.
+    """
+
+    affected = [page for page in atlas.pages if any(region.rotation in (180, 270)
+                                                    for region in atlas.regions_for_page(page.index))]
+    if not affected:
+        return atlas, {}
+    used_names = {page.name.casefold() for page in atlas.pages}
+    pages = list(atlas.pages)
+    regions = list(atlas.regions)
+    extra: dict[int, tuple[Path, int]] = {}
+    for page in affected:
+        turned = [(position, region) for position, region in enumerate(regions)
+                  if region.page_index == page.index and region.rotation in (180, 270)]
+        # Shelf-pack the blocks (tallest first) into a page about as wide as
+        # the widest block or 1024 pixels.
+        boxes = sorted(turned, key=lambda item: item[1].physical_size[1], reverse=True)
+        pad = _TURNED_PAGE_PADDING
+        page_width = max(1024, max(region.physical_size[0] for _position, region in turned) + 2 * pad)
+        x = y = shelf = pad
+        places: dict[int, tuple[int, int]] = {}
+        for position, region in boxes:
+            width, height = region.physical_size
+            if x + width + pad > page_width:
+                x, y, shelf = pad, y + shelf + pad, pad
+            places[position] = (x, y)
+            x += width + pad
+            shelf = max(shelf, height)
+        page_height = y + shelf + pad
+        source_page = _resolve_atlas_page(atlas_path.parent, page.name, source_root)
+        stem = Path(page.name)
+        name = stem.with_name(f"{stem.stem}_3x_turned.png").as_posix()
+        counter = 2
+        while name.casefold() in used_names:
+            name = stem.with_name(f"{stem.stem}_3x_turned{counter}.png").as_posix()
+            counter += 1
+        used_names.add(name.casefold())
+        index = len(pages)
+        try:
+            with Image.open(source_page) as original:
+                image = original.convert("RGBA")
+        except Exception as exc:
+            raise SpineConversionError(f"Unable to read atlas page {source_page}: {exc}") from exc
+        sheet = Image.new("RGBA", (page_width, page_height), (0, 0, 0, 0))
+        for position, region in turned:
+            width, height = region.physical_size
+            block = image.crop((region.x, region.y, region.x + width, region.y + height))
+            new_x, new_y = places[position]
+            sheet.paste(block.transpose(Image.Transpose.ROTATE_180), (new_x, new_y))
+            regions[position] = replace(region, page_index=index, x=new_x, y=new_y,
+                                        rotation=(region.rotation + 180) % 360)
+        image.close()
+        sheet_path = scratch / f"{index}.png"
+        sheet.save(sheet_path, format="PNG")
+        pages.append(replace(page, name=name, index=index, size=(page_width, page_height), format="RGBA8888"))
+        extra[index] = (sheet_path, page.index)
+        warnings.append(
+            f"Atlas page {page.name}: {len(turned)} region(s) packed at 180/270 degrees were copied, turned by "
+            f"180 degrees, to extra page {name} so 3.x can read them."
+        )
+    return replace(atlas, pages=pages, regions=regions), extra
 
 
 def _copy_page(
