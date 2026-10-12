@@ -244,6 +244,105 @@ class CubismCoreModel:
             applied[parameter_id] = value
         return applied
 
+    def parameter_influence(
+        self,
+        drawable_id: str,
+        parameter_values: dict[str, float] | None = None,
+        *,
+        min_pixels: float = 0.5,
+        min_opacity: float = 0.01,
+    ) -> list[dict[str, Any]]:
+        """Rank the parameters that move or fade one drawable around a pose.
+
+        The moc does not expose which deformers bind a drawable, so each
+        parameter is probed: starting from ``parameter_values`` it is pushed
+        to its minimum and maximum, and every drawable's largest vertex
+        displacement (canvas pixels) and opacity change are measured.  A
+        parameter that moves the whole model (body angle, breath) is less
+        telling than one that moves only the clicked part, so the ranking
+        ``score`` multiplies the part's own effect by its specificity: that
+        effect over the model-wide mean.  The parameter array is restored
+        afterwards, so this is safe on the session's shared core model.
+        """
+        import numpy as np
+
+        dll = self.core.dll
+        model = self.model_pointer
+        ids = self.drawable_ids()
+        try:
+            target = ids.index(str(drawable_id))
+        except ValueError:
+            raise CubismCoreError(f"Unknown drawable: {drawable_id}") from None
+        drawable_count = len(ids)
+        count = int(dll.csmGetParameterCount(model))
+        values = dll.csmGetParameterValues(model)
+        saved = [float(values[index]) for index in range(max(0, count))]
+        parameter_ids = dll.csmGetParameterIds(model)
+        minimums = dll.csmGetParameterMinimumValues(model)
+        maximums = dll.csmGetParameterMaximumValues(model)
+        pixels_per_unit = float(self._read_canvas().get("pixels_per_unit") or 1.0)
+        float_pointer = ctypes.POINTER(ctypes.c_float)
+
+        def sample() -> tuple[list[np.ndarray], np.ndarray]:
+            dll.csmUpdateModel(model)
+            counts = dll.csmGetDrawableVertexCounts(model)
+            positions = dll.csmGetDrawableVertexPositions(model)
+            vertices = []
+            for index in range(drawable_count):
+                size = int(counts[index]) * 2
+                if size <= 0:
+                    vertices.append(np.zeros((0, 2), dtype=np.float32))
+                    continue
+                flat = np.ctypeslib.as_array(ctypes.cast(positions[index], float_pointer), shape=(size,))
+                vertices.append(flat.reshape(-1, 2).copy())
+            opacities = np.ctypeslib.as_array(dll.csmGetDrawableOpacities(model), shape=(drawable_count,)).copy()
+            return vertices, opacities
+
+        def displacements(vertices: list[np.ndarray], base: list[np.ndarray]) -> np.ndarray:
+            return np.asarray([
+                float(np.sqrt(((moved - origin) ** 2).sum(axis=1)).max()) if len(moved) and moved.shape == origin.shape else 0.0
+                for moved, origin in zip(vertices, base)
+            ]) * pixels_per_unit
+
+        results: list[dict[str, Any]] = []
+        try:
+            base_values = self.apply_parameters(parameter_values or {})
+            base_vertices, base_opacities = sample()
+            for index in range(max(0, count)):
+                base = float(values[index])
+                moved = np.zeros(drawable_count)
+                faded = np.zeros(drawable_count)
+                for probe in (float(minimums[index]), float(maximums[index])):
+                    if abs(probe - base) <= 1e-6:
+                        continue
+                    values[index] = probe
+                    vertices, opacities = sample()
+                    moved = np.maximum(moved, displacements(vertices, base_vertices))
+                    faded = np.maximum(faded, np.abs(opacities - base_opacities))
+                values[index] = base
+                displacement, opacity = float(moved[target]), float(faded[target])
+                if displacement < min_pixels and opacity < min_opacity:
+                    continue
+                # A full fade is as telling as a 100-pixel move.
+                effects = moved + faded * 100.0
+                effect = float(effects[target])
+                specificity = effect / max(1e-6, float(effects.mean()))
+                identifier = parameter_ids[index].decode("utf-8", errors="replace")
+                results.append({
+                    "id": identifier,
+                    "displacement": displacement,
+                    "opacity": opacity,
+                    "value": base_values.get(identifier, base),
+                    "specificity": specificity,
+                    "score": effect * specificity,
+                })
+        finally:
+            for index, value in enumerate(saved):
+                values[index] = value
+            dll.csmUpdateModel(model)
+        results.sort(key=lambda item: item["score"], reverse=True)
+        return results
+
     def _read_parts(self) -> list[dict[str, Any]]:
         dll = self.core.dll
         model = self.model_pointer

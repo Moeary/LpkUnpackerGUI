@@ -6,6 +6,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -48,6 +49,12 @@ struct Bridge {
     float duration = 0;
     bool renderDirty = true;
 
+    struct BoneOverride { float x, y, rotation, scaleX, scaleY; };
+    std::map<int, BoneOverride> overrides;
+    // Bones without timelines keep whatever local values they were last
+    // given.  After an override ends they must return to the setup pose.
+    bool resetBones = false;
+
     ~Bridge() { clear(); }
 
     void clear() {
@@ -69,6 +76,29 @@ struct Bridge {
         duration = 0;
         renderDirty = true;
         version.clear();
+        overrides.clear();
+        resetBones = false;
+    }
+
+    // Every animation evaluation goes through here so bone overrides always
+    // replace the animated local pose before world transforms are computed.
+    void applyState() {
+        if (!skeleton) return;
+        if (!overrides.empty() || resetBones) {
+            skeleton->setBonesToSetupPose();
+            resetBones = false;
+        }
+        if (state) state->apply(*skeleton);
+        Vector<Bone *> &bones = skeleton->getBones();
+        for (std::map<int, BoneOverride>::const_iterator it = overrides.begin(); it != overrides.end(); ++it) {
+            if (it->first < 0 || (size_t)it->first >= bones.size()) continue;
+            Bone *bone = bones[(size_t)it->first];
+            bone->setX(it->second.x);
+            bone->setY(it->second.y);
+            bone->setRotation(it->second.rotation);
+            bone->setScaleX(it->second.scaleX);
+            bone->setScaleY(it->second.scaleY);
+        }
     }
 
     void setError(const char *message) { error = message ? message : "Unknown Spine native error."; }
@@ -108,7 +138,7 @@ struct Bridge {
         duration = animation->getDuration();
         if (state) {
             state->setAnimation(0, animation->getName(), loop);
-            state->apply(*skeleton);
+            applyState();
         }
         renderDirty = true;
     }
@@ -344,14 +374,14 @@ SpineNativePageInfo spine_native_page_info(void *handle, int32_t index) {
 }
 
 int spine_native_set_skin(void *handle, const char *name) {
-    Bridge *b = asBridge(handle); if (!b || !b->skeleton || !name) return 0; b->skeleton->setSkin(String(name)); b->skeleton->setSlotsToSetupPose(); if (b->state) b->state->apply(*b->skeleton); b->renderDirty = true; return b->skeleton->getSkin() != nullptr;
+    Bridge *b = asBridge(handle); if (!b || !b->skeleton || !name) return 0; b->skeleton->setSkin(String(name)); b->skeleton->setSlotsToSetupPose(); b->applyState(); b->renderDirty = true; return b->skeleton->getSkin() != nullptr;
 }
 int spine_native_set_animation(void *handle, const char *name, int loop) {
-    Bridge *b = asBridge(handle); if (!b || !b->state || !b->skeleton || !name) return 0; Animation *animation = b->data->findAnimation(String(name)); if (!animation) return 0; b->loop = loop != 0; b->duration = animation->getDuration(); b->state->setAnimation(0, animation->getName(), b->loop); b->state->apply(*b->skeleton); b->renderDirty = true; return 1;
+    Bridge *b = asBridge(handle); if (!b || !b->state || !b->skeleton || !name) return 0; Animation *animation = b->data->findAnimation(String(name)); if (!animation) return 0; b->loop = loop != 0; b->duration = animation->getDuration(); b->state->setAnimation(0, animation->getName(), b->loop); b->applyState(); b->renderDirty = true; return 1;
 }
-int spine_native_set_loop(void *handle, int loop) { Bridge *b = asBridge(handle); if (!b || !b->state || !b->skeleton) return 0; b->loop = loop != 0; TrackEntry *entry = b->state->getCurrent(0); if (entry) { entry->setLoop(b->loop); float trackTime = std::max(0.0f, entry->getTrackTime()); if (b->duration > 0.0f) trackTime = b->loop ? std::fmod(trackTime, b->duration) : std::min(trackTime, b->duration); entry->setTrackTime(trackTime); b->state->apply(*b->skeleton); b->skeleton->updateWorldTransform(); } b->renderDirty = true; return 1; }
+int spine_native_set_loop(void *handle, int loop) { Bridge *b = asBridge(handle); if (!b || !b->state || !b->skeleton) return 0; b->loop = loop != 0; TrackEntry *entry = b->state->getCurrent(0); if (entry) { entry->setLoop(b->loop); float trackTime = std::max(0.0f, entry->getTrackTime()); if (b->duration > 0.0f) trackTime = b->loop ? std::fmod(trackTime, b->duration) : std::min(trackTime, b->duration); entry->setTrackTime(trackTime); b->applyState(); b->skeleton->updateWorldTransform(); } b->renderDirty = true; return 1; }
 int spine_native_set_paused(void *handle, int paused) { Bridge *b = asBridge(handle); if (!b) return 0; b->paused = paused != 0; return 1; }
-int spine_native_set_time(void *handle, float time) { Bridge *b = asBridge(handle); if (!b || !b->state || !b->skeleton) return 0; if (!std::isfinite(time)) time = 0.0f; if (b->duration > 0) time = b->loop ? std::fmod(std::max(0.0f, time), b->duration) : std::min(std::max(0.0f, time), b->duration); else time = std::max(0.0f, time); TrackEntry *entry = b->state->getCurrent(0); if (!entry) return 0; entry->setTrackTime(time); b->state->apply(*b->skeleton); b->skeleton->updateWorldTransform(); b->renderDirty = true; return 1; }
+int spine_native_set_time(void *handle, float time) { Bridge *b = asBridge(handle); if (!b || !b->state || !b->skeleton) return 0; if (!std::isfinite(time)) time = 0.0f; if (b->duration > 0) time = b->loop ? std::fmod(std::max(0.0f, time), b->duration) : std::min(std::max(0.0f, time), b->duration); else time = std::max(0.0f, time); TrackEntry *entry = b->state->getCurrent(0); if (!entry) return 0; entry->setTrackTime(time); b->applyState(); b->skeleton->updateWorldTransform(); b->renderDirty = true; return 1; }
 int spine_native_reset_pose(void *handle) { Bridge *b = asBridge(handle); if (!b || !b->skeleton || !b->state) return 0; b->skeleton->setToSetupPose(); b->state->clearTracks(); b->selectDefaultAnimation(); return 1; }
 float spine_native_time(void *handle) { Bridge *b = asBridge(handle); TrackEntry *entry = b && b->state ? b->state->getCurrent(0) : nullptr; if (!entry) return 0.0f; float time = std::max(0.0f, entry->getTrackTime()); if (b->duration > 0.0f) time = b->loop ? std::fmod(time, b->duration) : std::min(time, b->duration); return time; }
 float spine_native_duration(void *handle) { return asBridge(handle) ? asBridge(handle)->duration : 0.0f; }
@@ -364,7 +394,7 @@ void spine_native_update(void *handle, float delta) {
         float current = std::max(0.0f, entry->getTrackTime());
         if (current >= b->duration) {
             entry->setTrackTime(b->duration);
-            b->state->apply(*b->skeleton);
+            b->applyState();
             b->skeleton->updateWorldTransform();
             b->renderDirty = true;
             return;
@@ -372,7 +402,7 @@ void spine_native_update(void *handle, float delta) {
         advance = std::min(advance, b->duration - current);
     }
     b->state->update(advance);
-    b->state->apply(*b->skeleton);
+    b->applyState();
     entry = b->state->getCurrent(0);
     if (!b->loop && entry && b->duration > 0.0f && entry->getTrackTime() > b->duration) entry->setTrackTime(b->duration);
     b->skeleton->updateWorldTransform();
@@ -382,6 +412,110 @@ int spine_native_required_sizes(void *handle, int32_t *vertices, int32_t *indice
 int spine_native_render(void *handle, SpineNativeVertex *vertices, int32_t vertex_capacity, uint32_t *indices, int32_t index_capacity, SpineNativeBatch *batches, int32_t batch_capacity) {
     Bridge *b = asBridge(handle); if (!b) return -1; b->render(); if ((int32_t)b->vertices.size() > vertex_capacity || (int32_t)b->indices.size() > index_capacity || (int32_t)b->batches.size() > batch_capacity) return -1; if (!b->vertices.empty() && vertices) std::memcpy(vertices, b->vertices.data(), b->vertices.size() * sizeof(SpineNativeVertex)); if (!b->indices.empty() && indices) std::memcpy(indices, b->indices.data(), b->indices.size() * sizeof(uint32_t)); if (!b->batches.empty() && batches) std::memcpy(batches, b->batches.data(), b->batches.size() * sizeof(SpineNativeBatch)); return (int)b->batches.size();
 }
+int32_t spine_native_abi_version(void) { return 2; }
+
+int32_t spine_native_bone_count(void *handle) { Bridge *b = asBridge(handle); return b && b->skeleton ? (int32_t)b->skeleton->getBones().size() : 0; }
+
+int spine_native_bone_info(void *handle, int32_t index, SpineNativeBoneInfo *out) {
+    Bridge *b = asBridge(handle);
+    if (!b || !b->skeleton || !out || index < 0 || (size_t)index >= b->skeleton->getBones().size()) return 0;
+    Bone *bone = b->skeleton->getBones()[(size_t)index];
+    BoneData &data = bone->getData();
+    std::memset(out, 0, sizeof(*out));
+    out->name = Bridge::safe(data.getName());
+    out->parent = bone->getParent() ? bone->getParent()->getData().getIndex() : -1;
+    int32_t flags = bone->isActive() ? SPINE_NATIVE_BONE_ACTIVE : 0;
+    if (b->overrides.count(index)) flags |= SPINE_NATIVE_BONE_OVERRIDDEN;
+    Vector<IkConstraint *> &iks = b->skeleton->getIkConstraints();
+    for (size_t i = 0; i < iks.size(); ++i) {
+        if (iks[i]->getTarget() == bone) flags |= SPINE_NATIVE_BONE_IK_TARGET;
+        Vector<Bone *> &chain = iks[i]->getBones();
+        for (size_t j = 0; j < chain.size(); ++j) if (chain[j] == bone) flags |= SPINE_NATIVE_BONE_IK;
+    }
+    Vector<TransformConstraint *> &transforms = b->skeleton->getTransformConstraints();
+    for (size_t i = 0; i < transforms.size(); ++i) {
+        Vector<Bone *> &constrained = transforms[i]->getBones();
+        for (size_t j = 0; j < constrained.size(); ++j) if (constrained[j] == bone) flags |= SPINE_NATIVE_BONE_CONSTRAINED;
+    }
+    Vector<PathConstraint *> &paths = b->skeleton->getPathConstraints();
+    for (size_t i = 0; i < paths.size(); ++i) {
+        Vector<Bone *> &constrained = paths[i]->getBones();
+        for (size_t j = 0; j < constrained.size(); ++j) if (constrained[j] == bone) flags |= SPINE_NATIVE_BONE_CONSTRAINED;
+    }
+    out->flags = flags;
+    out->length = data.getLength();
+    out->x = bone->getX();
+    out->y = bone->getY();
+    out->rotation = bone->getRotation();
+    out->scale_x = bone->getScaleX();
+    out->scale_y = bone->getScaleY();
+    out->shear_x = bone->getShearX();
+    out->shear_y = bone->getShearY();
+    out->a = bone->getA();
+    out->b = bone->getB();
+    out->c = bone->getC();
+    out->d = bone->getD();
+    out->world_x = bone->getWorldX();
+    out->world_y = bone->getWorldY();
+    return 1;
+}
+
+int32_t spine_native_ik_count(void *handle) { Bridge *b = asBridge(handle); return b && b->skeleton ? (int32_t)b->skeleton->getIkConstraints().size() : 0; }
+
+int spine_native_ik_info(void *handle, int32_t index, SpineNativeIkInfo *out) {
+    Bridge *b = asBridge(handle);
+    if (!b || !b->skeleton || !out || index < 0 || (size_t)index >= b->skeleton->getIkConstraints().size()) return 0;
+    IkConstraint *ik = b->skeleton->getIkConstraints()[(size_t)index];
+    std::memset(out, 0, sizeof(*out));
+    out->name = Bridge::safe(ik->getData().getName());
+    out->target = ik->getTarget() ? ik->getTarget()->getData().getIndex() : -1;
+    Vector<Bone *> &chain = ik->getBones();
+    out->bone_count = (int32_t)std::min<size_t>(chain.size(), 2);
+    out->bones[0] = out->bones[1] = -1;
+    for (int32_t i = 0; i < out->bone_count; ++i) out->bones[i] = chain[(size_t)i]->getData().getIndex();
+    out->mix = ik->getMix();
+    out->bend_direction = ik->getBendDirection();
+    return 1;
+}
+
+int spine_native_set_bone_override(void *handle, int32_t index, float x, float y, float rotation, float scale_x, float scale_y) {
+    Bridge *b = asBridge(handle);
+    if (!b || !b->skeleton || index < 0 || (size_t)index >= b->skeleton->getBones().size()) return 0;
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(rotation) || !std::isfinite(scale_x) || !std::isfinite(scale_y)) return 0;
+    Bridge::BoneOverride value = {x, y, rotation, scale_x, scale_y};
+    b->overrides[index] = value;
+    b->applyState();
+    b->skeleton->updateWorldTransform();
+    b->renderDirty = true;
+    return 1;
+}
+
+int spine_native_clear_bone_overrides(void *handle) {
+    Bridge *b = asBridge(handle);
+    if (!b || !b->skeleton) return 0;
+    if (!b->overrides.empty()) {
+        b->overrides.clear();
+        b->resetBones = true;
+        b->applyState();
+        b->skeleton->updateWorldTransform();
+        b->renderDirty = true;
+    }
+    return 1;
+}
+
+int spine_native_show_setup_pose(void *handle) {
+    Bridge *b = asBridge(handle);
+    if (!b || !b->skeleton || !b->state) return 0;
+    b->state->clearTracks();
+    b->skeleton->setToSetupPose();
+    b->animationIndex = -1;
+    b->duration = 0;
+    b->applyState();
+    b->skeleton->updateWorldTransform();
+    b->renderDirty = true;
+    return 1;
+}
+
 int spine_native_bounds(void *handle, float *x, float *y, float *width, float *height) { Bridge *b = asBridge(handle); if (!b || !b->skeleton) return 0; Vector<float> buffer; float bx=0, by=0, bw=0, bh=0; b->skeleton->getBounds(bx, by, bw, bh, buffer); if (x) *x=bx; if (y) *y=by; if (width) *width=bw; if (height) *height=bh; return 1; }
 
 } // extern "C"

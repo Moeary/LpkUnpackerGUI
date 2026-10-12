@@ -256,6 +256,44 @@ class SpineEditorSessionTests(unittest.TestCase):
             _rename_directory(other, target)
         self.assertTrue(other.is_dir())
 
+    def test_key_bone_pose_writes_setup_offsets_in_one_undo_step(self):
+        for version, rotate_key in (("3.8.75", "angle"), ("4.0.37", "value")):
+            with self.subTest(version=version):
+                bones = [{"name": "root"}, {"name": "hip", "parent": "root", "x": 10, "y": 20, "rotation": 15}]
+                session = self.open(self.model(version, bones=bones))
+                history = len(session._undo)
+                # A new key between the existing ones, from absolute local values.
+                session.key_bone_pose("Idle", "hip", 1.0, {"rotation": 40.0})
+                frames = session.get_bone_track("Idle", "hip", "rotate")["keyframes"]
+                self.assertEqual([frame["time"] for frame in frames], [0, 1.0, 2])
+                self.assertAlmostEqual(frames[1]["angle"], 25.0)
+                self.assertEqual(frames[1]["interpolation"], "linear")
+                raw = session.document["animations"]["Idle"]["bones"]["hip"]["rotate"][1]
+                self.assertAlmostEqual(raw[rotate_key], 25.0)
+                # Re-keying the same time replaces the value; it is not a second key.
+                session.key_bone_pose("Idle", "hip", 1.0, {"rotation": 5.0})
+                frames = session.get_bone_track("Idle", "hip", "rotate")["keyframes"]
+                self.assertEqual(len(frames), 3)
+                self.assertAlmostEqual(frames[1]["angle"], -10.0)
+                session.key_bone_pose("Idle", "hip", 0.5, {"x": 13.0, "y": 18.0})
+                translate = session.get_bone_track("Idle", "hip", "translate")["keyframes"]
+                self.assertEqual(translate, [{"time": 0.5, "x": 3.0, "y": -2.0, "interpolation": "linear"}])
+                # One axis keeps the other axis where the animation holds it.
+                session.key_bone_pose("Idle", "hip", 1.5, {"x": 11.0})
+                translate = session.get_bone_track("Idle", "hip", "translate")["keyframes"]
+                self.assertAlmostEqual(translate[-1]["x"], 1.0)
+                self.assertAlmostEqual(translate[-1]["y"], -2.0)
+                self.assertEqual(len(session._undo), history + 4)
+                session.undo()
+                session.undo()
+                session.undo()
+                self.assertAlmostEqual(session.get_bone_track("Idle", "hip", "rotate")["keyframes"][1]["angle"], 25.0)
+                self.assertEqual(session.get_bone_track("Idle", "hip", "translate")["keyframes"], [])
+                with self.assertRaises(AnimationEditingError):
+                    session.key_bone_pose("Idle", "hip", 5.0, {"rotation": 1.0})
+                with self.assertRaises(AnimationEditingError):
+                    session.key_bone_pose("Idle", "hip", 1.0, {"scaleX": 2.0})
+
 
 if __name__ == "__main__":
     unittest.main()

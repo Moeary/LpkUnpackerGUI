@@ -17,7 +17,7 @@ from qfluentwidgets import (
     BodyLabel as QLabel, CaptionLabel, CheckBox as QCheckBox,
     DoubleSpinBox as QDoubleSpinBox, FluentIcon, IndeterminateProgressBar, ListWidget as QListWidget,
     PrimaryPushButton, PushButton as QPushButton, RoundMenu, ScrollArea as QScrollArea,
-    SearchLineEdit, SubtitleLabel, TransparentToolButton, TreeWidget as QTreeWidget,
+    SearchLineEdit, SubtitleLabel, TogglePushButton, TransparentToolButton, TreeWidget as QTreeWidget,
 )
 
 from app.core.animation_editing import AnimationEditingError
@@ -106,6 +106,13 @@ SPINE_EDITOR_TEXT = {
     "spine_editor.pick_hint": "在预览中单击可选中该处的部件；Ctrl+滚轮或 Ctrl+= / Ctrl+- 缩放，Ctrl+0 复位，按住中键拖动平移",
     "spine_editor.picked": "已选中部件：{name}",
     "spine_editor.pick_none": "单击处没有可见的部件",
+    "spine_editor.bone_mode": "骨骼模式",
+    "spine_editor.bone_mode_hint": "显示骨骼：白色为 FK 骨骼，橙色为 IK 链，红色十字为 IK 目标，绿色受变换/路径约束。单击优先选中骨骼；拖动旋转，Shift+拖动或切到平移工具则移动，拖动 IK 目标会带动整条 IK 链。设置姿态下修改骨骼设置姿态，动作中在当前时间写入关键帧。",
+    "spine_editor.bone_tool": "拖动骨骼时的工具",
+    "spine_editor.bone_mode_unavailable": "已安装的 Spine 原生桥不支持骨骼模式，请重新构建 Spine 原生运行时（pixi run native-spine）",
+    "spine_editor.bone_picked": "已选中骨骼：{name}",
+    "spine_editor.bone_keyed": "已在 {time} 秒为 {bone} 写入{channel}关键帧",
+    "spine_editor.bone_setup_posed": "已修改 {bone} 的设置姿态",
 }
 
 
@@ -507,6 +514,16 @@ class SpineEditorPage(QWidget):
         view_controls = QHBoxLayout()
         view_controls.addWidget(self.skin_label)
         view_controls.addWidget(self.skin_combo)
+        # Bone mode: draw FK/IK bones over the preview, pick and pose them.
+        self.bone_mode_button = TogglePushButton(self)
+        self.bone_mode_button.setIcon(FluentIcon.ROBOT)
+        self.bone_tool_combo = QComboBox(self)
+        self.bone_tool_combo.setFixedWidth(96)
+        for tool in ("rotate", "translate"):
+            self.bone_tool_combo.addItem(_text(f"spine_editor.{tool}"), tool)
+        self.bone_tool_combo.hide()
+        view_controls.addWidget(self.bone_mode_button)
+        view_controls.addWidget(self.bone_tool_combo)
         view_controls.addStretch(1)
         self.zoom_controls = ViewZoomControls(self)
         view_controls.addWidget(self.zoom_controls)
@@ -630,6 +647,11 @@ class SpineEditorPage(QWidget):
         self.preview.set_view_interaction(True)
         self.preview.set_pick_enabled(True)
         self.preview.regionPicked.connect(self._preview_picked)
+        self.preview.bonePicked.connect(self._preview_bone_picked)
+        self.preview.bonePosed.connect(self._preview_bone_posed)
+        self.bone_mode_button.toggled.connect(self._bone_mode_toggled)
+        self.bone_tool_combo.currentIndexChanged.connect(
+            lambda _index: self.preview.set_bone_tool(self.bone_tool_combo.currentData() or "rotate"))
         self.preview.viewScaleChanged.connect(self.zoom_controls.set_scale)
         self.zoom_controls.zoomInRequested.connect(lambda: self.preview.zoom_by(self.preview.ZOOM_STEP))
         self.zoom_controls.zoomOutRequested.connect(lambda: self.preview.zoom_by(1 / self.preview.ZOOM_STEP))
@@ -876,7 +898,7 @@ class SpineEditorPage(QWidget):
             if self.animation_name:
                 self.preview.set_animation(self.animation_name, False)
             else:
-                self.preview.reset_pose()
+                self.preview.show_setup_pose()
             self.preview.set_paused(True)
             self.preview.set_time(0)
         self._update_actions()
@@ -907,6 +929,7 @@ class SpineEditorPage(QWidget):
             self._show_selection()
 
     def _show_selection(self):
+        self.preview.set_selected_bone(self._selected_bone_name())
         if not self.session or not self._selection:
             self.inspector_stack.setCurrentWidget(self.inspector_empty)
             return
@@ -1203,6 +1226,13 @@ class SpineEditorPage(QWidget):
         if result is None:
             self.status_label.setText(_text("spine_editor.pick_none"))
             return
+        if self.bone_mode_button.isChecked():
+            slot = self._slot_for_region(result.name)
+            bone = next((item.get("bone") for item in self.session.document.get("slots", [])
+                         if item.get("name") == slot), None) if slot else None
+            if bone:
+                self._preview_bone_picked(bone)
+                return
         tab = self.tabs.currentIndex()
         if tab == 2:
             item = next((self.atlas_list.item(index) for index in range(self.atlas_list.count())
@@ -1228,6 +1258,71 @@ class SpineEditorPage(QWidget):
                     self.tree.setCurrentItem(item)
                     self.tree.scrollToItem(item)
         self.status_label.setText(_text("spine_editor.picked", name=result.name))
+
+    # Bone mode ------------------------------------------------------------
+    def _selected_bone_name(self) -> str:
+        if not self.session or not self._selection:
+            return ""
+        kind, name = self._selection
+        if kind == "bone":
+            return name
+        if kind == "slot":
+            return next((item.get("bone", "") for item in self.session.document.get("slots", [])
+                         if item.get("name") == name), "")
+        return ""
+
+    def _bone_mode_toggled(self, checked: bool):
+        self.bone_tool_combo.setVisible(checked)
+        self.preview.set_bone_mode(checked)
+        if checked:
+            self.preview.set_selected_bone(self._selected_bone_name())
+            if self.preview.model is not None and not self.preview.bones_supported:
+                self.status_label.setText(_text("spine_editor.bone_mode_unavailable"))
+
+    def _preview_bone_picked(self, name: str):
+        """Jump the skeleton tree to a bone clicked (or posed) in the preview."""
+        if not self.session:
+            return
+        item = next((node for node in self._structure_items()
+                     if node.data(0, Qt.ItemDataRole.UserRole) == ("bone", name)), None)
+        if item is None:
+            return
+        if self.tabs.currentIndex() != 0:
+            self.tabs.setCurrentIndex(0)
+        if item.isHidden():
+            self.search_edit.clear()
+        parent = item.parent()
+        while parent is not None:
+            parent.setExpanded(True)
+            parent = parent.parent()
+        self.tree.setCurrentItem(item)
+        self.tree.scrollToItem(item)
+        self.status_label.setText(_text("spine_editor.bone_picked", name=name))
+
+    def _preview_bone_posed(self, name: str, values: dict):
+        """Commit a preview drag: setup pose, or a key at the current time."""
+        if not self.session:
+            return
+        channel = "rotate" if "rotation" in values else "translate"
+        animation, seconds = self.animation_name, self.timeline.current_time
+        self._selection = "bone", name
+        index = self.channel_combo.findData(channel)
+        if index >= 0:
+            self._updating = True
+            self.channel_combo.setCurrentIndex(index)
+            self._updating = False
+        if animation:
+            ok = self._edit(lambda: self.session.key_bone_pose(animation, name, seconds, values))
+            message = _text("spine_editor.bone_keyed", time=f"{seconds:.3f}", bone=name,
+                            channel=_text(f"spine_editor.{channel}"))
+        else:
+            ok = self._edit(lambda: self.session.set_bone_transform(name, values))
+            message = _text("spine_editor.bone_setup_posed", bone=name)
+        if ok:
+            self.status_label.setText(message)
+        else:
+            # The native pose was only a preview of the rejected edit.
+            self.preview.clear_bone_overrides()
 
     def _slot_for_region(self, region: str) -> str | None:
         """The slot drawing ``region`` now; the topmost one when several can."""
@@ -1296,10 +1391,12 @@ class SpineEditorPage(QWidget):
         if self.animation_name:
             self.preview.set_animation(self.animation_name, False)
         else:
-            self.preview.reset_pose()
+            self.preview.show_setup_pose()
         self.preview.set_time(self.timeline.current_time)
         if not self.workspace.is_panel_visible("preview"):
             self.preview._status_timer.stop()
+        if self.bone_mode_button.isChecked() and not self.preview.bones_supported:
+            self.status_label.setText(_text("spine_editor.bone_mode_unavailable"))
 
     def _preview_failed(self, error: str):
         self.status_label.setText(_text("spine_editor.preview_error", error=error))
@@ -1401,6 +1498,11 @@ class SpineEditorPage(QWidget):
         self.psd_panel.retranslate_ui()
         self.zoom_controls.retranslate_ui()
         self.preview.setToolTip(_text("spine_editor.pick_hint"))
+        self.bone_mode_button.setText(_text("spine_editor.bone_mode"))
+        self.bone_mode_button.setToolTip(_text("spine_editor.bone_mode_hint"))
+        self.bone_tool_combo.setToolTip(_text("spine_editor.bone_tool"))
+        for index in range(self.bone_tool_combo.count()):
+            self.bone_tool_combo.setItemText(index, _text(f"spine_editor.{self.bone_tool_combo.itemData(index)}"))
         # Shown while no model/track list is loaded, like the Live2D track picker.
         self.track_combo.setPlaceholderText(_text("spine_editor.track_placeholder"))
         self.animation_combo.retranslate_ui()

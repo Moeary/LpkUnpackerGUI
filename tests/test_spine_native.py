@@ -106,6 +106,36 @@ class SpineNativeRuntimeTests(unittest.TestCase):
             finally:
                 model.close()
 
+    def test_bone_overrides_pose_until_cleared_and_setup_pose_has_no_track(self):
+        for _label, source, family in self.CASES:
+            model = self._open(source, family)
+            try:
+                if not model.supports_bones:
+                    self.skipTest("installed bridge predates bone mode (ABI 2)")
+                bones = model.bones()
+                self.assertTrue(bones)
+                self.assertEqual(bones[0].parent, -1)
+                for ik in model.ik_constraints():
+                    self.assertTrue(bones[ik.target].is_ik_target)
+                    self.assertTrue(all(bones[index].is_ik for index in ik.bones))
+                bone = next(item for item in bones if item.parent >= 0 and item.length > 0)
+                model.set_paused(True)
+                model.set_time(0.0)
+                animated = model.bones()[bone.index].rotation
+                self.assertTrue(model.set_bone_override(bone.index, bone.x, bone.y, animated + 40.0, 1.0, 1.0))
+                self.assertAlmostEqual(model.bones()[bone.index].rotation, animated + 40.0, places=3)
+                model.set_time(model.duration / 2.0)
+                self.assertAlmostEqual(model.bones()[bone.index].rotation, animated + 40.0, places=3)
+                model.set_time(0.0)
+                model.clear_bone_overrides()
+                self.assertAlmostEqual(model.bones()[bone.index].rotation, animated, places=3)
+                self.assertFalse(model.set_bone_override(bone.index, float("nan"), 0, 0, 1, 1))
+                self.assertTrue(model.show_setup_pose())
+                self.assertEqual(model.time, 0.0)
+                self.assertGreater(model.render_into()[1], 0)
+            finally:
+                model.close()
+
 
 if __name__ == "__main__":
     unittest.main()

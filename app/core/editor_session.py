@@ -354,6 +354,67 @@ class SpineEditorSession:
             self.project.modified.add(animation)
         self._change(operation)
 
+    def key_bone_pose(self, animation: str, bone: str, seconds: float, values: dict[str, float]):
+        """Key a posed bone at ``seconds`` as one undoable step.
+
+        ``values`` are local pose values (``rotation``, ``x``, ``y``) such as a
+        preview drag produces; they are stored as offsets from the setup pose
+        in the rotate/translate timelines.  A key already at that time is
+        replaced, keeping its interpolation; a new key is linear.
+        """
+        from app.core.spine_pose import animation_offsets
+        if set(values) - {"rotation", "x", "y"} or not values:
+            raise AnimationEditingError("A bone pose key needs rotation and/or x, y values.")
+        seconds = _number(seconds, "time")
+        if not 0 <= seconds <= self.duration(animation):
+            raise AnimationEditingError("Bone key time is outside the animation.")
+        offsets = animation_offsets(self.bone(bone), values)
+        channels = {}
+        if "angle" in offsets:
+            channels["rotate"] = {"angle": offsets["angle"]}
+        if "x" in offsets or "y" in offsets:
+            translate = {}
+            if "x" not in offsets or "y" not in offsets:
+                # Keep the other axis where the animation currently has it.
+                current = self._bone_track_value(animation, bone, "translate", seconds)
+                translate.update(current)
+            translate.update({key: offsets[key] for key in ("x", "y") if key in offsets})
+            channels["translate"] = translate
+        encoded = {}
+        for channel, fields in channels.items():
+            frames = self.get_bone_track(animation, bone, channel)["keyframes"]
+            existing = next((frame for frame in frames if abs(float(frame["time"]) - seconds) <= 1e-4), None)
+            if existing is not None:
+                existing.update(fields)
+            else:
+                frames.append({"time": seconds, "interpolation": "linear", **fields})
+                frames.sort(key=lambda item: float(item["time"]))
+            encoded[channel] = encode_bone_track(frames, channel, self.project.version, self.duration(animation))
+
+        def operation():
+            data = self.project._animation(animation).setdefault("bones", {}).setdefault(bone, {})
+            data.update(encoded)
+            self.project.modified.add(animation)
+        self._change(operation)
+
+    def _bone_track_value(self, animation: str, bone: str, channel: str, seconds: float) -> dict[str, float]:
+        """Linear estimate of a track at ``seconds`` (the held value for one axis)."""
+        frames = self.get_bone_track(animation, bone, channel)["keyframes"]
+        fields = BONE_FIELDS[channel]
+        default = {field: 1.0 if channel.startswith("scale") else 0.0 for field in fields}
+        if not frames:
+            return default
+        before = [frame for frame in frames if float(frame["time"]) <= seconds]
+        after = [frame for frame in frames if float(frame["time"]) > seconds]
+        if not before:
+            return {field: float(after[0][field]) for field in fields}
+        start = before[-1]
+        if not after or start.get("interpolation") == "stepped":
+            return {field: float(start[field]) for field in fields}
+        end = after[0]
+        t = (seconds - float(start["time"])) / max(1e-9, float(end["time"]) - float(start["time"]))
+        return {field: float(start[field]) + (float(end[field]) - float(start[field])) * t for field in fields}
+
     def slot(self, name: str) -> dict:
         slot = next((item for item in self.document.get("slots", []) if item["name"] == name), None)
         if slot is None:

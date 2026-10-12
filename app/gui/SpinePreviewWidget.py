@@ -15,8 +15,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QTimer, Qt, Signal
-from PySide6.QtGui import QColor, QGuiApplication, QOpenGLContext, QPalette, QSurfaceFormat
+from PySide6.QtCore import QPointF, QTimer, Qt, Signal
+from PySide6.QtGui import (
+    QBrush, QColor, QGuiApplication, QOpenGLContext, QPainter, QPainterPath, QPalette, QPen, QPolygonF,
+    QSurfaceFormat,
+)
 from PySide6.QtWidgets import QLabel, QFrame, QSizePolicy, QVBoxLayout, QWidget
 
 try:
@@ -34,6 +37,7 @@ except (ImportError, OSError):  # keep non-GUI imports and diagnostics usable
     OPENGL_AVAILABLE = False
 
 from app.core.spine_native import SpineNativeError, SpineNativeModel, find_native_library
+from app.core.spine_pose import parent_of, pick_bone, rotate_bone, translate_bone
 from app.gui.view_zoom import ZOOM_STEP as ZOOM_KEY_STEP, zoom_key_action
 
 
@@ -158,6 +162,7 @@ if OPENGL_AVAILABLE:
                 dpr = float(self.devicePixelRatio())
                 GL.glViewport(0, 0, max(1, int(self.width() * dpr)), max(1, int(self.height() * dpr)))
                 self._owner._paint_native(self)
+                self._owner._paint_bone_overlay(self)
             except Exception as exc:
                 self._owner._native_gl_error = str(exc)
                 self._owner._report_error(f"Spine OpenGL rendering failed: {exc}")
@@ -180,6 +185,7 @@ if OPENGL_AVAILABLE:
                     dpr = float(self.devicePixelRatio())
                     GL.glViewport(0, 0, max(1, int(self.width() * dpr)), max(1, int(self.height() * dpr)))
                     self._owner._paint_native(self)
+                    self._owner._paint_bone_overlay(self)
                     GL.glFinish()
                 except Exception as exc:
                     self._owner._native_gl_error = str(exc)
@@ -318,6 +324,16 @@ class SpinePreviewWidget(QFrame):
     viewScaleChanged = Signal(float)
     # Emitted with a PickResult (or None) when a click selects a part.
     regionPicked = Signal(object)
+    # Bone mode: a bone was clicked, and a drag finished posing a bone with
+    # new local values ({"rotation"} or {"x", "y"}).
+    bonePicked = Signal(str)
+    bonePosed = Signal(str, dict)
+
+    # Bone overlay colours, chosen to read on light and dark stages alike.
+    BONE_COLORS = {
+        "fk": QColor(236, 236, 236), "ik": QColor(255, 159, 28), "target": QColor(255, 77, 109),
+        "constrained": QColor(61, 220, 151), "selected": QColor(0, 183, 255),
+    }
 
     # Same 25%-800% range as Live2D and the preview page's scale slider.
     ZOOM_STEP = ZOOM_KEY_STEP
@@ -353,6 +369,10 @@ class SpinePreviewWidget(QFrame):
         self._pick_regions: dict[int, list] = {}
         self._pick_page_sizes: dict[int, tuple[int, int]] = {}
         self._pick_alpha: dict[int, Any] = {}
+        self._bone_mode = False
+        self._bone_tool = "rotate"
+        self._selected_bone = ""
+        self._bone_drag: dict[str, Any] | None = None
         self._status_timer = QTimer(self)
         self._status_timer.setInterval(16)
         self._status_timer.setTimerType(Qt.TimerType.PreciseTimer)
@@ -452,6 +472,7 @@ class SpinePreviewWidget(QFrame):
         self._url = ""
         self._last_state = {}
         self._pick_regions, self._pick_page_sizes, self._pick_alpha = {}, {}, {}
+        self._bone_drag = None
         self._textures_uploaded = False
         self._renderer_ready = False
         self._ready_emitted = False
@@ -495,6 +516,199 @@ class SpinePreviewWidget(QFrame):
         if self._model:
             self._model.reset_pose()
         self._refresh_canvas()
+
+    def show_setup_pose(self) -> None:
+        """Show the bare setup pose (no animation) where the bridge supports it."""
+        if self._model:
+            self._model.show_setup_pose()
+        self._refresh_canvas()
+
+    # Bone mode ------------------------------------------------------------
+    @property
+    def bones_supported(self) -> bool:
+        return bool(self._model is not None and getattr(self._model, "supports_bones", False))
+
+    def bone_mode(self) -> bool:
+        return self._bone_mode
+
+    def set_bone_mode(self, enabled: bool) -> None:
+        """Draw the skeleton, pick bones before parts and pose them by dragging."""
+        self._bone_mode = bool(enabled)
+        self._bone_drag = None
+        self._request_canvas_update()
+
+    def bone_tool(self) -> str:
+        return self._bone_tool
+
+    def set_bone_tool(self, tool: str) -> None:
+        if tool not in {"rotate", "translate"}:
+            raise ValueError("Bone tool must be rotate or translate")
+        self._bone_tool = tool
+
+    @property
+    def selected_bone(self) -> str:
+        return self._selected_bone
+
+    def set_selected_bone(self, name: str | None) -> None:
+        name = str(name or "")
+        if name != self._selected_bone:
+            self._selected_bone = name
+            if self._bone_mode:
+                self._request_canvas_update()
+
+    def clear_bone_overrides(self) -> None:
+        if self._model is not None:
+            self._model.clear_bone_overrides()
+        self._refresh_canvas()
+
+    def skeleton_to_view(self, x: float, y: float) -> tuple[float, float]:
+        """Map skeleton coordinates to a canvas pixel (inverse of view_to_skeleton)."""
+        width, height = self._canvas_size()
+        kx, ky, cosine, sine, offset_x, offset_y, centre_x, centre_y = self._view_parameters(width, height)
+        u, v = x - centre_x, y - centre_y
+        ndc_x = kx * (cosine * u - sine * v) + offset_x
+        ndc_y = ky * (sine * u + cosine * v) + offset_y
+        return (ndc_x + 1.0) * width / 2.0, (1.0 - ndc_y) * height / 2.0
+
+    def bone_at(self, x: float, y: float):
+        if not self.bones_supported:
+            return None
+        return pick_bone(self._model.bones(), (x, y), self.skeleton_to_view)
+
+    def _bone_press(self, event) -> bool:
+        if not (self._bone_mode and self.bones_supported and event.button() == Qt.MouseButton.LeftButton):
+            return False
+        position = event.position()
+        bones = self._model.bones()
+        bone = pick_bone(bones, (position.x(), position.y()), self.skeleton_to_view)
+        if bone is None:
+            return False  # an empty spot still picks the part there
+        self.set_selected_bone(bone.name)
+        self.bonePicked.emit(bone.name)
+        translate = (self._bone_tool == "translate" or bone.is_ik_target
+                     or bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier))
+        self._bone_drag = {
+            "bone": bone, "parent": parent_of(bone, bones), "mode": "translate" if translate else "rotate",
+            "press": self.view_to_skeleton(position.x(), position.y()), "view": (position.x(), position.y()),
+            "values": None,
+        }
+        event.accept()
+        return True
+
+    def _bone_move(self, event) -> bool:
+        drag = self._bone_drag
+        if drag is None:
+            return False
+        position = event.position()
+        if drag["values"] is None and abs(position.x() - drag["view"][0]) + abs(position.y() - drag["view"][1]) < 3:
+            event.accept()
+            return True
+        bone, parent = drag["bone"], drag["parent"]
+        current = self.view_to_skeleton(position.x(), position.y())
+        x, y, rotation = bone.x, bone.y, bone.rotation
+        if drag["mode"] == "rotate":
+            rotation = rotate_bone(bone, parent, drag["press"], current)
+            drag["values"] = {"rotation": rotation}
+        else:
+            x, y = translate_bone(bone, parent, drag["press"], current)
+            drag["values"] = {"x": x, "y": y}
+        if self._model is not None and self._model.set_bone_override(bone.index, x, y, rotation, bone.scale_x, bone.scale_y):
+            self._request_canvas_update()
+        event.accept()
+        return True
+
+    def _bone_release(self, event) -> bool:
+        drag = self._bone_drag
+        if drag is None or event.button() != Qt.MouseButton.LeftButton:
+            return False
+        self._bone_drag = None
+        if drag["values"]:
+            self.bonePosed.emit(drag["bone"].name, dict(drag["values"]))
+        event.accept()
+        return True
+
+    def _paint_bone_overlay(self, canvas) -> None:
+        """Draw bones like the Spine editor: FK, IK chain, IK targets, constrained."""
+        if not (self._bone_mode and self.bones_supported):
+            return
+        bones = self._model.bones()
+        if not bones:
+            return
+        GL.glUseProgram(0)
+        GL.glBindVertexArray(0)
+        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, 0)
+        painter = QPainter(canvas)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            outline = QPen(QColor(0, 0, 0, 170), 1.2)
+            by_index = {bone.index: bone for bone in bones}
+            to_view = self.skeleton_to_view
+            # IK constraints: dashed line from the chain end to its target.
+            for ik in self._model.ik_constraints():
+                target = by_index.get(ik.target)
+                chain = [by_index[index] for index in ik.bones if index in by_index]
+                if target is None or not chain or ik.mix <= 0 or not target.active:
+                    continue
+                painter.setPen(QPen(self.BONE_COLORS["ik"], 1.4, Qt.PenStyle.DashLine))
+                painter.drawLine(QPointF(*to_view(*chain[-1].tip)), QPointF(*to_view(*target.origin)))
+            selected = None
+            for bone in bones:
+                if not bone.active:
+                    continue
+                if bone.name == self._selected_bone:
+                    selected = bone
+                    continue
+                self._draw_bone(painter, bone, outline, self._bone_color(bone))
+            if selected is not None:
+                self._draw_bone(painter, selected, QPen(QColor(255, 255, 255), 1.6), self.BONE_COLORS["selected"])
+                # A vector path, not drawText: the GL engine's glyph cache
+                # does not survive the native renderer's texture state.
+                x, y = to_view(*selected.origin)
+                label = QPainterPath()
+                label.addText(QPointF(x + 9, y - 9), painter.font(), selected.name)
+                painter.strokePath(label, QPen(QColor(0, 0, 0, 200), 3.0))
+                painter.fillPath(label, QBrush(QColor(255, 255, 255)))
+        finally:
+            painter.end()
+
+    def _bone_color(self, bone) -> QColor:
+        if bone.is_ik_target:
+            return self.BONE_COLORS["target"]
+        if bone.is_ik:
+            return self.BONE_COLORS["ik"]
+        if bone.is_constrained:
+            return self.BONE_COLORS["constrained"]
+        return self.BONE_COLORS["fk"]
+
+    def _draw_bone(self, painter, bone, outline: QPen, color: QColor) -> None:
+        origin = QPointF(*self.skeleton_to_view(*bone.origin))
+        tip = QPointF(*self.skeleton_to_view(*bone.tip))
+        dx, dy = tip.x() - origin.x(), tip.y() - origin.y()
+        length = math.hypot(dx, dy)
+        if bone.is_ik_target:
+            # A target is a handle, drawn as a crosshair ring.
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(color, 2.0))
+            painter.drawEllipse(origin, 7.0, 7.0)
+            painter.drawLine(QPointF(origin.x() - 11, origin.y()), QPointF(origin.x() + 11, origin.y()))
+            painter.drawLine(QPointF(origin.x(), origin.y() - 11), QPointF(origin.x(), origin.y() + 11))
+            return
+        fill = QColor(color)
+        fill.setAlpha(150)
+        painter.setPen(outline)
+        painter.setBrush(QBrush(fill))
+        if length >= 6.0:
+            ux, uy = dx / length, dy / length
+            width = min(6.0, max(2.5, length * 0.12))
+            shoulder = QPointF(origin.x() + dx * 0.18, origin.y() + dy * 0.18)
+            painter.drawPolygon(QPolygonF([
+                origin,
+                QPointF(shoulder.x() - uy * width, shoulder.y() + ux * width),
+                tip,
+                QPointF(shoulder.x() + uy * width, shoulder.y() - ux * width),
+            ]))
+        painter.setBrush(QBrush(color))
+        painter.drawEllipse(origin, 3.2, 3.2)
 
     def export_pose_psd(self) -> None:
         self.statusChanged.emit("info", "Native Spine pose export is not available in this canvas.")
@@ -670,6 +884,8 @@ class SpinePreviewWidget(QFrame):
     def _canvas_press(self, event) -> bool:
         if self._model is None:
             return False
+        if self._bone_press(event):
+            return True
         position = event.position()
         if self._view_interaction and event.button() == Qt.MouseButton.MiddleButton:
             self._pan_last = (position.x(), position.y())
@@ -684,6 +900,8 @@ class SpinePreviewWidget(QFrame):
         return False
 
     def _canvas_move(self, event) -> bool:
+        if self._bone_move(event):
+            return True
         if self._pan_last is None:
             return False
         position = event.position()
@@ -693,6 +911,8 @@ class SpinePreviewWidget(QFrame):
         return True
 
     def _canvas_release(self, event) -> bool:
+        if self._bone_release(event):
+            return True
         position = event.position()
         if self._pan_last is not None and event.button() == Qt.MouseButton.MiddleButton:
             self._pan_last = None
@@ -836,6 +1056,7 @@ class SpinePreviewWidget(QFrame):
             GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
             GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGBA, image.width, image.height, 0, GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, raw)
             canvas._textures[index] = texture
+        GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 4)  # the default other GL users expect
         GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
         self._textures_uploaded = True
 
@@ -862,6 +1083,10 @@ class SpinePreviewWidget(QFrame):
             # hierarchy, so exposed previews always get an opaque RGB stage.
             GL.glClearColor(color.redF(), color.greenF(), color.blueF(), 1.0)
         GL.glClear(GL.GL_COLOR_BUFFER_BIT)
+        # The bone overlay's QPainter may leave clipping state enabled.
+        GL.glDisable(GL.GL_SCISSOR_TEST)
+        GL.glDisable(GL.GL_STENCIL_TEST)
+        GL.glDisable(GL.GL_DEPTH_TEST)
         GL.glEnable(GL.GL_MULTISAMPLE) if bool(self._settings.get("antialias", True)) else GL.glDisable(GL.GL_MULTISAMPLE)
         render_result = self._model.render_into()
         vertex_buffer, vertex_count, _index_buffer, index_count, batch_buffer, batch_count = render_result

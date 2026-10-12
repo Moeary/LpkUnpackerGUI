@@ -339,6 +339,56 @@ class SpineEditorPageTests(unittest.TestCase):
         self.page.preview.regionPicked.emit(None)
         self.assertEqual(self.page._selection, ("slot", "front"))  # a miss keeps the selection
 
+        # Bone mode prefers bones: a part click selects the bone it hangs on.
+        self.page.tabs.setCurrentIndex(2)
+        self.page.bone_mode_button.setChecked(True)
+        self.assertTrue(self.page.preview.bone_mode())
+        self.assertTrue(self.page.bone_tool_combo.isVisibleTo(self.page))
+        self.page.preview.regionPicked.emit(face)
+        self.assertEqual(self.page.tabs.currentIndex(), 0)
+        self.assertEqual(self.page._selection, ("bone", "hip"))
+        self.assertEqual(self.page.preview.selected_bone, "hip")
+        self.page.bone_tool_combo.setCurrentIndex(self.page.bone_tool_combo.findData("translate"))
+        self.assertEqual(self.page.preview.bone_tool(), "translate")
+
+    def test_bone_mode_jumps_the_tree_and_commits_drags_as_setup_or_keys(self):
+        self.open()
+        page = self.page
+        page.bone_mode_button.setChecked(True)
+        page.tabs.setCurrentIndex(1)
+        page.search_edit.setText("root")
+        page.preview.bonePicked.emit("hip")
+        self.assertEqual(page.tabs.currentIndex(), 0)
+        self.assertEqual(page.tree.currentItem().data(0, Qt.UserRole), ("bone", "hip"))
+        self.assertFalse(page.tree.currentItem().isHidden())
+        self.assertEqual(page.preview.selected_bone, "hip")
+        # In an animation a drag keys the current time.
+        self.assertEqual(page.animation_name, "Idle")
+        page.timeline.set_time(1.0)
+        page.preview.bonePosed.emit("hip", {"rotation": 4.0})
+        frames = page.session.get_bone_track("Idle", "hip", "rotate")["keyframes"]
+        self.assertEqual([frame["time"] for frame in frames], [0, 1.0, 2])
+        self.assertAlmostEqual(frames[1]["angle"], 4.0)
+        self.assertEqual(page.track_combo.currentData(), ("hip", "rotate"))
+        self.assertIn("hip", page.status_label.text())
+        page.preview.bonePosed.emit("hip", {"x": 3.0, "y": -2.0})
+        self.assertEqual(page.track_combo.currentData(), ("hip", "translate"))
+        self.assertEqual(page.session.get_bone_track("Idle", "hip", "translate")["keyframes"][0]["x"], 3.0)
+        page.undo()
+        self.assertEqual(page.session.get_bone_track("Idle", "hip", "translate")["keyframes"], [])
+        # In the setup pose a drag edits the bone's setup transform.
+        page.animation_combo.setCurrentIndex(0)
+        page.preview.bonePosed.emit("hip", {"rotation": 30.0})
+        self.assertEqual(page.session.bone("hip")["rotation"], 30.0)
+        # A rejected key (outside the animation) clears the preview's pose.
+        page.animation_combo.setCurrentIndex(page.animation_combo.findData("Idle"))
+        page.timeline.set_time(1.0)
+        with patch.object(page.session, "key_bone_pose", side_effect=ValueError("bad key")), \
+                patch.object(page.preview, "clear_bone_overrides") as cleared:
+            page.preview.bonePosed.emit("hip", {"rotation": 1.0})
+        cleared.assert_called_once()
+        self.assertIn("bad key", page.status_label.text())
+
     def test_ctrl_plus_minus_zero_shortcuts_zoom_the_preview_from_anywhere_in_the_page(self):
         self.open()
         self.page.tree.setFocus()

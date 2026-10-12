@@ -46,6 +46,25 @@ class _PageInfo(ctypes.Structure):
     ]
 
 
+class _BoneInfo(ctypes.Structure):
+    _fields_ = [
+        ("name", ctypes.c_char_p), ("parent", ctypes.c_int32), ("flags", ctypes.c_int32),
+        ("length", ctypes.c_float),
+        ("x", ctypes.c_float), ("y", ctypes.c_float), ("rotation", ctypes.c_float),
+        ("scale_x", ctypes.c_float), ("scale_y", ctypes.c_float),
+        ("shear_x", ctypes.c_float), ("shear_y", ctypes.c_float),
+        ("a", ctypes.c_float), ("b", ctypes.c_float), ("c", ctypes.c_float), ("d", ctypes.c_float),
+        ("world_x", ctypes.c_float), ("world_y", ctypes.c_float),
+    ]
+
+
+class _IkInfo(ctypes.Structure):
+    _fields_ = [
+        ("name", ctypes.c_char_p), ("target", ctypes.c_int32), ("bone_count", ctypes.c_int32),
+        ("bones", ctypes.c_int32 * 2), ("mix", ctypes.c_float), ("bend_direction", ctypes.c_int32),
+    ]
+
+
 @dataclass(frozen=True)
 class SpineNativePage:
     path: Path
@@ -224,6 +243,26 @@ class SpineNativeModel:
             ("spine_native_bounds", ctypes.c_int, (p, ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float))),
         ):
             _configure(getattr(self._lib, name), restype, *args)
+        # Bone mode arrived with bridge ABI 2.  An older installed bridge
+        # still previews; it just cannot show or pose bones.
+        self.supports_bones = hasattr(self._lib, "spine_native_abi_version") and all(
+            hasattr(self._lib, name) for name in (
+                "spine_native_bone_count", "spine_native_bone_info", "spine_native_ik_count",
+                "spine_native_ik_info", "spine_native_set_bone_override",
+                "spine_native_clear_bone_overrides", "spine_native_show_setup_pose"))
+        if self.supports_bones:
+            for name, restype, args in (
+                ("spine_native_abi_version", ctypes.c_int32, ()),
+                ("spine_native_bone_count", ctypes.c_int32, (p,)),
+                ("spine_native_bone_info", ctypes.c_int, (p, ctypes.c_int32, ctypes.POINTER(_BoneInfo))),
+                ("spine_native_ik_count", ctypes.c_int32, (p,)),
+                ("spine_native_ik_info", ctypes.c_int, (p, ctypes.c_int32, ctypes.POINTER(_IkInfo))),
+                ("spine_native_set_bone_override", ctypes.c_int,
+                 (p, ctypes.c_int32, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float)),
+                ("spine_native_clear_bone_overrides", ctypes.c_int, (p,)),
+                ("spine_native_show_setup_pose", ctypes.c_int, (p,)),
+            ):
+                _configure(getattr(self._lib, name), restype, *args)
         self._create = self._lib.spine_native_create
         self._destroy = self._lib.spine_native_destroy
         self._native_load = self._lib.spine_native_load_memory
@@ -344,6 +383,57 @@ class SpineNativeModel:
         if ok:
             self.selected_animation = self._choose_animation()
         return ok
+
+    def show_setup_pose(self) -> bool:
+        """Show the setup pose with no animation track (bone mode setup editing)."""
+        if not self.supports_bones:
+            return self.reset_pose()
+        ok = bool(self._lib.spine_native_show_setup_pose(self._handle))
+        if ok:
+            self.selected_animation = ""
+        return ok
+
+    def bones(self):
+        """Current bones as :class:`app.core.spine_pose.SpineBone` values."""
+        from app.core.spine_pose import SpineBone
+        if not self.supports_bones:
+            return ()
+        info = _BoneInfo()
+        result = []
+        for index in range(int(self._lib.spine_native_bone_count(self._handle))):
+            if not self._lib.spine_native_bone_info(self._handle, index, ctypes.byref(info)):
+                continue
+            result.append(SpineBone(
+                index, self._decode(info.name), int(info.parent), int(info.flags), float(info.length),
+                float(info.x), float(info.y), float(info.rotation), float(info.scale_x), float(info.scale_y),
+                float(info.shear_x), float(info.shear_y), float(info.a), float(info.b), float(info.c),
+                float(info.d), float(info.world_x), float(info.world_y)))
+        return tuple(result)
+
+    def ik_constraints(self):
+        from app.core.spine_pose import SpineIk
+        if not self.supports_bones:
+            return ()
+        info = _IkInfo()
+        result = []
+        for index in range(int(self._lib.spine_native_ik_count(self._handle))):
+            if self._lib.spine_native_ik_info(self._handle, index, ctypes.byref(info)):
+                bones = tuple(int(info.bones[i]) for i in range(max(0, min(2, int(info.bone_count)))))
+                result.append(SpineIk(self._decode(info.name), int(info.target), bones,
+                                      float(info.mix), int(info.bend_direction)))
+        return tuple(result)
+
+    def set_bone_override(self, index: int, x: float, y: float, rotation: float,
+                          scale_x: float, scale_y: float) -> bool:
+        if not self.supports_bones:
+            return False
+        values = [float(value) for value in (x, y, rotation, scale_x, scale_y)]
+        if not all(math.isfinite(value) for value in values):
+            return False
+        return bool(self._lib.spine_native_set_bone_override(self._handle, int(index), *values))
+
+    def clear_bone_overrides(self) -> bool:
+        return bool(self.supports_bones and self._lib.spine_native_clear_bone_overrides(self._handle))
 
     def update(self, delta: float) -> None:
         delta = float(delta)

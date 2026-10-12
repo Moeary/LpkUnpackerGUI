@@ -18,7 +18,7 @@ from qfluentwidgets import (
     FluentIcon, LineEdit, PrimaryPushButton,
     PushButton, RoundMenu, ScrollArea, Slider, SubtitleLabel, TableWidget,
     TogglePushButton, TransparentToolButton,
-    TransparentToggleToolButton,
+    TransparentToggleToolButton, themeColor,
 )
 
 from app.core.live2d_editor_session import Live2DEditorSession
@@ -63,7 +63,11 @@ LIVE2D_EDITOR_TEXT = {
     "editor.live2d.parameter": "参数 / ID",
     "editor.live2d.value": "数值",
     "editor.live2d.range": "范围",
-    "editor.live2d.parameter_hint": "修改数值会立即预览；加入关键帧后保存到动作。",
+    "editor.live2d.parameter_hint": "修改数值会立即预览；加入关键帧后保存到动作。在预览中点击部件可跳到驱动它的参数。",
+    "editor.live2d.parameter_related_only": "仅显示点选部件的相关参数",
+    "editor.live2d.parameter_located": "{drawable}：{count} 个相关参数，已选中 {parameter}",
+    "editor.live2d.parameter_located_none": "{drawable} 不受任何参数驱动",
+    "editor.live2d.parameter_locate_unavailable": "需要 Cubism Core 才能定位部件对应的参数",
     "editor.live2d.motion": "动作",
     "editor.live2d.no_motion": "无动作；可新建动作",
     "editor.live2d.new_motion": "新建",
@@ -504,6 +508,13 @@ class Live2DEditorPage(QFrame):
         self.parameter_search = LineEdit(self.parameter_tab)
         self.parameter_search.textChanged.connect(self._filter_parameters)
         layout.addWidget(self.parameter_search)
+        # A preview click in this tab names the parameters driving that part.
+        self._related_parameters: dict[str, dict] = {}
+        self._parameter_pick_drawables: list[str] = []
+        self.parameter_related_only = CheckBox(self.parameter_tab)
+        self.parameter_related_only.setEnabled(False)
+        self.parameter_related_only.toggled.connect(lambda _checked: self._filter_parameters(self.parameter_search.text()))
+        layout.addWidget(self.parameter_related_only)
         self.parameter_table = TableWidget(self.parameter_tab)
         self.parameter_table.setColumnCount(3)
         self.parameter_table.setBorderVisible(False)
@@ -774,6 +785,7 @@ class Live2DEditorPage(QFrame):
         self.open_button.setToolTip(_text("editor.live2d.project_open"))
         self.save_button.setToolTip(appearance_text("editor.appearance.save_scope"))
         self.parameter_search.setPlaceholderText(_text("editor.live2d.search"))
+        self.parameter_related_only.setText(_text("editor.live2d.parameter_related_only"))
         self.parameter_table.setHorizontalHeaderLabels([_text("editor.live2d." + key) for key in ("parameter", "value", "range")])
         self.editor_label.setText(self._external_editor or _text("editor.live2d.default_editor"))
         self.part_opacity.setToolTip(_text("editor.live2d.opacity"))
@@ -1572,6 +1584,11 @@ class Live2DEditorPage(QFrame):
         self.parameter_table.setRowCount(0)
         self._parameter_spins.clear()
         self._parameter_rows.clear()
+        self._related_parameters = {}
+        self._parameter_pick_drawables = []
+        with QSignalBlocker(self.parameter_related_only):
+            self.parameter_related_only.setChecked(False)
+        self.parameter_related_only.setEnabled(False)
         for row, parameter in enumerate(self.session.parameters if self.session else []):
             self.parameter_table.insertRow(row)
             parameter_id = parameter["id"]
@@ -1633,9 +1650,79 @@ class Live2DEditorPage(QFrame):
 
     def _filter_parameters(self, text: str):
         text = text.casefold()
+        related_only = self.parameter_related_only.isChecked() and bool(self._related_parameters)
         for row in range(self.parameter_table.rowCount()):
             item = self.parameter_table.item(row, 0)
-            self.parameter_table.setRowHidden(row, text not in (item.text() + " " + str(item.data(Qt.UserRole))).casefold())
+            identifier = str(item.data(Qt.UserRole))
+            hidden = text not in (item.text() + " " + identifier).casefold()
+            self.parameter_table.setRowHidden(row, hidden or (related_only and identifier not in self._related_parameters))
+
+    def _parameter_tab_active(self) -> bool:
+        return self.tabs.currentWidget() is self.parameter_tab and not self._in_viewer_workspace()
+
+    def locate_parameters_for_drawables(self, identifiers) -> str | None:
+        """Jump the parameter list to what drives the first clicked part.
+
+        ``identifiers`` are hit-test candidates, topmost first.  The first
+        one moved or faded by any parameter wins; its related parameters are
+        emphasised and the strongest becomes the selected parameter.
+        """
+        identifiers = [str(identifier) for identifier in identifiers or [] if identifier]
+        if not self.session or not identifiers:
+            return None
+        render_session = self._preview_session or self.session
+        core = getattr(render_session, "_core_model", None)
+        if core is None or not hasattr(core, "parameter_influence"):
+            self._status(_text("editor.live2d.parameter_locate_unavailable"))
+            return None
+        known = {parameter["id"] for parameter in render_session.parameters}
+        pose = {key: value for key, value in self._pose().items() if key in known}
+        drawable, ranking = identifiers[0], []
+        try:
+            for candidate in identifiers:
+                ranking = [item for item in core.parameter_influence(candidate, pose) if item["id"] in self._parameter_rows]
+                if ranking:
+                    drawable = candidate
+                    break
+        except Exception as exc:
+            self._error(exc)
+            return None
+        self._set_related_parameters(ranking)
+        self._parameter_pick_drawables = [drawable]
+        self._sync_selection_highlights()
+        if not ranking:
+            self._status(_text("editor.live2d.parameter_located_none", drawable=drawable))
+            return None
+        target = ranking[0]["id"]
+        row = self._parameter_rows[target]
+        if self.parameter_table.isRowHidden(row):
+            with QSignalBlocker(self.parameter_search):
+                self.parameter_search.clear()
+            self._filter_parameters("")
+        self.parameter_table.setCurrentCell(row, 0)
+        self._parameter_selected(row)
+        self.parameter_table.scrollToItem(self.parameter_table.item(row, 0), QAbstractItemView.PositionAtCenter)
+        self._status(_text("editor.live2d.parameter_located", drawable=drawable, count=len(ranking), parameter=target))
+        return target
+
+    def _set_related_parameters(self, ranking: list[dict]):
+        self._related_parameters = {item["id"]: item for item in ranking}
+        accent = QColor(themeColor())
+        for identifier, row in self._parameter_rows.items():
+            item = self.parameter_table.item(row, 0)
+            if item is None:
+                continue
+            related = self._related_parameters.get(identifier)
+            font = item.font()
+            font.setBold(related is not None)
+            item.setFont(font)
+            item.setForeground(QBrush(accent) if related is not None else QBrush())
+            tooltip = item.toolTip().split("\n\u2192 ")[0]
+            if related is not None:
+                tooltip += f"\n\u2192 {related['displacement']:.1f}px / {related['opacity']:.2f}"
+            item.setToolTip(tooltip)
+        self.parameter_related_only.setEnabled(bool(self._related_parameters))
+        self._filter_parameters(self.parameter_search.text())
 
     def _parameter_selected(self, row: int, *_args):
         if self._refreshing or row < 0:
@@ -2053,10 +2140,16 @@ class Live2DEditorPage(QFrame):
         canvas = self.preview.live2d_canvas if self.preview else None
         if canvas and hasattr(canvas, "setSelectionHighlights"):
             active = self.tabs.currentWidget() is self.artmesh_tab
+            if not active and self.tabs.currentWidget() is getattr(self, "parameter_tab", None):
+                canvas.setSelectionHighlights(getattr(self, "_parameter_pick_drawables", []), [])
+                return
             canvas.setSelectionHighlights(self._selected_drawable_ids if active else [],
                                           self.selection_tools._related if active else [])
 
     def _native_drawables_picked(self, identifiers: list, mode: str = "replace"):
+        if self._parameter_tab_active():
+            self.locate_parameters_for_drawables(identifiers)
+            return
         self._selection_region = None
         in_mod = self._in_viewer_workspace()
         if not in_mod:
@@ -2142,6 +2235,9 @@ class Live2DEditorPage(QFrame):
     def _native_drawable_clicked(self, drawable_id: str):
         # Some wrappers return a Part ID from HitPart. Only an actual drawable
         # match can replace the more precise pose-geometry click selection.
+        if self._parameter_tab_active():
+            self.locate_parameters_for_drawables([drawable_id])
+            return
         if self._inspector_session is not (self._preview_session or self.session):
             self._refresh_mesh()
         if any(entry.drawable_id == drawable_id for entry in self.artmesh_inspector.entries):
@@ -2156,7 +2252,8 @@ class Live2DEditorPage(QFrame):
         if not self.session:
             return
         in_mod = self._in_viewer_workspace()
-        if not in_mod:
+        locate = self._parameter_tab_active()
+        if not in_mod and not locate:
             self.tabs.setCurrentWidget(self.artmesh_tab)
         # MOD keeps its own tab visible while picking a trigger in the stage.
         # It still needs the current pose geometry for an accurate hit test.
@@ -2173,6 +2270,10 @@ class Live2DEditorPage(QFrame):
                 continue
             if any(_point_in_triangle((x, y), triangle) for triangle in entry.pose_triangles()):
                 candidates.append(((entry.render_order, entry.draw_order, entry.source_index), index))
+        if locate:
+            entries = self.artmesh_inspector.entries
+            self.locate_parameters_for_drawables([entries[index].drawable_id for _key, index in sorted(candidates, reverse=True)])
+            return
         if candidates:
             selected = self.artmesh_inspector.entries[max(candidates)[1]]
             self.artmesh_inspector.select_entry(selected.drawable_id)

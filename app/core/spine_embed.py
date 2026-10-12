@@ -293,7 +293,7 @@ def build_native_runtime(
             {
                 "runtimeFamily": family,
                 "bridge": "official spine-cpp + lpk native C ABI",
-                "bridgeAbi": 1,
+                "bridgeAbi": 2,
                 "library": installed.name,
                 "sourceDirectory": str(source),
                 "licenseRequired": True,

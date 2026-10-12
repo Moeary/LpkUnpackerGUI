@@ -45,6 +45,34 @@ typedef struct SpineNativePageInfo {
     int32_t pma;
 } SpineNativePageInfo;
 
+/* Bone mode (bridge ABI 2).  Local values are the animated pose before
+ * constraints; a, b, c, d and world_x/world_y are the final world matrix. */
+enum {
+    SPINE_NATIVE_BONE_IK = 1,          /* constrained by an IK constraint */
+    SPINE_NATIVE_BONE_IK_TARGET = 2,   /* target of an IK constraint */
+    SPINE_NATIVE_BONE_CONSTRAINED = 4, /* transform or path constrained */
+    SPINE_NATIVE_BONE_ACTIVE = 8,      /* active for the current skin */
+    SPINE_NATIVE_BONE_OVERRIDDEN = 16  /* posed through set_bone_override */
+};
+
+typedef struct SpineNativeBoneInfo {
+    const char *name;
+    int32_t parent;
+    int32_t flags;
+    float length;
+    float x, y, rotation, scale_x, scale_y, shear_x, shear_y;
+    float a, b, c, d, world_x, world_y;
+} SpineNativeBoneInfo;
+
+typedef struct SpineNativeIkInfo {
+    const char *name;
+    int32_t target;
+    int32_t bone_count;
+    int32_t bones[2];
+    float mix;
+    int32_t bend_direction;
+} SpineNativeIkInfo;
+
 SPINE_BRIDGE_API void *spine_native_create(void);
 SPINE_BRIDGE_API void spine_native_destroy(void *handle);
 
@@ -89,6 +117,19 @@ SPINE_BRIDGE_API int spine_native_render(
     SpineNativeBatch *batches,
     int32_t batch_capacity);
 SPINE_BRIDGE_API int spine_native_bounds(void *handle, float *x, float *y, float *width, float *height);
+
+SPINE_BRIDGE_API int32_t spine_native_abi_version(void);
+SPINE_BRIDGE_API int32_t spine_native_bone_count(void *handle);
+SPINE_BRIDGE_API int spine_native_bone_info(void *handle, int32_t index, SpineNativeBoneInfo *out);
+SPINE_BRIDGE_API int32_t spine_native_ik_count(void *handle);
+SPINE_BRIDGE_API int spine_native_ik_info(void *handle, int32_t index, SpineNativeIkInfo *out);
+/* Replace one bone's local transform after the animation is applied, until
+ * cleared.  IK and other constraints still run on top of the override. */
+SPINE_BRIDGE_API int spine_native_set_bone_override(
+    void *handle, int32_t index, float x, float y, float rotation, float scale_x, float scale_y);
+SPINE_BRIDGE_API int spine_native_clear_bone_overrides(void *handle);
+/* Clear every track and show the skeleton's setup pose. */
+SPINE_BRIDGE_API int spine_native_show_setup_pose(void *handle);
 
 #ifdef __cplusplus
 }

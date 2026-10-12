@@ -570,6 +570,84 @@ class SpinePreviewWidgetTests(unittest.TestCase):
         widget._model = None
         widget.deleteLater()
 
+    def test_bone_mode_picks_bones_first_and_drag_poses_then_reports_local_values(self):
+        from PySide6.QtCore import QPointF, Qt
+        from PySide6.QtGui import QMouseEvent
+        from app.core.spine_pose import BONE_ACTIVE, BONE_IK_TARGET, SpineBone
+
+        def mouse(kind, x, y, modifiers=Qt.KeyboardModifier.NoModifier):
+            button = Qt.MouseButton.LeftButton
+            buttons = Qt.MouseButton.NoButton if kind == QEvent.Type.MouseButtonRelease else button
+            return QMouseEvent(kind, QPointF(x, y), QPointF(x, y), button, buttons, modifiers)
+
+        identity = (1.0, 0.0, 0.0, 1.0)
+        bones = (
+            SpineBone(0, "root", -1, BONE_ACTIVE, 0.0, 0, 0, 0, 1, 1, 0, 0, *identity, 0.0, 0.0),
+            SpineBone(1, "arm", 0, BONE_ACTIVE, 50.0, 0, 0, 10.0, 1, 1, 0, 0, *identity, 0.0, 0.0),
+            SpineBone(2, "target", 0, BONE_ACTIVE | BONE_IK_TARGET, 0.0, 80, 0, 0, 1, 1, 0, 0, *identity, 80.0, 0.0),
+        )
+
+        class _Model:
+            supports_bones = True
+            overrides = []
+
+            def bones(self):
+                return bones
+
+            def ik_constraints(self):
+                return ()
+
+            def set_bone_override(self, *values):
+                self.overrides.append(values)
+                return True
+
+        widget = SpinePreviewWidget()
+        widget.resize(400, 300)
+        widget._base_bounds = (-100.0, -100.0, 200.0, 200.0)
+        widget._model = _Model()
+        picked, posed = [], []
+        widget.bonePicked.connect(picked.append)
+        widget.bonePosed.connect(lambda name, values: posed.append((name, values)))
+        for point in ((0.0, 0.0), (37.5, -20.0)):
+            view = widget.skeleton_to_view(*point)
+            back = widget.view_to_skeleton(*view)
+            self.assertAlmostEqual(back[0], point[0], places=4)
+            self.assertAlmostEqual(back[1], point[1], places=4)
+        # Without bone mode a left click is not a bone gesture.
+        self.assertFalse(widget._bone_press(mouse(QEvent.Type.MouseButtonPress, *widget.skeleton_to_view(25, 0))))
+        widget.set_bone_mode(True)
+        # Rotate the arm by sweeping a quarter turn around its origin.
+        x, y = widget.skeleton_to_view(25, 0)
+        self.assertTrue(widget._canvas_press(mouse(QEvent.Type.MouseButtonPress, x, y)))
+        self.assertEqual((picked, widget.selected_bone), (["arm"], "arm"))
+        self.assertTrue(widget._canvas_move(mouse(QEvent.Type.MouseMove, *widget.skeleton_to_view(0, 25))))
+        self.assertTrue(widget._canvas_release(mouse(QEvent.Type.MouseButtonRelease, *widget.skeleton_to_view(0, 25))))
+        self.assertEqual(posed[-1][0], "arm")
+        self.assertAlmostEqual(posed[-1][1]["rotation"], 100.0, places=3)
+        self.assertEqual(set(posed[-1][1]), {"rotation"})
+        self.assertAlmostEqual(_Model.overrides[-1][3], 100.0, places=3)
+        # An IK target always moves; a click without a drag only selects.
+        tx, ty = widget.skeleton_to_view(80, 0)
+        widget._canvas_press(mouse(QEvent.Type.MouseButtonPress, tx, ty))
+        widget._canvas_move(mouse(QEvent.Type.MouseMove, *widget.skeleton_to_view(90, 10)))
+        widget._canvas_release(mouse(QEvent.Type.MouseButtonRelease, *widget.skeleton_to_view(90, 10)))
+        self.assertEqual(posed[-1][0], "target")
+        self.assertAlmostEqual(posed[-1][1]["x"], 90.0, places=3)
+        self.assertAlmostEqual(posed[-1][1]["y"], 10.0, places=3)
+        count = len(posed)
+        widget._canvas_press(mouse(QEvent.Type.MouseButtonPress, tx, ty))
+        widget._canvas_release(mouse(QEvent.Type.MouseButtonRelease, tx, ty))
+        self.assertEqual(len(posed), count)
+        # Shift+drag translates an ordinary bone too.
+        widget._canvas_press(mouse(QEvent.Type.MouseButtonPress, x, y, Qt.KeyboardModifier.ShiftModifier))
+        widget._canvas_move(mouse(QEvent.Type.MouseMove, *widget.skeleton_to_view(30, 5)))
+        widget._canvas_release(mouse(QEvent.Type.MouseButtonRelease, *widget.skeleton_to_view(30, 5)))
+        self.assertEqual(set(posed[-1][1]), {"x", "y"})
+        # Empty space falls back to part picking.
+        self.assertFalse(widget._bone_press(mouse(QEvent.Type.MouseButtonPress, *widget.skeleton_to_view(-60, 60))))
+        widget._model = None
+        widget.deleteLater()
+
 
 if __name__ == "__main__":
     unittest.main()

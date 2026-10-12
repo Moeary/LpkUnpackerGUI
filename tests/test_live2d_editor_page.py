@@ -459,6 +459,8 @@ class Live2DEditorPageTests(unittest.TestCase):
         with patch("app.gui.Live2DPreviewWindow.Live2DPreviewWindow", _ModePreview):
             self.assertTrue(self.page.open_source(str(self.model)))
         page = self.page
+        # The parameter tab locates parameters instead; picking is ArtMesh's.
+        page.tabs.setCurrentWidget(page.artmesh_tab)
         canvas = page.preview.live2d_canvas
         before = page.session._signature()
         canvas.drawablesPickedWithMode.emit(["ArtMeshFace"], "replace")
@@ -921,6 +923,12 @@ class Live2DEditorPageTests(unittest.TestCase):
 
     def test_native_point_selection_uses_actual_artmesh_geometry(self):
         self.open()
+        located = []
+        with patch.object(self.page, "locate_parameters_for_drawables", side_effect=located.append):
+            self.page.preview.live2d_canvas.modelPointClicked.emit(.5, .5)
+        self.assertEqual(located, [["ArtMeshFace"]])
+        self.assertIs(self.page.tabs.currentWidget(), self.page.parameter_tab)
+        self.page.tabs.setCurrentWidget(self.page.artmesh_tab)
         self.page.preview.live2d_canvas.modelPointClicked.emit(.5, .5)
         self.assertEqual(self.page.artmesh_inspector.current_entry().drawable_id, "ArtMeshFace")
 
@@ -1172,6 +1180,47 @@ class Live2DEditorPageTests(unittest.TestCase):
         self.assertIn("NewPose[0]", self.page.session.project.motions)
         self.assertNotIn("CopyPose[0]", self.page.session.project.motions)
         self.assertEqual(self.model.read_bytes(), before)
+
+    def test_preview_click_in_parameter_tab_jumps_to_driving_parameter(self):
+        inventory = self.model.parent / "live2d_parameter_inventory.json"
+        data = json.loads(inventory.read_text(encoding="utf-8"))
+        data["parameters"].append({"id": "ParamMouthOpenY", "name": "口 開閉", "min": 0, "max": 1, "default": 0})
+        inventory.write_text(json.dumps(data), encoding="utf-8")
+        self.open()
+        page = self.page
+        self.assertEqual(page._selected_parameter, "ParamAngleY")
+        calls = []
+
+        class _Core:
+            def parameter_influence(self, drawable, pose):
+                calls.append((drawable, dict(pose)))
+                if drawable != "ArtMeshFace":
+                    return []
+                return [{"id": "ParamMouthOpenY", "displacement": 24.0, "opacity": 0.0, "score": 90.0},
+                        {"id": "ParamAngleY", "displacement": 6.0, "opacity": 0.0, "score": 7.0}]
+
+        page.session._core_model = _Core()
+        page.tabs.setCurrentWidget(page.parameter_tab)
+        # The topmost hit is not driven by anything; the next candidate is.
+        page.preview.live2d_canvas.drawablesPicked.emit(["Unbound", "ArtMeshFace"])
+        self.assertIs(page.tabs.currentWidget(), page.parameter_tab)
+        self.assertEqual([drawable for drawable, _pose in calls], ["Unbound", "ArtMeshFace"])
+        self.assertIn("ParamAngleY", calls[0][1])
+        self.assertEqual(page._selected_parameter, "ParamMouthOpenY")
+        self.assertEqual(page.parameter_table.currentRow(), page._parameter_rows["ParamMouthOpenY"])
+        self.assertEqual(page._parameter_pick_drawables, ["ArtMeshFace"])
+        self.assertTrue(page.parameter_related_only.isEnabled())
+        self.assertTrue(page.parameter_table.item(page._parameter_rows["ParamAngleY"], 0).font().bold())
+        page.parameter_search.setText("Angle")
+        page.parameter_related_only.setChecked(True)
+        page.locate_parameters_for_drawables(["ArtMeshFace"])
+        self.assertFalse(page.parameter_table.isRowHidden(page._parameter_rows["ParamMouthOpenY"]))
+        # Outside the parameter tab a click still selects the ArtMesh.
+        page.tabs.setCurrentWidget(page.artmesh_tab)
+        calls.clear()
+        page.preview.live2d_canvas.drawablesPicked.emit(["ArtMeshFace"])
+        self.assertEqual(calls, [])
+        self.assertIs(page.tabs.currentWidget(), page.artmesh_tab)
 
 
 if __name__ == "__main__":
