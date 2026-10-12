@@ -437,6 +437,42 @@ class SpineEditorPageTests(unittest.TestCase):
         page.redo()
         self.assertEqual(page.hidden_slots, set())
 
+    def test_export_animation_renders_each_frame_and_encodes_in_background(self):
+        from PySide6.QtGui import QColor, QImage
+        from PIL import Image
+        self.open()
+        page = self.page
+        self.assertEqual(page.animation_name, "Idle")
+        times = []
+
+        def render(width, height, transparent=True):
+            times.append(page.preview._model_time)
+            image = QImage(width, height, QImage.Format.Format_RGBA8888)
+            image.fill(QColor(255, 0, 0, 255) if len(times) % 2 else QColor(0, 0, 255, 128))
+            return image
+
+        page.preview._model_time = 0.0
+        options = {"format": "webp", "fps": 2, "width": 20, "height": 10, "transparent": True,
+                   "start": 0.0, "end": 2.0, "speed": 1.0}
+        output = self.root / "idle.webp"
+        page.timeline.set_time(0.7)
+        with patch.object(page.preview, "can_render_images", return_value=True), \
+                patch.object(page.preview, "render_image", side_effect=render), \
+                patch.object(page.preview, "set_time", side_effect=lambda t: setattr(page.preview, "_model_time", t)):
+            self.assertTrue(page.export_animation(str(output), options))
+            self.assertFalse(page.export_animation_button.isEnabled())  # one export at a time
+            self.wait(lambda: not page.animation_export_busy, 20)
+            self.assertEqual(page.preview._model_time, 0.7)  # the preview returns to the timeline
+        self.assertEqual(times, [0.0, 0.5, 1.0, 1.5])
+        self.assertIn("idle.webp", page.status_label.text())
+        with Image.open(output) as image:
+            self.assertEqual((image.n_frames, image.size), (4, (20, 10)))
+        self.assertFalse(page.session.dirty)
+
+        page.animation_combo.setCurrentIndex(0)  # the setup pose has no frames to export
+        self.assertFalse(page.export_animation(str(output), options))
+        self.assertFalse(page.export_animation_button.isEnabled())
+
     def test_bone_mode_jumps_the_tree_and_commits_drags_as_setup_or_keys(self):
         self.open()
         page = self.page

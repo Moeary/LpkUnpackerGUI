@@ -773,6 +773,54 @@ class SpinePreviewWidget(QFrame):
         painter.setBrush(QBrush(color))
         painter.drawEllipse(origin, 3.2, 3.2)
 
+    # Off-screen frames ---------------------------------------------------
+    MAX_RENDER_SIZE = 4096
+
+    def can_render_images(self) -> bool:
+        return bool(self._model is not None and self.canvas is not None
+                    and getattr(self.canvas, "_initialized", False) and GL is not None)
+
+    def render_image(self, width: int, height: int, *, transparent: bool = True):
+        """Render the current pose into a ``width`` × ``height`` QImage.
+
+        The frame uses the preview's framing (zoom, pan, hidden slots) but
+        not the bone overlay, and is drawn into a multisampled off-screen
+        framebuffer, so the size does not depend on the window and the
+        background can be transparent.  Returns None when the canvas has no
+        GL context yet.
+        """
+        if not self.can_render_images():
+            return None
+        from PySide6.QtCore import QSize
+        from PySide6.QtGui import QImage
+        from PySide6.QtOpenGL import QOpenGLFramebufferObject, QOpenGLFramebufferObjectFormat
+        width = max(1, min(self.MAX_RENDER_SIZE, int(width)))
+        height = max(1, min(self.MAX_RENDER_SIZE, int(height)))
+        canvas = self.canvas
+        previous_context = QOpenGLContext.currentContext()
+        previous_surface = previous_context.surface() if previous_context is not None else None
+        canvas.makeCurrent()
+        try:
+            fmt = QOpenGLFramebufferObjectFormat()
+            fmt.setAttachment(QOpenGLFramebufferObject.Attachment.NoAttachment)
+            fmt.setInternalTextureFormat(GL.GL_RGBA8)
+            fmt.setSamples(4 if bool(self._settings.get("antialias", True)) else 0)
+            fbo = QOpenGLFramebufferObject(QSize(width, height), fmt)
+            if not fbo.isValid():
+                raise RuntimeError("OpenGL could not create a framebuffer for export")
+            fbo.bind()
+            GL.glViewport(0, 0, width, height)
+            self._paint_native(canvas, (width, height), clear_transparent=transparent)
+            GL.glFinish()
+            fbo.release()
+            # The blend output is premultiplied; Qt reads it as such.
+            image = fbo.toImage().convertToFormat(QImage.Format.Format_RGBA8888)
+        finally:
+            canvas.doneCurrent()
+            if previous_context is not None and previous_surface is not None and previous_context is not canvas.context():
+                previous_context.makeCurrent(previous_surface)
+        return image
+
     def export_pose_psd(self) -> None:
         self.statusChanged.emit("info", "Native Spine pose export is not available in this canvas.")
 
@@ -1123,7 +1171,13 @@ class SpinePreviewWidget(QFrame):
         GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
         self._textures_uploaded = True
 
-    def _paint_native(self, canvas: _SpineOpenGLWindow) -> None:
+    def _paint_native(self, canvas: _SpineOpenGLWindow, target_size: tuple[int, int] | None = None,
+                      clear_transparent: bool | None = None) -> None:
+        """Draw the model into the bound framebuffer.
+
+        ``target_size`` (device pixels) and ``clear_transparent`` serve
+        off-screen export into an FBO; the on-screen paint passes neither.
+        """
         color = self._background_color()
         if self._model is None:
             GL.glClearColor(color.redF(), color.greenF(), color.blueF(), 1.0)
@@ -1137,7 +1191,12 @@ class SpinePreviewWidget(QFrame):
         # black rectangle.  Keep the on-screen RGB stage in the configured
         # theme color for both modes; an off-screen exporter can still bind a
         # transparent target explicitly without changing the native preview.
-        if transparent and not canvas.isExposed():
+        if clear_transparent is not None:
+            if clear_transparent:
+                GL.glClearColor(0.0, 0.0, 0.0, 0.0)
+            else:
+                GL.glClearColor(color.redF(), color.greenF(), color.blueF(), 1.0)
+        elif transparent and not canvas.isExposed():
             # A hidden/off-screen surface can retain a real transparent
             # framebuffer for callers that capture it explicitly.
             GL.glClearColor(0.0, 0.0, 0.0, 0.0)
@@ -1156,8 +1215,11 @@ class SpinePreviewWidget(QFrame):
         if vertex_buffer is None or vertex_count <= 0 or index_count <= 0 or batch_buffer is None or batch_count <= 0:
             self._mark_renderer_ready()
             return
-        width = max(1, int(canvas.width() * float(canvas.devicePixelRatio())))
-        height = max(1, int(canvas.height() * float(canvas.devicePixelRatio())))
+        if target_size is not None:
+            width, height = max(1, int(target_size[0])), max(1, int(target_size[1]))
+        else:
+            width = max(1, int(canvas.width() * float(canvas.devicePixelRatio())))
+            height = max(1, int(canvas.height() * float(canvas.devicePixelRatio())))
         # Shared with view_to_skeleton(), so a click maps to what is drawn.
         kx, ky, cosine, sine, offset_x, offset_y, center_x, center_y = self._view_parameters(width, height)
         # Keep skeleton-space positions in the VBO and perform fit/scale/

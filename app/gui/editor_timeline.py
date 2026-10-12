@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 )
 from qfluentwidgets import (
     CaptionLabel, CheckBox, DoubleSpinBox, FluentIcon, PushButton, Slider,
-    RoundMenu, TableWidget, TransparentToolButton, TransparentToggleToolButton,
+    RoundMenu, TableWidget, TransparentPushButton, TransparentToolButton, TransparentToggleToolButton,
 )
 
 from app.i18n import tr
@@ -48,7 +48,21 @@ TIMELINE_TEXT = {
     "editor.timeline.table": "数值表",
     "editor.timeline.controls": "控制点",
     "editor.timeline.selection": "关键帧 {index} · {time} 秒",
+    "editor.timeline.playback": "播放速度与区间循环",
+    "editor.timeline.speed": "播放速度",
+    "editor.timeline.range": "只播放区间",
+    "editor.timeline.range_hint": "播放与循环只在起点和终点之间进行；导出动画也可只导出这一段",
+    "editor.timeline.range_start": "起点",
+    "editor.timeline.range_end": "终点",
+    "editor.timeline.range_use_current": "设为当前时间",
 }
+
+# Playback speeds offered by the playback menu.
+PLAYBACK_SPEEDS = (0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 4.0)
+
+
+def _speed_text(speed: float) -> str:
+    return f"{speed:g}×"
 
 
 # Compatibility import for older pages; real Fluent controls own their style.
@@ -157,6 +171,17 @@ class _TimelineCanvas(QWidget):
         bg, fg = self.palette().base().color(), self.palette().text().color()
         painter.fillRect(self.rect(), bg)
         plot = self._plot()
+        play_range = self.editor.play_range()
+        if play_range is not None:
+            # Dim the time outside the playback range and mark its ends.
+            shade = QColor(fg)
+            shade.setAlpha(22)
+            start, end = self._x(play_range[0]), self._x(play_range[1])
+            painter.fillRect(QRectF(plot.left(), 16, start - plot.left(), plot.bottom() - 16), shade)
+            painter.fillRect(QRectF(end, 16, plot.right() - end, plot.bottom() - 16), shade)
+            painter.setPen(QPen(self.palette().highlight().color(), 1.5))
+            for x in (start, end):
+                painter.drawLine(QPointF(x, 16), QPointF(x, plot.bottom()))
         grid = QColor(fg)
         grid.setAlpha(42)
         painter.setPen(QPen(grid, 1))
@@ -284,6 +309,10 @@ class AnimationTimelineEditor(QWidget):
         self.editable = False
         self._updating = False
         self._last_tick = 0.0
+        # Playback only: never part of the track or its history.
+        self.playback_speed = 1.0
+        self._range_enabled = False
+        self._range = (0.0, 1.0)
         self.timer = QTimer(self)
         self.timer.setInterval(33)
         self.timer.timeout.connect(self._tick)
@@ -297,6 +326,8 @@ class AnimationTimelineEditor(QWidget):
         self.loop_check = TransparentToggleToolButton(FluentIcon.SYNC, self)
         self.loop_check.setFixedSize(26, 28)
         self.loop_check.setChecked(True)
+        self.speed_button = TransparentPushButton(_speed_text(1.0), self)
+        self.speed_button.setFixedSize(58, 28)
         self.time_spin = DoubleSpinBox(self)
         self.time_spin.setDecimals(3)
         self.time_spin.setRange(0, self.duration)
@@ -326,10 +357,11 @@ class AnimationTimelineEditor(QWidget):
         self.curve_controls_check = CheckBox(self)
         self.more_button = TransparentToolButton(FluentIcon.MORE, self)
         self.more_button.setFixedSize(24, 28)
-        for widget in (self.play_button, self.loop_check, self.time_spin, self.seek_slider,
+        for widget in (self.play_button, self.loop_check, self.speed_button, self.time_spin, self.seek_slider,
                        self.add_button, self.delete_button, self.field_combo, self.more_button):
             bar.addWidget(widget, 1 if widget is self.seek_slider else 0)
         layout.addLayout(bar)
+        self._build_playback_menu()
         self.canvas = _TimelineCanvas(self)
         layout.addWidget(self.canvas, 1)
         self.options_menu = RoundMenu(parent=self)
@@ -391,6 +423,96 @@ class AnimationTimelineEditor(QWidget):
         self.retranslate_ui()
         self.set_track([], 1, [], editable=False)
 
+    def _build_playback_menu(self):
+        self.playback_menu = RoundMenu(parent=self)
+        panel = QWidget(self.playback_menu)
+        panel.setFixedSize(330, 150)
+        grid = QGridLayout(panel)
+        grid.setContentsMargins(10, 6, 10, 6)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
+        self.speed_label = CaptionLabel(panel)
+        self.speed_combo = EditorComboBox(panel)
+        for speed in PLAYBACK_SPEEDS:
+            self.speed_combo.addItem(_speed_text(speed), speed)
+        self.speed_combo.setCurrentIndex(PLAYBACK_SPEEDS.index(1.0))
+        grid.addWidget(self.speed_label, 0, 0)
+        grid.addWidget(self.speed_combo, 0, 1, 1, 2)
+        self.range_check = CheckBox(panel)
+        grid.addWidget(self.range_check, 1, 0, 1, 3)
+        self.range_labels, self.range_spins, self.range_buttons = [], [], []
+        for row, key in ((2, "range_start"), (3, "range_end")):
+            label = CaptionLabel(panel)
+            spin = DoubleSpinBox(panel)
+            spin.setDecimals(3)
+            spin.setSingleStep(1 / 30)
+            spin.setSuffix(" s")
+            spin.setSymbolVisible(False)
+            button = TransparentToolButton(FluentIcon.PIN, panel)
+            button.setFixedSize(28, 28)
+            grid.addWidget(label, row, 0)
+            grid.addWidget(spin, row, 1)
+            grid.addWidget(button, row, 2)
+            self.range_labels.append(label)
+            self.range_spins.append(spin)
+            self.range_buttons.append(button)
+        grid.setColumnStretch(1, 1)
+        self.playback_menu.addWidget(panel, selectable=False)
+        self.speed_button.clicked.connect(lambda: self.playback_menu.exec(
+            self.speed_button.mapToGlobal(QPoint(0, self.speed_button.height()))))
+        self.speed_combo.currentIndexChanged.connect(
+            lambda _index: self.set_playback_speed(self.speed_combo.currentData() or 1.0))
+        self.range_check.toggled.connect(lambda checked: self.set_play_range(*self._range, enabled=checked))
+        self.range_spins[0].valueChanged.connect(lambda value: self._range_spin_changed(0, value))
+        self.range_spins[1].valueChanged.connect(lambda value: self._range_spin_changed(1, value))
+        self.range_buttons[0].clicked.connect(lambda: self.set_play_range(self.current_time, self._range[1], enabled=True))
+        self.range_buttons[1].clicked.connect(lambda: self.set_play_range(self._range[0], self.current_time, enabled=True))
+
+    def set_playback_speed(self, speed: float):
+        speed = float(speed)
+        self.playback_speed = speed if math.isfinite(speed) and speed > 0 else 1.0
+        self.speed_button.setText(_speed_text(self.playback_speed))
+        index = self.speed_combo.findData(self.playback_speed)
+        if index >= 0 and index != self.speed_combo.currentIndex():
+            self.speed_combo.setCurrentIndex(index)
+
+    def play_range(self) -> tuple[float, float] | None:
+        """(start, end) while range playback is on, else None."""
+        return self._range if self._range_enabled else None
+
+    def set_play_range(self, start: float, end: float, *, enabled: bool = True):
+        """Play (and loop) only between ``start`` and ``end``.  The ends are
+        clamped to the animation and kept at least one frame apart."""
+        start = max(0.0, min(self.duration, float(start)))
+        end = max(0.0, min(self.duration, float(end)))
+        if end < start:
+            start, end = end, start
+        if end - start < 1 / 120:
+            end = min(self.duration, start + 1 / 30)
+            start = max(0.0, end - 1 / 30)
+        self._range, self._range_enabled = (start, end), bool(enabled)
+        self._sync_range_controls()
+        self.canvas.update()
+
+    def _range_spin_changed(self, index: int, value: float):
+        if self._updating:
+            return
+        values = list(self._range)
+        values[index] = value
+        self.set_play_range(*values, enabled=self._range_enabled)
+
+    def _sync_range_controls(self):
+        previous = self._updating
+        self._updating = True
+        self.range_check.setChecked(self._range_enabled)
+        for spin, value in zip(self.range_spins, self._range):
+            spin.setRange(0, self.duration)
+            spin.setValue(value)
+            spin.setEnabled(self._range_enabled)
+        for button in self.range_buttons:
+            button.setEnabled(self._range_enabled)
+        self._updating = previous
+
     def set_allowed_interpolations(self, allowed: list[str]):
         self._updating = True
         self.interpolation_combo.clear()
@@ -415,7 +537,12 @@ class AnimationTimelineEditor(QWidget):
         self._updating = True
         selected_time = self._frames[self.selected_index].get("time") if 0 <= self.selected_index < len(self._frames) else None
         self._frames = copy.deepcopy(frames)
+        previous_duration = self.duration
         self.duration = max(0.001, float(duration)) if math.isfinite(float(duration)) else 1.0
+        if not math.isclose(previous_duration, self.duration) or not self._range_enabled:
+            # Another animation (or length): the old range no longer applies.
+            self._range_enabled, self._range = False, (0.0, self.duration)
+        self._sync_range_controls()
         self._fields = list(fields)
         self.editable = bool(editable and fields)
         previous_field = self.current_field
@@ -453,8 +580,9 @@ class AnimationTimelineEditor(QWidget):
         if playing == self.is_playing:
             return
         if playing:
-            if self.current_time >= self.duration:
-                self._seek(0)
+            start, end = self._range if self._range_enabled else (0.0, self.duration)
+            if not start <= self.current_time < end:
+                self._seek(start)
             self._last_tick = time.monotonic()
             self.timer.start()
         else:
@@ -465,15 +593,21 @@ class AnimationTimelineEditor(QWidget):
 
     def _tick(self):
         now = time.monotonic()
-        seconds = self.current_time + min(now - self._last_tick, 0.25)
+        self._seek(self.advance(self.current_time, min(now - self._last_tick, 0.25)))
         self._last_tick = now
-        if seconds > self.duration:
-            if self.loop_check.isChecked():
-                seconds %= self.duration
+
+    def advance(self, seconds: float, elapsed: float) -> float:
+        """The time ``elapsed`` wall-clock seconds after ``seconds`` at the
+        current speed, looping or stopping at the end of the play range."""
+        start, end = self._range if self._range_enabled else (0.0, self.duration)
+        seconds += elapsed * self.playback_speed
+        if seconds > end:
+            if self.loop_check.isChecked() and end > start:
+                seconds = start + (seconds - start) % (end - start)
             else:
-                seconds = self.duration
+                seconds = end
                 self.set_playing(False)
-        self._seek(seconds)
+        return seconds
 
     def select_frame(self, index: int):
         self.selected_index = index if 0 <= index < len(self._frames) else -1
@@ -638,6 +772,15 @@ class AnimationTimelineEditor(QWidget):
         self.apply_curve_button.setText(_text("editor.timeline.apply_curve"))
         self.table_check.setText(_text("editor.timeline.table"))
         self.curve_controls_check.setText(_text("editor.timeline.controls"))
+        self.speed_button.setToolTip(_text("editor.timeline.playback"))
+        self.speed_button.setAccessibleName(_text("editor.timeline.playback"))
+        self.speed_label.setText(_text("editor.timeline.speed"))
+        self.range_check.setText(_text("editor.timeline.range"))
+        self.range_check.setToolTip(_text("editor.timeline.range_hint"))
+        for label, key in zip(self.range_labels, ("range_start", "range_end")):
+            label.setText(_text(f"editor.timeline.{key}"))
+        for button in self.range_buttons:
+            button.setToolTip(_text("editor.timeline.range_use_current"))
         self._updating = True
         for index in range(self.interpolation_combo.count()):
             self.interpolation_combo.setItemText(index, _text(f"editor.timeline.{self.interpolation_combo.itemData(index)}"))

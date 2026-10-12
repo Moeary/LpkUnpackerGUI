@@ -44,6 +44,7 @@ SPECS = {
         ("up", "Slot 图层上移", "Alt+Up"), ("down", "Slot 图层下移", "Alt+Down"),
         ("slot_hide", "预览中隐藏 / 显示选中的 Slot", "H"), ("slot_solo", "预览中仅显示选中的 Slot", "Shift+H"),
         ("slot_show_all", "显示全部临时隐藏的 Slot", "Alt+H"),
+        ("export_animation", "导出动画（GIF / WebP / PNG 序列）", "Ctrl+Shift+E"),
     ],
 }
 
@@ -214,3 +215,5 @@ class EditorShortcutRouter(QObject):
                 page.solo_selected()
             elif action == "slot_show_all":
                 page.show_all_slots()
+            elif action == "export_animation":
+                page.export_animation()

@@ -33,6 +33,31 @@ class TimelineTests(unittest.TestCase):
         self.widget.deleteLater()
         self.app.processEvents()
 
+    def test_playback_speed_and_range_loop(self):
+        widget = self.widget
+        widget.set_track([], 4, ["value"])
+        widget.set_playback_speed(2.0)
+        self.assertEqual(widget.speed_button.text(), "2×")
+        self.assertAlmostEqual(widget.advance(0.5, 0.25), 1.0)
+        widget.set_play_range(3, 1)  # ends are ordered
+        self.assertEqual(widget.play_range(), (1.0, 3.0))
+        self.assertTrue(widget.range_check.isChecked())
+        widget.set_time(0.2)
+        widget.set_playing(True)  # outside the range: start at its beginning
+        self.assertEqual(widget.current_time, 1.0)
+        widget.set_playing(False)
+        self.assertAlmostEqual(widget.advance(2.9, 0.1), 1.1)  # loops inside the range
+        widget.loop_check.setChecked(False)
+        self.assertEqual(widget.advance(2.9, 0.1), 3.0)  # stops at the end
+        widget.set_time(1.5)
+        widget.range_buttons[1].click()  # end = current time
+        self.assertEqual(widget.play_range(), (1.0, 1.5))
+        widget.set_track([], 4, ["other"])  # another track of the same animation
+        self.assertEqual(widget.play_range(), (1.0, 1.5))
+        widget.set_track([], 6, ["value"])  # another animation length
+        self.assertIsNone(widget.play_range())
+        self.assertEqual(widget.playback_speed, 2.0)
+
     def test_empty_track_add_and_delete_last_key_are_committed_without_mutating_input(self):
         edited = []
         self.widget.framesEdited.connect(edited.append)
