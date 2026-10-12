@@ -136,6 +136,28 @@ class SpineNativeRuntimeTests(unittest.TestCase):
             finally:
                 model.close()
 
+    def test_hidden_slots_are_skipped_until_shown_again(self):
+        for _label, source, family in self.CASES:
+            model = self._open(source, family)
+            try:
+                if not model.supports_slot_visibility:
+                    self.skipTest("installed bridge predates slot hiding (ABI 3)")
+                model.set_paused(True)
+                full = model.render_into()[1]
+                self.assertFalse(model.set_slot_hidden("no such slot", True))
+                skeleton = Path(load_spine_asset((Path(__file__).resolve().parents[1] / source).resolve()).skeleton_path)
+                if skeleton.suffix.lower() != ".json":
+                    continue  # slot names are read from JSON skeletons only
+                names = [slot["name"] for slot in json.loads(skeleton.read_text(encoding="utf-8"))["slots"]]
+                for name in names:
+                    self.assertTrue(model.set_slot_hidden(name, True))
+                self.assertEqual(model.render_into()[1], 0)
+                self.assertTrue(model.set_slot_hidden(names[0], False))
+                self.assertTrue(model.clear_hidden_slots())
+                self.assertEqual(model.render_into()[1], full)
+            finally:
+                model.close()
+
 
 if __name__ == "__main__":
     unittest.main()

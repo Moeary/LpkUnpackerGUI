@@ -247,6 +247,7 @@ class MainWindow(FluentWindow):
 
         self.initWindow()
         self.initNavigation()
+        self._open_startup_page()
         self.stackedWidget.currentChanged.connect(self._on_page_changed)
         self._on_page_changed()
         self.apply_theme()
@@ -401,6 +402,24 @@ class MainWindow(FluentWindow):
             )
         except Exception as e:
             print(f"Error adding SettingsPage to navigation: {e}")
+
+    def startup_page(self):
+        """The page named by the "startup_page" setting, if it is navigable."""
+        key = str(self.settings_manager.get("startup_page", "extractor") or "extractor")
+        page = {
+            "extractor": self.extractorPage, "preview": self.previewPage,
+            "live2d_editor": self.live2dEditorPage, "spine_editor": self.spineEditorPage,
+            "spine_converter": self.spineConverterPage,
+        }.get(key)
+        # A page that failed to load or is disabled has no navigation item.
+        if page is None or self.stackedWidget.indexOf(page) < 0:
+            return None
+        return page
+
+    def _open_startup_page(self):
+        page = self.startup_page()
+        if page is not None and page is not self.stackedWidget.currentWidget():
+            self.switchTo(page)
 
     def _on_page_changed(self, _index=None):
         current = self.stackedWidget.currentWidget()

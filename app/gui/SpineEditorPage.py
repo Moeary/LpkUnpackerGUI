@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import QPoint, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QDragEnterEvent, QDropEvent, QPixmap
+from PySide6.QtGui import QBrush, QColor, QDragEnterEvent, QDropEvent, QPixmap
 from PySide6.QtWidgets import (
     QDialog, QFileDialog, QFormLayout, QGridLayout, QHBoxLayout, QListWidgetItem,
     QFrame, QStackedWidget, QTreeWidgetItem, QVBoxLayout, QWidget, QSizePolicy,
@@ -16,8 +16,9 @@ from PySide6.QtWidgets import (
 from qfluentwidgets import (
     BodyLabel as QLabel, CaptionLabel, CheckBox as QCheckBox,
     DoubleSpinBox as QDoubleSpinBox, FluentIcon, IndeterminateProgressBar, ListWidget as QListWidget,
-    PrimaryPushButton, PushButton as QPushButton, RoundMenu, ScrollArea as QScrollArea,
-    SearchLineEdit, SegmentedWidget, SubtitleLabel, TogglePushButton, TransparentToolButton, TreeWidget as QTreeWidget,
+    Action, PrimaryPushButton, PushButton as QPushButton, RoundMenu, ScrollArea as QScrollArea,
+    SearchLineEdit, SegmentedWidget, StrongBodyLabel, SubtitleLabel, TogglePushButton, TransparentPushButton,
+    TransparentToolButton, TreeWidget as QTreeWidget, VerticalSeparator,
 )
 
 from app.core.animation_editing import AnimationEditingError
@@ -120,6 +121,19 @@ SPINE_EDITOR_TEXT = {
     "spine_editor.bone_filter_constrained": "仅约束",
     "spine_editor.bone_names": "名称",
     "spine_editor.bone_names_hint": "在每根显示的骨骼旁标注名称；选中的骨骼始终标注",
+    "spine_editor.hide_selected": "隐藏 / 显示选中 (H)",
+    "spine_editor.hide_selected_hint": "在预览中临时隐藏选中的 slot，全部已隐藏时重新显示（H）。选中骨骼时作用于其下全部 slot，选中图集部件时作用于用到它的 slot；只影响预览，不改变模型与导出",
+    "spine_editor.solo_selected": "仅看选中 (Shift+H)",
+    "spine_editor.solo_selected_hint": "只显示选中的 slot，其余临时隐藏，再按一次恢复（Shift+H）；只影响预览",
+    "spine_editor.show_all": "显示全部 ({count})",
+    "spine_editor.show_all_hint": "恢复所有临时隐藏的 slot（Alt+H）",
+    "spine_editor.hidden_selected": "已在预览中隐藏 {count} 个 slot",
+    "spine_editor.shown_selected": "已重新显示 {count} 个 slot",
+    "spine_editor.solo_applied": "仅显示 {count} 个 slot，其余已临时隐藏",
+    "spine_editor.shown_all": "已显示全部 slot",
+    "spine_editor.no_slots_selected": "当前选中项下没有 slot",
+    "spine_editor.slot_visibility_unavailable": "已安装的 Spine 原生桥不支持临时隐藏部件，请重新构建 Spine 原生运行时（pixi run native-spine）",
+    "spine_editor.hide_in_preview": "在预览中临时隐藏 / 显示此 slot（H）",
 }
 
 
@@ -259,7 +273,7 @@ class _BoneInspector(QWidget):
         layout.setSpacing(9)
         self.title = CaptionLabel(self)
         layout.addWidget(self.title)
-        self.name_label = QLabel(self)
+        self.name_label = StrongBodyLabel(self)
         self.name_label.setWordWrap(True)
         layout.addWidget(self.name_label)
         self.spins = {}
@@ -318,6 +332,7 @@ class _BoneInspector(QWidget):
 
 
 class _SlotInspector(QWidget):
+    previewHideRequested = Signal()
     applyRequested = Signal()
     deleteKeyRequested = Signal()
     moveRequested = Signal(int)
@@ -328,10 +343,17 @@ class _SlotInspector(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 5, 4, 8)
         layout.setSpacing(9)
-        self.title, self.name_label = CaptionLabel(self), QLabel(self)
+        self.title, self.name_label = CaptionLabel(self), StrongBodyLabel(self)
         self.name_label.setWordWrap(True)
         layout.addWidget(self.title)
-        layout.addWidget(self.name_label)
+        # The slot name with its temporary preview visibility beside it.
+        name_row = QHBoxLayout()
+        name_row.setSpacing(4)
+        name_row.addWidget(self.name_label, 1)
+        self.preview_hide_button = TransparentToolButton(FluentIcon.VIEW, self)
+        self.preview_hide_button.setFixedSize(30, 30)
+        name_row.addWidget(self.preview_hide_button)
+        layout.addLayout(name_row)
         self.attachment_label = QLabel(self)
         self.attachment_combo = QComboBox(self)
         layout.addWidget(self.attachment_label)
@@ -363,6 +385,7 @@ class _SlotInspector(QWidget):
         self.hint.hide()
         layout.addWidget(self.hint)
         layout.addStretch(1)
+        self.preview_hide_button.clicked.connect(self.previewHideRequested)
         self.apply_button.clicked.connect(self.applyRequested)
         self.delete_button.clicked.connect(self.deleteKeyRequested)
         self.up_button.clicked.connect(lambda: self.moveRequested.emit(1))
@@ -381,12 +404,16 @@ class _SlotInspector(QWidget):
         self.key_check.setEnabled(bool(animation))
         self.delete_button.setEnabled(bool(animation))
 
+    def set_preview_hidden(self, hidden: bool):
+        self.preview_hide_button.setIcon(FluentIcon.HIDE if hidden else FluentIcon.VIEW)
+
     def retranslate_ui(self):
         self.title.setText(_text("spine_editor.slot"))
         for widget, key in ((self.attachment_label, "attachment"), (self.visible_check, "visible"), (self.key_check, "key_slot"),
                             (self.apply_button, "apply_slot"), (self.hint, "order_hint"), (self.order_label, "layers")):
             widget.setText(_text(f"spine_editor.{key}"))
-        for widget, key in ((self.delete_button, "delete_slot_key"), (self.up_button, "layer_up"), (self.down_button, "layer_down")):
+        for widget, key in ((self.delete_button, "delete_slot_key"), (self.up_button, "layer_up"), (self.down_button, "layer_down"),
+                            (self.preview_hide_button, "hide_in_preview")):
             widget.setToolTip(_text(f"spine_editor.{key}"))
         self.order_label.setToolTip(_text("spine_editor.order_hint"))
 
@@ -453,6 +480,9 @@ class SpineEditorPage(QWidget):
         self._action_dialog = None
         self._selection = None
         self._track = None
+        # Slots hidden in the preview only: view state, never part of the
+        # document, its undo history or an export.
+        self._hidden_slots: set[str] = set()
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
         self._preview_timer.setInterval(240)
@@ -504,6 +534,9 @@ class SpineEditorPage(QWidget):
         self.tree.setIndentation(18)
         self.layers = QListWidget(self)
         self.atlas_list = QListWidget(self)
+        for view in (self.tree, self.layers, self.atlas_list):
+            view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            view.customContextMenuRequested.connect(lambda pos, v=view: self._structure_menu(v, pos))
         self.tabs.addTab(self.tree, "")
         self.tabs.addTab(self.layers, "")
         self.tabs.addTab(self.atlas_list, "")
@@ -540,6 +573,17 @@ class SpineEditorPage(QWidget):
         self.bone_names_button.hide()
         self.bone_mode_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         view_controls.addWidget(self.bone_mode_button)
+        # Temporary part visibility, like the Live2D editor's ArtMesh hiding.
+        self.visibility_separator = VerticalSeparator(self)
+        view_controls.addWidget(self.visibility_separator)
+        self.hide_button = TransparentToolButton(FluentIcon.HIDE, self)
+        self.solo_button = TransparentToolButton(FluentIcon.FILTER, self)
+        for button in (self.hide_button, self.solo_button):
+            button.setFixedSize(32, 32)
+            view_controls.addWidget(button)
+        self.show_all_button = TransparentPushButton(FluentIcon.VIEW, "", self)
+        self.show_all_button.hide()
+        view_controls.addWidget(self.show_all_button)
         view_controls.addStretch(1)
         self.zoom_controls = ViewZoomControls(self)
         view_controls.addWidget(self.zoom_controls)
@@ -666,6 +710,10 @@ class SpineEditorPage(QWidget):
         self.timeline.framesEdited.connect(self._frames_edited)
         self.bone_inspector.transformEdited.connect(self._transform_edited)
         self.slot_inspector.applyRequested.connect(self._apply_slot)
+        self.slot_inspector.previewHideRequested.connect(self.toggle_selected_visibility)
+        self.hide_button.clicked.connect(lambda _checked=False: self.toggle_selected_visibility())
+        self.solo_button.clicked.connect(lambda _checked=False: self.solo_selected())
+        self.show_all_button.clicked.connect(lambda _checked=False: self.show_all_slots())
         self.slot_inspector.deleteKeyRequested.connect(self._delete_slot_key)
         self.slot_inspector.moveRequested.connect(self._move_slot)
         self.atlas_inspector.replaceRequested.connect(self._replace_region)
@@ -753,6 +801,8 @@ class SpineEditorPage(QWidget):
         self.source_label.setText(session.original_source.name)
         self.source_label.setToolTip(str(session.original_source))
         self.source_label.show()
+        self._hidden_slots.clear()
+        self.preview.set_hidden_slots(())
         self._populate(preserve_view=False)
         self._load_preview(plan)
         self.status_label.setText(_text("spine_editor.ready"))
@@ -814,14 +864,16 @@ class SpineEditorPage(QWidget):
         self.skin_combo.setCurrentIndex(max(0, self.skin_combo.findText(skin)))
         self.tree.clear()
         nodes = {}
+        bone_icon = FluentIcon.ROBOT.icon()
         for bone in self.session.document["bones"]:
             item = QTreeWidgetItem([bone["name"]])
+            item.setIcon(0, bone_icon)
             item.setData(0, Qt.ItemDataRole.UserRole, ("bone", bone["name"]))
             nodes[bone["name"]] = item
             parent = nodes.get(bone.get("parent"))
             parent.addChild(item) if parent else self.tree.addTopLevelItem(item)
         for slot in self.session.document.get("slots", []):
-            item = QTreeWidgetItem([f"◇ {slot['name']}"])
+            item = QTreeWidgetItem([slot["name"]])
             item.setData(0, Qt.ItemDataRole.UserRole, ("slot", slot["name"]))
             nodes[slot["bone"]].addChild(item)
         keyed_items = {item.data(0, Qt.ItemDataRole.UserRole): item for item in self._structure_items()}
@@ -870,8 +922,13 @@ class SpineEditorPage(QWidget):
             self.atlas_list.verticalScrollBar().setValue(atlas_scroll[1])
         self._updating = False
         self._selection = selection
+        # Slots removed by an edit (or undo) are no longer hidden.
+        if self._hidden_slots - self._slot_names():
+            self._hidden_slots &= self._slot_names()
+            self.preview.set_hidden_slots(self._hidden_slots)
         self._refresh_track_list()
         self._refresh_layers()
+        self._refresh_visibility_markers()
         self._show_selection()
         self._refresh_track()
         self._update_actions()
@@ -969,6 +1026,7 @@ class SpineEditorPage(QWidget):
             elif kind == "slot":
                 attachment = self.session.attachment_at(name, self.animation_name, self.timeline.current_time)
                 self.slot_inspector.set_slot(name, self.session.attachments(name, self.skin_combo.currentText() or None), attachment, self.animation_name)
+                self.slot_inspector.set_preview_hidden(name in self._hidden_slots)
                 self.inspector_stack.setCurrentWidget(self.slot_inspector)
             elif kind == "atlas":
                 item = self.session._region(*name)
@@ -1065,6 +1123,7 @@ class SpineEditorPage(QWidget):
             if slot == selected:
                 self.layers.setCurrentItem(item)
         self._updating = False
+        self._refresh_visibility_markers()
 
     def _edit(self, operation, refresh_tree: bool = False, immediate: bool = False):
         if not self.session:
@@ -1289,6 +1348,149 @@ class SpineEditorPage(QWidget):
                     self.tree.scrollToItem(item)
         self.status_label.setText(_text("spine_editor.picked", name=result.name))
 
+    # Temporary slot visibility -------------------------------------------
+    @property
+    def hidden_slots(self) -> frozenset[str]:
+        return frozenset(self._hidden_slots)
+
+    def _slot_names(self) -> set[str]:
+        return {slot["name"] for slot in self.session.document.get("slots", [])} if self.session else set()
+
+    def _visibility_targets(self) -> list[str]:
+        """Slots the selection stands for: the slot itself, every slot under a
+        selected bone, or every slot that can show a selected atlas part."""
+        if not self.session or not self._selection:
+            return []
+        kind, name = self._selection
+        slots = self.session.document.get("slots", [])
+        if kind == "slot":
+            return [name]
+        if kind == "bone":
+            children = {}
+            for bone in self.session.document["bones"]:
+                children.setdefault(bone.get("parent"), []).append(bone["name"])
+            bones, pending = set(), [name]
+            while pending:
+                bone = pending.pop()
+                bones.add(bone)
+                pending.extend(children.get(bone, ()))
+            return [slot["name"] for slot in slots if slot.get("bone") in bones]
+        if kind == "atlas":
+            try:
+                region = self.session._region(*name)["name"]
+            except Exception:
+                return []
+            users = {slot for slot, _attachment in self._region_attachments(region)}
+            return [slot["name"] for slot in slots if slot["name"] in users]
+        return []
+
+    def _region_attachments(self, region: str) -> list[tuple[str, str]]:
+        """(slot, attachment) pairs of the current skin that can draw ``region``."""
+        raw = self.session.document.get("skins", {})
+        skins = [(item.get("name"), item.get("attachments", {})) for item in raw] if isinstance(raw, list) else list(raw.items())
+        skin = self.skin_combo.currentText()
+        result = []
+        for name, attachments in skins:
+            if skin and name not in {skin, "default"}:
+                continue
+            for slot, entries in (attachments or {}).items():
+                for attachment, data in (entries or {}).items():
+                    data = data if isinstance(data, dict) else {}
+                    if (data.get("path") or data.get("name") or attachment) == region:
+                        result.append((slot, attachment))
+        return result
+
+    def _set_hidden_slots(self, names, message: str) -> None:
+        self._hidden_slots = set(names) & self._slot_names()
+        self.preview.set_hidden_slots(self._hidden_slots)
+        self._refresh_visibility_markers()
+        if self._selection and self._selection[0] == "slot":
+            self.slot_inspector.set_preview_hidden(self._selection[1] in self._hidden_slots)
+        if self.preview.model is not None and not self.preview.slot_visibility_supported:
+            message = _text("spine_editor.slot_visibility_unavailable")
+        self.status_label.setText(message)
+
+    def toggle_selected_visibility(self) -> bool:
+        """H: hide the selected slots in the preview, or show them when all are hidden.
+
+        Only the preview changes; the document, its history and exports keep
+        every slot.  Hidden slots are skipped by click picking too.
+        """
+        if not self.session or self.loading:
+            return False
+        targets = self._visibility_targets()
+        if not targets:
+            self.status_label.setText(_text("spine_editor.no_slots_selected"))
+            return False
+        hide = any(slot not in self._hidden_slots for slot in targets)
+        hidden = self._hidden_slots | set(targets) if hide else self._hidden_slots - set(targets)
+        self._set_hidden_slots(hidden, _text("spine_editor.hidden_selected" if hide else "spine_editor.shown_selected",
+                                             count=len(targets)))
+        return True
+
+    def solo_selected(self) -> bool:
+        """Shift+H: show only the selected slots; again restores every slot."""
+        if not self.session or self.loading:
+            return False
+        targets = set(self._visibility_targets())
+        if not targets:
+            self.status_label.setText(_text("spine_editor.no_slots_selected"))
+            return False
+        others = self._slot_names() - targets
+        if self._hidden_slots and self._hidden_slots == others:
+            return self.show_all_slots()
+        self._set_hidden_slots(others, _text("spine_editor.solo_applied", count=len(targets)))
+        return True
+
+    def show_all_slots(self) -> bool:
+        """Alt+H: draw every slot again."""
+        if not self.session or not self._hidden_slots:
+            return False
+        self._set_hidden_slots((), _text("spine_editor.shown_all"))
+        return True
+
+    def _refresh_visibility_markers(self) -> None:
+        """Mark hidden slots in the tree and layer list with a closed eye."""
+        hidden = self._hidden_slots
+        dim = QBrush(QColor(128, 128, 128))
+        slot_icon, hidden_icon = FluentIcon.PHOTO.icon(), FluentIcon.HIDE.icon()
+        for item in self._structure_items():
+            kind, name = item.data(0, Qt.ItemDataRole.UserRole)
+            if kind == "slot":
+                item.setIcon(0, hidden_icon if name in hidden else slot_icon)
+                item.setData(0, Qt.ItemDataRole.ForegroundRole, dim if name in hidden else None)
+        for index in range(self.layers.count()):
+            item = self.layers.item(index)
+            name = item.data(Qt.ItemDataRole.UserRole)
+            item.setIcon(hidden_icon if name in hidden else slot_icon)
+            item.setData(Qt.ItemDataRole.ForegroundRole, dim if name in hidden else None)
+        self.show_all_button.setText(_text("spine_editor.show_all", count=len(hidden)))
+        self.show_all_button.setVisible(bool(hidden))
+
+    def _structure_menu(self, view, position) -> None:
+        """Right-click menu of the tree and lists: hide, solo, show all."""
+        if not self.session:
+            return
+        item = view.itemAt(position)
+        if item is not None:
+            view.setCurrentItem(item)
+        menu = RoundMenu(parent=self)
+        targets = self._visibility_targets()
+        hide = not targets or any(slot not in self._hidden_slots for slot in targets)
+        toggle = Action(FluentIcon.HIDE if hide else FluentIcon.VIEW, _text("spine_editor.hide_selected"), menu)
+        toggle.setEnabled(bool(targets))
+        toggle.triggered.connect(lambda: self.toggle_selected_visibility())
+        solo = Action(FluentIcon.FILTER, _text("spine_editor.solo_selected"), menu)
+        solo.setEnabled(bool(targets))
+        solo.triggered.connect(lambda: self.solo_selected())
+        show_all = Action(FluentIcon.VIEW, _text("spine_editor.show_all", count=len(self._hidden_slots)), menu)
+        show_all.setEnabled(bool(self._hidden_slots))
+        show_all.triggered.connect(lambda: self.show_all_slots())
+        menu.addActions([toggle, solo])
+        menu.addSeparator()
+        menu.addAction(show_all)
+        menu.exec(view.viewport().mapToGlobal(position))
+
     # Bone mode ------------------------------------------------------------
     def _selected_bone_name(self) -> str:
         if not self.session or not self._selection:
@@ -1356,18 +1558,7 @@ class SpineEditorPage(QWidget):
 
     def _slot_for_region(self, region: str) -> str | None:
         """The slot drawing ``region`` now; the topmost one when several can."""
-        raw = self.session.document.get("skins", {})
-        skins = [(item.get("name"), item.get("attachments", {})) for item in raw] if isinstance(raw, list) else list(raw.items())
-        skin = self.skin_combo.currentText()
-        candidates = []
-        for name, attachments in skins:
-            if skin and name not in {skin, "default"}:
-                continue
-            for slot, entries in (attachments or {}).items():
-                for attachment, data in (entries or {}).items():
-                    data = data if isinstance(data, dict) else {}
-                    if (data.get("path") or data.get("name") or attachment) == region:
-                        candidates.append((slot, attachment))
+        candidates = self._region_attachments(region)
         if not candidates:
             return None
         animation, seconds = self.animation_name, self.timeline.current_time
@@ -1448,6 +1639,8 @@ class SpineEditorPage(QWidget):
         self.duration_spin.setEnabled(opened and bool(self.animation_name) and not busy)
         self.animation_combo.setEnabled(opened and not busy)
         self.skin_combo.setEnabled(opened and not busy)
+        for button in (self.hide_button, self.solo_button):
+            button.setEnabled(opened and not busy)
         psd_ready = opened and not busy and not self.psd_busy
         self.psd_panel.export_button.setEnabled(psd_ready)
         self.psd_panel.import_button.setEnabled(psd_ready)
@@ -1538,6 +1731,10 @@ class SpineEditorPage(QWidget):
             self.bone_filter_bar.items[kind].setText(_text(f"spine_editor.bone_filter_{kind}"))
         self.bone_names_button.setText(_text("spine_editor.bone_names"))
         self.bone_names_button.setToolTip(_text("spine_editor.bone_names_hint"))
+        self.hide_button.setToolTip(_text("spine_editor.hide_selected_hint"))
+        self.solo_button.setToolTip(_text("spine_editor.solo_selected_hint"))
+        self.show_all_button.setToolTip(_text("spine_editor.show_all_hint"))
+        self.show_all_button.setText(_text("spine_editor.show_all", count=len(self._hidden_slots)))
         # Shown while no model/track list is loaded, like the Live2D track picker.
         self.track_combo.setPlaceholderText(_text("spine_editor.track_placeholder"))
         self.animation_combo.retranslate_ui()

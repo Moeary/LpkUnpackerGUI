@@ -375,6 +375,9 @@ class SpinePreviewWidget(QFrame):
         self._bone_names = False
         self._selected_bone = ""
         self._bone_drag: dict[str, Any] | None = None
+        # Slots hidden from the drawing (editor view state); reapplied to
+        # every model the preview loads.
+        self._hidden_slots: frozenset[str] = frozenset()
         self._status_timer = QTimer(self)
         self._status_timer.setInterval(16)
         self._status_timer.setTimerType(Qt.TimerType.PreciseTimer)
@@ -447,6 +450,7 @@ class SpinePreviewWidget(QFrame):
         try:
             self._model = SpineNativeModel(library, skeleton, atlas_paths[0], getattr(asset, "skeleton_format", None))
             self._base_bounds = self._model.bounds()
+            self._apply_hidden_slots()
             self._load_pick_regions(atlas_paths[0])
             self._textures_uploaded = False
             self._last_state = self._make_state()
@@ -524,6 +528,28 @@ class SpinePreviewWidget(QFrame):
         if self._model:
             self._model.show_setup_pose()
         self._refresh_canvas()
+
+    # Slot visibility ------------------------------------------------------
+    @property
+    def slot_visibility_supported(self) -> bool:
+        return bool(self._model is not None and getattr(self._model, "supports_slot_visibility", False))
+
+    @property
+    def hidden_slots(self) -> frozenset[str]:
+        return self._hidden_slots
+
+    def set_hidden_slots(self, names) -> None:
+        """Draw every slot except ``names``; a click then picks through them."""
+        self._hidden_slots = frozenset(str(name) for name in names)
+        self._apply_hidden_slots()
+        self._request_canvas_update()
+
+    def _apply_hidden_slots(self) -> None:
+        if not self.slot_visibility_supported:
+            return
+        self._model.clear_hidden_slots()
+        for name in self._hidden_slots:
+            self._model.set_slot_hidden(name, True)
 
     # Bone mode ------------------------------------------------------------
     @property

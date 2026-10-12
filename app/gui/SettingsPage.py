@@ -74,6 +74,17 @@ from app.gui.theme import fluent_scroll_bars
 from app.gui.typography import CardTitleLabel
 
 
+# Pages the app can open on start ("startup_page" setting), with their
+# navigation labels.  MainWindow maps each key to its page.
+STARTUP_PAGES = {
+    "extractor": "main.nav.extractor",
+    "preview": "main.nav.preview_native",
+    "live2d_editor": "main.nav.live2d_editor",
+    "spine_editor": "main.nav.spine_editor",
+    "spine_converter": "main.nav.spine_converter",
+}
+
+
 class ToolchainInstallWorker(QThread):
     """Run a tool download/build without blocking the settings page."""
 
@@ -126,6 +137,7 @@ class SettingsPage(QFrame):
 
         self._language_codes = ["en_US", "zh_CN", "ja_JP"]
         self._theme_values = ["auto", "light", "dark"]
+        self._startup_pages = list(STARTUP_PAGES)
         self._font_family_values = [""]
         self._texture_viewer_values = ["internal", "system", "custom"]
         self._spine_native_family_values = ["3.8.75", "4.0"]
@@ -420,6 +432,27 @@ class SettingsPage(QFrame):
         self.language_note.setWordWrap(True)
         general_layout.addWidget(self.language_note)
         # A second section inside the same card needs a visible break.
+        general_layout.addSpacing(12)
+
+        # Startup page: which navigation page MainWindow opens first.
+        self.startup_section_title = CardTitleLabel("", general_card)
+        self.startup_section_title.setWordWrap(True)
+        self.startup_section_title.setMinimumWidth(0)
+        self.startup_section_title.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        general_layout.addWidget(self.startup_section_title)
+        self.startup_page_label = BodyLabel("", general_card)
+        self.startup_page_desc = CaptionLabel("", general_card)
+        self.startup_page_desc.setWordWrap(True)
+        self.startup_page_combo = ComboBox(general_card)
+        self.startup_page_combo.currentIndexChanged.connect(self.on_startup_page_combo_changed)
+        self._add_choice_block(
+            general_layout,
+            self.startup_page_label,
+            self.startup_page_desc,
+            self.startup_page_combo,
+        )
         general_layout.addSpacing(12)
 
         self.theme_section_title = CardTitleLabel("", general_card)
@@ -1293,8 +1326,10 @@ class SettingsPage(QFrame):
             self.mcp_port_spin.setValue(port if isinstance(port, int) and not isinstance(port, bool) and 1 <= port <= 65535 else DEFAULT_MCP_PORT)
             language = normalize_language_code(self.settings_manager.get("language", "en_US"))
             self._set_combo_by_value(self.language_combo, self._language_codes, language)
+            self._set_combo_by_value(self.startup_page_combo, self._startup_pages,
+                                     str(self.settings_manager.get("startup_page", "extractor")))
 
-            theme = str(self.settings_manager.get("theme", "auto")).lower()
+            theme =str(self.settings_manager.get("theme", "auto")).lower()
             if theme not in self._theme_values:
                 theme = "auto"
             self._set_combo_by_value(self.theme_combo, self._theme_values, theme)
@@ -1637,6 +1672,14 @@ class SettingsPage(QFrame):
                 self.language_combo.addItem(label)
             self._set_combo_by_value(self.language_combo, self._language_codes, current_language)
 
+            self.startup_section_title.setText(tr("settings.section.startup"))
+            self.startup_page_label.setText(tr("settings.startup_page_label"))
+            self.startup_page_desc.setText(tr("settings.startup_page_desc"))
+            current_startup = self._current_combo_value(self.startup_page_combo, self._startup_pages)
+            self.startup_page_combo.clear()
+            self.startup_page_combo.addItems([tr(STARTUP_PAGES[key]) for key in self._startup_pages])
+            self._set_combo_by_value(self.startup_page_combo, self._startup_pages, current_startup)
+
             self.theme_section_title.setText(tr("settings.section.appearance"))
             self.theme_label.setText(tr("settings.theme_label"))
             self.theme_desc.setText(tr("settings.theme_desc"))
@@ -1871,6 +1914,20 @@ class SettingsPage(QFrame):
         InfoBar.success(
             title=tr("common.success"),
             content=tr("settings.language_saved"),
+            orient=Qt.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP,
+            duration=2500,
+            parent=self
+        )
+
+    def on_startup_page_combo_changed(self, index: int):
+        if self._syncing_ui or not 0 <= index < len(self._startup_pages):
+            return
+        self.settings_manager.set("startup_page", self._startup_pages[index])
+        InfoBar.success(
+            title=tr("common.success"),
+            content=tr("settings.startup_page_saved"),
             orient=Qt.Horizontal,
             isClosable=True,
             position=InfoBarPosition.TOP,

@@ -263,6 +263,12 @@ class SpineNativeModel:
                 ("spine_native_show_setup_pose", ctypes.c_int, (p,)),
             ):
                 _configure(getattr(self._lib, name), restype, *args)
+        # Slot hiding arrived with bridge ABI 3.
+        self.supports_slot_visibility = all(
+            hasattr(self._lib, name) for name in ("spine_native_set_slot_hidden", "spine_native_clear_hidden_slots"))
+        if self.supports_slot_visibility:
+            _configure(self._lib.spine_native_set_slot_hidden, ctypes.c_int, p, cstr, ctypes.c_int)
+            _configure(self._lib.spine_native_clear_hidden_slots, ctypes.c_int, p)
         self._create = self._lib.spine_native_create
         self._destroy = self._lib.spine_native_destroy
         self._native_load = self._lib.spine_native_load_memory
@@ -434,6 +440,15 @@ class SpineNativeModel:
 
     def clear_bone_overrides(self) -> bool:
         return bool(self.supports_bones and self._lib.spine_native_clear_bone_overrides(self._handle))
+
+    def set_slot_hidden(self, name: str, hidden: bool) -> bool:
+        """Skip (or draw again) one slot while rendering; False if unknown."""
+        if not self.supports_slot_visibility:
+            return False
+        return bool(self._lib.spine_native_set_slot_hidden(self._handle, str(name).encode("utf-8"), int(bool(hidden))))
+
+    def clear_hidden_slots(self) -> bool:
+        return bool(self.supports_slot_visibility and self._lib.spine_native_clear_hidden_slots(self._handle))
 
     def update(self, delta: float) -> None:
         delta = float(delta)

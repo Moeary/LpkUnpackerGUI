@@ -137,6 +137,28 @@ class SettingsPageLayoutTests(unittest.TestCase):
                 page.deleteLater()
                 self.app.processEvents()
 
+    def test_startup_page_choice_is_saved_and_reloaded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "settings.json"
+
+            class TempSettings(SettingsManager):
+                def __init__(self, settings_file=None):
+                    super().__init__(settings_path)
+
+            with patch.object(settings_page_module, "SettingsManager", TempSettings):
+                page = settings_page_module.SettingsPage()
+            try:
+                self.assertEqual(page.startup_page_combo.count(), len(settings_page_module.STARTUP_PAGES))
+                self.assertEqual(page.startup_page_combo.currentIndex(), 0)  # extractor by default
+                page.startup_page_combo.setCurrentIndex(page._startup_pages.index("spine_editor"))
+                self.assertEqual(SettingsManager(settings_path).get("startup_page"), "spine_editor")
+                page.retranslate_ui()  # rebuilding the labels keeps the choice
+                self.assertEqual(page._startup_pages[page.startup_page_combo.currentIndex()], "spine_editor")
+            finally:
+                page.close()
+                page.deleteLater()
+                self.app.processEvents()
+
 
 if __name__ == "__main__":
     unittest.main()

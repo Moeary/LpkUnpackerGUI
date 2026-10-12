@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstring>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -54,6 +55,9 @@ struct Bridge {
     // Bones without timelines keep whatever local values they were last
     // given.  After an override ends they must return to the setup pose.
     bool resetBones = false;
+    // Slots (by slot data index) the editor hides temporarily.  They are
+    // skipped while drawing only; the skeleton and its animation are intact.
+    std::set<int> hiddenSlots;
 
     ~Bridge() { clear(); }
 
@@ -78,6 +82,7 @@ struct Bridge {
         version.clear();
         overrides.clear();
         resetBones = false;
+        hiddenSlots.clear();
     }
 
     // Every animation evaluation goes through here so bone overrides always
@@ -229,7 +234,9 @@ struct Bridge {
             Slot *slot = drawOrder[slotIndex];
             if (!slot) continue;
             Attachment *attachment = slot->getAttachment();
-            if (!attachment) {
+            // A hidden clipping slot does not clip; a hidden slot may still
+            // end the clipping range of an earlier one.
+            if (!attachment || (!hiddenSlots.empty() && hiddenSlots.count(slot->getData().getIndex()))) {
                 if (clipping.isClipping()) clipping.clipEnd(*slot);
                 continue;
             }
@@ -412,7 +419,7 @@ int spine_native_required_sizes(void *handle, int32_t *vertices, int32_t *indice
 int spine_native_render(void *handle, SpineNativeVertex *vertices, int32_t vertex_capacity, uint32_t *indices, int32_t index_capacity, SpineNativeBatch *batches, int32_t batch_capacity) {
     Bridge *b = asBridge(handle); if (!b) return -1; b->render(); if ((int32_t)b->vertices.size() > vertex_capacity || (int32_t)b->indices.size() > index_capacity || (int32_t)b->batches.size() > batch_capacity) return -1; if (!b->vertices.empty() && vertices) std::memcpy(vertices, b->vertices.data(), b->vertices.size() * sizeof(SpineNativeVertex)); if (!b->indices.empty() && indices) std::memcpy(indices, b->indices.data(), b->indices.size() * sizeof(uint32_t)); if (!b->batches.empty() && batches) std::memcpy(batches, b->batches.data(), b->batches.size() * sizeof(SpineNativeBatch)); return (int)b->batches.size();
 }
-int32_t spine_native_abi_version(void) { return 2; }
+int32_t spine_native_abi_version(void) { return 3; }
 
 int32_t spine_native_bone_count(void *handle) { Bridge *b = asBridge(handle); return b && b->skeleton ? (int32_t)b->skeleton->getBones().size() : 0; }
 
@@ -513,6 +520,27 @@ int spine_native_show_setup_pose(void *handle) {
     b->applyState();
     b->skeleton->updateWorldTransform();
     b->renderDirty = true;
+    return 1;
+}
+
+int spine_native_set_slot_hidden(void *handle, const char *name, int hidden) {
+    Bridge *b = asBridge(handle);
+    if (!b || !b->skeleton || !name) return 0;
+    Slot *slot = b->skeleton->findSlot(String(name));
+    if (!slot) return 0;
+    int index = slot->getData().getIndex();
+    if (hidden) b->hiddenSlots.insert(index); else b->hiddenSlots.erase(index);
+    b->renderDirty = true;
+    return 1;
+}
+
+int spine_native_clear_hidden_slots(void *handle) {
+    Bridge *b = asBridge(handle);
+    if (!b) return 0;
+    if (!b->hiddenSlots.empty()) {
+        b->hiddenSlots.clear();
+        b->renderDirty = true;
+    }
     return 1;
 }
 

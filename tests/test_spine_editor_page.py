@@ -358,6 +358,45 @@ class SpineEditorPageTests(unittest.TestCase):
         self.page.bone_mode_button.setChecked(False)
         self.assertFalse(self.page.bone_bar.isVisibleTo(self.page))
 
+    def test_h_hides_slots_in_the_preview_only_and_solo_and_show_all_restore(self):
+        self.open_with_parts()
+        page = self.page
+        page.tabs.setCurrentIndex(1)
+        front = next(page.layers.item(i) for i in range(page.layers.count())
+                     if page.layers.item(i).data(Qt.UserRole) == "front")
+        page.layers.setCurrentItem(front)
+        page.shortcuts.dispatch("slot_hide", page.layers)
+        self.assertEqual(page.hidden_slots, {"front"})
+        self.assertEqual(page.preview.hidden_slots, {"front"})
+        self.assertFalse(page.session.dirty)  # view state, not an edit
+        self.assertTrue(page.show_all_button.isVisibleTo(page))
+        self.assertIsNotNone(front.data(Qt.ForegroundRole))
+        page.shortcuts.dispatch("slot_hide", page.layers)  # all hidden: H shows them again
+        self.assertEqual(page.hidden_slots, set())
+        self.assertFalse(page.show_all_button.isVisibleTo(page))
+
+        # A bone stands for every slot under it; an atlas part for its users.
+        page.tabs.setCurrentIndex(0)
+        hip = next(item for item in page._structure_items() if item.data(0, Qt.UserRole) == ("bone", "hip"))
+        page.tree.setCurrentItem(hip)
+        self.assertTrue(page.toggle_selected_visibility())
+        self.assertEqual(page.hidden_slots, {"back", "front"})
+        page.show_all_slots()
+        page.tabs.setCurrentIndex(2)
+        face = next(page.atlas_list.item(i) for i in range(page.atlas_list.count())
+                    if page.atlas_list.item(i).text() == "face")
+        page.atlas_list.setCurrentItem(face)
+        self.assertTrue(page.solo_selected())
+        self.assertEqual(page.hidden_slots, {"back"})  # front and spare can show "face"
+        page.shortcuts.dispatch("slot_solo", page.atlas_list)  # again: everything back
+        self.assertEqual(page.hidden_slots, set())
+
+        page.tabs.setCurrentIndex(1)
+        page.layers.setCurrentItem(front)
+        page.toggle_selected_visibility()
+        page.shortcuts.dispatch("slot_show_all", page.layers)
+        self.assertEqual(page.preview.hidden_slots, set())
+
     def test_bone_mode_jumps_the_tree_and_commits_drags_as_setup_or_keys(self):
         self.open()
         page = self.page

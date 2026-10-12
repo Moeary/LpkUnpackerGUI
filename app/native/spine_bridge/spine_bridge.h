@@ -130,6 +130,10 @@ SPINE_BRIDGE_API int spine_native_set_bone_override(
 SPINE_BRIDGE_API int spine_native_clear_bone_overrides(void *handle);
 /* Clear every track and show the skeleton's setup pose. */
 SPINE_BRIDGE_API int spine_native_show_setup_pose(void *handle);
+/* Slot visibility (bridge ABI 3): skip a slot while drawing, for the editor's
+ * temporary hiding.  Returns 0 when no slot has that name. */
+SPINE_BRIDGE_API int spine_native_set_slot_hidden(void *handle, const char *name, int hidden);
+SPINE_BRIDGE_API int spine_native_clear_hidden_slots(void *handle);
 
 #ifdef __cplusplus
 }

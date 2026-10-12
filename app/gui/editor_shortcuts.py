@@ -42,6 +42,8 @@ SPECS = {
         ("atlas", "图集面板", "3"), ("slot_key", "当前 Slot 设置关键帧", "Shift+K"),
         ("slot_clear", "删除当前 Slot 关键帧", "Ctrl+Delete"),
         ("up", "Slot 图层上移", "Alt+Up"), ("down", "Slot 图层下移", "Alt+Down"),
+        ("slot_hide", "预览中隐藏 / 显示选中的 Slot", "H"), ("slot_solo", "预览中仅显示选中的 Slot", "Shift+H"),
+        ("slot_show_all", "显示全部临时隐藏的 Slot", "Alt+H"),
     ],
 }
 
@@ -206,3 +208,9 @@ class EditorShortcutRouter(QObject):
                     page._delete_slot_key()
             elif action in ("up", "down"):
                 page._move_slot(-1 if action == "up" else 1)
+            elif action == "slot_hide":
+                page.toggle_selected_visibility()
+            elif action == "slot_solo":
+                page.solo_selected()
+            elif action == "slot_show_all":
+                page.show_all_slots()
