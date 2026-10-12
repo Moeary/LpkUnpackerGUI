@@ -17,11 +17,11 @@ from qfluentwidgets import (
     BodyLabel as QLabel, CaptionLabel, CheckBox as QCheckBox,
     DoubleSpinBox as QDoubleSpinBox, FluentIcon, IndeterminateProgressBar, ListWidget as QListWidget,
     PrimaryPushButton, PushButton as QPushButton, RoundMenu, ScrollArea as QScrollArea,
-    SearchLineEdit, SubtitleLabel, TogglePushButton, TransparentToolButton, TreeWidget as QTreeWidget,
+    SearchLineEdit, SegmentedWidget, SubtitleLabel, TogglePushButton, TransparentToolButton, TreeWidget as QTreeWidget,
 )
 
 from app.core.animation_editing import AnimationEditingError
-from app.core.editor_session import BONE_FIELDS, SpineEditorSession
+from app.core.editor_session import BONE_FIELDS, SpineEditorSession, clone_json
 from app.gui.SpinePreviewWidget import SpinePreviewWidget
 from app.gui.editor_shortcuts import EditorShortcutRouter
 from app.gui.editor_recovery import EditorRecoveryController
@@ -113,6 +113,13 @@ SPINE_EDITOR_TEXT = {
     "spine_editor.bone_picked": "已选中骨骼：{name}",
     "spine_editor.bone_keyed": "已在 {time} 秒为 {bone} 写入{channel}关键帧",
     "spine_editor.bone_setup_posed": "已修改 {bone} 的设置姿态",
+    "spine_editor.bone_filter": "骨骼模式显示与可选的骨骼",
+    "spine_editor.bone_filter_all": "全部",
+    "spine_editor.bone_filter_fk": "仅 FK",
+    "spine_editor.bone_filter_ik": "仅 IK",
+    "spine_editor.bone_filter_constrained": "仅约束",
+    "spine_editor.bone_names": "名称",
+    "spine_editor.bone_names_hint": "在每根显示的骨骼旁标注名称；选中的骨骼始终标注",
 }
 
 
@@ -159,7 +166,7 @@ def _session_snapshot(session: SpineEditorSession) -> SpineEditorSession:
     """A copy whose document and textures stay fixed while GUI edits go on."""
     snapshot = copy.copy(session)
     snapshot.project = copy.copy(session.project)
-    snapshot.project.document = copy.deepcopy(session.document)
+    snapshot.project.document = clone_json(session.document)
     snapshot._textures = dict(session._textures)
     return snapshot
 
@@ -522,13 +529,33 @@ class SpineEditorPage(QWidget):
         for tool in ("rotate", "translate"):
             self.bone_tool_combo.addItem(_text(f"spine_editor.{tool}"), tool)
         self.bone_tool_combo.hide()
+        # Which bones bone mode draws and picks: all, only FK, only IK, only constrained.
+        self.bone_filter_bar = SegmentedWidget(self)
+        for kind in SpinePreviewWidget.BONE_FILTERS:
+            self.bone_filter_bar.addItem(kind, kind, onClick=lambda _checked=False, k=kind: self.preview.set_bone_filter(k))
+        self.bone_filter_bar.setCurrentItem("all")
+        self.bone_filter_bar.hide()
+        self.bone_names_button = TogglePushButton(self)
+        self.bone_names_button.setIcon(FluentIcon.FONT)
+        self.bone_names_button.hide()
+        self.bone_mode_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         view_controls.addWidget(self.bone_mode_button)
-        view_controls.addWidget(self.bone_tool_combo)
         view_controls.addStretch(1)
         self.zoom_controls = ViewZoomControls(self)
         view_controls.addWidget(self.zoom_controls)
         view_controls.addSpacing(28)
         stage_layout.addLayout(view_controls)
+        # Bone tools get their own row so the stage toolbar never squeezes.
+        self.bone_bar = QWidget(self)
+        bone_row = QHBoxLayout(self.bone_bar)
+        bone_row.setContentsMargins(0, 0, 0, 0)
+        bone_row.setSpacing(8)
+        for widget in (self.bone_tool_combo, self.bone_filter_bar, self.bone_names_button):
+            widget.show()
+            bone_row.addWidget(widget)
+        bone_row.addStretch(1)
+        self.bone_bar.hide()
+        stage_layout.addWidget(self.bone_bar)
         self.preview_stack = QStackedWidget(self)
         self.preview_stack.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.preview = SpinePreviewWidget(self)
@@ -650,6 +677,7 @@ class SpineEditorPage(QWidget):
         self.preview.bonePicked.connect(self._preview_bone_picked)
         self.preview.bonePosed.connect(self._preview_bone_posed)
         self.bone_mode_button.toggled.connect(self._bone_mode_toggled)
+        self.bone_names_button.toggled.connect(self.preview.set_bone_names_visible)
         self.bone_tool_combo.currentIndexChanged.connect(
             lambda _index: self.preview.set_bone_tool(self.bone_tool_combo.currentData() or "rotate"))
         self.preview.viewScaleChanged.connect(self.zoom_controls.set_scale)
@@ -1038,7 +1066,7 @@ class SpineEditorPage(QWidget):
                 self.layers.setCurrentItem(item)
         self._updating = False
 
-    def _edit(self, operation, refresh_tree: bool = False):
+    def _edit(self, operation, refresh_tree: bool = False, immediate: bool = False):
         if not self.session:
             return False
         try:
@@ -1055,7 +1083,9 @@ class SpineEditorPage(QWidget):
             self._refresh_track()
             self._refresh_layers()
             self._show_selection()
-        self._preview_timer.start()
+        # Typing and dragging edits are coalesced; undo/redo should show the
+        # restored pose straight away instead of waiting for the debounce.
+        self._preview_timer.start(0 if immediate else 240)
         self._update_actions()
         self.status_label.setText(_text("spine_editor.modified") if self.session.dirty else _text("spine_editor.ready"))
         return True
@@ -1272,7 +1302,7 @@ class SpineEditorPage(QWidget):
         return ""
 
     def _bone_mode_toggled(self, checked: bool):
-        self.bone_tool_combo.setVisible(checked)
+        self.bone_bar.setVisible(checked)
         self.preview.set_bone_mode(checked)
         if checked:
             self.preview.set_selected_bone(self._selected_bone_name())
@@ -1350,12 +1380,12 @@ class SpineEditorPage(QWidget):
     def undo(self):
         if self.session:
             self.pause_playback()
-            self._edit(self.session.undo, refresh_tree=True)
+            self._edit(self.session.undo, refresh_tree=True, immediate=True)
 
     def redo(self):
         if self.session:
             self.pause_playback()
-            self._edit(self.session.redo, refresh_tree=True)
+            self._edit(self.session.redo, refresh_tree=True, immediate=True)
 
     def _start_preview_refresh(self):
         if not self.session or self._closing:
@@ -1503,6 +1533,11 @@ class SpineEditorPage(QWidget):
         self.bone_tool_combo.setToolTip(_text("spine_editor.bone_tool"))
         for index in range(self.bone_tool_combo.count()):
             self.bone_tool_combo.setItemText(index, _text(f"spine_editor.{self.bone_tool_combo.itemData(index)}"))
+        self.bone_filter_bar.setToolTip(_text("spine_editor.bone_filter"))
+        for kind in SpinePreviewWidget.BONE_FILTERS:
+            self.bone_filter_bar.items[kind].setText(_text(f"spine_editor.bone_filter_{kind}"))
+        self.bone_names_button.setText(_text("spine_editor.bone_names"))
+        self.bone_names_button.setToolTip(_text("spine_editor.bone_names_hint"))
         # Shown while no model/track list is loaded, like the Live2D track picker.
         self.track_combo.setPlaceholderText(_text("spine_editor.track_placeholder"))
         self.animation_combo.retranslate_ui()

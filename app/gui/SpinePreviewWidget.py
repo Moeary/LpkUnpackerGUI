@@ -371,6 +371,8 @@ class SpinePreviewWidget(QFrame):
         self._pick_alpha: dict[int, Any] = {}
         self._bone_mode = False
         self._bone_tool = "rotate"
+        self._bone_filter = "all"
+        self._bone_names = False
         self._selected_bone = ""
         self._bone_drag: dict[str, Any] | None = None
         self._status_timer = QTimer(self)
@@ -545,6 +547,36 @@ class SpinePreviewWidget(QFrame):
             raise ValueError("Bone tool must be rotate or translate")
         self._bone_tool = tool
 
+    BONE_FILTERS = ("all", "fk", "ik", "constrained")
+
+    def bone_filter(self) -> str:
+        return self._bone_filter
+
+    def set_bone_filter(self, kind: str) -> None:
+        """Show (and pick) all bones, or only FK, IK (chains and targets) or constrained ones."""
+        if kind not in self.BONE_FILTERS:
+            raise ValueError(f"Bone filter must be one of {self.BONE_FILTERS}")
+        self._bone_filter = kind
+        self._request_canvas_update()
+
+    def bone_names_visible(self) -> bool:
+        return self._bone_names
+
+    def set_bone_names_visible(self, visible: bool) -> None:
+        self._bone_names = bool(visible)
+        self._request_canvas_update()
+
+    @staticmethod
+    def bone_kind(bone) -> str:
+        if bone.is_ik_target or bone.is_ik:
+            return "ik"
+        if bone.is_constrained:
+            return "constrained"
+        return "fk"
+
+    def _bone_shown(self, bone) -> bool:
+        return bone.active and (self._bone_filter == "all" or self.bone_kind(bone) == self._bone_filter)
+
     @property
     def selected_bone(self) -> str:
         return self._selected_bone
@@ -573,14 +605,15 @@ class SpinePreviewWidget(QFrame):
     def bone_at(self, x: float, y: float):
         if not self.bones_supported:
             return None
-        return pick_bone(self._model.bones(), (x, y), self.skeleton_to_view)
+        return pick_bone([bone for bone in self._model.bones() if self._bone_shown(bone)], (x, y), self.skeleton_to_view)
 
     def _bone_press(self, event) -> bool:
         if not (self._bone_mode and self.bones_supported and event.button() == Qt.MouseButton.LeftButton):
             return False
         position = event.position()
         bones = self._model.bones()
-        bone = pick_bone(bones, (position.x(), position.y()), self.skeleton_to_view)
+        bone = pick_bone([item for item in bones if self._bone_shown(item)], (position.x(), position.y()),
+                         self.skeleton_to_view)
         if bone is None:
             return False  # an empty spot still picks the part there
         self.set_selected_bone(bone.name)
@@ -644,7 +677,7 @@ class SpinePreviewWidget(QFrame):
             by_index = {bone.index: bone for bone in bones}
             to_view = self.skeleton_to_view
             # IK constraints: dashed line from the chain end to its target.
-            for ik in self._model.ik_constraints():
+            for ik in self._model.ik_constraints() if self._bone_filter in {"all", "ik"} else ():
                 target = by_index.get(ik.target)
                 chain = [by_index[index] for index in ik.bones if index in by_index]
                 if target is None or not chain or ik.mix <= 0 or not target.active:
@@ -652,22 +685,26 @@ class SpinePreviewWidget(QFrame):
                 painter.setPen(QPen(self.BONE_COLORS["ik"], 1.4, Qt.PenStyle.DashLine))
                 painter.drawLine(QPointF(*to_view(*chain[-1].tip)), QPointF(*to_view(*target.origin)))
             selected = None
+            shown = []
             for bone in bones:
-                if not bone.active:
+                if bone.active and bone.name == self._selected_bone:
+                    selected = bone  # stays visible even when filtered out
                     continue
-                if bone.name == self._selected_bone:
-                    selected = bone
+                if not self._bone_shown(bone):
                     continue
+                shown.append(bone)
                 self._draw_bone(painter, bone, outline, self._bone_color(bone))
             if selected is not None:
                 self._draw_bone(painter, selected, QPen(QColor(255, 255, 255), 1.6), self.BONE_COLORS["selected"])
-                # A vector path, not drawText: the GL engine's glyph cache
-                # does not survive the native renderer's texture state.
-                x, y = to_view(*selected.origin)
-                label = QPainterPath()
-                label.addText(QPointF(x + 9, y - 9), painter.font(), selected.name)
-                painter.strokePath(label, QPen(QColor(0, 0, 0, 200), 3.0))
-                painter.fillPath(label, QBrush(QColor(255, 255, 255)))
+            # Vector paths, not drawText: the GL engine's glyph cache does not
+            # survive the native renderer's texture state.
+            labels = QPainterPath()
+            for bone in (shown if self._bone_names else []) + ([selected] if selected is not None else []):
+                x, y = to_view(*bone.origin)
+                labels.addText(QPointF(x + 9, y - 9), painter.font(), bone.name)
+            if not labels.isEmpty():
+                painter.strokePath(labels, QPen(QColor(0, 0, 0, 200), 3.0))
+                painter.fillPath(labels, QBrush(QColor(255, 255, 255)))
         finally:
             painter.end()
 

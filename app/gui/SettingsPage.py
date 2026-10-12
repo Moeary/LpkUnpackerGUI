@@ -1386,6 +1386,30 @@ class SettingsPage(QFrame):
     def _toggle_spine_runtime_advanced(self, visible: bool) -> None:
         self._set_spine_runtime_advanced_visible(bool(visible))
 
+    def showEvent(self, event):  # noqa: N802
+        super().showEvent(event)
+        self._sync_spine_compatibility_from_disk()
+
+    def _sync_spine_compatibility_from_disk(self) -> None:
+        """Pick up the compatibility switch changed on the preview page."""
+        checkbox = self.spine_compatibility_checkbox
+        settings_file = getattr(self.settings_manager, "settings_file", None)
+        if checkbox is None or not settings_file:
+            return
+        try:
+            enabled = SettingsManager(settings_file=settings_file).get_spine_compatibility_mode()
+        except Exception:
+            return
+        if bool(enabled) == checkbox.isChecked():
+            return
+        self.settings_manager.set("spine.compatibility_mode", bool(enabled))
+        previous, self._syncing_ui = self._syncing_ui, True
+        try:
+            checkbox.setChecked(bool(enabled))
+            self._refresh_spine_runtime_version_combo()
+        finally:
+            self._syncing_ui = previous
+
     def _on_spine_compatibility_toggled(self, _checked: bool) -> None:
         if self._syncing_ui:
             return

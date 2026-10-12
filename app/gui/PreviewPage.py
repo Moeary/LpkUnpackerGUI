@@ -2039,6 +2039,14 @@ class PreviewPage(QFrame):
         source_button_row.addWidget(self.source_folder_btn)
         import_layout.addLayout(source_button_row)
 
+        # The application-wide Spine compatibility policy, surfaced where a
+        # mismatched skeleton is actually opened.  On: every Spine preview is
+        # converted to the verified 3.8.75 bridge; off: exact runtimes only.
+        self.spine_auto_convert_check = CheckBox("", import_card)
+        self.spine_auto_convert_check.setChecked(self._spine_compatibility_mode_for_import())
+        self.spine_auto_convert_check.toggled.connect(self._spine_auto_convert_toggled)
+        import_layout.addWidget(self.spine_auto_convert_check)
+
         spine_runtime_row = QHBoxLayout()
         self.spine_runtime_label = BodyLabel("Spine runtime", import_card)
         self.spine_runtime_edit = LineEdit(import_card)
@@ -2391,6 +2399,9 @@ class PreviewPage(QFrame):
             self.source_file_btn.setText(tr("preview.browse_files"))
         if self.source_folder_btn:
             self.source_folder_btn.setText(tr("preview.browse_folder"))
+        if getattr(self, "spine_auto_convert_check", None):
+            self.spine_auto_convert_check.setText(tr("preview.spine_auto_convert"))
+            self.spine_auto_convert_check.setToolTip(tr("preview.spine_auto_convert_hint"))
         if self.spine_runtime_edit:
             self.spine_runtime_edit.setText(
                 str(self.settings_manager.get("preview.spine_runtime_dir", "") or "")
@@ -2638,6 +2649,7 @@ class PreviewPage(QFrame):
 
     def showEvent(self, event):
         super().showEvent(event)
+        self._sync_spine_auto_convert_check()  # Settings may have changed it
         self.set_active(True)
 
     def hideEvent(self, event):
@@ -2828,6 +2840,50 @@ class PreviewPage(QFrame):
                         ).update(current_ui)
                 return str(preview.get("spine_runtime_dir") or "").strip()
         return str(manager.get("preview.spine_runtime_dir", "") or "").strip()
+
+    def _spine_auto_convert_toggled(self, checked: bool) -> None:
+        """Persist the compatibility switch and reopen a Spine preview with it."""
+        checked = bool(checked)
+        manager = self.settings_manager
+        settings_file = getattr(manager, "settings_file", None)
+        if settings_file:
+            # Write through a fresh manager so this page's older cache cannot
+            # overwrite settings changed meanwhile by the Settings page.
+            try:
+                latest = SettingsManager(settings_file=settings_file)
+                self._store_spine_compatibility(latest, checked)
+                latest.save_settings()
+            except Exception:
+                pass
+        self._store_spine_compatibility(manager, checked)
+        current = str(self.source_edit.text() or "") if self.source_edit else ""
+        if self._spine_mode and current and (
+            _is_spine_preview_source(current)
+            or os.path.splitext(current)[1].lower() in PACKAGE_PREVIEW_EXTENSIONS
+        ):
+            self.start_spine_preview_import(
+                current,
+                package_fallback=os.path.splitext(current)[1].lower() in PACKAGE_PREVIEW_EXTENSIONS,
+            )
+
+    @staticmethod
+    def _store_spine_compatibility(manager, enabled: bool) -> None:
+        setter = getattr(manager, "set_spine_compatibility_mode", None)
+        if callable(setter):
+            setter(enabled)
+        else:
+            manager.set("spine.compatibility_mode", enabled)
+            manager.set("spine.compatibility_mode_migrated", True)
+
+    def _sync_spine_auto_convert_check(self) -> None:
+        check = getattr(self, "spine_auto_convert_check", None)
+        if check is None:
+            return
+        enabled = self._spine_compatibility_mode_for_import()
+        if check.isChecked() != enabled:
+            check.blockSignals(True)
+            check.setChecked(enabled)
+            check.blockSignals(False)
 
     def _spine_preview_unify_for_import(self) -> bool:
         """Compatibility alias for older integrations and tests."""

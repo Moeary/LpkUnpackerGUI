@@ -350,6 +350,13 @@ class SpineEditorPageTests(unittest.TestCase):
         self.assertEqual(self.page.preview.selected_bone, "hip")
         self.page.bone_tool_combo.setCurrentIndex(self.page.bone_tool_combo.findData("translate"))
         self.assertEqual(self.page.preview.bone_tool(), "translate")
+        self.assertTrue(self.page.bone_bar.isVisibleTo(self.page))
+        self.page.bone_filter_bar.items["ik"].click()
+        self.assertEqual(self.page.preview.bone_filter(), "ik")
+        self.page.bone_names_button.setChecked(True)
+        self.assertTrue(self.page.preview.bone_names_visible())
+        self.page.bone_mode_button.setChecked(False)
+        self.assertFalse(self.page.bone_bar.isVisibleTo(self.page))
 
     def test_bone_mode_jumps_the_tree_and_commits_drags_as_setup_or_keys(self):
         self.open()

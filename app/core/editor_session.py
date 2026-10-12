@@ -32,6 +32,12 @@ BONE_FIELDS = {
 }
 
 
+def clone_json(value: Any) -> Any:
+    """Deep-copy JSON data.  The C JSON codec is far faster than copy.deepcopy
+    on multi-megabyte skeletons, which made every edit and undo stall."""
+    return json.loads(json.dumps(value, ensure_ascii=False))
+
+
 def decode_draw_order(frame: dict, setup: list[str]) -> list[str]:
     """Decode Spine's sparse offsets against the *original* setup slot indices."""
     order: list[str | None] = [None] * len(setup)
@@ -179,6 +185,10 @@ class SpineEditorSession:
         self._textures: dict[str, bytes] = {}
         self._undo: list[dict] = []
         self._redo: list[dict] = []
+        # Hashing the whole document is the cost of ``dirty``; recompute it
+        # only after the history-managed state actually changed.
+        self._revision = 0
+        self._signature_cache: tuple[int, bytes] | None = None
         self._saved = self._signature()
         self.last_saved_path: str | None = None
         self._closed = False
@@ -245,49 +255,66 @@ class SpineEditorSession:
     def dirty(self) -> bool:
         return self._signature() != self._saved
 
+    def _live_state(self) -> dict:
+        """The current state objects themselves (not copies)."""
+        return {"document": self.document, "settings": self.project.settings,
+                "wrapper": self.project.wrapper, "modified": self.project.modified,
+                "textures": self._textures}
+
     def _state(self) -> dict:
-        return copy.deepcopy({"document": self.document, "settings": self.project.settings,
-                              "wrapper": self.project.wrapper, "modified": self.project.modified,
-                              "textures": self._textures})
+        # Texture values are immutable bytes, so a new dict is a full copy.
+        state = clone_json({key: value for key, value in self._live_state().items() if key not in {"modified", "textures"}})
+        state["modified"] = set(self.project.modified)
+        state["textures"] = dict(self._textures)
+        return state
 
     def _restore(self, state: dict):
-        self.project.document = copy.deepcopy(state["document"])
-        self.project.settings = copy.deepcopy(state["settings"])
-        self.project.wrapper = copy.deepcopy(state["wrapper"])
+        """Adopt ``state``; callers hand over a copy nobody else references."""
+        self.project.document = state["document"]
+        self.project.settings = state["settings"]
+        self.project.wrapper = state["wrapper"]
         self.project.modified = set(state["modified"])
         self._textures = dict(state["textures"])
+        self._revision += 1
 
     def _signature(self) -> bytes:
+        if self._signature_cache and self._signature_cache[0] == self._revision:
+            return self._signature_cache[1]
         payload = {"document": self.document, "settings": self.project.settings, "wrapper": self.project.wrapper,
                    "textures": {name: hashlib.sha256(data).hexdigest() for name, data in self._textures.items()}}
-        return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False, allow_nan=False).encode()).digest()
+        signature = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False, allow_nan=False).encode()).digest()
+        self._signature_cache = self._revision, signature
+        return signature
 
     def _change(self, operation: Callable[[], Any]):
         before = self._state()
+        self._revision += 1
         try:
             result = operation()
             self._signature()  # validate the complete edited state before committing history
         except Exception:
             self._restore(before)
             raise
-        current = self._state()
-        if before != current:
+        live = self._live_state()
+        if any(before[key] != live[key] for key in before):
             self._undo.append(before)
             self._undo = self._undo[-60:]
             self._redo.clear()
         return result
 
+    # Undo and redo move whole states between the stacks.  The state being
+    # left is no longer referenced by the session, so neither side is copied.
     def undo(self) -> bool:
         if not self._undo:
             return False
-        self._redo.append(self._state())
+        self._redo.append(self._live_state())
         self._restore(self._undo.pop())
         return True
 
     def redo(self) -> bool:
         if not self._redo:
             return False
-        self._undo.append(self._state())
+        self._undo.append(self._live_state())
         self._restore(self._redo.pop())
         return True
 

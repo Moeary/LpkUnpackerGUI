@@ -334,6 +334,28 @@ class SpinePreviewWidgetTests(unittest.TestCase):
                 self.assertEqual(saved["preview"]["spine_runtime_dir"], str(new_runtime))
                 self.assertEqual(saved["tools"]["spine_converter_path"], "new-converter")
                 self.assertEqual(saved["preview"]["ui_state"]["opacity"], 73)
+
+                # The left-panel switch is the shared compatibility policy:
+                # it is persisted and reopens the current Spine source with it.
+                check = page.spine_auto_convert_check
+                self.assertTrue(check.isChecked())
+                skeleton = root / "model.json"
+                skeleton.write_text(json.dumps({"skeleton": {"spine": "3.8.99"}, "bones": []}), encoding="utf-8")
+                (root / "model.atlas").write_text("page.png\nsize: 1,1\n", encoding="utf-8")
+                page.source_edit.setText(str(skeleton))
+                page._spine_mode = True
+                count = len(captured_runtimes)
+                check.setChecked(False)
+                self._wait(lambda: not page._spine_preview_workers, timeout=2.0)
+                self.assertEqual(len(captured_runtimes), count + 1)
+                self.assertFalse(page._spine_runtime_policy_for_import().compatibility_mode)
+                with open(settings_file, "r", encoding="utf-8") as handle:
+                    self.assertFalse(json.load(handle)["spine"]["compatibility_mode"])
+                external_settings = FileSettings(settings_file)
+                external_settings.set("spine.compatibility_mode", True)
+                page._sync_spine_auto_convert_check()
+                self.assertTrue(check.isChecked())
+                self.assertEqual(len(captured_runtimes), count + 1)  # syncing does not reimport
             finally:
                 page.close_preview_window()
                 page._destroy_embedded_spine()
@@ -645,6 +667,15 @@ class SpinePreviewWidgetTests(unittest.TestCase):
         self.assertEqual(set(posed[-1][1]), {"x", "y"})
         # Empty space falls back to part picking.
         self.assertFalse(widget._bone_press(mouse(QEvent.Type.MouseButtonPress, *widget.skeleton_to_view(-60, 60))))
+        # A filter hides bones from drawing and picking alike.
+        widget.set_bone_filter("ik")
+        self.assertIsNone(widget.bone_at(x, y))
+        self.assertEqual(widget.bone_at(tx, ty).name, "target")
+        widget.set_bone_filter("fk")
+        self.assertIsNone(widget.bone_at(tx, ty))
+        self.assertEqual(widget.bone_at(x, y).name, "arm")
+        with self.assertRaises(ValueError):
+            widget.set_bone_filter("bogus")
         widget._model = None
         widget.deleteLater()
 

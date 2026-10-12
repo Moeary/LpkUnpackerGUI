@@ -295,5 +295,32 @@ class SpineEditorSessionTests(unittest.TestCase):
                     session.key_bone_pose("Idle", "hip", 1.0, {"scaleX": 2.0})
 
 
+    def test_undo_redo_swap_states_without_aliasing_and_dirty_tracks_them(self):
+        session = self.open(self.model())
+        self.assertFalse(session.dirty)
+        session.set_bone_transform("hip", {"rotation": 12})
+        self.assertTrue(session.dirty)
+        edited = session.document
+        session.undo()
+        self.assertFalse(session.dirty)
+        self.assertNotIn("rotation", session.bone("hip"))
+        self.assertIsNot(session.document, edited)
+        session.redo()
+        self.assertIs(session.document, edited)  # moved back, not copied
+        self.assertEqual(session.bone("hip")["rotation"], 12)
+        self.assertTrue(session.dirty)
+        # A further edit must not change the state held for undo.
+        session.set_bone_transform("hip", {"rotation": 30})
+        session.undo()
+        self.assertEqual(session.bone("hip")["rotation"], 12)
+        self.assertTrue(session.can_redo)
+        # A failed edit restores the prior state and keeps history unchanged.
+        history = len(session._undo)
+        with self.assertRaises(AnimationEditingError):
+            session.set_bone_transform("hip", {"rotation": float("nan")})
+        self.assertEqual(len(session._undo), history)
+        self.assertEqual(session.bone("hip")["rotation"], 12)
+
+
 if __name__ == "__main__":
     unittest.main()
