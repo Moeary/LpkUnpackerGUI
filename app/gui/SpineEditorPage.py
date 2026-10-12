@@ -17,7 +17,7 @@ from qfluentwidgets import (
     BodyLabel as QLabel, CaptionLabel, CheckBox as QCheckBox,
     DoubleSpinBox as QDoubleSpinBox, FluentIcon, IndeterminateProgressBar, ListWidget as QListWidget,
     Action, PrimaryPushButton, PushButton as QPushButton, RoundMenu, ScrollArea as QScrollArea,
-    SearchLineEdit, SegmentedWidget, SpinBox, StrongBodyLabel, SubtitleLabel, TogglePushButton, TransparentPushButton,
+    SearchLineEdit, SegmentedWidget, StrongBodyLabel, SubtitleLabel, TogglePushButton, TransparentPushButton,
     TransparentToolButton, TreeWidget as QTreeWidget, VerticalSeparator,
 )
 
@@ -28,7 +28,8 @@ from app.gui.editor_shortcuts import EditorShortcutRouter
 from app.gui.editor_recovery import EditorRecoveryController
 from app.gui.editor_timeline import AnimationTimelineEditor
 from app.gui.editor_actions import ActionComboBox, ActionDeleteDialog, ActionNameDialog, close_editor_popup
-from app.gui.editor_dialogs import EditorMessageBox as QMessageBox, ThemedEditorDialog
+from app.gui.animation_export_ui import AnimationExportController, AnimationExportDialog, ask_output, export_text
+from app.gui.editor_dialogs import EditorMessageBox as QMessageBox
 from app.gui.editor_workspace import (
     EditorComboBox as QComboBox, EditorSplitter, EditorTabs, EditorViewportLayout, EditorWorkspace,
     ViewZoomControls,
@@ -135,25 +136,6 @@ SPINE_EDITOR_TEXT = {
     "spine_editor.no_slots_selected": "当前选中项下没有 slot",
     "spine_editor.slot_visibility_unavailable": "已安装的 Spine 原生桥不支持临时隐藏部件，请重新构建 Spine 原生运行时（pixi run native-spine）",
     "spine_editor.hide_in_preview": "在预览中临时隐藏 / 显示此 slot（H）",
-    "spine_editor.export_animation": "导出动画",
-    "spine_editor.export_animation_hint": "把当前动作导出为 GIF、WebP 或 PNG 序列，便于分享展示；画面与预览的缩放、平移和隐藏部件一致",
-    "spine_editor.export_format": "格式",
-    "spine_editor.export_png_sequence": "PNG 序列（文件夹）",
-    "spine_editor.export_fps": "帧率 (fps)",
-    "spine_editor.export_size": "尺寸 (像素)",
-    "spine_editor.export_keep_aspect": "保持预览比例",
-    "spine_editor.export_transparent": "透明背景",
-    "spine_editor.export_transparent_gif": "GIF 只有全透明或不透明两种像素，柔和边缘会变硬；需要半透明请用 WebP 或 PNG",
-    "spine_editor.export_range": "只导出播放区间 ({start} – {end} 秒)",
-    "spine_editor.export_summary": "{count} 帧 · 时长 {seconds} 秒 · 播放速度 {speed} · 约占内存 {memory} MB",
-    "spine_editor.export_too_large": "帧数或尺寸过大（约需 {memory} MB 内存），请降低帧率、尺寸或缩短区间",
-    "spine_editor.export_dialog": "保存动画",
-    "spine_editor.export_needs_animation": "请先选择一个动作再导出动画",
-    "spine_editor.export_unavailable": "预览尚未就绪，无法渲染动画帧",
-    "spine_editor.export_rendering": "正在渲染第 {index} / {count} 帧…",
-    "spine_editor.export_encoding": "正在编码 {count} 帧…",
-    "spine_editor.export_done": "已导出动画：{path}",
-    "spine_editor.export_failed": "导出动画失败：{error}",
 }
 
 
@@ -246,116 +228,6 @@ class _PsdWorker(QThread):
                 self.completed.emit(self.snapshot.read_atlas_psd(self.path))
         except Exception as exc:
             self.failed.emit(str(exc))
-
-
-class _AnimationExportWorker(QThread):
-    """Encode already rendered frames off the GUI thread."""
-
-    completed = Signal(str)
-    failed = Signal(str)
-
-    def __init__(self, frames, output: str, options: dict, parent=None):
-        super().__init__(parent)
-        self.frames, self.output, self.options = frames, output, options
-
-    def run(self):
-        from app.core.animation_export import write_animation
-        try:
-            path = write_animation(self.frames, self.output, self.options["format"], self.options["fps"],
-                                   transparent=self.options["transparent"], background=self.options["background"],
-                                   cancelled=self.isInterruptionRequested)
-            self.completed.emit(str(path))
-        except Exception as exc:
-            self.failed.emit(str(exc))
-        finally:
-            self.frames = None
-
-
-class _AnimationExportDialog(ThemedEditorDialog):
-    """Format, frame rate, size, background and range of an animation export."""
-
-    def __init__(self, parent, *, size: tuple[int, int], duration: float, play_range, speed: float):
-        super().__init__(parent)
-        self.setWindowTitle(_text("spine_editor.export_animation"))
-        self.setMinimumWidth(400)
-        self._duration, self._play_range, self._speed = duration, play_range, speed
-        self._aspect = size[0] / max(1, size[1])
-        layout = self.viewLayout
-        form = QFormLayout()
-        form.setSpacing(10)
-        self.format_combo = QComboBox(self)
-        for fmt, label in (("gif", "GIF"), ("webp", "WebP"), ("png", _text("spine_editor.export_png_sequence"))):
-            self.format_combo.addItem(label, fmt)
-        form.addRow(QLabel(_text("spine_editor.export_format"), self), self.format_combo)
-        self.fps_spin = SpinBox(self)
-        self.fps_spin.setRange(1, 60)
-        self.fps_spin.setValue(30)
-        form.addRow(QLabel(_text("spine_editor.export_fps"), self), self.fps_spin)
-        size_row = QHBoxLayout()
-        self.width_spin, self.height_spin = SpinBox(self), SpinBox(self)
-        for spin, value in ((self.width_spin, size[0]), (self.height_spin, size[1])):
-            spin.setRange(16, SpinePreviewWidget.MAX_RENDER_SIZE)
-            spin.setValue(int(value))
-            size_row.addWidget(spin, 1)
-        form.addRow(QLabel(_text("spine_editor.export_size"), self), size_row)
-        layout.addLayout(form)
-        self.aspect_check = QCheckBox(_text("spine_editor.export_keep_aspect"), self)
-        self.aspect_check.setChecked(True)
-        self.transparent_check = QCheckBox(_text("spine_editor.export_transparent"), self)
-        self.range_check = QCheckBox(self)
-        if play_range is not None:
-            self.range_check.setText(_text("spine_editor.export_range", start=f"{play_range[0]:.3f}",
-                                           end=f"{play_range[1]:.3f}"))
-            self.range_check.setChecked(True)
-        else:
-            self.range_check.hide()
-        for widget in (self.aspect_check, self.transparent_check, self.range_check):
-            layout.addWidget(widget)
-        self.summary = CaptionLabel(self)
-        self.summary.setWordWrap(True)
-        layout.addWidget(self.summary)
-        self.width_spin.valueChanged.connect(lambda value: self._follow_aspect(self.height_spin, value / self._aspect))
-        self.height_spin.valueChanged.connect(lambda value: self._follow_aspect(self.width_spin, value * self._aspect))
-        self.format_combo.currentIndexChanged.connect(self._format_changed)
-        for signal in (self.fps_spin.valueChanged, self.width_spin.valueChanged, self.height_spin.valueChanged,
-                       self.range_check.toggled):
-            signal.connect(lambda *_args: self._refresh_summary())
-        self._following = False
-        self.yesButton.setText(_text("spine_editor.export_animation"))
-        self._format_changed()
-
-    def _follow_aspect(self, spin, value: float):
-        if self._following or not self.aspect_check.isChecked():
-            return
-        self._following = True
-        spin.setValue(max(16, round(value)))
-        self._following = False
-
-    def _format_changed(self, *_args):
-        gif = self.options()["format"] == "gif"
-        # Hard GIF edges look worse than a solid background, so GIF starts opaque.
-        self.transparent_check.setChecked(not gif)
-        self.transparent_check.setToolTip(_text("spine_editor.export_transparent_gif") if gif else "")
-        self._refresh_summary()
-
-    def options(self) -> dict:
-        play_range = self._play_range if self._play_range is not None and self.range_check.isChecked() else None
-        start, end = play_range or (0.0, self._duration)
-        return {"format": self.format_combo.currentData() or "gif", "fps": self.fps_spin.value(),
-                "width": self.width_spin.value(), "height": self.height_spin.value(),
-                "transparent": self.transparent_check.isChecked(), "start": start, "end": end, "speed": self._speed}
-
-    def _refresh_summary(self):
-        from app.core.animation_export import MAX_MEMORY_BYTES, estimated_memory, frame_times
-        options = self.options()
-        count = len(frame_times(options["start"], options["end"], options["fps"], options["speed"]))
-        memory = estimated_memory(count, options["width"], options["height"])
-        megabytes = max(1, round(memory / 1024 ** 2))
-        too_large = memory > MAX_MEMORY_BYTES
-        self.summary.setText(_text("spine_editor.export_too_large", memory=megabytes) if too_large else
-                             _text("spine_editor.export_summary", count=count, memory=megabytes,
-                                   seconds=f"{count / options['fps']:.2f}", speed=f"{options['speed']:g}×"))
-        self.yesButton.setEnabled(not too_large)
 
 
 class _PsdPanel(QWidget):
@@ -618,8 +490,6 @@ class SpineEditorPage(QWidget):
         # session's own undo/redo entry and only replays while still on top.
         self._undo_tokens: list[tuple] = []
         self._redo_tokens: list[tuple] = []
-        self._export_worker = None
-        self._rendering_export = False
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
         self._preview_timer.setInterval(240)
@@ -872,6 +742,11 @@ class SpineEditorPage(QWidget):
         self.zoom_controls.zoomInRequested.connect(lambda: self.preview.zoom_by(self.preview.ZOOM_STEP))
         self.zoom_controls.zoomOutRequested.connect(lambda: self.preview.zoom_by(1 / self.preview.ZOOM_STEP))
         self.zoom_controls.resetRequested.connect(self.preview.reset_view)
+        self.animation_export = AnimationExportController(
+            self, render_frame=self._render_export_frame,
+            restore=lambda: self.preview.set_time(self.timeline.current_time), background=self._stage_rgb)
+        self.animation_export.message.connect(self.status_label.setText)
+        self.animation_export.busyChanged.connect(lambda _busy: self._update_actions())
         self.recovery = EditorRecoveryController(self, "spine")
         self.layout().insertWidget(1, self.recovery.bar)
         self.shortcuts = EditorShortcutRouter(self, "spine")
@@ -1456,7 +1331,15 @@ class SpineEditorPage(QWidget):
     # Animation export (GIF / WebP / PNG sequence) -------------------------
     @property
     def animation_export_busy(self) -> bool:
-        return self._rendering_export or self._export_worker is not None
+        return self.animation_export.busy
+
+    def _render_export_frame(self, seconds: float, width: int, height: int, transparent: bool):
+        self.preview.set_time(seconds)
+        return self.preview.render_image(width, height, transparent=transparent)
+
+    def _stage_rgb(self) -> tuple[int, int, int]:
+        color = self.preview._background_color()
+        return color.red(), color.green(), color.blue()
 
     def export_animation(self, output: str | None = None, options: dict | None = None) -> bool:
         """Render the current animation and encode it in the background.
@@ -1468,15 +1351,15 @@ class SpineEditorPage(QWidget):
         if not self.session or self.loading or self.animation_export_busy:
             return False
         if not self.animation_name:
-            self.status_label.setText(_text("spine_editor.export_needs_animation"))
+            self.status_label.setText(export_text("needs_animation"))
             return False
         if not self.preview.can_render_images():
-            self.status_label.setText(_text("spine_editor.export_unavailable"))
+            self.status_label.setText(export_text("unavailable"))
             return False
         self.pause_playback()
         if options is None:
             canvas = self.preview.canvas
-            dialog = _AnimationExportDialog(
+            dialog = AnimationExportDialog(
                 self, size=(max(16, canvas.width()), max(16, canvas.height())),
                 duration=self.timeline.duration, play_range=self.timeline.play_range(),
                 speed=self.timeline.playback_speed)
@@ -1484,83 +1367,17 @@ class SpineEditorPage(QWidget):
                 return False
             options = dialog.options()
         if output is None:
-            from app.core.animation_export import SUFFIXES
-            suffix = SUFFIXES[options["format"]]
-            suggested = self.session.original_source.parent / f"{self.animation_name}{suffix}"
-            filters = {"gif": "GIF (*.gif)", "webp": "WebP (*.webp)", "png": ""}[options["format"]]
-            if options["format"] == "png":
-                parent = QFileDialog.getExistingDirectory(self, _text("spine_editor.export_dialog"),
-                                                          str(suggested.parent))
-                output = str(Path(parent) / f"{self.animation_name}_frames") if parent else ""
-            else:
-                output, _filter = QFileDialog.getSaveFileName(self, _text("spine_editor.export_dialog"),
-                                                              str(suggested), filters)
+            output = ask_output(self, options["format"], self.session.original_source.parent, self.animation_name)
         if not output:
             return False
-        try:
-            frames = self._render_animation_frames(options)
-        except Exception as exc:
-            self.status_label.setText(_text("spine_editor.export_failed", error=exc))
-            return False
-        background = self.preview._background_color()
-        options = dict(options, background=(background.red(), background.green(), background.blue()))
-        worker = _AnimationExportWorker(frames, output, options, self)
-        worker.completed.connect(lambda path: self.status_label.setText(_text("spine_editor.export_done", path=path)))
-        worker.failed.connect(lambda error: self.status_label.setText(_text("spine_editor.export_failed", error=error)))
-        worker.finished.connect(lambda w=worker: self._export_worker_done(w))
-        self._export_worker = worker
-        self._workers.append(worker)
-        self.status_label.setText(_text("spine_editor.export_encoding", count=len(frames)))
-        self._update_actions()
-        worker.start()
-        return True
-
-    def _render_animation_frames(self, options: dict) -> list:
-        """Draw each frame off-screen on the GUI thread, which owns the GL context."""
-        from PIL import Image
-        from PySide6.QtCore import QEventLoop
-        from PySide6.QtWidgets import QApplication
-        from app.core.animation_export import MAX_MEMORY_BYTES, estimated_memory, frame_times
-        times = frame_times(options["start"], options["end"], options["fps"], options["speed"])
-        width, height = int(options["width"]), int(options["height"])
-        if estimated_memory(len(times), width, height) > MAX_MEMORY_BYTES:
-            raise ValueError(_text("spine_editor.export_too_large",
-                                   memory=round(estimated_memory(len(times), width, height) / 1024 ** 2)))
-        current = self.timeline.current_time
-        frames = []
-        self._rendering_export = True
         # A debounced preview reload would swap the native model mid-export.
         reload_due = self._preview_timer.isActive()
         self._preview_timer.stop()
-        self._update_actions()
         try:
-            for index, seconds in enumerate(times):
-                self.preview.set_time(seconds)
-                image = self.preview.render_image(width, height, transparent=options["transparent"])
-                if image is None:
-                    raise RuntimeError(_text("spine_editor.export_unavailable"))
-                frames.append(Image.frombytes("RGBA", (image.width(), image.height()), bytes(image.constBits()),
-                                              "raw", "RGBA", image.bytesPerLine()))
-                if index % 5 == 0:
-                    self.status_label.setText(_text("spine_editor.export_rendering", index=index + 1, count=len(times)))
-                    # Paint progress only; edits must wait for the frames.
-                    QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+            return self.animation_export.start(output, options)
         finally:
-            self._rendering_export = False
-            self.preview.set_time(current)
             if reload_due:
                 self._preview_timer.start(0)
-            self._update_actions()
-        return frames
-
-    def _export_worker_done(self, worker):
-        if worker in self._workers:
-            self._workers.remove(worker)
-        if self._export_worker is worker:
-            self._export_worker = None
-        worker.deleteLater()
-        if not self._closing:
-            self._update_actions()
 
     # Click-to-pick in the preview ----------------------------------------
     def _preview_picked(self, result):
@@ -1999,6 +1816,7 @@ class SpineEditorPage(QWidget):
             if isinstance(worker, _OpenWorker) and worker.session is not None:
                 worker.session.close()
                 worker.session = None
+        self.animation_export.shutdown()
         self.recovery.shutdown()
         self.preview.shutdown()
         if self.session:
@@ -2007,8 +1825,7 @@ class SpineEditorPage(QWidget):
 
     def retranslate_ui(self, *args):
         self.title.setText(_text("spine_editor.title"))
-        self.export_animation_button.setToolTip(_text("spine_editor.export_animation") + " (Ctrl+Shift+E)\n"
-                                                + _text("spine_editor.export_animation_hint"))
+        self.export_animation_button.setToolTip(export_text("title") + " (Ctrl+Shift+E)\n" + export_text("hint"))
         for widget, key in ((self.open_button, "open"), (self.save_button, "save"),
                             (self.animation_label, "animation"), (self.skin_label, "skin"), (self.duration_label, "duration"),
                             (self.track_label, "track"), (self.inspector_empty, "choose_item")):

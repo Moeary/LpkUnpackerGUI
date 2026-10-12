@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QFileSystemWatcher, QPoint, QProcess, QSignalBlocker, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QBrush, QColor, QDesktopServices, QImage, QPainter, QPixmap
+from PySide6.QtGui import QBrush, QColor, QDesktopServices, QImage, QPainter, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QDialog, QFileDialog,
     QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel,
@@ -32,6 +32,7 @@ from app.gui.live2d_appearance import (
     SharedTaskFeedback, appearance_text,
 )
 from app.gui.PsdReconstructionPage import PsdReconstructionPage
+from app.gui.animation_export_ui import AnimationExportController, AnimationExportDialog, ask_output, export_text
 from app.gui.editor_shortcuts import EditorShortcutRouter
 from app.gui.editor_recovery import EditorRecoveryController
 from app.gui.editor_timeline import AnimationTimelineEditor
@@ -244,6 +245,11 @@ class Live2DEditorPage(QFrame):
         self._parameter_commit_timer.setInterval(250)
         self._parameter_commit_timer.timeout.connect(self._flush_parameter_edit)
         self._build_ui()
+        self.animation_export = AnimationExportController(
+            self, render_frame=self._render_export_frame, restore=self._apply_preview_pose,
+            background=lambda: self._stage_color().getRgb()[:3])
+        self.animation_export.message.connect(self._status)
+        self.animation_export.busyChanged.connect(lambda _busy: self._update_actions())
         self.recovery = EditorRecoveryController(self, "live2d")
         self.layout().insertWidget(1, self.recovery.bar)
         self.retranslate_ui()
@@ -432,14 +438,19 @@ class Live2DEditorPage(QFrame):
         self.clone_motion_button = TransparentToolButton(FluentIcon.COPY, timeline_host)
         self.delete_motion_button = TransparentToolButton(FluentIcon.REMOVE, timeline_host)
         self.key_pose_button = TransparentToolButton(FluentIcon.ACCEPT, timeline_host)
-        for button in (self.new_motion_button, self.delete_motion_button, self.clone_motion_button, self.key_pose_button):
+        # GIF / WebP / PNG sequence of the current motion, as in the Spine editor.
+        self.export_motion_button = TransparentToolButton(FluentIcon.VIDEO, timeline_host)
+        for button in (self.new_motion_button, self.delete_motion_button, self.clone_motion_button, self.key_pose_button,
+                       self.export_motion_button):
             button.setFixedSize(28, 28)
         self.new_motion_button.clicked.connect(self._create_motion)
         self.clone_motion_button.clicked.connect(self._clone_motion)
         self.delete_motion_button.clicked.connect(self._delete_motion)
         self.key_pose_button.clicked.connect(self._key_current_pose)
+        self.export_motion_button.clicked.connect(lambda _checked=False: self.export_animation())
         row.addWidget(self.motion_combo)
-        for button in (self.new_motion_button, self.delete_motion_button, self.clone_motion_button):
+        for button in (self.new_motion_button, self.delete_motion_button, self.clone_motion_button,
+                       self.export_motion_button):
             row.addWidget(button)
         self.track_label = CaptionLabel(timeline_host)
         self.track_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
@@ -763,6 +774,8 @@ class Live2DEditorPage(QFrame):
         for button, key in ((self.new_motion_button, "new"), (self.clone_motion_button, "copy"), (self.delete_motion_button, "delete")):
             button.setToolTip(action_text("editor.actions." + key))
             button.setAccessibleName(button.toolTip())
+        self.export_motion_button.setToolTip(export_text("title") + " (Ctrl+Alt+E)\n" + export_text("hint"))
+        self.export_motion_button.setAccessibleName(export_text("title"))
         self.motion_combo.retranslate_ui()
         self.parameter_combo.retranslate_ui()
         for button, key in ((self.point_select_button, "pick_point"), (self.rect_select_button, "pick_rectangle"),
@@ -1929,6 +1942,52 @@ class Live2DEditorPage(QFrame):
         self._manual_pose = False
         self._apply_preview_pose()
         self._schedule_mesh_refresh()
+
+    # Animation export (GIF / WebP / PNG sequence) -----------------------
+    def _stage_color(self) -> QColor:
+        return self.palette().color(QPalette.ColorRole.Base)
+
+    def _render_export_frame(self, seconds: float, width: int, height: int, transparent: bool):
+        """Pose the preview as playback does at ``seconds`` and render it off-screen."""
+        render_session = self._preview_session or self.session
+        supported = {parameter["id"] for parameter in render_session.parameters}
+        values = self.session.pose_at(self._current_motion(), seconds)
+        self.preview.apply_settings({"advanced_enabled": True,
+                                     "advanced_params": {key: value for key, value in values.items() if key in supported}})
+        return self.preview.render_image(width, height, transparent=transparent,
+                                         background=self._stage_color().getRgbF())
+
+    def export_animation(self, output: str | None = None, options: dict | None = None) -> bool:
+        """Export the current motion as GIF, WebP or a PNG sequence.
+
+        Frames are the motion as the editor plays it (keyed parameters, part
+        and ArtMesh visibility, the preview's zoom and pan), at the timeline's
+        speed and play range.  ``output`` and ``options`` skip the dialogs.
+        """
+        if (not self.session or not self.preview or self.animation_export.busy or self._projects_busy()
+                or self._preview_workers):
+            return False
+        motion = self._current_motion()
+        if not motion:
+            self._status(export_text("needs_animation"))
+            return False
+        if not self.preview.can_render_images():
+            self._status(export_text("unavailable"))
+            return False
+        self._flush_parameter_edit()
+        self.timeline.set_playing(False)
+        if options is None:
+            dialog = AnimationExportDialog(self, size=self.preview.canvas_size(), duration=self.timeline.duration,
+                                           play_range=self.timeline.play_range(), speed=self.timeline.playback_speed)
+            if self._exec_action_dialog(dialog) != QDialog.Accepted:
+                return False
+            options = dialog.options()
+        if output is None:
+            output = ask_output(self, options["format"], self.session.source_path.parent, Path(motion).stem)
+        if not output:
+            return False
+        self._manual_pose = False  # restore() shows the motion, as playback does
+        return self.animation_export.start(output, options)
 
     def _play_state_changed(self, playing: bool):
         if playing:
@@ -3163,6 +3222,7 @@ class Live2DEditorPage(QFrame):
                 self._closing = False
                 return False
         watched = self.texture_watcher.files() + self.texture_watcher.directories()
+        self.animation_export.shutdown()
         self.recovery.shutdown()
         self.selection_tools.shutdown()
         if watched:
@@ -3243,6 +3303,9 @@ class Live2DEditorPage(QFrame):
         self.use_for_mod_button.setEnabled(bool(session))
         self.clone_motion_button.setEnabled(bool(session and self._current_motion()))
         self.delete_motion_button.setEnabled(bool(session and self._current_motion()))
+        exporter = getattr(self, "animation_export", None)
+        self.export_motion_button.setEnabled(bool(session and self.preview and self._current_motion()
+                                                  and exporter is not None and not exporter.busy))
         self.key_pose_button.setEnabled(bool(session and self._current_motion() and self._selected_parameter))
         self.parameter_tab.setEnabled(bool(session))
         self.artmesh_tab.setEnabled(bool(session))

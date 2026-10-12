@@ -309,6 +309,42 @@ class Live2DEditorPageTests(unittest.TestCase):
         self.assertTrue(self.page.open_source(result["model_path"]))
         self.assertEqual(self.page._current_motion(), "Move[0]")
 
+    def test_export_animation_poses_each_frame_and_returns_to_the_timeline(self):
+        from PySide6.QtGui import QColor, QImage
+        from PIL import Image
+        self.open()
+        page, session = self.page, self.page.session
+        session.create_motion("Turn", 2)
+        session.set_keyframes("Turn", "ParamAngleY", [{"time": 0, "value": -20}, {"time": 2, "value": 20}])
+        page._populate_motions("Turn")
+        page.timeline._seek(0.5)
+        posed = []
+
+        def render(width, height, *, transparent=True, background=None):
+            posed.append(round(page.preview.values["ParamAngleY"], 3))
+            image = QImage(width, height, QImage.Format.Format_ARGB32)
+            image.fill(QColor(0, 200, 0, 255) if len(posed) % 2 else QColor(0, 0, 0, 0))
+            return image
+
+        page.preview.can_render_images = lambda: True
+        page.preview.render_image = render
+        options = {"format": "gif", "fps": 2, "width": 24, "height": 16, "transparent": True,
+                   "start": 0.0, "end": 2.0, "speed": 1.0}
+        output = self.root / "turn.gif"
+        history = (session.dirty, session.can_undo, session.can_redo)
+        self.assertTrue(page.export_animation(str(output), options))
+        deadline = time.monotonic() + 20
+        while page.animation_export.busy and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.005)
+        self.assertEqual(posed, [-20.0, -10.0, 0.0, 10.0])  # motion values at 0, 0.5, 1, 1.5 s
+        self.assertEqual(page.preview.values["ParamAngleY"], -10.0)  # back at the timeline's 0.5 s
+        with Image.open(output) as image:
+            self.assertEqual((image.n_frames, image.size), (4, (24, 16)))
+        self.assertEqual((session.dirty, session.can_undo, session.can_redo), history)  # exporting is no edit
+        self.assertIn("turn.gif", page.task_feedback.message_label.text()
+                      if hasattr(page.task_feedback, "message_label") else str(output))
+
     def _add_second_parameter(self):
         inventory = self.model.parent / "live2d_parameter_inventory.json"
         data = json.loads(inventory.read_text(encoding="utf-8"))

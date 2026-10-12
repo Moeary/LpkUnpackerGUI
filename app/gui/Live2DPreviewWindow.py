@@ -994,6 +994,19 @@ class Live2DPreviewWindow(QWidget):
         if self.live2d_canvas:
             self.live2d_canvas.setDrawableOpacityOverrides(values)
 
+    def can_render_images(self) -> bool:
+        return bool(self.live2d_canvas and self.live2d_canvas.canRenderImages())
+
+    def render_image(self, width: int, height: int, *, transparent: bool = True, background=None):
+        """An off-screen frame of the current pose (see Live2DCanvas.renderImage)."""
+        if not self.live2d_canvas:
+            return None
+        return self.live2d_canvas.renderImage(width, height, transparent, background)
+
+    def canvas_size(self) -> tuple[int, int]:
+        canvas = self.live2d_canvas
+        return (max(16, canvas.width()), max(16, canvas.height())) if canvas else (512, 512)
+
     def toggle_control_panel(self):
         """切换控制面板显示/隐藏"""
         if self.control_panel.isVisible():

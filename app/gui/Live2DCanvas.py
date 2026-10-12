@@ -8,7 +8,7 @@ from typing import Optional, List, Dict, Any
 
 from PySide6.QtOpenGL import QOpenGLWindow
 from PySide6.QtCore import QEvent, QLineF, QPointF, Qt, Signal
-from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPalette, QPen
+from PySide6.QtGui import QColor, QGuiApplication, QOpenGLContext, QPainter, QPalette, QPen
 import OpenGL.GL as GL
 from abc import abstractmethod
 
@@ -376,6 +376,11 @@ class ADPOpenGLCanvas(QOpenGLWindow):
         dpr = float(self.devicePixelRatioF()) if hasattr(self, 'devicePixelRatioF') else float(self.devicePixelRatio())
         vp_w = max(1, int(round(self.width() * dpr)))
         vp_h = max(1, int(round(self.height() * dpr)))
+        self.__composite(vp_w, vp_h, self.__use_background, self.__bg_color)
+        self.draw_overlay(vp_w, vp_h, dpr)
+
+    def __composite(self, vp_w: int, vp_h: int, use_background: bool, bg_color) -> None:
+        """Draw the model canvas texture with the view transform into the bound framebuffer."""
         GL.glViewport(0, 0, vp_w, vp_h)
 
         GL.glBindVertexArray(self._vao)
@@ -396,8 +401,8 @@ class ADPOpenGLCanvas(QOpenGLWindow):
             self._stage_to_canvas_scale_loc,
             *stage_to_canvas,
         )
-        GL.glProgramUniform4f(self._program, self._bg_color_loc, *self.__bg_color)
-        GL.glProgramUniform1i(self._program, self._use_bg_loc, 1 if self.__use_background else 0)
+        GL.glProgramUniform4f(self._program, self._bg_color_loc, *bg_color)
+        GL.glProgramUniform1i(self._program, self._use_bg_loc, 1 if use_background else 0)
 
         GL.glActiveTexture(GL.GL_TEXTURE0)
         GL.glBindTexture(GL.GL_TEXTURE_2D, _gl_object_id(self._canvas_texture))
@@ -405,7 +410,65 @@ class ADPOpenGLCanvas(QOpenGLWindow):
 
         GL.glBindVertexArray(0)
 
-        self.draw_overlay(vp_w, vp_h, dpr)
+    def canRenderImages(self) -> bool:  # noqa: N802
+        return bool(getattr(self, "_program", None) and getattr(self, "model", None) is not None)
+
+    def renderImage(self, width: int, height: int, transparent: bool = True, background=None):  # noqa: N802
+        """Render the current pose into a ``width`` × ``height`` QImage.
+
+        Uses the preview's framing (zoom, pan, rotation, opacity) without
+        editor overlays.  The model is drawn into a canvas framebuffer sized
+        for the export, so a large export stays sharp; the preview's own
+        framebuffer is restored afterwards.  ``background`` is an RGBA float
+        tuple used when ``transparent`` is false (default: the stage color).
+        Returns None when no GL context or model is ready.
+        """
+        if not self.canRenderImages():
+            return None
+        from PySide6.QtCore import QSize
+        from PySide6.QtGui import QImage
+        from PySide6.QtOpenGL import QOpenGLFramebufferObject, QOpenGLFramebufferObjectFormat
+        width, height = max(1, int(width)), max(1, int(height))
+        previous_context = QOpenGLContext.currentContext()
+        previous_surface = previous_context.surface() if previous_context is not None else None
+        self.makeCurrent()
+        saved = (self._canvas_framebuffer, self._canvas_texture, self._fbo_width, self._fbo_height)
+        fit_pending, self._content_fit_pending = self._content_fit_pending, False
+        dpr = max(self._dpr, 1e-3)
+        export_canvas = None
+        try:
+            # Same sizing rule as the preview, at the export's resolution.
+            fb_w, fb_h = self._desired_canvas_size(max(1, round(width / dpr)), max(1, round(height / dpr)))
+            export_canvas = create_canvas_framebuffer(fb_w, fb_h)
+            self._canvas_framebuffer, self._canvas_texture = export_canvas
+            self._fbo_width, self._fbo_height = fb_w, fb_h
+            self.on_resize(fb_w, fb_h)
+            self.__draw_on_canvas()
+            fmt = QOpenGLFramebufferObjectFormat()
+            fmt.setAttachment(QOpenGLFramebufferObject.Attachment.NoAttachment)
+            fmt.setInternalTextureFormat(GL.GL_RGBA8)
+            target = QOpenGLFramebufferObject(QSize(width, height), fmt)
+            if not target.isValid():
+                raise RuntimeError("OpenGL could not create a framebuffer for export")
+            target.bind()
+            GL.glClearColor(0.0, 0.0, 0.0, 0.0)
+            GL.glClear(GL.GL_COLOR_BUFFER_BIT)
+            color = background if background is not None else self.__bg_color
+            self.__composite(width, height, not transparent, tuple(color))
+            GL.glFinish()
+            target.release()
+            image = target.toImage().convertToFormat(QImage.Format.Format_RGBA8888)
+        finally:
+            if export_canvas is not None:
+                GL.glDeleteTextures([_gl_object_id(export_canvas[1])])
+                GL.glDeleteFramebuffers(1, [_gl_object_id(export_canvas[0])])
+            self._canvas_framebuffer, self._canvas_texture, self._fbo_width, self._fbo_height = saved
+            self.on_resize(self._fbo_width, self._fbo_height)
+            self._content_fit_pending = fit_pending
+            self.doneCurrent()
+            if previous_context is not None and previous_surface is not None and previous_context is not self.context():
+                previous_context.makeCurrent(previous_surface)
+        return image
 
     def draw_overlay(self, _width, _height, _dpr):
         """Native-window overlays must be painted after the composition pass."""

@@ -34,6 +34,7 @@ SPECS = {
         ("clear", "清空选区", "Esc"), ("named", "保存命名选区", "Ctrl+Alt+S"),
         ("uv", "共享 UV 高亮", "U"), ("psd", "导出选区 PSD", "Ctrl+Shift+E"),
         ("hide", "隐藏 / 显示选中的 ArtMesh", "H"),
+        ("export_animation", "导出动画（GIF / WebP / PNG 序列）", "Ctrl+Alt+E"),
         ("selection_undo", "撤销选区（任意编辑区域）", "Ctrl+Alt+Z"),
         ("selection_redo", "重做选区（任意编辑区域）", "Ctrl+Alt+Shift+Z"),
     ],
@@ -195,6 +196,8 @@ class EditorShortcutRouter(QObject):
                 page.export_selection_button.click()
             elif action == "hide":
                 page.toggle_selected_visibility()
+            elif action == "export_animation":
+                page.export_animation()
             elif action in ("selection_undo", "selection_redo"):
                 getattr(page.artmesh_inspector, action.split("_")[1] + "_selection")()
         else:
