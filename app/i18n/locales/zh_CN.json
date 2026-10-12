@@ -1,4 +1,5 @@
 {
+  "spine_editor.hidden_count": "预览中隐藏了 {count} 个 slot",
   "settings.section.startup": "启动",
   "settings.startup_page_label": "启动时打开的页面",
   "settings.startup_page_desc": "打开软件后首先显示的页面，下次启动时生效。",

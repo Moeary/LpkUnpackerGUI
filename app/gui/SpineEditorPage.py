@@ -131,6 +131,7 @@ SPINE_EDITOR_TEXT = {
     "spine_editor.shown_selected": "已重新显示 {count} 个 slot",
     "spine_editor.solo_applied": "仅显示 {count} 个 slot，其余已临时隐藏",
     "spine_editor.shown_all": "已显示全部 slot",
+    "spine_editor.hidden_count": "预览中隐藏了 {count} 个 slot",
     "spine_editor.no_slots_selected": "当前选中项下没有 slot",
     "spine_editor.slot_visibility_unavailable": "已安装的 Spine 原生桥不支持临时隐藏部件，请重新构建 Spine 原生运行时（pixi run native-spine）",
     "spine_editor.hide_in_preview": "在预览中临时隐藏 / 显示此 slot（H）",
@@ -483,6 +484,11 @@ class SpineEditorPage(QWidget):
         # Slots hidden in the preview only: view state, never part of the
         # document, its undo history or an export.
         self._hidden_slots: set[str] = set()
+        # Order of document edits and hiding steps, so Ctrl+Z undoes whichever
+        # came last, as in the Live2D editor.  A document token holds the
+        # session's own undo/redo entry and only replays while still on top.
+        self._undo_tokens: list[tuple] = []
+        self._redo_tokens: list[tuple] = []
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
         self._preview_timer.setInterval(240)
@@ -803,6 +809,8 @@ class SpineEditorPage(QWidget):
         self.source_label.show()
         self._hidden_slots.clear()
         self.preview.set_hidden_slots(())
+        self._undo_tokens.clear()
+        self._redo_tokens.clear()
         self._populate(preserve_view=False)
         self._load_preview(plan)
         self.status_label.setText(_text("spine_editor.ready"))
@@ -1125,15 +1133,18 @@ class SpineEditorPage(QWidget):
         self._updating = False
         self._refresh_visibility_markers()
 
-    def _edit(self, operation, refresh_tree: bool = False, immediate: bool = False):
+    def _edit(self, operation, refresh_tree: bool = False, immediate: bool = False, record: bool = True):
         if not self.session:
             return False
+        top = self.session._undo[-1] if self.session._undo else None
         try:
             operation()
         except Exception as exc:
             self._report_error(exc)
             self._refresh_track()
             return False
+        if record and self.session._undo and self.session._undo[-1] is not top:
+            self._push_undo_token(("document", self.session._undo[-1]))
         self._pending_preview = True
         if refresh_tree:
             self._populate()
@@ -1401,20 +1412,31 @@ class SpineEditorPage(QWidget):
         return result
 
     def _set_hidden_slots(self, names, message: str) -> None:
+        """A user hiding step: one undo step, ordered with document edits."""
+        before, after = frozenset(self._hidden_slots), frozenset(set(names) & self._slot_names())
+        if after != before:
+            self._push_undo_token(("visibility", before, after))
+        self._apply_hidden_slots(after)
+        if self.preview.model is not None and not self.preview.slot_visibility_supported:
+            message = _text("spine_editor.slot_visibility_unavailable")
+        self.status_label.setText(message)
+        self._update_actions()
+
+    def _apply_hidden_slots(self, names) -> None:
         self._hidden_slots = set(names) & self._slot_names()
         self.preview.set_hidden_slots(self._hidden_slots)
         self._refresh_visibility_markers()
         if self._selection and self._selection[0] == "slot":
             self.slot_inspector.set_preview_hidden(self._selection[1] in self._hidden_slots)
-        if self.preview.model is not None and not self.preview.slot_visibility_supported:
-            message = _text("spine_editor.slot_visibility_unavailable")
-        self.status_label.setText(message)
+        self.status_label.setText(_text("spine_editor.hidden_count", count=len(self._hidden_slots)))
 
     def toggle_selected_visibility(self) -> bool:
         """H: hide the selected slots in the preview, or show them when all are hidden.
 
-        Only the preview changes; the document, its history and exports keep
-        every slot.  Hidden slots are skipped by click picking too.
+        Only the preview changes; the document and exports keep every slot.
+        Like the Live2D editor's ArtMesh hiding, each step is undone and
+        redone with Ctrl+Z / Ctrl+Shift+Z in order with document edits, yet
+        never marks the model modified.  Hidden slots are skipped by picking.
         """
         if not self.session or self.loading:
             return False
@@ -1568,15 +1590,46 @@ class SpineEditorPage(QWidget):
         pool = shown or [slot for slot, _attachment in candidates]
         return max(pool, key=lambda slot: order.index(slot) if slot in order else -1)
 
+    def _push_undo_token(self, token) -> None:
+        """A new step: remember its order and drop the redo branch."""
+        self._undo_tokens.append(token)
+        del self._undo_tokens[:-200]
+        self._redo_tokens.clear()
+
     def undo(self):
-        if self.session:
-            self.pause_playback()
-            self._edit(self.session.undo, refresh_tree=True, immediate=True)
+        """Undo the latest step: a document edit or hiding/showing slots."""
+        self._history(redo=False)
 
     def redo(self):
-        if self.session:
-            self.pause_playback()
-            self._edit(self.session.redo, refresh_tree=True, immediate=True)
+        self._history(redo=True)
+
+    def _history(self, *, redo: bool) -> bool:
+        if not self.session or self.loading:
+            return False
+        self.pause_playback()
+        tokens, opposite = (self._redo_tokens, self._undo_tokens) if redo else (self._undo_tokens, self._redo_tokens)
+        token = tokens.pop() if tokens else None
+        if token is not None and token[0] == "visibility":
+            _kind, before, after = token
+            self._apply_hidden_slots(after if redo else before)
+            opposite.append(token)
+            self._update_actions()
+            return True
+        stack = self.session._redo if redo else self.session._undo
+        current = token is not None and bool(stack) and stack[-1] is token[1]
+        # Undo falls back to the session's own history (e.g. after recovery);
+        # redo does not, since a newer step dropped that redo branch.
+        if not stack or (redo and not current):
+            self._update_actions()
+            return False
+        if not self._edit(self.session.redo if redo else self.session.undo,
+                          refresh_tree=True, immediate=True, record=False):
+            return False
+        after = self.session._undo if redo else self.session._redo
+        if after:
+            opposite.append(("document", after[-1]))
+        self._update_actions()
+        return True
 
     def _start_preview_refresh(self):
         if not self.session or self._closing:
@@ -1631,8 +1684,8 @@ class SpineEditorPage(QWidget):
         opened = self.session is not None
         busy = self.loading
         self.save_button.setEnabled(opened and not busy)
-        self.undo_button.setEnabled(opened and self.session.can_undo and not busy)
-        self.redo_button.setEnabled(opened and self.session.can_redo and not busy)
+        self.undo_button.setEnabled(opened and not busy and (self.session.can_undo or bool(self._undo_tokens)))
+        self.redo_button.setEnabled(opened and not busy and bool(self._redo_tokens))
         self.new_button.setEnabled(opened and not busy)
         self.clone_button.setEnabled(opened and bool(self.animation_name) and not busy)
         self.delete_animation_button.setEnabled(opened and bool(self.animation_name) and not busy)

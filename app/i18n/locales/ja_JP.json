@@ -1,4 +1,5 @@
 {
+  "spine_editor.hidden_count": "プレビューで {count} 個のスロットを非表示中",
   "settings.section.startup": "起動",
   "settings.startup_page_label": "起動時に開くページ",
   "settings.startup_page_desc": "アプリ起動時に最初に表示するページです。次回の起動から反映されます。",

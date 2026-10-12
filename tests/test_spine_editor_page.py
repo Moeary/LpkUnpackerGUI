@@ -397,6 +397,46 @@ class SpineEditorPageTests(unittest.TestCase):
         page.shortcuts.dispatch("slot_show_all", page.layers)
         self.assertEqual(page.preview.hidden_slots, set())
 
+    def test_ctrl_z_undoes_hiding_and_document_edits_in_the_order_made(self):
+        self.open_with_parts()
+        page = self.page
+        page.tabs.setCurrentIndex(1)
+        page.layers.setCurrentItem(next(page.layers.item(i) for i in range(page.layers.count())
+                                        if page.layers.item(i).data(Qt.UserRole) == "front"))
+        page.shortcuts.dispatch("slot_hide", page.layers)  # 1. hide front
+        page.tabs.setCurrentIndex(0)
+        hip = next(item for item in page._structure_items() if item.data(0, Qt.UserRole) == ("bone", "hip"))
+        page.tree.setCurrentItem(hip)
+        page.bone_inspector.spins["rotation"].setValue(25)
+        page.bone_inspector.apply_button.click()  # 2. a document edit
+        self.assertEqual(page.session.bone("hip")["rotation"], 25)
+        page.shortcuts.dispatch("slot_hide", page.tree)  # 3. hide back and front
+        self.assertEqual(page.hidden_slots, {"back", "front"})
+
+        page.shortcuts.dispatch("undo", page.tree)  # undoes 3 only
+        self.assertEqual(page.hidden_slots, {"front"})
+        self.assertEqual(page.session.bone("hip")["rotation"], 25)
+        page.shortcuts.dispatch("undo", page.tree)  # then the edit
+        self.assertEqual(page.session.bone("hip").get("rotation", 0), 0)
+        self.assertEqual(page.hidden_slots, {"front"})
+        page.shortcuts.dispatch("undo", page.tree)  # then 1
+        self.assertEqual(page.hidden_slots, set())
+        self.assertFalse(page.session.dirty)
+
+        page.shortcuts.dispatch("redo", page.tree)
+        self.assertEqual(page.hidden_slots, {"front"})
+        page.shortcuts.dispatch("redo", page.tree)
+        self.assertEqual(page.session.bone("hip")["rotation"], 25)
+        page.shortcuts.dispatch("redo", page.tree)
+        self.assertEqual(page.hidden_slots, {"back", "front"})
+        self.assertFalse(page.redo_button.isEnabled())
+
+        # A new step drops the redo branch, hiding included.
+        page.undo()
+        page.show_all_slots()
+        page.redo()
+        self.assertEqual(page.hidden_slots, set())
+
     def test_bone_mode_jumps_the_tree_and_commits_drags_as_setup_or_keys(self):
         self.open()
         page = self.page

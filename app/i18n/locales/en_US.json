@@ -1,4 +1,5 @@
 {
+  "spine_editor.hidden_count": "{count} slot(s) hidden in the preview",
   "settings.section.startup": "Startup",
   "settings.startup_page_label": "Page opened at startup",
   "settings.startup_page_desc": "The page shown first when the app starts; takes effect on the next launch.",
