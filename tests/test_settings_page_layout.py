@@ -63,6 +63,7 @@ class SettingsPageLayoutTests(unittest.TestCase):
                         "settingsPhotoshopCard",
                         "settingsSpineCard",
                         "settingsTextureCard",
+                        "settingsFfmpegCard",
                         "settingsMcpCard",
                         "settingsMcpConnectionCard",
                         "settingsMcpGuideCard",

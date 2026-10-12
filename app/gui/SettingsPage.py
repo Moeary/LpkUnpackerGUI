@@ -724,6 +724,24 @@ class SettingsPage(QFrame):
             self.photoshop_status,
         )
 
+        # FFmpeg encodes WebM / MP4 animation exports.
+        ffmpeg_card, ffmpeg_layout = self._new_settings_card(content, "settingsFfmpegCard")
+        self.ffmpeg_card = ffmpeg_card
+        right_column.addWidget(ffmpeg_card)
+        self.ffmpeg_label = BodyLabel("", ffmpeg_card)
+        self.ffmpeg_desc = CaptionLabel("", ffmpeg_card)
+        self.ffmpeg_desc.setWordWrap(True)
+        self.ffmpeg_status = CaptionLabel("", ffmpeg_card)
+        self.ffmpeg_status.setWordWrap(True)
+        self.ffmpeg_edit = LineEdit(ffmpeg_card)
+        self.ffmpeg_edit.editingFinished.connect(lambda: self.save_ffmpeg(self.ffmpeg_edit.text()))
+        self.ffmpeg_button = PushButton("", ffmpeg_card)
+        self.ffmpeg_button.clicked.connect(self.browse_ffmpeg)
+        self.ffmpeg_clear_button = PushButton("", ffmpeg_card)
+        self.ffmpeg_clear_button.clicked.connect(lambda: (self.ffmpeg_edit.clear(), self.save_ffmpeg("")))
+        self._add_path_block(ffmpeg_layout, self.ffmpeg_label, self.ffmpeg_desc, self.ffmpeg_edit,
+                             (self.ffmpeg_button, self.ffmpeg_clear_button), self.ffmpeg_status)
+
         spine_card, spine_layout = self._new_settings_card(
             content, "settingsSpineCard"
         )
@@ -1058,7 +1076,7 @@ class SettingsPage(QFrame):
             ("spine", [spine_card, self.spine_shortcuts_card]),
             ("resources", [archive_card, asset_card, download_card]),
             ("ai", [mcp_card, connection_card, guide_card]),
-            ("other", [texture_card]),
+            ("other", [texture_card, ffmpeg_card]),
         ]
         for key, _cards in self._settings_categories:
             item = QListWidgetItem()
@@ -1351,6 +1369,7 @@ class SettingsPage(QFrame):
                 self.cubism_core_edit.setText(self.settings_manager.get_cubism_core_dll_path())
             if self.photoshop_edit:
                 self.photoshop_edit.setText(self.settings_manager.get_photoshop_path())
+            self.ffmpeg_edit.setText(self.settings_manager.get_ffmpeg_path())
             if self.spine_runtime_edit:
                 self.spine_runtime_edit.setText(self.settings_manager.get_spine_runtime_dir())
             if self.spine_compatibility_checkbox:
@@ -1730,6 +1749,11 @@ class SettingsPage(QFrame):
             self.cubism_core_edit.setPlaceholderText(tr("settings.cubism_core_placeholder"))
             self.cubism_core_button.setText(tr("common.browse"))
             self.cubism_core_auto_button.setText(tr("settings.tool_auto"))
+            self.ffmpeg_label.setText(tr("settings.ffmpeg_label"))
+            self.ffmpeg_desc.setText(tr("settings.ffmpeg_desc"))
+            self.ffmpeg_edit.setPlaceholderText(tr("settings.ffmpeg_placeholder"))
+            self.ffmpeg_button.setText(tr("common.browse"))
+            self.ffmpeg_clear_button.setText(tr("common.clear"))
             self.photoshop_label.setText(tr("settings.photoshop_label"))
             self.photoshop_desc.setText(tr("settings.photoshop_desc"))
             self.photoshop_edit.setPlaceholderText(tr("settings.photoshop_placeholder"))
@@ -2261,6 +2285,27 @@ class SettingsPage(QFrame):
         self.image_viewer_edit.clear()
         self.settings_manager.set_image_viewer_path("")
 
+    def browse_ffmpeg(self):
+        path, _ = QFileDialog.getOpenFileName(self, tr("settings.ffmpeg_label"), self.ffmpeg_edit.text() or "",
+                                              "ffmpeg (ffmpeg.exe);;Executable (*.exe)")
+        if path:
+            self.ffmpeg_edit.setText(path)
+            self.save_ffmpeg(path)
+
+    def save_ffmpeg(self, path: str):
+        self.settings_manager.set_ffmpeg_path(path)
+        self._refresh_ffmpeg_status()
+
+    def _refresh_ffmpeg_status(self):
+        if getattr(self, "ffmpeg_status", None) is None:
+            return
+        found =self.settings_manager.get_ffmpeg_executable()
+        configured = self.settings_manager.get_ffmpeg_path()
+        if found:
+            self.ffmpeg_status.setText(tr("settings.ffmpeg_found", path=found))
+        else:
+            self.ffmpeg_status.setText(tr("settings.ffmpeg_invalid" if configured else "settings.ffmpeg_missing"))
+
     def clear_photoshop(self):
         self.photoshop_edit.clear()
         self.save_photoshop("")
@@ -2555,6 +2600,7 @@ class SettingsPage(QFrame):
         )
 
     def refresh_tool_status_labels(self):
+        self._refresh_ffmpeg_status()
         if self.archive_tool_status:
             self.archive_tool_status.setText(
                 self.tool_status_text(

@@ -16,7 +16,7 @@ from PySide6.QtWidgets import QFileDialog, QFormLayout, QHBoxLayout
 from qfluentwidgets import BodyLabel, CaptionLabel, CheckBox, SpinBox
 
 from app.core.animation_export import (
-    MAX_MEMORY_BYTES, SUFFIXES, estimated_memory, frame_times, write_animation,
+    MAX_MEMORY_BYTES, SUFFIXES, VIDEO_FORMATS, estimated_memory, frame_times, video_encoder, write_animation,
 )
 from app.gui.editor_dialogs import ThemedEditorDialog
 from app.gui.editor_workspace import EditorComboBox
@@ -44,7 +44,16 @@ ANIMATION_EXPORT_TEXT = {
     "editor.animation_export.encoding": "正在编码 {count} 帧…",
     "editor.animation_export.done": "已导出动画：{path}",
     "editor.animation_export.failed": "导出动画失败：{error}",
+    "editor.animation_export.webm": "WebM 视频",
+    "editor.animation_export.mp4": "MP4 视频",
+    "editor.animation_export.needs_ffmpeg": "WebM / MP4 需要 FFmpeg：请安装 FFmpeg 或在“设置 → 其他 → FFmpeg”中指定 ffmpeg.exe",
+    "editor.animation_export.mp4_opaque": "MP4 不支持透明，将使用舞台背景色；需要透明视频请用 WebM",
 }
+
+
+def find_ffmpeg_executable() -> str:
+    from app.core.settings_manager import SettingsManager
+    return SettingsManager().get_ffmpeg_executable()
 
 
 def export_text(key: str, **values) -> str:
@@ -66,7 +75,7 @@ class AnimationExportWorker(QThread):
         try:
             path = write_animation(self.frames, self.output, self.options["format"], self.options["fps"],
                                    transparent=self.options["transparent"], background=self.options["background"],
-                                   cancelled=self.isInterruptionRequested)
+                                   cancelled=self.isInterruptionRequested, ffmpeg=self.options.get("ffmpeg"))
             self.completed.emit(str(path))
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -77,17 +86,20 @@ class AnimationExportWorker(QThread):
 class AnimationExportDialog(ThemedEditorDialog):
     """Format, frame rate, size, background and range of an animation export."""
 
-    def __init__(self, parent, *, size: tuple[int, int], duration: float, play_range, speed: float):
+    def __init__(self, parent, *, size: tuple[int, int], duration: float, play_range, speed: float,
+                 ffmpeg: str | None = None):
         super().__init__(parent)
         self.setWindowTitle(export_text("title"))
         self.setMinimumWidth(400)
         self._duration, self._play_range, self._speed = duration, play_range, speed
+        self._ffmpeg = find_ffmpeg_executable() if ffmpeg is None else ffmpeg
         self._aspect = size[0] / max(1, size[1])
         layout = self.viewLayout
         form = QFormLayout()
         form.setSpacing(10)
         self.format_combo = EditorComboBox(self)
-        for fmt, label in (("gif", "GIF"), ("webp", "WebP"), ("png", export_text("png_sequence"))):
+        for fmt, label in (("gif", "GIF"), ("webp", "WebP"), ("webm", export_text("webm")), ("mp4", export_text("mp4")),
+                           ("png", export_text("png_sequence"))):
             self.format_combo.addItem(label, fmt)
         form.addRow(BodyLabel(export_text("format"), self), self.format_combo)
         self.fps_spin = SpinBox(self)
@@ -138,18 +150,23 @@ class AnimationExportDialog(ThemedEditorDialog):
         self._following = False
 
     def _format_changed(self, *_args):
-        gif = self.options()["format"] == "gif"
-        # Hard GIF edges look worse than a solid background, so GIF starts opaque.
-        self.transparent_check.setChecked(not gif)
-        self.transparent_check.setToolTip(export_text("transparent_gif") if gif else "")
+        fmt = self.format_combo.currentData() or "gif"
+        # Hard GIF edges look worse than a solid background, so GIF starts
+        # opaque; MP4 has no alpha channel at all.
+        self.transparent_check.setEnabled(fmt != "mp4")
+        self.transparent_check.setChecked(fmt not in {"gif", "mp4"})
+        self.transparent_check.setToolTip(export_text("transparent_gif") if fmt == "gif" else
+                                          export_text("mp4_opaque") if fmt == "mp4" else "")
         self._refresh_summary()
 
     def options(self) -> dict:
         play_range = self._play_range if self._play_range is not None and self.range_check.isChecked() else None
         start, end = play_range or (0.0, self._duration)
-        return {"format": self.format_combo.currentData() or "gif", "fps": self.fps_spin.value(),
+        fmt = self.format_combo.currentData() or "gif"
+        return {"format": fmt, "fps": self.fps_spin.value(),
                 "width": self.width_spin.value(), "height": self.height_spin.value(),
-                "transparent": self.transparent_check.isChecked(), "start": start, "end": end, "speed": self._speed}
+                "transparent": self.transparent_check.isChecked() and fmt != "mp4",
+                "start": start, "end": end, "speed": self._speed, "ffmpeg": self._ffmpeg}
 
     def _refresh_summary(self):
         options = self.options()
@@ -157,10 +174,16 @@ class AnimationExportDialog(ThemedEditorDialog):
         memory = estimated_memory(count, options["width"], options["height"])
         megabytes = max(1, round(memory / 1024 ** 2))
         too_large = memory > MAX_MEMORY_BYTES
-        self.summary.setText(export_text("too_large", memory=megabytes) if too_large else
-                             export_text("summary", count=count, memory=megabytes,
-                                         seconds=f"{count / options['fps']:.2f}", speed=f"{options['speed']:g}×"))
-        self.yesButton.setEnabled(not too_large)
+        missing_ffmpeg = options["format"] in VIDEO_FORMATS and video_encoder(self._ffmpeg, options["format"]) is None
+        if missing_ffmpeg:
+            text = export_text("needs_ffmpeg")
+        elif too_large:
+            text = export_text("too_large", memory=megabytes)
+        else:
+            text = export_text("summary", count=count, memory=megabytes,
+                               seconds=f"{count / options['fps']:.2f}", speed=f"{options['speed']:g}×")
+        self.summary.setText(text)
+        self.yesButton.setEnabled(not too_large and not missing_ffmpeg)
 
 
 def ask_output(parent, fmt: str, directory: Path, name: str) -> str:
@@ -168,7 +191,7 @@ def ask_output(parent, fmt: str, directory: Path, name: str) -> str:
     if fmt == "png":
         folder = QFileDialog.getExistingDirectory(parent, export_text("save_dialog"), str(directory))
         return str(Path(folder) / f"{name}_frames") if folder else ""
-    filters = {"gif": "GIF (*.gif)", "webp": "WebP (*.webp)"}[fmt]
+    filters = {"gif": "GIF (*.gif)", "webp": "WebP (*.webp)", "webm": "WebM (*.webm)", "mp4": "MP4 (*.mp4)"}[fmt]
     output, _filter = QFileDialog.getSaveFileName(parent, export_text("save_dialog"),
                                                   str(directory / f"{name}{SUFFIXES[fmt]}"), filters)
     return output
@@ -179,16 +202,19 @@ class AnimationExportController(QObject):
 
     ``render_frame(seconds, width, height, transparent)`` poses the preview at
     an animation time and returns a QImage (or None when it cannot render);
-    ``restore()`` returns the preview to the editor's own time afterwards.
+    ``prepare(times)`` (optional) runs once before the first frame, e.g. to
+    settle physics; ``restore()`` returns the preview to the editor's own
+    time afterwards.
     """
 
     busyChanged = Signal(bool)
     message = Signal(str)
 
     def __init__(self, parent, *, render_frame: Callable, restore: Callable[[], None],
-                 background: Callable[[], tuple[int, int, int]]):
+                 background: Callable[[], tuple[int, int, int]], prepare: Callable[[list], None] | None = None):
         super().__init__(parent)
         self._render_frame, self._restore, self._background = render_frame, restore, background
+        self._prepare = prepare
         self._rendering = False
         self.worker: AnimationExportWorker | None = None
 
@@ -200,6 +226,11 @@ class AnimationExportController(QObject):
         """Render every frame now, then encode on a worker; True when encoding started."""
         if self.busy or not output:
             return False
+        if options["format"] in VIDEO_FORMATS:
+            options = dict(options, ffmpeg=options.get("ffmpeg") or find_ffmpeg_executable())
+            if video_encoder(options["ffmpeg"], options["format"]) is None:
+                self.message.emit(export_text("needs_ffmpeg"))
+                return False
         try:
             frames = self._render(options)
         except Exception as exc:
@@ -229,6 +260,8 @@ class AnimationExportController(QObject):
         self._rendering = True
         self.busyChanged.emit(True)
         try:
+            if self._prepare is not None:
+                self._prepare(times)
             for index, seconds in enumerate(times):
                 image = self._render_frame(seconds, width, height, options["transparent"])
                 if image is None or image.isNull():

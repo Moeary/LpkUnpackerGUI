@@ -140,6 +140,14 @@ LIVE2D_EDITOR_TEXT = {
     "editor.live2d.isolate_selection_hint": "预览中只显示选中的 ArtMesh，用于导出前确认选区覆盖的区域；只影响预览，不改变模型与导出",
     "editor.live2d.hidden_selected": "已隐藏 {count} 个选中的 ArtMesh（Ctrl+Z 撤销）",
     "editor.live2d.shown_selected": "已显示 {count} 个选中的 ArtMesh",
+    "editor.live2d.dynamics": "动态效果：物理、眨眼、呼吸与表情",
+    "editor.live2d.dynamics_hint": "在关键帧姿态之上实时叠加，只影响预览与导出动画，不写入动作",
+    "editor.live2d.dynamics_physics": "物理（头发、衣物摆动）",
+    "editor.live2d.dynamics_blink": "自动眨眼",
+    "editor.live2d.dynamics_breath": "呼吸",
+    "editor.live2d.dynamics_expression": "表情",
+    "editor.live2d.dynamics_no_expression": "（无表情）",
+    "editor.live2d.dynamics_unavailable": "已安装的 Live2D 预览运行时不支持动态效果",
 }
 
 
@@ -246,8 +254,8 @@ class Live2DEditorPage(QFrame):
         self._parameter_commit_timer.timeout.connect(self._flush_parameter_edit)
         self._build_ui()
         self.animation_export = AnimationExportController(
-            self, render_frame=self._render_export_frame, restore=self._apply_preview_pose,
-            background=lambda: self._stage_color().getRgb()[:3])
+            self, render_frame=self._render_export_frame, restore=self._finish_export_frames,
+            background=lambda: self._stage_color().getRgb()[:3], prepare=self._prepare_export_frames)
         self.animation_export.message.connect(self._status)
         self.animation_export.busyChanged.connect(lambda _busy: self._update_actions())
         self.recovery = EditorRecoveryController(self, "live2d")
@@ -440,9 +448,12 @@ class Live2DEditorPage(QFrame):
         self.key_pose_button = TransparentToolButton(FluentIcon.ACCEPT, timeline_host)
         # GIF / WebP / PNG sequence of the current motion, as in the Spine editor.
         self.export_motion_button = TransparentToolButton(FluentIcon.VIDEO, timeline_host)
+        # Physics, blink, breath and expression over the keyed pose.
+        self.dynamics_button = TransparentToggleToolButton(FluentIcon.LEAF, timeline_host)
         for button in (self.new_motion_button, self.delete_motion_button, self.clone_motion_button, self.key_pose_button,
-                       self.export_motion_button):
+                       self.export_motion_button, self.dynamics_button):
             button.setFixedSize(28, 28)
+        self._build_dynamics_menu(timeline_host)
         self.new_motion_button.clicked.connect(self._create_motion)
         self.clone_motion_button.clicked.connect(self._clone_motion)
         self.delete_motion_button.clicked.connect(self._delete_motion)
@@ -450,7 +461,7 @@ class Live2DEditorPage(QFrame):
         self.export_motion_button.clicked.connect(lambda _checked=False: self.export_animation())
         row.addWidget(self.motion_combo)
         for button in (self.new_motion_button, self.delete_motion_button, self.clone_motion_button,
-                       self.export_motion_button):
+                       self.export_motion_button, self.dynamics_button):
             row.addWidget(button)
         self.track_label = CaptionLabel(timeline_host)
         self.track_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
@@ -776,6 +787,13 @@ class Live2DEditorPage(QFrame):
             button.setAccessibleName(button.toolTip())
         self.export_motion_button.setToolTip(export_text("title") + " (Ctrl+Alt+E)\n" + export_text("hint"))
         self.export_motion_button.setAccessibleName(export_text("title"))
+        self.dynamics_button.setToolTip(_text("editor.live2d.dynamics") + "\n" + _text("editor.live2d.dynamics_hint"))
+        self.dynamics_button.setAccessibleName(_text("editor.live2d.dynamics"))
+        for key, check in self.dynamics_checks.items():
+            check.setText(_text("editor.live2d.dynamics_" + key))
+        self.dynamics_expression_label.setText(_text("editor.live2d.dynamics_expression"))
+        if self.dynamics_expression_combo.count():
+            self.dynamics_expression_combo.setItemText(0, _text("editor.live2d.dynamics_no_expression"))
         self.motion_combo.retranslate_ui()
         self.parameter_combo.retranslate_ui()
         for button, key in ((self.point_select_button, "pick_point"), (self.rect_select_button, "pick_rectangle"),
@@ -1556,6 +1574,8 @@ class Live2DEditorPage(QFrame):
         self.preview.apply_settings({"motion_frozen": True, "mouse_tracking": False,
                                      "auto_blink": False, "auto_breath": False,
                                      "transparent_bg": False, "antialias": True})
+        self._refresh_expression_choices()
+        self._apply_dynamics()
         self._apply_preview_pose()
         self._selection_cache = None
         canvas = self.preview.live2d_canvas
@@ -1947,15 +1967,121 @@ class Live2DEditorPage(QFrame):
     def _stage_color(self) -> QColor:
         return self.palette().color(QPalette.ColorRole.Base)
 
-    def _render_export_frame(self, seconds: float, width: int, height: int, transparent: bool):
-        """Pose the preview as playback does at ``seconds`` and render it off-screen."""
+    def _export_pose(self, seconds: float) -> dict[str, float]:
         render_session = self._preview_session or self.session
         supported = {parameter["id"] for parameter in render_session.parameters}
         values = self.session.pose_at(self._current_motion(), seconds)
-        self.preview.apply_settings({"advanced_enabled": True,
-                                     "advanced_params": {key: value for key, value in values.items() if key in supported}})
+        return {key: value for key, value in values.items() if key in supported}
+
+    def _prepare_export_frames(self, times: list[float]):
+        """Settle dynamics before the first frame: hold still on the first
+        pose, then play the exported span once, so physics enter the first
+        frame already in motion and a looping file has no visible seam."""
+        self._export_step = (times[1] - times[0]) if len(times) > 1 else 1 / 30
+        if not self._dynamics_active():
+            return
+        self.preview.set_secondary_motion_hold(True)
+        first = self._export_pose(times[0])
+        for _ in range(max(1, round(1.5 / self._export_step))):
+            self.preview.advance_secondary_motion(first, self._export_step)
+        for seconds in times[1:]:
+            self.preview.advance_secondary_motion(self._export_pose(seconds), self._export_step)
+
+    def _render_export_frame(self, seconds: float, width: int, height: int, transparent: bool):
+        """Pose the preview as playback does at ``seconds`` and render it off-screen."""
+        self.preview.apply_settings({"advanced_enabled": True, "advanced_params": self._export_pose(seconds)})
+        if self._dynamics_active():
+            self.preview.step_secondary_motion(self._export_step)
         return self.preview.render_image(width, height, transparent=transparent,
                                          background=self._stage_color().getRgbF())
+
+    def _finish_export_frames(self):
+        if self._dynamics_active():
+            self.preview.set_secondary_motion_hold(False)
+        self._apply_preview_pose()
+
+    # Dynamics: physics, blink, breath and expression over the keyed pose --
+    def _build_dynamics_menu(self, parent):
+        self._dynamics = {"physics": False, "blink": False, "breath": False, "expression": ""}
+        self.dynamics_menu = RoundMenu(parent=self)
+        panel = QWidget(self.dynamics_menu)
+        panel.setFixedWidth(300)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(10, 6, 10, 6)
+        layout.setSpacing(6)
+        self.dynamics_checks = {}
+        for key in ("physics", "blink", "breath"):
+            check = CheckBox(panel)
+            check.toggled.connect(lambda checked, k=key: self._set_dynamics(**{k: checked}))
+            self.dynamics_checks[key] = check
+            layout.addWidget(check)
+        expression_row = QHBoxLayout()
+        self.dynamics_expression_label = CaptionLabel(panel)
+        self.dynamics_expression_combo = EditorComboBox(panel)
+        self.dynamics_expression_combo.currentIndexChanged.connect(
+            lambda _index: self._set_dynamics(expression=self.dynamics_expression_combo.currentData() or ""))
+        expression_row.addWidget(self.dynamics_expression_label)
+        expression_row.addWidget(self.dynamics_expression_combo, 1)
+        layout.addLayout(expression_row)
+        panel.adjustSize()
+        self.dynamics_menu.addWidget(panel, selectable=False)
+        # The toggle shows whether any dynamics run; a click opens the menu.
+        self.dynamics_button.clicked.connect(self._show_dynamics_menu)
+
+    def _show_dynamics_menu(self, *_args):
+        self._sync_dynamics_button()
+        self.dynamics_menu.exec(self.dynamics_button.mapToGlobal(QPoint(0, self.dynamics_button.height())))
+
+    def _sync_dynamics_button(self):
+        """Show the current dynamics on the toggle and in the menu's controls."""
+        active = any(self._dynamics[key] for key in ("physics", "blink", "breath")) or bool(self._dynamics["expression"])
+        with QSignalBlocker(self.dynamics_button):
+            self.dynamics_button.setChecked(active)
+        for key, check in self.dynamics_checks.items():
+            with QSignalBlocker(check):
+                check.setChecked(self._dynamics[key])
+        combo = self.dynamics_expression_combo
+        with QSignalBlocker(combo):
+            combo.setCurrentIndex(max(0, combo.findData(self._dynamics["expression"])))
+
+    def _set_dynamics(self, **values):
+        if getattr(self, "_refreshing_dynamics", False):
+            return
+        self._dynamics.update(values)
+        self._sync_dynamics_button()
+        self._apply_dynamics()
+
+    def _dynamics_active(self) -> bool:
+        active = getattr(self.preview, "secondary_motion_active", None)
+        return bool(callable(active) and active())
+
+    def _apply_dynamics(self):
+        supported = getattr(self.preview, "secondary_motion_supported", None)
+        if not callable(supported):
+            return
+        if not supported():
+            if any(self._dynamics.values()):
+                self._status(_text("editor.live2d.dynamics_unavailable"))
+            return
+        self.preview.set_secondary_motion(**self._dynamics)
+
+    def _refresh_expression_choices(self):
+        expression_ids = getattr(self.preview, "expression_ids", None)
+        names = expression_ids() if callable(expression_ids) else []
+        if self._dynamics["expression"] not in names:
+            self._dynamics["expression"] = ""
+        self._refreshing_dynamics = True
+        try:
+            combo = self.dynamics_expression_combo
+            combo.clear()
+            combo.addItem(_text("editor.live2d.dynamics_no_expression"), "")
+            for name in names:
+                combo.addItem(name, name)
+            combo.setCurrentIndex(max(0, combo.findData(self._dynamics["expression"])))
+            combo.setEnabled(bool(names))
+        finally:
+            self._refreshing_dynamics = False
+        self._sync_dynamics_button()
 
     def export_animation(self, output: str | None = None, options: dict | None = None) -> bool:
         """Export the current motion as GIF, WebP or a PNG sequence.

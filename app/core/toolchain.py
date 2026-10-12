@@ -223,6 +223,41 @@ def find_archive_extractor(
     return _first_named_file(ARCHIVE_TOOL_NAMES, roots=tool_roots())
 
 
+FFMPEG_NAMES = ("ffmpeg.exe", "ffmpeg")
+
+
+def find_ffmpeg(
+    explicit: str | os.PathLike[str] | None = None,
+) -> Path | None:
+    """Find ffmpeg for WebM / MP4 animation export.
+
+    A configured file, or a folder holding ``ffmpeg.exe`` (directly or in
+    ``bin``), wins; then ``LPK_FFMPEG_PATH``, PATH and the tool roots.
+    """
+
+    configured = _clean_path(explicit)
+    if configured:
+        if configured.is_dir():
+            for candidate in (configured / "ffmpeg.exe", configured / "bin" / "ffmpeg.exe", configured / "ffmpeg"):
+                found = _existing_file(candidate)
+                if found:
+                    return found
+        else:
+            found = _existing_file(configured)
+            if found:
+                return found
+    path = _existing_file(os.environ.get("LPK_FFMPEG_PATH"))
+    if path:
+        return path
+    for name in FFMPEG_NAMES:
+        found = shutil.which(name)
+        if found:
+            path = _existing_file(found)
+            if path:
+                return path
+    return _first_named_file(FFMPEG_NAMES, roots=tool_roots())
+
+
 def find_assetstudio_cli(
     explicit: str | os.PathLike[str] | None = None,
 ) -> Path | None:
@@ -513,6 +548,7 @@ def detect_toolchain_paths(
         ("tools.assetstudio_cli_path", find_assetstudio_cli),
         ("tools.cubism_core_dll_path", find_cubism_core),
         ("tools.photoshop_path", find_photoshop),
+        ("tools.ffmpeg_path", find_ffmpeg),
         ("tools.spine_converter_path", find_spine_converter),
         # The single persisted Spine path is the common native bridge root.
         ("preview.spine_runtime_dir", find_spine_native_runtime_root),
@@ -531,12 +567,14 @@ __all__ = [
     "ARCHIVE_TOOL_NAMES",
     "ASSETSTUDIO_TOOL_NAMES",
     "CUBISM_CORE_NAMES",
+    "FFMPEG_NAMES",
     "PHOTOSHOP_NAMES",
     "SPINE_CONVERTER_NAMES",
     "detect_toolchain_paths",
     "find_archive_extractor",
     "find_assetstudio_cli",
     "find_cubism_core",
+    "find_ffmpeg",
     "find_photoshop",
     "find_photoshop_path",
     "find_spine_converter",

@@ -328,6 +328,12 @@ class Live2DEditorPageTests(unittest.TestCase):
 
         page.preview.can_render_images = lambda: True
         page.preview.render_image = render
+        # Dynamics on: physics settle before the first frame and step once per frame.
+        dynamics = []
+        page.preview.secondary_motion_active = lambda: True
+        page.preview.set_secondary_motion_hold = lambda hold: dynamics.append(("hold", hold))
+        page.preview.advance_secondary_motion = lambda values, step: dynamics.append(("preroll", step))
+        page.preview.step_secondary_motion = lambda step: dynamics.append(("step", step))
         options = {"format": "gif", "fps": 2, "width": 24, "height": 16, "transparent": True,
                    "start": 0.0, "end": 2.0, "speed": 1.0}
         output = self.root / "turn.gif"
@@ -338,6 +344,8 @@ class Live2DEditorPageTests(unittest.TestCase):
             self.app.processEvents()
             time.sleep(0.005)
         self.assertEqual(posed, [-20.0, -10.0, 0.0, 10.0])  # motion values at 0, 0.5, 1, 1.5 s
+        # Hold, 1.5 s still on the first pose (3 steps) plus the span once (3), four frame steps, release.
+        self.assertEqual(dynamics, [("hold", True)] + [("preroll", .5)] * 6 + [("step", .5)] * 4 + [("hold", False)])
         self.assertEqual(page.preview.values["ParamAngleY"], -10.0)  # back at the timeline's 0.5 s
         with Image.open(output) as image:
             self.assertEqual((image.n_frames, image.size), (4, (24, 16)))
@@ -933,6 +941,36 @@ class Live2DEditorPageTests(unittest.TestCase):
         self.page.undo()
         self.assertEqual(self.page.preview.parts["PartFace"], .7)
 
+    def test_dynamics_follow_sdk_order_with_explicit_held_and_live_steps(self):
+        from types import MethodType
+        from app.gui.Live2DCanvas import Live2DCanvas
+        calls = []
+        core = SimpleNamespace(**{name: (lambda delta, n=name: calls.append((n, round(delta, 6))))
+                                  for name in ("UpdateBlink", "UpdateExpression", "UpdateBreath", "UpdatePhysics")})
+        canvas = SimpleNamespace(model=SimpleNamespace(_model=core), SECONDARY_HOLD_STEP=1e-4,
+                                 _secondary={"physics": True, "blink": True, "breath": False},
+                                 _secondary_expression="smile", _secondary_step=None, _secondary_hold=False,
+                                 _secondary_clock=None)
+        for name in ("_core_model", "secondaryMotionSupported", "secondaryMotionActive", "stepSecondaryMotion",
+                     "setSecondaryMotionHold"):
+            setattr(canvas, name, MethodType(getattr(Live2DCanvas, name), canvas))
+        canvas.stepSecondaryMotion(0.05)
+        Live2DCanvas._update_secondary_motion(canvas)  # an export step
+        self.assertEqual(calls, [("UpdateBlink", 0.05), ("UpdateExpression", 0.05), ("UpdatePhysics", 0.05)])
+        calls.clear()
+        canvas.setSecondaryMotionHold(True)
+        Live2DCanvas._update_secondary_motion(canvas)  # a repaint during export: re-apply, do not advance
+        self.assertEqual(calls, [("UpdateBlink", 0.0), ("UpdateExpression", 0.0), ("UpdatePhysics", 0.0001)])
+        calls.clear()
+        canvas.setSecondaryMotionHold(False)
+        Live2DCanvas._update_secondary_motion(canvas)  # live: the first frame starts the clock
+        self.assertEqual(calls[0], ("UpdateBlink", 0.0))
+        canvas._secondary = {"physics": False, "blink": False, "breath": False}
+        canvas._secondary_expression = ""
+        calls.clear()
+        Live2DCanvas._update_secondary_motion(canvas)
+        self.assertEqual(calls, [])  # all off: the frozen pose is untouched
+
     def test_frozen_native_update_applies_parameters_and_restores_part_defaults(self):
         from app.gui.Live2DCanvas import Live2DCanvas
         calls = []
@@ -945,6 +983,8 @@ class Live2DEditorPageTests(unittest.TestCase):
                                  _part_opacity_defaults={}, _part_opacity_overrides={},
                                  _motion_frozen=True, _advanced_enabled=True,
                                  _apply_advanced_params=lambda: calls.append(("parameters",)),
+                                 # Dynamics off: nothing runs between parameters and draw.
+                                 _update_secondary_motion=lambda: None,
                                  update=lambda: None)
         with patch("app.gui.Live2DCanvas.live2d.clearBuffer"):
             Live2DCanvas.setPartOpacityOverrides(canvas, {"PartFace": 0}, {"PartFace": .7})

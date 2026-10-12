@@ -84,6 +84,7 @@ class SettingsManager:
                 "assetstudio_cli_path": "",
                 "cubism_core_dll_path": "",
                 "photoshop_path": "",
+                "ffmpeg_path": "",
                 "image_viewer_path": "",
                 "spine_converter_path": "",
             },
@@ -423,6 +424,18 @@ class SettingsManager:
     def set_photoshop_path(self, path: str):
         self.set("tools.photoshop_path", str(path or "").strip())
 
+    def get_ffmpeg_path(self) -> str:
+        return str(self.get("tools.ffmpeg_path", "") or "").strip()
+
+    def set_ffmpeg_path(self, path: str):
+        self.set("tools.ffmpeg_path", str(path or "").strip())
+
+    def get_ffmpeg_executable(self) -> str:
+        """The configured ffmpeg, else one found on PATH or in the tool roots."""
+        from app.core.toolchain import find_ffmpeg
+        found = find_ffmpeg(self.get_ffmpeg_path() or None)
+        return str(found) if found else ""
+
     def get_photoshop_executable(self) -> str:
         configured = Path(self.get_photoshop_path()).expanduser()
         if configured.is_file():
@@ -695,6 +708,7 @@ class SettingsManager:
             "tools.assetstudio_cli_path": self.get_assetstudio_cli_path(),
             "tools.cubism_core_dll_path": self.get_cubism_core_dll_path(),
             "tools.photoshop_path": self.get_photoshop_path(),
+            "tools.ffmpeg_path": self.get_ffmpeg_path(),
             "tools.spine_converter_path": self.get_spine_converter_path(),
             "preview.spine_runtime_dir": self.get_spine_runtime_dir(),
         }

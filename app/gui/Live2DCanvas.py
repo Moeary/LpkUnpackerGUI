@@ -861,6 +861,14 @@ class Live2DCanvas(ADPOpenGLCanvas):
         self._part_indices = {}
         self._drawable_opacity_overrides = {}
         self._drawable_indices = {}
+        # Editor "dynamics": physics, eye blink, breath and an expression run
+        # on top of the frozen, keyed pose (stock Update() would replay the
+        # motion and reload saved parameters, discarding the keyed pose).
+        self._secondary = {"physics": False, "blink": False, "breath": False}
+        self._secondary_expression = ""
+        self._secondary_clock = None
+        self._secondary_step = None
+        self._secondary_hold = False
         self._gl_initialized = False
         self._model_load_generation = 1 if model_path else 0
         self._active_model_generation = 0
@@ -923,8 +931,12 @@ class Live2DCanvas(ADPOpenGLCanvas):
         self._part_opacity_defaults = {}
         self._drawable_opacity_overrides = {}
         self._drawable_indices = {str(identifier): index for index, identifier in enumerate(model.GetDrawableIds())}
+        self._secondary_clock = None
+        self._secondary_step = None
+        if self._secondary_expression:
+            self._start_secondary_expression()
         try:
-            self._part_indices = {str(part_id): index for index, part_id in enumerate(model.GetPartIds())}
+            self._part_indices ={str(part_id): index for index, part_id in enumerate(model.GetPartIds())}
         except Exception:
             self._part_indices = {}
         try:
@@ -1003,12 +1015,108 @@ class Live2DCanvas(ADPOpenGLCanvas):
                 index = self._part_indices.get(part_id)
                 if index is not None:
                     self.model.SetPartOpacity(index, float(value))
+        dynamics = getattr(self, "_update_secondary_motion", None)  # absent on lightweight canvas stand-ins
+        if self._motion_frozen and dynamics is not None:
+            dynamics()
         # live2d-py's native Draw recomputes Cubism Core vertices before drawing.
         # Calling SDK Update(0) here would also run motion/physics/pose, changing
         # an otherwise frozen frame and unrelated parameters during edits.
         # https://github.com/EasyLive2D/live2d-py/blob/v0.7.0.2/Live2D/V3/Main/src/Model.cpp#L1018
         self.model.Draw()
         return True
+
+    # --- Editor dynamics: physics, blink, breath, expression ---------------
+    SECONDARY_HOLD_STEP = 1e-4  # re-applies physics output without moving it
+
+    def _core_model(self):
+        return getattr(self.model, "_model", None) if self.model is not None else None
+
+    def secondaryMotionSupported(self) -> bool:  # noqa: N802
+        core = self._core_model()
+        return bool(core is not None and all(hasattr(core, name) for name in
+                                             ("UpdatePhysics", "UpdateBlink", "UpdateBreath", "UpdateExpression")))
+
+    def secondaryMotion(self) -> dict:  # noqa: N802
+        return {**self._secondary, "expression": self._secondary_expression}
+
+    def setSecondaryMotion(self, *, physics=None, blink=None, breath=None):  # noqa: N802
+        for key, value in (("physics", physics), ("blink", blink), ("breath", breath)):
+            if value is not None:
+                self._secondary[key] = bool(value)
+        self._secondary_clock = None
+        self.update()
+
+    def expressionIds(self) -> list[str]:  # noqa: N802
+        try:
+            return [str(name) for name in self.model.GetExpressionIds()] if self.model is not None else []
+        except Exception:
+            return []
+
+    def setPreviewExpression(self, name: str | None):  # noqa: N802
+        self._secondary_expression = str(name or "")
+        self._start_secondary_expression()
+        self.update()
+
+    def _start_secondary_expression(self):
+        core = self._core_model()
+        if core is None:
+            return
+        try:
+            if self._secondary_expression:
+                core.SetExpression(self._secondary_expression)
+            else:
+                core.ResetExpression()
+        except Exception:
+            pass
+
+    def secondaryMotionActive(self) -> bool:  # noqa: N802
+        return bool(any(self._secondary.values()) or self._secondary_expression)
+
+    def setSecondaryMotionHold(self, hold: bool):  # noqa: N802
+        """While held, repaints do not advance dynamics (an export steps them)."""
+        self._secondary_hold = bool(hold)
+        self._secondary_clock = None
+
+    def stepSecondaryMotion(self, seconds: float):  # noqa: N802
+        """Advance dynamics by exactly ``seconds`` on the next draw."""
+        self._secondary_step = max(0.0, float(seconds))
+
+    def advanceSecondaryMotion(self, parameters: dict, seconds: float):  # noqa: N802
+        """Pose ``parameters`` and advance dynamics without drawing (export pre-roll)."""
+        core = self._core_model()
+        if core is None or not self.secondaryMotionActive():
+            return
+        saved = self._advanced_params
+        self._advanced_params = dict(parameters)
+        try:
+            self._apply_advanced_params()
+        finally:
+            self._advanced_params = saved
+        self._secondary_step = max(0.0, float(seconds))
+        self._update_secondary_motion()
+
+    def _update_secondary_motion(self):
+        if not self.secondaryMotionActive() or not self.secondaryMotionSupported():
+            self._secondary_step = None
+            return
+        core = self._core_model()
+        if self._secondary_step is not None:
+            delta, self._secondary_step = self._secondary_step, None
+        elif self._secondary_hold:
+            delta = 0.0
+        else:
+            now = time.monotonic()
+            delta = 0.0 if self._secondary_clock is None else min(now - self._secondary_clock, 0.1)
+            self._secondary_clock = now
+        # Same order as the SDK's Model::Update after the motion.
+        if self._secondary["blink"]:
+            core.UpdateBlink(delta)
+        if self._secondary_expression:
+            core.UpdateExpression(delta)
+        if self._secondary["breath"]:
+            core.UpdateBreath(delta)
+        if self._secondary["physics"]:
+            core.UpdatePhysics(max(delta, self.SECONDARY_HOLD_STEP))
 
     def modelLoadGeneration(self) -> int:
         """Identity of the latest load request, including deferred native loads."""

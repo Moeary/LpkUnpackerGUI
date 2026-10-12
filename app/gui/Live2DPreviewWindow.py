@@ -994,6 +994,35 @@ class Live2DPreviewWindow(QWidget):
         if self.live2d_canvas:
             self.live2d_canvas.setDrawableOpacityOverrides(values)
 
+    # Editor dynamics (physics, blink, breath, expression); see Live2DCanvas.
+    def secondary_motion_supported(self) -> bool:
+        return bool(self.live2d_canvas and self.live2d_canvas.secondaryMotionSupported())
+
+    def set_secondary_motion(self, *, physics=None, blink=None, breath=None, expression=None):
+        if not self.live2d_canvas:
+            return
+        self.live2d_canvas.setSecondaryMotion(physics=physics, blink=blink, breath=breath)
+        if expression is not None:
+            self.live2d_canvas.setPreviewExpression(expression)
+
+    def expression_ids(self) -> list[str]:
+        return self.live2d_canvas.expressionIds() if self.live2d_canvas else []
+
+    def secondary_motion_active(self) -> bool:
+        return bool(self.live2d_canvas and self.live2d_canvas.secondaryMotionActive())
+
+    def set_secondary_motion_hold(self, hold: bool):
+        if self.live2d_canvas:
+            self.live2d_canvas.setSecondaryMotionHold(hold)
+
+    def step_secondary_motion(self, seconds: float):
+        if self.live2d_canvas:
+            self.live2d_canvas.stepSecondaryMotion(seconds)
+
+    def advance_secondary_motion(self, parameters: dict, seconds: float):
+        if self.live2d_canvas:
+            self.live2d_canvas.advanceSecondaryMotion(parameters, seconds)
+
     def can_render_images(self) -> bool:
         return bool(self.live2d_canvas and self.live2d_canvas.canRenderImages())
 

@@ -60,6 +60,30 @@ class AnimationExportTests(unittest.TestCase):
             with Image.open(files[0]) as image:
                 self.assertEqual(image.getpixel((11, 7)), (0, 0, 255, 60))  # soft alpha kept
 
+    def test_video_needs_ffmpeg_and_encodes_webm_with_alpha_and_mp4(self):
+        import shutil
+        import subprocess
+        from app.core.animation_export import video_encoder
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(RuntimeError):
+                write_animation(_frames(), Path(directory) / "x", "mp4", 10, ffmpeg=None)
+        self.assertIsNone(video_encoder(None, "webm"))
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg or video_encoder(ffmpeg, "webm") is None or video_encoder(ffmpeg, "mp4") is None:
+            self.skipTest("ffmpeg with WebM and MP4 encoders is not installed")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            frames = _frames(size=(13, 9))  # odd sizes are padded for 4:2:0
+            webm = write_animation(frames, root / "a", "webm", 10, transparent=True, ffmpeg=ffmpeg)
+            mp4 = write_animation(frames, root / "a", "mp4", 10, transparent=True, ffmpeg=ffmpeg)
+            self.assertEqual((webm.name, mp4.name), ("a.webm", "a.mp4"))
+            png = root / "first.png"
+            subprocess.run([ffmpeg, "-v", "error", "-y", "-c:v", video_encoder(ffmpeg, "webm")[0], "-i", str(webm),
+                            "-frames:v", "1", str(png)], check=True)
+            with Image.open(png) as image:
+                self.assertEqual(image.size, (14, 10))
+                self.assertEqual(image.convert("RGBA").getpixel((11, 0))[3], 0)  # alpha survives in WebM
+
     def test_cancel_writes_nothing(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "out.webp"
